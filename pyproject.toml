@@ -1,16 +1,32 @@
 [project]
 name = "strawberry-orm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
 authors = [
+    { name = "James Davidson", email = "jamie.t.davidson@gmail.com" },
     { name = "Patrick Arminio", email = "patrick.arminio@gmail.com" }
 ]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "strawberry-graphql>=0.311.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/strawberry-graphql/strawberry-orm"
+Repository = "https://github.com/strawberry-graphql/strawberry-orm"
+Issues = "https://github.com/strawberry-graphql/strawberry-orm/issues"
 
 [project.optional-dependencies]
 django = ["django>=4.2"]

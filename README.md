@@ -2,6 +2,9 @@
 
 Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.rocks/) on top of Django ORM, SQLAlchemy, and Tortoise ORM.
 
+> **WARNING**
+> `strawberry-orm` is still in **alpha**. Expect breaking changes, incomplete APIs, and release-to-release churn while the package stabilizes.
+
 `strawberry-orm` helps you keep one Strawberry schema style across multiple ORMs. It focuses on:
 
 - model-backed Strawberry types
