@@ -1,13 +1,7 @@
 """Abstract error handling and edge-case tests (backend-agnostic)."""
 
-import pytest
-
 
 class AbstractTestQueryErrorHandling:
-    def test_aggregate_raises_not_implemented(self, orm, User):
-        with pytest.raises(NotImplementedError, match="aggregate"):
-            orm.aggregate(User)
-
     def test_empty_result(self, execute, seed):
         data = execute("""
             { users(filter: { field: { name: { exact: "Nobody" } } }) { name } }

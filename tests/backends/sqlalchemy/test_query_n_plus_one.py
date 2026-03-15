@@ -480,6 +480,58 @@ class TestQueryNestedGetQueryset:
         }
         assert len(query_counter) <= 2
 
+    def test_get_queryset_still_applies_with_nested_filter_argument(
+        self, sa_session, seed, Post, User
+    ):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        PostFilter = orm.filter(Post)
+
+        @orm.type(Post, filters=PostFilter)
+        class PT:
+            id: auto
+            title: auto
+            is_published: auto
+
+            @classmethod
+            def get_queryset(cls, stmt, info):
+                return stmt.where(Post.is_published == True)  # noqa: E712
+
+        @orm.type(User)
+        class UT:
+            id: auto
+            name: auto
+            posts: list[PT]
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users(self, info: strawberry.types.Info) -> list[UT]:
+                return select(User)  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = schema.execute_sync(
+            """
+            {
+                users {
+                    name
+                    posts(filter: { field: { title: { contains: "Draft" } } }) {
+                        title
+                        isPublished
+                    }
+                }
+            }
+            """,
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "posts": []},
+                {"name": "Bob", "posts": []},
+                {"name": "Charlie", "posts": []},
+            ]
+        }
+
     def test_get_queryset_composes_with_load_callable(
         self, sa_session, seed, query_counter, Post, User
     ):

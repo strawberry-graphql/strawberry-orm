@@ -3,7 +3,7 @@
 
 class AbstractTestQueryOrderDirection:
     def test_order_by_name_asc(self, execute, seed):
-        data = execute("{ users(order: { name: ASC }) { name } }")
+        data = execute("{ users(order: [{ name: ASC }]) { name } }")
         assert data == {
             "users": [
                 {"name": "Alice"},
@@ -13,7 +13,7 @@ class AbstractTestQueryOrderDirection:
         }
 
     def test_order_by_name_desc(self, execute, seed):
-        data = execute("{ users(order: { name: DESC }) { name } }")
+        data = execute("{ users(order: [{ name: DESC }]) { name } }")
         assert data == {
             "users": [
                 {"name": "Charlie"},
@@ -23,7 +23,7 @@ class AbstractTestQueryOrderDirection:
         }
 
     def test_order_by_title_asc(self, execute, seed):
-        data = execute("{ posts(order: { title: ASC }) { title } }")
+        data = execute("{ posts(order: [{ title: ASC }]) { title } }")
         assert data == {
             "posts": [
                 {"title": "Draft Post"},
@@ -37,7 +37,7 @@ class AbstractTestQueryOrderDirection:
         data = execute("""
             { posts(
                 filter: { field: { isPublished: { exact: true } } },
-                order: { title: DESC }
+                order: [{ title: DESC }]
             ) { title } }
         """)
         assert data == {
@@ -52,7 +52,7 @@ class AbstractTestQueryOrderDirection:
         data = execute("""
             { users(
                 filter: { field: { email: { contains: "example" } } },
-                order: { name: DESC }
+                order: [{ name: DESC }]
             ) { name email } }
         """)
         assert data == {
@@ -63,10 +63,38 @@ class AbstractTestQueryOrderDirection:
         }
 
 
+class AbstractTestQueryOrderTieBreaking:
+    def test_tie_break_published_then_title(self, execute, seed):
+        data = execute(
+            "{ posts(order: [{ isPublished: DESC }, { title: ASC }]) { title isPublished } }"
+        )
+        assert data == {
+            "posts": [
+                {"title": "GraphQL Guide", "isPublished": True},
+                {"title": "Hello World", "isPublished": True},
+                {"title": "Rust Adventures", "isPublished": True},
+                {"title": "Draft Post", "isPublished": False},
+            ]
+        }
+
+    def test_tie_break_published_then_title_desc(self, execute, seed):
+        data = execute(
+            "{ posts(order: [{ isPublished: DESC }, { title: DESC }]) { title isPublished } }"
+        )
+        assert data == {
+            "posts": [
+                {"title": "Rust Adventures", "isPublished": True},
+                {"title": "Hello World", "isPublished": True},
+                {"title": "GraphQL Guide", "isPublished": True},
+                {"title": "Draft Post", "isPublished": False},
+            ]
+        }
+
+
 class AbstractTestQueryOrderNulls:
     def test_asc_nulls_first(self, execute, seed):
         data = execute(
-            "{ comments(order: { parentId: ASC_NULLS_FIRST }) { id parentId } }"
+            "{ comments(order: [{ parentId: ASC_NULLS_FIRST }]) { id parentId } }"
         )
         parent_ids = [c["parentId"] for c in data["comments"]]
         null_positions = [i for i, v in enumerate(parent_ids) if v is None]
@@ -76,7 +104,7 @@ class AbstractTestQueryOrderNulls:
 
     def test_asc_nulls_last(self, execute, seed):
         data = execute(
-            "{ comments(order: { parentId: ASC_NULLS_LAST }) { id parentId } }"
+            "{ comments(order: [{ parentId: ASC_NULLS_LAST }]) { id parentId } }"
         )
         parent_ids = [c["parentId"] for c in data["comments"]]
         null_positions = [i for i, v in enumerate(parent_ids) if v is None]
@@ -86,7 +114,7 @@ class AbstractTestQueryOrderNulls:
 
     def test_desc_nulls_first(self, execute, seed):
         data = execute(
-            "{ comments(order: { parentId: DESC_NULLS_FIRST }) { id parentId } }"
+            "{ comments(order: [{ parentId: DESC_NULLS_FIRST }]) { id parentId } }"
         )
         parent_ids = [c["parentId"] for c in data["comments"]]
         null_positions = [i for i, v in enumerate(parent_ids) if v is None]
@@ -96,7 +124,7 @@ class AbstractTestQueryOrderNulls:
 
     def test_desc_nulls_last(self, execute, seed):
         data = execute(
-            "{ comments(order: { parentId: DESC_NULLS_LAST }) { id parentId } }"
+            "{ comments(order: [{ parentId: DESC_NULLS_LAST }]) { id parentId } }"
         )
         parent_ids = [c["parentId"] for c in data["comments"]]
         null_positions = [i for i, v in enumerate(parent_ids) if v is None]

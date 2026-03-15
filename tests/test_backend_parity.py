@@ -1,21 +1,22 @@
-"""Meta-reflection test ensuring SQLAlchemy and Django backends have matching test coverage.
+"""Meta-reflection test ensuring all backends have matching test coverage.
 
 Uses ast introspection to collect test file names, class names, and method names
-from both backends, then asserts they are identical sets. This catches parity
+from all backends, then asserts they are identical sets. This catches parity
 drift automatically when a developer adds a test to one backend but not the other.
 """
 
 import ast
-import os
 from pathlib import Path
 
 
 SA_DIR = Path(__file__).parent / "backends" / "sqlalchemy"
 DJ_DIR = Path(__file__).parent / "backends" / "django"
+TORT_DIR = Path(__file__).parent / "backends" / "tortoise"
 
 EXCLUDED_FILES = {
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
+    "test_queryset_detection.py",
 }
 
 EXCLUDED_METHODS = {
@@ -26,6 +27,30 @@ EXCLUDED_METHODS = {
     ),
 }
 
+TORT_EXCLUDED_FILES = {
+    "test_query_session_resolution.py",
+    "test_query_queryset_detection.py",
+    "test_query_basic.py",
+    "test_query_filter_field_lookups.py",
+    "test_query_filter_boolean_operators.py",
+    "test_query_filter_nested_conditions.py",
+    "test_query_filter_relationships.py",
+    "test_query_order_direction_and_nulls.py",
+    "test_query_auto_resolution.py",
+    "test_query_type_generation.py",
+    "test_query_nested_resolution.py",
+    "test_query_self_is_model.py",
+    "test_query_multiple_types.py",
+    "test_query_get_queryset.py",
+    "test_query_error_handling.py",
+    "test_mutation_crud.py",
+    "test_query_field_hints.py",
+    "test_mutation_ref_list.py",
+    "test_query_optimizer.py",
+    "test_backend.py",
+    "test_ref_type.py",
+}
+
 
 def _collect_test_structure(directory: Path) -> dict[str, dict[str, list[str]]]:
     """Parse all test_*.py files in *directory* and build a structure of
@@ -33,9 +58,6 @@ def _collect_test_structure(directory: Path) -> dict[str, dict[str, list[str]]]:
     result: dict[str, dict[str, list[str]]] = {}
 
     for filepath in sorted(directory.glob("test_*.py")):
-        if filepath.name in EXCLUDED_FILES:
-            continue
-
         tree = ast.parse(filepath.read_text(), filename=str(filepath))
         classes: dict[str, list[str]] = {}
 
@@ -56,10 +78,34 @@ def _collect_test_structure(directory: Path) -> dict[str, dict[str, list[str]]]:
     return result
 
 
+def _filter_structure(
+    struct: dict[str, dict[str, list[str]]],
+    excluded_files: set[str],
+    excluded_methods: set[tuple[str, str, str]] | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    """Remove excluded files and methods from a test structure."""
+    result: dict[str, dict[str, list[str]]] = {}
+    for fname, classes in struct.items():
+        if fname in excluded_files:
+            continue
+        filtered_classes: dict[str, list[str]] = {}
+        for cls_name, methods in classes.items():
+            filtered = [
+                m
+                for m in methods
+                if not excluded_methods or (fname, cls_name, m) not in excluded_methods
+            ]
+            if filtered:
+                filtered_classes[cls_name] = filtered
+        if filtered_classes:
+            result[fname] = filtered_classes
+    return result
+
+
 class TestBackendParity:
-    def test_same_test_files(self):
-        sa_struct = _collect_test_structure(SA_DIR)
-        dj_struct = _collect_test_structure(DJ_DIR)
+    def test_sa_django_same_test_files(self):
+        sa_struct = _filter_structure(_collect_test_structure(SA_DIR), EXCLUDED_FILES)
+        dj_struct = _filter_structure(_collect_test_structure(DJ_DIR), EXCLUDED_FILES)
 
         sa_files = set(sa_struct.keys())
         dj_files = set(dj_struct.keys())
@@ -73,9 +119,9 @@ class TestBackendParity:
             f"  Django only: {sorted(dj_only) or 'none'}"
         )
 
-    def test_same_test_classes(self):
-        sa_struct = _collect_test_structure(SA_DIR)
-        dj_struct = _collect_test_structure(DJ_DIR)
+    def test_sa_django_same_test_classes(self):
+        sa_struct = _filter_structure(_collect_test_structure(SA_DIR), EXCLUDED_FILES)
+        dj_struct = _filter_structure(_collect_test_structure(DJ_DIR), EXCLUDED_FILES)
 
         common_files = set(sa_struct.keys()) & set(dj_struct.keys())
         mismatches = []
@@ -96,9 +142,13 @@ class TestBackendParity:
             mismatches
         )
 
-    def test_same_test_methods(self):
-        sa_struct = _collect_test_structure(SA_DIR)
-        dj_struct = _collect_test_structure(DJ_DIR)
+    def test_sa_django_same_test_methods(self):
+        sa_struct = _filter_structure(
+            _collect_test_structure(SA_DIR), EXCLUDED_FILES, EXCLUDED_METHODS
+        )
+        dj_struct = _filter_structure(
+            _collect_test_structure(DJ_DIR), EXCLUDED_FILES, EXCLUDED_METHODS
+        )
 
         common_files = set(sa_struct.keys()) & set(dj_struct.keys())
         mismatches = []
@@ -111,12 +161,6 @@ class TestBackendParity:
             for cls_name in sorted(common_classes):
                 sa_methods = set(sa_classes[cls_name])
                 dj_methods = set(dj_classes[cls_name])
-
-                for m in list(sa_methods | dj_methods):
-                    if (fname, cls_name, m) in EXCLUDED_METHODS:
-                        sa_methods.discard(m)
-                        dj_methods.discard(m)
-
                 sa_only = sa_methods - dj_methods
                 dj_only = dj_methods - sa_methods
                 if sa_only or dj_only:
@@ -127,5 +171,45 @@ class TestBackendParity:
                     )
 
         assert not mismatches, "Test method mismatch between backends!\n" + "\n".join(
+            mismatches
+        )
+
+    def test_tortoise_has_common_tests(self):
+        """Verify Tortoise has parity with SA/Django for non-excluded tests."""
+        sa_struct = _filter_structure(
+            _collect_test_structure(SA_DIR),
+            EXCLUDED_FILES | TORT_EXCLUDED_FILES,
+        )
+        tort_struct = _filter_structure(
+            _collect_test_structure(TORT_DIR),
+            EXCLUDED_FILES | TORT_EXCLUDED_FILES,
+        )
+
+        sa_files = set(sa_struct.keys())
+        tort_files = set(tort_struct.keys())
+        sa_only = sa_files - tort_files
+        tort_only = tort_files - sa_files
+
+        assert not sa_only and not tort_only, (
+            f"Test file mismatch (SA vs Tortoise, excluding known gaps)!\n"
+            f"  SA only: {sorted(sa_only) or 'none'}\n"
+            f"  Tortoise only: {sorted(tort_only) or 'none'}"
+        )
+
+        common_files = sa_files & tort_files
+        mismatches = []
+        for fname in sorted(common_files):
+            sa_classes = set(sa_struct[fname].keys())
+            tort_classes = set(tort_struct[fname].keys())
+            sa_only_cls = sa_classes - tort_classes
+            tort_only_cls = tort_classes - sa_classes
+            if sa_only_cls or tort_only_cls:
+                mismatches.append(
+                    f"  {fname}:\n"
+                    f"    SA only classes: {sorted(sa_only_cls) or 'none'}\n"
+                    f"    Tortoise only classes: {sorted(tort_only_cls) or 'none'}"
+                )
+
+        assert not mismatches, "Test class mismatch (SA vs Tortoise)!\n" + "\n".join(
             mismatches
         )

@@ -95,7 +95,7 @@ class AbstractTestQueryOrderRelationships:
         data = execute("""
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: { title: ASC }) { title }
+                posts(order: [{ title: ASC }]) { title }
             } }
         """)
         assert data == {
@@ -114,7 +114,7 @@ class AbstractTestQueryOrderRelationships:
         data = execute("""
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: { title: DESC }) { title }
+                posts(order: [{ title: DESC }]) { title }
             } }
         """)
         assert data == {
@@ -133,7 +133,7 @@ class AbstractTestQueryOrderRelationships:
         data = execute("""
             { posts(filter: { field: { title: { exact: "GraphQL Guide" } } }) {
                 title
-                tags(order: { name: DESC }) { name }
+                tags(order: [{ name: DESC }]) { name }
             } }
         """)
         assert data == {
@@ -152,7 +152,7 @@ class AbstractTestQueryOrderRelationships:
         data = execute("""
             { posts(filter: { field: { title: { exact: "GraphQL Guide" } } }) {
                 title
-                tags(order: { name: ASC }) { name }
+                tags(order: [{ name: ASC }]) { name }
             } }
         """)
         assert data == {
@@ -171,7 +171,7 @@ class AbstractTestQueryOrderRelationships:
         data = execute("""
             { posts(filter: { field: { title: { exact: "Hello World" } } }) {
                 title
-                comments(order: { body: ASC }) { body }
+                comments(order: [{ body: ASC }]) { body }
             } }
         """)
         assert data == {
@@ -196,7 +196,7 @@ class AbstractTestQueryFilterAndOrderRelationships:
                 name
                 posts(
                     filter: { field: { isPublished: { exact: true } } },
-                    order: { title: DESC }
+                    order: [{ title: DESC }]
                 ) { title }
             } }
         """)
@@ -218,7 +218,7 @@ class AbstractTestQueryFilterAndOrderRelationships:
                 title
                 comments(
                     filter: { field: { body: { neq: "Thanks!" } } },
-                    order: { id: ASC }
+                    order: [{ id: ASC }]
                 ) { body }
             } }
         """)
@@ -230,11 +230,11 @@ class AbstractTestQueryFilterAndOrderRelationships:
 
     def test_multiple_users_with_nested_filter_and_order(self, execute, seed):
         data = execute("""
-            { users(order: { name: ASC }) {
+            { users(order: [{ name: ASC }]) {
                 name
                 posts(
                     filter: { field: { isPublished: { exact: true } } },
-                    order: { title: ASC }
+                    order: [{ title: ASC }]
                 ) { title }
             } }
         """)
@@ -261,10 +261,10 @@ class AbstractTestQueryFilterAndOrderRelationships:
         data = execute("""
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: { title: ASC }) {
+                posts(order: [{ title: ASC }]) {
                     title
-                    comments(order: { body: ASC }) { body }
-                    tags(order: { name: ASC }) { name }
+                    comments(order: [{ body: ASC }]) { body }
+                    tags(order: [{ name: ASC }]) { name }
                 }
             } }
         """)

@@ -50,7 +50,7 @@ def _make_query_resolver(
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
-            "order": Optional[order_type],
+            "order": Optional[list[order_type]],
         }
     elif filter_type:
 
@@ -74,7 +74,7 @@ def _make_query_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "order": Optional[order_type],
+            "order": Optional[list[order_type]],
         }
     else:
 
@@ -170,9 +170,6 @@ class StrawberryORM:
     def order(self, model_or_type: type, **kwargs: Any) -> Any:
         return self._backend.order(model_or_type, **kwargs)
 
-    def aggregate(self, model: type, **kwargs: Any) -> Any:
-        return self._backend.aggregate(model, **kwargs)
-
     # -- Fields --------------------------------------------------------------
 
     def field(
@@ -188,7 +185,7 @@ class StrawberryORM:
         deprecation_reason: str | None = None,
     ) -> Any:
         if filters is not None or order is not None:
-            model = _infer_model(filters, order)
+            model = _infer_model_from_types(filters, order)
             resolver = _make_query_resolver(
                 self._backend,
                 model,
@@ -262,9 +259,10 @@ class StrawberryORM:
         info: Any,
         *,
         authorize: Any | None = None,
+        mode: str = "replace",
     ) -> None:
         return self._backend.apply_ref_list(
-            instance, field, refs, info, authorize=authorize
+            instance, field, refs, info, authorize=authorize, mode=mode
         )
 
     # -- Queryset overrides --------------------------------------------------
@@ -279,6 +277,19 @@ class StrawberryORM:
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)
+
+
+def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:
+    """Extract the ORM model class from filter/order types via ``__orm_model__``."""
+    for source in (filters, order):
+        if source is not None:
+            model = getattr(source, "__orm_model__", None)
+            if model is not None:
+                return model
+    raise ValueError(
+        "Cannot infer model: neither the filter nor the order type has "
+        "an __orm_model__ attribute.  Pass types created by orm.filter() / orm.order()."
+    )
 
 
 def _create_backend(name: BackendName, **kwargs: Any) -> Backend:

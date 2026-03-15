@@ -446,6 +446,57 @@ class TestQueryNestedGetQueryset:
         }
         assert len(ctx) <= 3
 
+    def test_get_queryset_still_applies_with_nested_filter_argument(
+        self, seed, Post, User
+    ):
+        orm = StrawberryORM("django")
+        PostFilter = orm.filter(Post)
+
+        @orm.type(Post, filters=PostFilter)
+        class PT:
+            id: auto
+            title: auto
+            is_published: auto
+
+            @classmethod
+            def get_queryset(cls, qs, info):
+                return qs.filter(is_published=True)
+
+        @orm.type(User)
+        class UT:
+            id: auto
+            name: auto
+            posts: list[PT]
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users(self) -> list[UT]:
+                return User.objects.all()  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = schema.execute_sync(
+            """
+            {
+                users {
+                    name
+                    posts(filter: { field: { title: { contains: "Draft" } } }) {
+                        title
+                        isPublished
+                    }
+                }
+            }
+            """
+        )
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "posts": []},
+                {"name": "Bob", "posts": []},
+                {"name": "Charlie", "posts": []},
+            ]
+        }
+
     def test_get_queryset_composes_with_load_callable(self, seed, Post, User):
         """Both type-level get_queryset and field-level load callable should compose."""
         orm = StrawberryORM("django")

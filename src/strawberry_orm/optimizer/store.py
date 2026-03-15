@@ -3,17 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
 
-
-@dataclass
-class FieldHints:
-    """Optimization hints for a single field."""
-
-    load: list[Any] | Callable[..., Any] | None = None
-    only: list[str] | None = None
-    compute: dict[str, Any] | None = None
-    disable_optimization: bool = False
+from strawberry_orm.types import FieldHints
 
 
 @dataclass

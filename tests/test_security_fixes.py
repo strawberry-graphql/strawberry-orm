@@ -524,7 +524,7 @@ class TestFix7_PermissionClassesApplied:
 
     def test_permission_classes_on_field_definition(self):
         from strawberry_orm.types import FieldDefinition
-        from strawberry_orm.permissions import BasePermission
+        from strawberry.permission import BasePermission
 
         class DenyAll(BasePermission):
             message = "denied"
@@ -670,6 +670,69 @@ class TestFix8_RefListAuthorizationHook:
 
 
 # =========================================================================
+# FIX 8B — ref(delete=True) should unlink by default
+# =========================================================================
+
+
+class TestFix8B_RefDeleteDefaults:
+    def _delete_ref(self, ref_id):
+        class DeletePayload:
+            id = ref_id
+
+        class RefOp:
+            id = strawberry.UNSET
+            create = strawberry.UNSET
+            update = strawberry.UNSET
+            delete = DeletePayload()
+
+        return RefOp()
+
+    def test_delete_unlinks_without_hard_delete(self, seeded):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        account = seeded.get(Account, 1)
+        role = seeded.get(Role, 1)
+        account.groups.append(role)
+        seeded.flush()
+
+        class FakeInfo:
+            context = {"session": seeded}
+
+        orm.apply_ref_list(
+            account,
+            "groups",
+            [self._delete_ref(1)],
+            FakeInfo(),
+            mode="patch",
+        )
+        seeded.flush()
+
+        assert seeded.get(Role, 1) is not None
+        assert list(account.groups) == []
+
+    def test_delete_can_hard_delete_when_opted_in(self, seeded):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite", hard_delete_refs=True)
+        account = seeded.get(Account, 1)
+        role = seeded.get(Role, 1)
+        account.groups.append(role)
+        seeded.flush()
+
+        class FakeInfo:
+            context = {"session": seeded}
+
+        orm.apply_ref_list(
+            account,
+            "groups",
+            [self._delete_ref(1)],
+            FakeInfo(),
+            mode="patch",
+        )
+        seeded.flush()
+
+        assert seeded.get(Role, 1) is None
+        assert list(account.groups) == []
+
+
+# =========================================================================
 # FIX 9 — Error sanitization (no table/column leakage)
 #
 # Plan:
@@ -745,6 +808,38 @@ class TestFix9_ErrorSanitization:
 class TestFix10_FilterExclude:
     """filter(exclude=...) should actually remove fields from the filter
     input so they cannot be used for data exfiltration."""
+
+    def test_sensitive_fields_excluded_by_default(self):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+
+        filt = orm.filter(Account)
+        field_names = set(filt._field_type.__dataclass_fields__.keys())
+        assert "password_hash" not in field_names
+        assert "api_key" not in field_names
+        assert "is_admin" not in field_names
+
+        order = orm.order(Account)
+        order_names = set(order.__dataclass_fields__.keys())
+        assert "password_hash" not in order_names
+        assert "api_key" not in order_names
+        assert "is_admin" not in order_names
+
+        inp = orm.input(Account)
+        input_names = set(inp.__dataclass_fields__.keys())
+        assert "password_hash" not in input_names
+        assert "api_key" not in input_names
+        assert "is_admin" not in input_names
+
+    def test_sensitive_fields_can_be_explicitly_included(self):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+
+        filt = orm.filter(Account, include=["password_hash"])
+        field_names = set(filt._field_type.__dataclass_fields__.keys())
+        assert "password_hash" in field_names
+
+        inp = orm.input(Account, include=["password_hash"])
+        input_names = set(inp.__dataclass_fields__.keys())
+        assert "password_hash" in input_names
 
     def test_excluded_field_not_in_filter(self):
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")

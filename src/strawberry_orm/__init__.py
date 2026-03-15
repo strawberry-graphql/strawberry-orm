@@ -10,11 +10,11 @@ from strawberry_orm.filters import (
     IDLookup,
     IntComparisonLookup,
     StringLookup,
+    StringLookupNoRegex,
     TimeComparisonLookup,
 )
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import FieldHints, OptimizerExtension, OptimizerStore
-from strawberry_orm.permissions import BasePermission
 from strawberry_orm.types import (
     UNSET,
     FieldDefinition,
@@ -25,7 +25,6 @@ from strawberry_orm.types import (
 )
 
 __all__ = [
-    "BasePermission",
     "BooleanLookup",
     "DateComparisonLookup",
     "DateTimeComparisonLookup",
@@ -41,6 +40,7 @@ __all__ = [
     "Ordering",
     "StrawberryORM",
     "StringLookup",
+    "StringLookupNoRegex",
     "TimeComparisonLookup",
     "UNSET",
     "auto",

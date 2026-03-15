@@ -9,13 +9,16 @@ from typing import Any, Callable, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
-from strawberry_orm.filters import TYPE_TO_LOOKUP
-from strawberry_orm.mutations import make_ref_type
-from strawberry_orm.optimizer import OptimizerExtension, OptimizerStore
-from strawberry_orm.types import Ordering
+from strawberry_orm.backends._base import (
+    BaseBackend,
+    _SENSITIVE_PATTERNS,
+    extract_element_type,
+    input_to_dict,
+)
+from strawberry_orm.optimizer import OptimizerExtension
 
 
-class SQLAlchemyBackend:
+class SQLAlchemyBackend(BaseBackend):
     """Backend adapter for SQLAlchemy."""
 
     def __init__(
@@ -27,22 +30,30 @@ class SQLAlchemyBackend:
         max_filter_depth: int = 10,
         max_filter_branches: int = 50,
         enable_regex_filters: bool = False,
+        max_in_list_size: int = 500,
         **kwargs: Any,
     ) -> None:
+        kwargs["filter_overrides"] = filter_overrides or {}
+        super().__init__(**kwargs)
         self._dialect = dialect
         self._session_getter = session_getter
-        self._filter_overrides = filter_overrides or {}
         self._max_filter_depth = max_filter_depth
         self._max_filter_branches = max_filter_branches
         self._enable_regex_filters = enable_regex_filters
-        self._store = OptimizerStore()
-        self._type_registry: dict[str, type] = {}
-        self._type_querysets: dict[type, Callable[..., Any]] = {}
+        self._max_in_list_size = max_in_list_size
+
+    # -- Introspection -------------------------------------------------------
+
+    def _introspect_model(
+        self, model: type
+    ) -> list[tuple[str, type, bool, type | None]]:
+        """Return (field_name, python_type, is_relation, related_model) for each
+        column and relationship on an SQLAlchemy mapped class."""
+        return _introspect_sa_model(model)
 
     # -- Type generation -----------------------------------------------------
 
     def type(self, model: type, **kwargs: Any) -> Any:
-        backend = self
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
         name = kwargs.get("name")
@@ -51,8 +62,6 @@ class SQLAlchemyBackend:
 
         def decorator(cls: type) -> Any:
             from sqlalchemy import inspect as sa_inspect
-            from strawberry_orm.types import FieldDefinition
-            from strawberry_orm.optimizer.store import FieldHints
 
             mapper = sa_inspect(model)
 
@@ -69,8 +78,8 @@ class SQLAlchemyBackend:
 
             rel_names = {rel.key for rel in mapper.relationships}
 
+            # PEP 563: resolve string annotations via get_type_hints
             annotations = getattr(cls, "__annotations__", {}).copy()
-
             try:
                 import typing as _t
 
@@ -87,68 +96,24 @@ class SQLAlchemyBackend:
                         annotations[k] = resolved[k]
             except Exception:
                 pass
-
-            for field_name in list(annotations):
-                if include and field_name not in include:
-                    continue
-                if exclude and field_name in exclude:
-                    del annotations[field_name]
-                    continue
-
-                ann = annotations[field_name]
-                if ann is strawberry.auto:
-                    if field_name in col_types:
-                        annotations[field_name] = col_types[field_name]
-
             cls.__annotations__ = annotations
-            cls.__orm_model__ = model  # type: ignore[attr-defined]
 
-            if filters is not None:
-                cls.__orm_filter__ = filters  # type: ignore[attr-defined]
-            if order is not None:
-                cls.__orm_order__ = order  # type: ignore[attr-defined]
+            type_name = self._process_type_annotations(
+                cls,
+                model,
+                col_types,
+                include=include,
+                exclude=exclude,
+                name=name,
+                filters=filters,
+                order=order,
+            )
 
-            type_name = name or cls.__name__
-
-            if hasattr(cls, "get_queryset") and isinstance(
-                vars(cls).get("get_queryset"), classmethod
-            ):
-                backend._type_querysets[model] = cls.get_queryset
-
-            for attr_name in list(vars(cls)):
-                val = getattr(cls, attr_name, None)
-                if isinstance(val, FieldDefinition):
-                    hints = FieldHints(
-                        load=val.load,
-                        only=val.only,
-                        compute=val.compute,
-                        disable_optimization=val.disable_optimization,
-                    )
-                    backend._store.register(type_name, attr_name, hints)
-                    if val.permission_classes:
-                        setattr(
-                            cls,
-                            attr_name,
-                            strawberry.field(
-                                permission_classes=val.permission_classes,
-                                description=val.description,
-                            ),
-                        )
-                    else:
-                        try:
-                            delattr(cls, attr_name)
-                        except AttributeError:
-                            pass
-                elif getattr(val, "_orm_auto_field", False):
-                    try:
-                        delattr(cls, attr_name)
-                    except AttributeError:
-                        pass
-
-            for field_name, ann in annotations.items():
+            # SA-specific: relation resolvers for list fields
+            for field_name, ann in cls.__annotations__.items():
                 if field_name in vars(cls):
                     continue
-                el_type = _extract_element_type(ann)
+                el_type = extract_element_type(ann)
                 if el_type is None:
                     continue
                 f_type = getattr(el_type, "__orm_filter__", None)
@@ -163,7 +128,7 @@ class SQLAlchemyBackend:
                     cls,
                     field_name,
                     _make_sa_rel_resolver(
-                        backend,
+                        self,
                         field_name,
                         model,
                         rel_model,
@@ -172,11 +137,7 @@ class SQLAlchemyBackend:
                     ),
                 )
 
-            result = strawberry.type(cls, name=name if name else None)
-
-            backend._type_registry[type_name] = model
-
-            return result
+            return self._finalize_type(cls, model, type_name, name)
 
         return decorator
 
@@ -188,7 +149,7 @@ class SQLAlchemyBackend:
 
         pk_names = _get_sa_pk_names(model) if exclude_pk else set()
 
-        fields_meta = _introspect_sa_model(model)
+        fields_meta = self._introspect_model(model)
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         for fname, ftype, is_relation, _rel_model in fields_meta:
@@ -198,6 +159,9 @@ class SQLAlchemyBackend:
                 continue
             if exclude and fname in exclude:
                 continue
+            if self._exclude_sensitive_fields and not (include and fname in include):
+                if _SENSITIVE_PATTERNS.search(fname):
+                    continue
             if is_relation:
                 continue
             annotations[fname] = Optional[ftype]
@@ -208,140 +172,6 @@ class SQLAlchemyBackend:
         cls = type(type_name, (), ns)
         return strawberry.input(cls)
 
-    def partial(self, model: type, **kwargs: Any) -> Any:
-        kwargs.setdefault("name", f"{model.__name__}PartialInput")
-        return self.input(model, **kwargs)
-
-    def filter(self, model_or_type: type, **kwargs: Any) -> Any:
-        model = model_or_type
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-
-        fields_meta = _introspect_sa_model(model)
-
-        field_annotations: dict[str, Any] = {}
-        field_defaults: dict[str, Any] = {}
-
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if is_relation:
-                continue
-            lookup_type = self._filter_overrides.get(ftype) or TYPE_TO_LOOKUP.get(ftype)
-            if lookup_type is not None:
-                field_annotations[fname] = Optional[lookup_type]
-                field_defaults[fname] = strawberry.UNSET
-
-        field_type_name = f"{model.__name__}Field"
-        field_ns: dict[str, Any] = {
-            "__annotations__": field_annotations,
-            **field_defaults,
-        }
-        field_cls = type(field_type_name, (), field_ns)
-        FieldType = strawberry.input(field_cls, one_of=True)
-
-        filter_type_name = f"{model.__name__}Filter"
-
-        filter_ns: dict[str, Any] = {
-            "__annotations__": {"field": Optional[FieldType]},
-            "field": strawberry.UNSET,
-        }
-        FilterCls = type(filter_type_name, (), filter_ns)
-
-        FilterCls.__annotations__["all"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["any"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["not_"] = Optional[FilterCls]
-        FilterCls.__annotations__["one_of"] = Optional[list[FilterCls]]
-        FilterCls.all = strawberry.UNSET
-        FilterCls.any = strawberry.UNSET
-        FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
-        FilterCls.one_of = strawberry.UNSET
-
-        FilterType = strawberry.input(FilterCls, one_of=True)
-        FilterType._field_type = FieldType  # type: ignore[attr-defined]
-        FilterType.__orm_model__ = model  # type: ignore[attr-defined]
-        return FilterType
-
-    def order(self, model_or_type: type, **kwargs: Any) -> Any:
-        model = model_or_type
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-
-        fields_meta = _introspect_sa_model(model)
-        annotations: dict[str, Any] = {}
-        defaults: dict[str, Any] = {}
-
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if is_relation:
-                continue
-            annotations[fname] = Optional[Ordering]
-            defaults[fname] = strawberry.UNSET
-
-        type_name = f"{model.__name__}Order"
-        ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
-        cls = type(type_name, (), ns)
-        result = strawberry.input(cls)
-        result.__orm_model__ = model  # type: ignore[attr-defined]
-        return result
-
-    def aggregate(self, model: type, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "aggregate() is not yet supported for the SQLAlchemy backend"
-        )
-
-    # -- Fields --------------------------------------------------------------
-
-    def field(self, **kwargs: Any) -> Any:
-        from strawberry_orm.types import FieldDefinition
-
-        hint_keys = {"load", "only", "compute", "disable_optimization"}
-        if hint_keys & set(kwargs):
-            return FieldDefinition(
-                load=kwargs.get("load"),
-                only=kwargs.get("only"),
-                compute=kwargs.get("compute"),
-                disable_optimization=kwargs.get("disable_optimization", False),
-                description=kwargs.get("description"),
-            )
-        allowed = {"description", "deprecation_reason", "default", "resolver", "name"}
-        return strawberry.field(**{k: v for k, v in kwargs.items() if k in allowed})
-
-    def node(self, **kwargs: Any) -> Any:
-        return strawberry.field(**kwargs)
-
-    def connection(self, **kwargs: Any) -> Any:
-        allowed = {"description", "deprecation_reason", "default", "resolver", "name"}
-        return strawberry.field(**{k: v for k, v in kwargs.items() if k in allowed})
-
-    # -- Mutations -----------------------------------------------------------
-
-    def create(self, input_type: type, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    def update(self, input_type: type, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    def delete(self, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    # -- Related list refs ---------------------------------------------------
-
-    def ref(
-        self,
-        model: type,
-        *,
-        create: type | None = None,
-        update: type | None = None,
-        delete: bool = False,
-    ) -> type:
-        return make_ref_type(model, create=create, update=update, delete=delete)
-
     def apply_ref_list(
         self,
         instance: Any,
@@ -350,6 +180,7 @@ class SQLAlchemyBackend:
         info: Any,
         *,
         authorize: Callable[..., bool] | None = None,
+        mode: str = "replace",
     ) -> None:
         from sqlalchemy.orm import Session
 
@@ -358,6 +189,7 @@ class SQLAlchemyBackend:
         target_model = relationship.mapper.class_
 
         new_related: list[Any] = []
+        to_remove: list[Any] = []
         for ref in refs:
             ref_id = getattr(ref, "id", strawberry.UNSET)
             ref_create = getattr(ref, "create", strawberry.UNSET)
@@ -373,11 +205,11 @@ class SQLAlchemyBackend:
             elif ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
-                obj = target_model(**_input_to_dict(ref_create))
+                obj = target_model(**input_to_dict(ref_create))
                 session.add(obj)
                 new_related.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = _input_to_dict(ref_update)
+                data = input_to_dict(ref_update)
                 pk = data.pop("id")
                 if authorize and not authorize("update", target_model, pk, info):
                     continue
@@ -393,9 +225,19 @@ class SQLAlchemyBackend:
                     continue
                 obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
-                    session.delete(obj)
+                    to_remove.append(obj)
+                    if self._hard_delete_refs:
+                        session.delete(obj)
 
-        setattr(instance, field, new_related)
+        if mode == "patch":
+            existing = list(getattr(instance, field))
+            merged = [o for o in existing if o not in to_remove]
+            for obj in new_related:
+                if obj not in merged:
+                    merged.append(obj)
+            setattr(instance, field, merged)
+        else:
+            setattr(instance, field, new_related)
 
     # -- Query application ----------------------------------------------------
 
@@ -406,13 +248,17 @@ class SQLAlchemyBackend:
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
+            max_in_list_size=self._max_in_list_size,
         )
         if clause is not None:
             query = query.where(clause)
         return query
 
     def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
-        clauses = _build_sa_ordering(order_input, model)
+        order_list = order_input if isinstance(order_input, list) else [order_input]
+        clauses: list[Any] = []
+        for entry in order_list:
+            clauses.extend(_build_sa_ordering(entry, model))
         if clauses:
             query = query.order_by(*clauses)
         return query
@@ -422,7 +268,10 @@ class SQLAlchemyBackend:
     def get_default_queryset(self, model: type) -> Any:
         from sqlalchemy import select
 
-        return select(model)
+        stmt = select(model)
+        if self._default_query_limit is not None:
+            stmt = stmt.limit(self._default_query_limit)
+        return stmt
 
     def is_query_object(self, value: Any) -> bool:
         try:
@@ -437,13 +286,34 @@ class SQLAlchemyBackend:
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
 
+    def _apply_nested_queryset(
+        self,
+        stmt: Any,
+        parent_entity: type,
+        field_name: str,
+        related_entity: type,
+        info: Any,
+    ) -> Any:
+        """Re-apply child scoping for nested relation resolvers."""
+        get_qs = self._type_querysets.get(related_entity)
+        if get_qs is not None:
+            stmt = get_qs(stmt, info)
+
+        type_name = self._type_name_for_model(parent_entity)
+        if type_name:
+            hints = self._store.get(type_name, field_name)
+            if hints and callable(hints.load):
+                stmt = hints.load(stmt)
+
+        return stmt
+
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy.orm import joinedload, selectinload, load_only
 
         try:
             entity = query.column_descriptions[0]["entity"]
-        except AttributeError, IndexError, KeyError:
+        except (AttributeError, IndexError, KeyError):
             return query
 
         mapper = sa_inspect(entity)
@@ -621,15 +491,9 @@ class SQLAlchemyBackend:
         session = self._get_session(info)
         try:
             result = session.execute(query).scalars().unique().all()
-        except OperationalError, ProgrammingError:
+        except (OperationalError, ProgrammingError):
             raise ValueError("Invalid filter expression") from None
         return list(result)
-
-    def _type_name_for_model(self, model: type) -> str | None:
-        for type_name, m in self._type_registry.items():
-            if m is model:
-                return type_name
-        return None
 
     # -- Helpers -------------------------------------------------------------
 
@@ -667,17 +531,6 @@ class SQLAlchemyBackend:
 # ---------------------------------------------------------------------------
 
 
-def _extract_element_type(ann: Any) -> Any:
-    """Extract T from list[T]."""
-    import typing
-
-    if typing.get_origin(ann) is list:
-        args = typing.get_args(ann)
-        if args:
-            return args[0]
-    return None
-
-
 def _make_sa_rel_resolver(
     backend: Any,
     fname: str,
@@ -694,6 +547,28 @@ def _make_sa_rel_resolver(
     """
     info_type = strawberry.types.Info
 
+    def _build_stmt(self: Any, info: Any) -> Any:
+        from sqlalchemy import select
+        from sqlalchemy.orm import with_parent
+
+        stmt = select(rel_model).where(with_parent(self, getattr(parent_model, fname)))
+        return backend._apply_nested_queryset(
+            stmt,
+            parent_model,
+            fname,
+            rel_model,
+            info,
+        )
+
+    def _execute(stmt: Any, info: Any) -> Any:
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        session = backend._get_session(info)
+        try:
+            return session.execute(stmt).scalars().unique().all()
+        except (OperationalError, ProgrammingError):
+            raise ValueError("Invalid filter expression") from None
+
     if filter_type and order_type:
 
         def resolver(
@@ -701,38 +576,26 @@ def _make_sa_rel_resolver(
         ) -> Any:
             if filter is None and order is None:
                 return getattr(self, fname)
-            from sqlalchemy import select
-            from sqlalchemy.orm import with_parent
-
-            session = backend._get_session(info)
-            stmt = select(rel_model).where(
-                with_parent(self, getattr(parent_model, fname))
-            )
+            stmt = _build_stmt(self, info)
             if filter is not None:
                 stmt = backend.apply_filters(stmt, filter, rel_model)
             if order is not None:
                 stmt = backend.apply_ordering(stmt, order, rel_model)
-            return session.execute(stmt).scalars().all()
+            return _execute(stmt, info)
 
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
-            "order": Optional[order_type],
+            "order": Optional[list[order_type]],
         }
     elif filter_type:
 
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             if filter is None:
                 return getattr(self, fname)
-            from sqlalchemy import select
-            from sqlalchemy.orm import with_parent
-
-            session = backend._get_session(info)
-            stmt = select(rel_model).where(
-                with_parent(self, getattr(parent_model, fname))
-            )
+            stmt = _build_stmt(self, info)
             stmt = backend.apply_filters(stmt, filter, rel_model)
-            return session.execute(stmt).scalars().all()
+            return _execute(stmt, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -743,19 +606,13 @@ def _make_sa_rel_resolver(
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
             if order is None:
                 return getattr(self, fname)
-            from sqlalchemy import select
-            from sqlalchemy.orm import with_parent
-
-            session = backend._get_session(info)
-            stmt = select(rel_model).where(
-                with_parent(self, getattr(parent_model, fname))
-            )
+            stmt = _build_stmt(self, info)
             stmt = backend.apply_ordering(stmt, order, rel_model)
-            return session.execute(stmt).scalars().all()
+            return _execute(stmt, info)
 
         resolver.__annotations__ = {
             "info": info_type,
-            "order": Optional[order_type],
+            "order": Optional[list[order_type]],
         }
 
     return strawberry.field(resolver=resolver)
@@ -817,15 +674,6 @@ def _introspect_sa_model(
     return result
 
 
-def _input_to_dict(obj: Any) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for f in obj.__class__.__dataclass_fields__:
-        val = getattr(obj, f)
-        if val is not strawberry.UNSET:
-            result[f] = val
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Filter translation
 # ---------------------------------------------------------------------------
@@ -853,6 +701,7 @@ def _build_sa_filter(
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = True,
+    max_in_list_size: int = 500,
     _depth: int = 0,
 ) -> Any:
     """Recursively translate a filter input object into a SQLAlchemy BooleanClause."""
@@ -869,6 +718,7 @@ def _build_sa_filter(
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
+        max_in_list_size=max_in_list_size,
         _depth=_depth + 1,
     )
 
@@ -878,7 +728,12 @@ def _build_sa_filter(
             continue
 
         if key == "field":
-            return _build_sa_field_clause(val, model, enable_regex=enable_regex)
+            return _build_sa_field_clause(
+                val,
+                model,
+                enable_regex=enable_regex,
+                max_in_list_size=max_in_list_size,
+            )
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -911,7 +766,11 @@ def _build_sa_filter(
 
 
 def _build_sa_field_clause(
-    field_input: Any, model: type, *, enable_regex: bool = True
+    field_input: Any,
+    model: type,
+    *,
+    enable_regex: bool = True,
+    max_in_list_size: int = 500,
 ) -> Any:
     """Translate a *Field input (e.g. UserField) into column-level conditions."""
     from sqlalchemy import and_
@@ -928,7 +787,12 @@ def _build_sa_field_clause(
         if column is None:
             continue
 
-        col_clauses = _build_lookup_clauses(column, lookup, enable_regex=enable_regex)
+        col_clauses = _build_lookup_clauses(
+            column,
+            lookup,
+            enable_regex=enable_regex,
+            max_in_list_size=max_in_list_size,
+        )
         clauses.extend(col_clauses)
 
     if not clauses:
@@ -942,7 +806,11 @@ def _escape_like(val: str) -> str:
 
 
 def _build_lookup_clauses(
-    column: Any, lookup: Any, *, enable_regex: bool = True
+    column: Any,
+    lookup: Any,
+    *,
+    enable_regex: bool = True,
+    max_in_list_size: int = 500,
 ) -> list[Any]:
     """Translate a single lookup object (e.g. StringLookup) into clauses."""
     clauses = []
@@ -955,22 +823,28 @@ def _build_lookup_clauses(
 
         if op_name == "is_null":
             clauses.append(column.is_(None) if val else column.isnot(None))
-        elif op_name == "in_list":
-            clauses.append(column.in_(val))
-        elif op_name == "not_in_list":
-            clauses.append(column.notin_(val))
+        elif op_name in ("in_list", "not_in_list"):
+            if len(val) > max_in_list_size:
+                raise ValueError(
+                    f"in_list/not_in_list has {len(val)} items; "
+                    f"maximum is {max_in_list_size}"
+                )
+            if op_name == "in_list":
+                clauses.append(column.in_(val))
+            else:
+                clauses.append(column.notin_(val))
         elif op_name == "range":
             clauses.append(column.between(val.start, val.end))
         elif op_name == "contains":
-            clauses.append(column.contains(val))
+            clauses.append(column.contains(val, autoescape=True))
         elif op_name == "i_contains":
             clauses.append(column.ilike(f"%{_escape_like(val)}%", escape="\\"))
         elif op_name == "starts_with":
-            clauses.append(column.startswith(val))
+            clauses.append(column.startswith(val, autoescape=True))
         elif op_name == "i_starts_with":
             clauses.append(column.ilike(f"{_escape_like(val)}%", escape="\\"))
         elif op_name == "ends_with":
-            clauses.append(column.endswith(val))
+            clauses.append(column.endswith(val, autoescape=True))
         elif op_name == "i_ends_with":
             clauses.append(column.ilike(f"%{_escape_like(val)}", escape="\\"))
         elif op_name == "regex":

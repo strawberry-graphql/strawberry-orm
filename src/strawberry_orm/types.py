@@ -40,11 +40,27 @@ class FieldDefinition:
     only: list[str] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False
-    filter_input: type | None = None
-    order_by: type | None = None
-    pagination: bool = False
     permission_classes: list[type] | None = None
     description: str | None = None
+
+    def to_hints(self) -> FieldHints:
+        """Return the optimizer-relevant subset as a :class:`FieldHints`."""
+        return FieldHints(
+            load=self.load,
+            only=self.only,
+            compute=self.compute,
+            disable_optimization=self.disable_optimization,
+        )
+
+
+@dataclass
+class FieldHints:
+    """Optimization hints for a single field (subset of FieldDefinition)."""
+
+    load: list[Any] | Callable[..., Any] | None = None
+    only: list[str] | None = None
+    compute: dict[str, Any] | None = None
+    disable_optimization: bool = False
 
 
 UNSET = strawberry.UNSET

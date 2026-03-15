@@ -21,7 +21,8 @@ def make_ref_type(
     - ``id`` (always): link an existing object by ID.
     - ``create`` (opt-in): create a new object inline.
     - ``update`` (opt-in): update an existing object in-place (input must have ``id``).
-    - ``delete`` (opt-in): unlink AND delete an existing object.
+    - ``delete`` (opt-in): unlink an existing object. Backends may optionally
+      hard-delete it when explicitly configured to do so.
     """
     type_name = name or f"{model.__name__}Ref"
     annotations: dict[str, Any] = {

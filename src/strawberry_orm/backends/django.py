@@ -9,10 +9,9 @@ from typing import Any, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
-from strawberry_orm.filters import TYPE_TO_LOOKUP
-from strawberry_orm.mutations import make_ref_type
-from strawberry_orm.optimizer import OptimizerExtension, OptimizerStore
-from strawberry_orm.types import Ordering
+from strawberry_orm.optimizer import OptimizerExtension
+
+from ._base import BaseBackend, extract_element_type, input_to_dict
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
     "AutoField": int,
@@ -48,19 +47,67 @@ _DJANGO_FIELD_MAP: dict[str, type] = {
 }
 
 
-class DjangoBackend:
+class DjangoBackend(BaseBackend):
     """Backend adapter for Django."""
 
-    def __init__(self, **kwargs: Any) -> None:
-        self._store = OptimizerStore()
-        self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides", {})
-        self._type_registry: dict[str, type] = {}
-        self._type_querysets: dict[type, Any] = {}
+    def __init__(
+        self,
+        *,
+        max_filter_depth: int = 10,
+        max_filter_branches: int = 50,
+        enable_regex_filters: bool = False,
+        max_in_list_size: int = 500,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._max_filter_depth = max_filter_depth
+        self._max_filter_branches = max_filter_branches
+        self._enable_regex_filters = enable_regex_filters
+        self._max_in_list_size = max_in_list_size
+
+    def _introspect_model(
+        self, model: type
+    ) -> list[tuple[str, type, bool, type | None]]:
+        """Return (field_name, python_type, is_relation, related_model) for each
+        field on a Django model."""
+        meta = model._meta  # type: ignore[attr-defined]
+        result: list[tuple[str, type, bool, type | None]] = []
+
+        for field in meta.get_fields():
+            field_class_name = type(field).__name__
+
+            if field_class_name in (
+                "ManyToManyField",
+                "ManyToManyRel",
+                "ManyToOneRel",
+                "OneToOneRel",
+                "ForeignObject",
+            ):
+                related_model = (
+                    field.related_model if hasattr(field, "related_model") else None
+                )
+                result.append((field.name, Any, True, related_model))
+                continue
+
+            if field_class_name in ("ForeignKey", "OneToOneField"):
+                related_model = (
+                    field.related_model if hasattr(field, "related_model") else None
+                )
+                result.append((field.name, Any, True, related_model))
+                # Also expose the _id column as a concrete integer field
+                attname = getattr(field, "attname", None)
+                if attname and attname != field.name:
+                    result.append((attname, int, False, None))
+                continue
+
+            py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
+            result.append((field.name, py_type, False, None))
+
+        return result
 
     # -- Type generation -----------------------------------------------------
 
     def type(self, model: type, **kwargs: Any) -> Any:
-        backend = self
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
         name = kwargs.get("name")
@@ -68,9 +115,6 @@ class DjangoBackend:
         order = kwargs.get("order")
 
         def decorator(cls: type) -> Any:
-            from strawberry_orm.types import FieldDefinition
-            from strawberry_orm.optimizer.store import FieldHints
-
             meta = model._meta  # type: ignore[attr-defined]
 
             col_types: dict[str, type] = {}
@@ -104,55 +148,18 @@ class DjangoBackend:
                 py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
                 col_types[field_obj.name] = py_type
 
-            annotations = getattr(cls, "__annotations__", {}).copy()
+            type_name = self._process_type_annotations(
+                cls,
+                model,
+                col_types,
+                include=include,
+                exclude=exclude,
+                name=name,
+                filters=filters,
+                order=order,
+            )
 
-            for field_name in list(annotations):
-                if include and field_name not in include:
-                    continue
-                if exclude and field_name in exclude:
-                    del annotations[field_name]
-                    continue
-
-                ann = annotations[field_name]
-                if ann is strawberry.auto:
-                    if field_name in col_types:
-                        annotations[field_name] = col_types[field_name]
-
-            cls.__annotations__ = annotations
-            cls.__orm_model__ = model  # type: ignore[attr-defined]
-
-            if filters is not None:
-                cls.__orm_filter__ = filters  # type: ignore[attr-defined]
-            if order is not None:
-                cls.__orm_order__ = order  # type: ignore[attr-defined]
-
-            type_name = name or cls.__name__
-
-            if hasattr(cls, "get_queryset") and isinstance(
-                vars(cls).get("get_queryset"), classmethod
-            ):
-                backend._type_querysets[model] = cls.get_queryset
-
-            for attr_name in list(vars(cls)):
-                val = getattr(cls, attr_name, None)
-                if isinstance(val, FieldDefinition):
-                    hints = FieldHints(
-                        load=val.load,
-                        only=val.only,
-                        compute=val.compute,
-                        disable_optimization=val.disable_optimization,
-                    )
-                    backend._store.register(type_name, attr_name, hints)
-                    try:
-                        delattr(cls, attr_name)
-                    except AttributeError:
-                        pass
-                elif getattr(val, "_orm_auto_field", False):
-                    try:
-                        delattr(cls, attr_name)
-                    except AttributeError:
-                        pass
-
+            annotations = getattr(cls, "__annotations__", {})
             for field_name, rel_info in rel_fields.items():
                 if field_name not in annotations:
                     continue
@@ -161,7 +168,7 @@ class DjangoBackend:
                 kind = rel_info["kind"]
                 if kind == "many":
                     ann = annotations[field_name]
-                    el_type = _extract_element_type(ann)
+                    el_type = extract_element_type(ann)
                     f_type = (
                         getattr(el_type, "__orm_filter__", None) if el_type else None
                     )
@@ -175,7 +182,7 @@ class DjangoBackend:
                             cls,
                             field_name,
                             _make_dj_rel_resolver(
-                                backend,
+                                self,
                                 field_name,
                                 rel_model,
                                 f_type,
@@ -194,170 +201,9 @@ class DjangoBackend:
 
                         setattr(cls, field_name, _make_resolver(field_name, ann))
 
-            result = strawberry.type(cls, name=name if name else None)
-
-            backend._type_registry[type_name] = model
-
-            return result
+            return self._finalize_type(cls, model, type_name, name)
 
         return decorator
-
-    def input(self, model: type, **kwargs: Any) -> Any:
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-        name = kwargs.get("name")
-
-        fields_meta = _introspect_django_model(model)
-        annotations: dict[str, Any] = {}
-        defaults: dict[str, Any] = {}
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if is_relation:
-                continue
-            annotations[fname] = Optional[ftype]
-            defaults[fname] = strawberry.UNSET
-
-        type_name = name or f"{model.__name__}Input"
-        ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
-        cls = type(type_name, (), ns)
-        return strawberry.input(cls)
-
-    def partial(self, model: type, **kwargs: Any) -> Any:
-        kwargs.setdefault("name", f"{model.__name__}PartialInput")
-        return self.input(model, **kwargs)
-
-    def filter(self, model_or_type: type, **kwargs: Any) -> Any:
-        model = model_or_type
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-
-        fields_meta = _introspect_django_model(model)
-
-        field_annotations: dict[str, Any] = {}
-        field_defaults: dict[str, Any] = {}
-
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if is_relation:
-                continue
-            lookup_type = self._filter_overrides.get(ftype) or TYPE_TO_LOOKUP.get(ftype)
-            if lookup_type is not None:
-                field_annotations[fname] = Optional[lookup_type]
-                field_defaults[fname] = strawberry.UNSET
-
-        field_type_name = f"{model.__name__}Field"
-        field_ns: dict[str, Any] = {
-            "__annotations__": field_annotations,
-            **field_defaults,
-        }
-        field_cls = type(field_type_name, (), field_ns)
-        FieldType = strawberry.input(field_cls, one_of=True)
-
-        filter_type_name = f"{model.__name__}Filter"
-
-        filter_ns: dict[str, Any] = {
-            "__annotations__": {"field": Optional[FieldType]},
-            "field": strawberry.UNSET,
-        }
-        FilterCls = type(filter_type_name, (), filter_ns)
-
-        FilterCls.__annotations__["all"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["any"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["not_"] = Optional[FilterCls]
-        FilterCls.__annotations__["one_of"] = Optional[list[FilterCls]]
-        FilterCls.all = strawberry.UNSET
-        FilterCls.any = strawberry.UNSET
-        FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
-        FilterCls.one_of = strawberry.UNSET
-
-        FilterType = strawberry.input(FilterCls, one_of=True)
-        FilterType._field_type = FieldType  # type: ignore[attr-defined]
-        FilterType.__orm_model__ = model  # type: ignore[attr-defined]
-        return FilterType
-
-    def order(self, model_or_type: type, **kwargs: Any) -> Any:
-        model = model_or_type
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-
-        fields_meta = _introspect_django_model(model)
-        annotations: dict[str, Any] = {}
-        defaults: dict[str, Any] = {}
-
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if is_relation:
-                continue
-            annotations[fname] = Optional[Ordering]
-            defaults[fname] = strawberry.UNSET
-
-        type_name = f"{model.__name__}Order"
-        ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
-        cls = type(type_name, (), ns)
-        result = strawberry.input(cls)
-        result.__orm_model__ = model  # type: ignore[attr-defined]
-        return result
-
-    def aggregate(self, model: type, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "aggregate() is not yet supported for the Django backend"
-        )
-
-    # -- Fields --------------------------------------------------------------
-
-    def field(self, **kwargs: Any) -> Any:
-        from strawberry_orm.types import FieldDefinition
-
-        hint_keys = {"load", "only", "compute", "disable_optimization"}
-        if hint_keys & set(kwargs):
-            return FieldDefinition(
-                load=kwargs.get("load"),
-                only=kwargs.get("only"),
-                compute=kwargs.get("compute"),
-                disable_optimization=kwargs.get("disable_optimization", False),
-                description=kwargs.get("description"),
-            )
-        allowed = {"description", "deprecation_reason", "default", "resolver", "name"}
-        return strawberry.field(**{k: v for k, v in kwargs.items() if k in allowed})
-
-    def node(self, **kwargs: Any) -> Any:
-        return strawberry.field(**kwargs)
-
-    def connection(self, **kwargs: Any) -> Any:
-        allowed = {"description", "deprecation_reason", "default", "resolver", "name"}
-        return strawberry.field(**{k: v for k, v in kwargs.items() if k in allowed})
-
-    # -- Mutations -----------------------------------------------------------
-
-    def create(self, input_type: type, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    def update(self, input_type: type, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    def delete(self, **kwargs: Any) -> Any:
-        return strawberry.field(description=kwargs.get("description"))
-
-    # -- Related list refs ---------------------------------------------------
-
-    def ref(
-        self,
-        model: type,
-        *,
-        create: type | None = None,
-        update: type | None = None,
-        delete: bool = False,
-    ) -> type:
-        return make_ref_type(model, create=create, update=update, delete=delete)
 
     def apply_ref_list(
         self,
@@ -367,6 +213,7 @@ class DjangoBackend:
         info: Any,
         *,
         authorize: Any | None = None,
+        mode: str = "replace",
     ) -> None:
         manager = getattr(instance, field)
         rel_model = manager.model
@@ -381,34 +228,61 @@ class DjangoBackend:
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
             if ref_id is not strawberry.UNSET and ref_id is not None:
+                if authorize and not authorize("link", rel_model, ref_id, info):
+                    continue
                 obj = rel_model.objects.get(pk=ref_id)
                 new_related.append(obj)
             elif ref_create is not strawberry.UNSET and ref_create is not None:
-                obj = rel_model.objects.create(**_input_to_dict(ref_create))
+                if authorize and not authorize("create", rel_model, None, info):
+                    continue
+                obj = rel_model.objects.create(**input_to_dict(ref_create))
                 new_related.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = _input_to_dict(ref_update)
+                data = input_to_dict(ref_update)
                 pk = data.pop("id")
+                if authorize and not authorize("update", rel_model, pk, info):
+                    continue
                 rel_model.objects.filter(pk=pk).update(**data)
                 obj = rel_model.objects.get(pk=pk)
                 new_related.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
+                if authorize and not authorize(
+                    "delete", rel_model, ref_delete.id, info
+                ):
+                    continue
                 to_delete.append(ref_delete.id)
 
-        manager.set(new_related)
-        if to_delete:
-            rel_model.objects.filter(pk__in=to_delete).delete()
+        if mode == "patch":
+            if new_related:
+                manager.add(*new_related)
+            if to_delete:
+                manager.remove(*rel_model.objects.filter(pk__in=to_delete))
+                if self._hard_delete_refs:
+                    rel_model.objects.filter(pk__in=to_delete).delete()
+        else:
+            manager.set(new_related)
+            if to_delete and self._hard_delete_refs:
+                rel_model.objects.filter(pk__in=to_delete).delete()
 
     # -- Query application ----------------------------------------------------
 
     def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        q_obj = _build_django_filter(filter_input)
+        q_obj = _build_django_filter(
+            filter_input,
+            max_depth=self._max_filter_depth,
+            max_branches=self._max_filter_branches,
+            enable_regex=self._enable_regex_filters,
+            max_in_list_size=self._max_in_list_size,
+        )
         if q_obj is not None:
             query = query.filter(q_obj)
         return query
 
     def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
-        clauses = _build_django_ordering(order_input)
+        order_list = order_input if isinstance(order_input, list) else [order_input]
+        clauses: list[Any] = []
+        for entry in order_list:
+            clauses.extend(_build_django_ordering(entry))
         if clauses:
             query = query.order_by(*clauses)
         return query
@@ -416,7 +290,10 @@ class DjangoBackend:
     # -- Queryset overrides --------------------------------------------------
 
     def get_default_queryset(self, model: type) -> Any:
-        return model.objects.all()
+        qs = model.objects.all()
+        if self._default_query_limit is not None:
+            qs = qs[: self._default_query_limit]
+        return qs
 
     def is_query_object(self, value: Any) -> bool:
         try:
@@ -619,34 +496,31 @@ class DjangoBackend:
         for field_node in info.field_nodes:
             _walk_selections(field_node.selection_set, model)
 
+        only_fields: list[str] = []
+
+        type_name_root = self._type_name_for_model(model)
+        if type_name_root and store:
+            for field_node in info.field_nodes:
+                if field_node.selection_set:
+                    for sel in field_node.selection_set.selections:
+                        fname = _to_snake(sel.name.value)
+                        hints = store.get(type_name_root, fname)
+                        if hints and hints.only:
+                            only_fields.extend(hints.only)
+
         if select_related:
             query = query.select_related(*select_related)
         if prefetch_related:
             query = query.prefetch_related(*prefetch_related)
+        if only_fields:
+            query = query.only(*only_fields)
 
-        return query
-
-    def _type_name_for_model(self, model: type) -> str | None:
-        for type_name, m in self._type_registry.items():
-            if m is model:
-                return type_name
-        return None
+        return list(query)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_element_type(ann: Any) -> Any:
-    """Extract T from list[T]."""
-    import typing
-
-    if typing.get_origin(ann) is list:
-        args = typing.get_args(ann)
-        if args:
-            return args[0]
-    return None
 
 
 def _make_dj_rel_resolver(
@@ -669,7 +543,7 @@ def _make_dj_rel_resolver(
 
         resolver.__annotations__ = {
             "filter": Optional[filter_type],
-            "order": Optional[order_type],
+            "order": Optional[list[order_type]],
         }
     elif filter_type:
 
@@ -688,59 +562,9 @@ def _make_dj_rel_resolver(
                 qs = backend.apply_ordering(qs, order, rel_model)
             return list(qs)
 
-        resolver.__annotations__ = {"order": Optional[order_type]}
+        resolver.__annotations__ = {"order": Optional[list[order_type]]}
 
     return strawberry.field(resolver=resolver)
-
-
-def _introspect_django_model(
-    model: type,
-) -> list[tuple[str, type, bool, type | None]]:
-    """Return (field_name, python_type, is_relation, related_model) for each
-    field on a Django model."""
-    meta = model._meta  # type: ignore[attr-defined]
-    result: list[tuple[str, type, bool, type | None]] = []
-
-    for field in meta.get_fields():
-        field_class_name = type(field).__name__
-
-        if field_class_name in (
-            "ManyToManyField",
-            "ManyToManyRel",
-            "ManyToOneRel",
-            "OneToOneRel",
-            "ForeignObject",
-        ):
-            related_model = (
-                field.related_model if hasattr(field, "related_model") else None
-            )
-            result.append((field.name, Any, True, related_model))
-            continue
-
-        if field_class_name in ("ForeignKey", "OneToOneField"):
-            related_model = (
-                field.related_model if hasattr(field, "related_model") else None
-            )
-            result.append((field.name, Any, True, related_model))
-            # Also expose the _id column as a concrete integer field
-            attname = getattr(field, "attname", None)
-            if attname and attname != field.name:
-                result.append((attname, int, False, None))
-            continue
-
-        py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
-        result.append((field.name, py_type, False, None))
-
-    return result
-
-
-def _input_to_dict(obj: Any) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for f in obj.__class__.__dataclass_fields__:
-        val = getattr(obj, f)
-        if val is not strawberry.UNSET:
-            result[f] = val
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -765,13 +589,31 @@ _LOOKUP_TO_DJANGO: dict[str, str] = {
 }
 
 
-def _build_django_filter(filter_input: Any) -> Any:
+def _build_django_filter(
+    filter_input: Any,
+    *,
+    max_depth: int = 10,
+    max_branches: int = 50,
+    enable_regex: bool = False,
+    max_in_list_size: int = 500,
+    _depth: int = 0,
+) -> Any:
     from django.db.models import Q
+
+    if _depth > max_depth:
+        raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
 
     if filter_input is None or filter_input is strawberry.UNSET:
         return None
 
     fields = filter_input.__class__.__dataclass_fields__
+    recurse_kw = dict(
+        max_depth=max_depth,
+        max_branches=max_branches,
+        enable_regex=enable_regex,
+        max_in_list_size=max_in_list_size,
+        _depth=_depth + 1,
+    )
 
     for key in fields:
         val = getattr(filter_input, key)
@@ -779,26 +621,42 @@ def _build_django_filter(filter_input: Any) -> Any:
             continue
 
         if key == "field":
-            return _build_django_field_clause(val)
+            return _build_django_field_clause(
+                val,
+                enable_regex=enable_regex,
+                max_in_list_size=max_in_list_size,
+            )
         elif key == "all":
-            sub = [_build_django_filter(f) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_django_filter(f, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             result = Q()
             for s in sub:
                 result &= s
             return result if sub else None
         elif key == "any":
-            sub = [_build_django_filter(f) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_django_filter(f, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             result = Q()
             for i, s in enumerate(sub):
                 result = s if i == 0 else result | s
             return result if sub else None
         elif key == "not_":
-            inner = _build_django_filter(val)
+            inner = _build_django_filter(val, **recurse_kw)
             return ~inner if inner is not None else None
         elif key == "one_of":
-            sub = [_build_django_filter(f) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_django_filter(f, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             result = Q()
             for i, s in enumerate(sub):
@@ -808,7 +666,12 @@ def _build_django_filter(filter_input: Any) -> Any:
     return None
 
 
-def _build_django_field_clause(field_input: Any) -> Any:
+def _build_django_field_clause(
+    field_input: Any,
+    *,
+    enable_regex: bool = False,
+    max_in_list_size: int = 500,
+) -> Any:
     from django.db.models import Q
 
     q = Q()
@@ -819,13 +682,24 @@ def _build_django_field_clause(field_input: Any) -> Any:
         if lookup is strawberry.UNSET or lookup is None:
             continue
 
-        col_q = _build_django_lookup(col_name, lookup)
+        col_q = _build_django_lookup(
+            col_name,
+            lookup,
+            enable_regex=enable_regex,
+            max_in_list_size=max_in_list_size,
+        )
         q &= col_q
 
     return q
 
 
-def _build_django_lookup(col_name: str, lookup: Any) -> Any:
+def _build_django_lookup(
+    col_name: str,
+    lookup: Any,
+    *,
+    enable_regex: bool = False,
+    max_in_list_size: int = 500,
+) -> Any:
     from django.db.models import Q
 
     q = Q()
@@ -838,14 +712,28 @@ def _build_django_lookup(col_name: str, lookup: Any) -> Any:
 
         if op_name == "is_null":
             q &= Q(**{f"{col_name}__isnull": val})
-        elif op_name == "in_list":
-            q &= Q(**{f"{col_name}__in": val})
-        elif op_name == "not_in_list":
-            q &= ~Q(**{f"{col_name}__in": val})
+        elif op_name in ("in_list", "not_in_list"):
+            if len(val) > max_in_list_size:
+                raise ValueError(
+                    f"in_list/not_in_list has {len(val)} items; "
+                    f"maximum is {max_in_list_size}"
+                )
+            if op_name == "in_list":
+                q &= Q(**{f"{col_name}__in": val})
+            else:
+                q &= ~Q(**{f"{col_name}__in": val})
         elif op_name == "range":
             q &= Q(**{f"{col_name}__range": (val.start, val.end)})
         elif op_name == "neq":
             q &= ~Q(**{f"{col_name}__exact": val})
+        elif op_name in ("regex", "i_regex"):
+            if not enable_regex:
+                raise ValueError(
+                    "Regex filters are disabled. Pass enable_regex_filters=True "
+                    "to enable."
+                )
+            django_lookup = _LOOKUP_TO_DJANGO[op_name]
+            q &= Q(**{f"{col_name}__{django_lookup}": val})
         elif op_name in _LOOKUP_TO_DJANGO:
             django_lookup = _LOOKUP_TO_DJANGO[op_name]
             q &= Q(**{f"{col_name}__{django_lookup}": val})

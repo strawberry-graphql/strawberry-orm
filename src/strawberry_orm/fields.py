@@ -13,9 +13,6 @@ def make_field(
     only: list[str] | None = None,
     compute: dict[str, Any] | None = None,
     disable_optimization: bool = False,
-    filter_input: type | None = None,
-    order_by: type | None = None,
-    pagination: bool = False,
     permission_classes: list[type] | None = None,
     description: str | None = None,
 ) -> FieldDefinition:
@@ -26,9 +23,6 @@ def make_field(
         only=only,
         compute=compute,
         disable_optimization=disable_optimization,
-        filter_input=filter_input,
-        order_by=order_by,
-        pagination=pagination,
         permission_classes=permission_classes,
         description=description,
     )

@@ -67,7 +67,7 @@ class TestMutationRefList:
         """)
         assert data == {"setPostTags": {"tags": [{"name": "python"}]}}
         tag2 = sa_session.get(Tag, 2)
-        assert tag2 is None
+        assert tag2 is not None
 
     def test_replace_all_tags(self, execute, seed):
         data = execute("""

@@ -7,7 +7,8 @@ whereclause, Tortoise Q objects).
 
 from __future__ import annotations
 
-from typing import Optional
+import datetime
+from decimal import Decimal
 
 import strawberry
 
@@ -19,35 +20,52 @@ import strawberry
 
 @strawberry.input
 class StringLookup:
-    exact: Optional[str] = strawberry.UNSET
-    neq: Optional[str] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[str]] = strawberry.UNSET
-    not_in_list: Optional[list[str]] = strawberry.UNSET
-    contains: Optional[str] = strawberry.UNSET
-    i_contains: Optional[str] = strawberry.UNSET
-    starts_with: Optional[str] = strawberry.UNSET
-    i_starts_with: Optional[str] = strawberry.UNSET
-    ends_with: Optional[str] = strawberry.UNSET
-    i_ends_with: Optional[str] = strawberry.UNSET
-    regex: Optional[str] = strawberry.UNSET
-    i_regex: Optional[str] = strawberry.UNSET
+    exact: str | None = strawberry.UNSET
+    neq: str | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[str] | None = strawberry.UNSET
+    not_in_list: list[str] | None = strawberry.UNSET
+    contains: str | None = strawberry.UNSET
+    i_contains: str | None = strawberry.UNSET
+    starts_with: str | None = strawberry.UNSET
+    i_starts_with: str | None = strawberry.UNSET
+    ends_with: str | None = strawberry.UNSET
+    i_ends_with: str | None = strawberry.UNSET
+    regex: str | None = strawberry.UNSET
+    i_regex: str | None = strawberry.UNSET
+
+
+@strawberry.input
+class StringLookupNoRegex:
+    """StringLookup variant that omits regex/i_regex from the GraphQL schema."""
+
+    exact: str | None = strawberry.UNSET
+    neq: str | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[str] | None = strawberry.UNSET
+    not_in_list: list[str] | None = strawberry.UNSET
+    contains: str | None = strawberry.UNSET
+    i_contains: str | None = strawberry.UNSET
+    starts_with: str | None = strawberry.UNSET
+    i_starts_with: str | None = strawberry.UNSET
+    ends_with: str | None = strawberry.UNSET
+    i_ends_with: str | None = strawberry.UNSET
 
 
 @strawberry.input
 class BooleanLookup:
-    exact: Optional[bool] = strawberry.UNSET
-    neq: Optional[bool] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
+    exact: bool | None = strawberry.UNSET
+    neq: bool | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
 
 
 @strawberry.input
 class IDLookup:
-    exact: Optional[strawberry.ID] = strawberry.UNSET
-    neq: Optional[strawberry.ID] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[strawberry.ID]] = strawberry.UNSET
-    not_in_list: Optional[list[strawberry.ID]] = strawberry.UNSET
+    exact: strawberry.ID | None = strawberry.UNSET
+    neq: strawberry.ID | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[strawberry.ID] | None = strawberry.UNSET
+    not_in_list: list[strawberry.ID] | None = strawberry.UNSET
 
 
 # ---------------------------------------------------------------------------
@@ -63,16 +81,16 @@ class IntRangeInput:
 
 @strawberry.input
 class IntComparisonLookup:
-    exact: Optional[int] = strawberry.UNSET
-    neq: Optional[int] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[int]] = strawberry.UNSET
-    not_in_list: Optional[list[int]] = strawberry.UNSET
-    gt: Optional[int] = strawberry.UNSET
-    gte: Optional[int] = strawberry.UNSET
-    lt: Optional[int] = strawberry.UNSET
-    lte: Optional[int] = strawberry.UNSET
-    range: Optional[IntRangeInput] = strawberry.UNSET
+    exact: int | None = strawberry.UNSET
+    neq: int | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[int] | None = strawberry.UNSET
+    not_in_list: list[int] | None = strawberry.UNSET
+    gt: int | None = strawberry.UNSET
+    gte: int | None = strawberry.UNSET
+    lt: int | None = strawberry.UNSET
+    lte: int | None = strawberry.UNSET
+    range: IntRangeInput | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -83,16 +101,16 @@ class FloatRangeInput:
 
 @strawberry.input
 class FloatComparisonLookup:
-    exact: Optional[float] = strawberry.UNSET
-    neq: Optional[float] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[float]] = strawberry.UNSET
-    not_in_list: Optional[list[float]] = strawberry.UNSET
-    gt: Optional[float] = strawberry.UNSET
-    gte: Optional[float] = strawberry.UNSET
-    lt: Optional[float] = strawberry.UNSET
-    lte: Optional[float] = strawberry.UNSET
-    range: Optional[FloatRangeInput] = strawberry.UNSET
+    exact: float | None = strawberry.UNSET
+    neq: float | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[float] | None = strawberry.UNSET
+    not_in_list: list[float] | None = strawberry.UNSET
+    gt: float | None = strawberry.UNSET
+    gte: float | None = strawberry.UNSET
+    lt: float | None = strawberry.UNSET
+    lte: float | None = strawberry.UNSET
+    range: FloatRangeInput | None = strawberry.UNSET
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +126,16 @@ class DateRangeInput:
 
 @strawberry.input
 class DateComparisonLookup:
-    exact: Optional[str] = strawberry.UNSET
-    neq: Optional[str] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[str]] = strawberry.UNSET
-    not_in_list: Optional[list[str]] = strawberry.UNSET
-    gt: Optional[str] = strawberry.UNSET
-    gte: Optional[str] = strawberry.UNSET
-    lt: Optional[str] = strawberry.UNSET
-    lte: Optional[str] = strawberry.UNSET
-    range: Optional[DateRangeInput] = strawberry.UNSET
+    exact: str | None = strawberry.UNSET
+    neq: str | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[str] | None = strawberry.UNSET
+    not_in_list: list[str] | None = strawberry.UNSET
+    gt: str | None = strawberry.UNSET
+    gte: str | None = strawberry.UNSET
+    lt: str | None = strawberry.UNSET
+    lte: str | None = strawberry.UNSET
+    range: DateRangeInput | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -128,14 +146,14 @@ class TimeRangeInput:
 
 @strawberry.input
 class TimeComparisonLookup:
-    exact: Optional[str] = strawberry.UNSET
-    neq: Optional[str] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    gt: Optional[str] = strawberry.UNSET
-    gte: Optional[str] = strawberry.UNSET
-    lt: Optional[str] = strawberry.UNSET
-    lte: Optional[str] = strawberry.UNSET
-    range: Optional[TimeRangeInput] = strawberry.UNSET
+    exact: str | None = strawberry.UNSET
+    neq: str | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    gt: str | None = strawberry.UNSET
+    gte: str | None = strawberry.UNSET
+    lt: str | None = strawberry.UNSET
+    lte: str | None = strawberry.UNSET
+    range: TimeRangeInput | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -146,24 +164,21 @@ class DateTimeRangeInput:
 
 @strawberry.input
 class DateTimeComparisonLookup:
-    exact: Optional[str] = strawberry.UNSET
-    neq: Optional[str] = strawberry.UNSET
-    is_null: Optional[bool] = strawberry.UNSET
-    in_list: Optional[list[str]] = strawberry.UNSET
-    not_in_list: Optional[list[str]] = strawberry.UNSET
-    gt: Optional[str] = strawberry.UNSET
-    gte: Optional[str] = strawberry.UNSET
-    lt: Optional[str] = strawberry.UNSET
-    lte: Optional[str] = strawberry.UNSET
-    range: Optional[DateTimeRangeInput] = strawberry.UNSET
+    exact: str | None = strawberry.UNSET
+    neq: str | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[str] | None = strawberry.UNSET
+    not_in_list: list[str] | None = strawberry.UNSET
+    gt: str | None = strawberry.UNSET
+    gte: str | None = strawberry.UNSET
+    lt: str | None = strawberry.UNSET
+    lte: str | None = strawberry.UNSET
+    range: DateTimeRangeInput | None = strawberry.UNSET
 
 
 # ---------------------------------------------------------------------------
 # Type-to-lookup mapping (used by backends during code generation)
 # ---------------------------------------------------------------------------
-
-import datetime
-from decimal import Decimal
 
 TYPE_TO_LOOKUP: dict[type, type] = {
     str: StringLookup,

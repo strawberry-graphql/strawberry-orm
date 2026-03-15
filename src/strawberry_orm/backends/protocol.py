@@ -37,10 +37,6 @@ class Backend(Protocol):
         """Generate an ordering input for a model or Strawberry type."""
         ...
 
-    def aggregate(self, model: type, **kwargs: Any) -> Any:
-        """Generate an aggregate type for a model."""
-        ...
-
     # -- Fields --------------------------------------------------------------
 
     def field(self, **kwargs: Any) -> Any:
@@ -90,8 +86,14 @@ class Backend(Protocol):
         info: Any,
         *,
         authorize: Any | None = None,
+        mode: str = "replace",
     ) -> None:
-        """Apply a list of ref operations to *instance*'s *field* relation."""
+        """Apply a list of ref operations to *instance*'s *field* relation.
+
+        *mode* controls how the relationship list is updated:
+        - ``"replace"`` (default): the entire relationship list is replaced
+        - ``"patch"``: only the mentioned items are added/removed/updated
+        """
         ...
 
     # -- Query application ----------------------------------------------------
@@ -101,7 +103,11 @@ class Backend(Protocol):
         ...
 
     def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
-        """Translate an order input object into ORM-specific ordering."""
+        """Translate a list of ``@oneOf`` order entries into ORM-specific ordering.
+
+        Each entry represents one column; list position determines tie-break
+        priority.
+        """
         ...
 
     # -- Queryset overrides --------------------------------------------------

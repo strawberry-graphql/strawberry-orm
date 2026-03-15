@@ -511,6 +511,58 @@ class TestQueryNestedGetQueryset:
         }
 
     @pytest.mark.asyncio
+    async def test_get_queryset_still_applies_with_nested_filter_argument(
+        self, seed, Post, User
+    ):
+        orm = StrawberryORM("tortoise")
+        PostFilter = orm.filter(Post)
+
+        @orm.type(Post, filters=PostFilter)
+        class PT:
+            id: auto
+            title: auto
+            is_published: auto
+
+            @classmethod
+            def get_queryset(cls, qs, info):
+                return qs.filter(is_published=True)
+
+        @orm.type(User)
+        class UT:
+            id: auto
+            name: auto
+            posts: list[PT]
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users(self) -> list[UT]:
+                return User.all()  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = await schema.execute(
+            """
+            {
+                users {
+                    name
+                    posts(filter: { field: { title: { contains: "Draft" } } }) {
+                        title
+                        isPublished
+                    }
+                }
+            }
+            """
+        )
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "posts": []},
+                {"name": "Bob", "posts": []},
+                {"name": "Charlie", "posts": []},
+            ]
+        }
+
+    @pytest.mark.asyncio
     async def test_get_queryset_composes_with_load_callable(self, seed, Post, User):
         """Both type-level get_queryset and field-level load callable should compose."""
         orm = StrawberryORM("tortoise")
@@ -545,3 +597,38 @@ class TestQueryNestedGetQueryset:
         assert "Draft Post" not in all_post_titles
         assert "GraphQL Guide" not in all_post_titles
         assert "Hello World" in all_post_titles
+
+    @pytest.mark.asyncio
+    async def test_custom_m2m_prefetch_does_not_leak_between_parents(
+        self, seed, Post, Tag
+    ):
+        orm = StrawberryORM("tortoise")
+
+        @orm.type(Tag)
+        class TT:
+            id: auto
+            name: auto
+
+        @orm.type(Post)
+        class PT:
+            id: auto
+            title: auto
+            tags: list[TT] = orm.field(load=lambda qs: qs.filter(name="rust"))
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def posts(self) -> list[PT]:
+                return Post.all()  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = await schema.execute("{ posts { title tags { name } } }")
+        assert result.errors is None
+        assert result.data == {
+            "posts": [
+                {"title": "Hello World", "tags": []},
+                {"title": "GraphQL Guide", "tags": []},
+                {"title": "Draft Post", "tags": []},
+                {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
+            ]
+        }

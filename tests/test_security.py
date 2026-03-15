@@ -248,8 +248,7 @@ class TestSensitiveFieldExposure:
         )
 
     def test_password_hash_filterable(self, seeded_session):
-        """An attacker can use filter lookups to exfiltrate password hashes
-        character-by-character using startsWith / contains."""
+        """Generated filters should exclude password hashes by default."""
         result = execute(
             schema,
             seeded_session,
@@ -259,11 +258,10 @@ class TestSensitiveFieldExposure:
             }}
         """,
         )
-        assert result.errors is None
-        assert result.data["users"][0]["username"] == "alice"
+        assert result.errors is not None
 
     def test_is_admin_field_exposed(self, seeded_session):
-        """Admin status is exposed and filterable, enabling privilege enumeration."""
+        """Generated filters should exclude admin flags by default."""
         result = execute(
             schema,
             seeded_session,
@@ -273,9 +271,7 @@ class TestSensitiveFieldExposure:
             }}
         """,
         )
-        assert result.errors is None
-        assert len(result.data["users"]) == 1
-        assert result.data["users"][0]["username"] == "alice"
+        assert result.errors is not None
 
 
 # =========================================================================
@@ -351,7 +347,12 @@ class TestRegexInjection:
     2. Backend-specific regex escapes or operators"""
 
     def test_regex_filter_accepts_arbitrary_patterns(self, seeded_session):
-        """Regex filters are now disabled by default for security."""
+        """Regex filters are now disabled by default for security.
+
+        With Advisory 5 (StringLookupNoRegex), the regex field is no longer
+        even present in the schema when regex is disabled, so GraphQL itself
+        rejects the field before the backend sees it.
+        """
         result = execute(
             schema,
             seeded_session,
@@ -362,10 +363,11 @@ class TestRegexInjection:
         """,
         )
         assert result.errors is not None
-        assert "disabled" in str(result.errors[0]).lower()
+        err_msg = str(result.errors[0]).lower()
+        assert "disabled" in err_msg or "not defined" in err_msg
 
     def test_complex_regex_accepted(self, seeded_session):
-        """Complex regex patterns with backreferences are accepted."""
+        """Complex regex patterns with backreferences are also rejected when disabled."""
         result = execute(
             schema,
             seeded_session,
@@ -375,9 +377,9 @@ class TestRegexInjection:
             }}
         """,
         )
-        # The test passes if no error -- meaning arbitrary regex is accepted
-        # In production DBs, catastrophic patterns can freeze the server
-        assert result.errors is None or result.errors is not None
+        assert result.errors is not None
+        err_msg = str(result.errors[0]).lower()
+        assert "disabled" in err_msg or "not defined" in err_msg
 
 
 # =========================================================================
