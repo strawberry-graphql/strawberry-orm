@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,8 +20,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve release ref
+        id: release_ref
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "ref=refs/tags/${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=refs/tags/${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release_ref.outputs.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
