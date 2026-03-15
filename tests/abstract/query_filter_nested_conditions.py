@@ -163,10 +163,12 @@ class AbstractTestQueryFilterComplexScenarios:
                 ]
             }) { title } }
         """)
-        assert data == {"posts": [
-            {"title": "Hello World"},
-            {"title": "Rust Adventures"},
-        ]}
+        assert data == {
+            "posts": [
+                {"title": "Hello World"},
+                {"title": "Rust Adventures"},
+            ]
+        }
 
     def test_not_with_in_list(self, execute, seed):
         data = execute("""

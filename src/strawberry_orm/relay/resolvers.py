@@ -67,6 +67,7 @@ async def resolve_nodes_tortoise(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_session(info: Any) -> Any:
     ctx = info.context
     if hasattr(ctx, "session"):
@@ -75,8 +76,7 @@ def _get_session(info: Any) -> Any:
     if hasattr(ctx, "get_session"):
         return ctx.get_session()
     raise RuntimeError(
-        "SQLAlchemy backend requires info.context.session or "
-        "info.context.get_session"
+        "SQLAlchemy backend requires info.context.session or info.context.get_session"
     )
 
 

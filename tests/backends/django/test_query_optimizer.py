@@ -29,14 +29,19 @@ class TestQueryOptimizerEagerLoading:
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
 
         with CaptureQueriesContext(connection) as ctx:
-            result = schema.execute_sync('{ users { name posts { title } } }')
+            result = schema.execute_sync("{ users { name posts { title } } }")
 
         assert result.errors is None
-        assert result.data == {"users": [
-            {"name": "Alice", "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}]},
-            {"name": "Bob", "posts": [{"title": "Draft Post"}]},
-            {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
-        ]}
+        assert result.data == {
+            "users": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": [{"title": "Draft Post"}]},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ]
+        }
         assert len(ctx) <= 2
 
     def test_optimizer_handles_nested_relationships(self, orm, seed, Post, Tag, User):
@@ -67,22 +72,36 @@ class TestQueryOptimizerEagerLoading:
 
         with CaptureQueriesContext(connection) as ctx:
             result = schema.execute_sync(
-                '{ users { name posts { title tags { name } } } }'
+                "{ users { name posts { title tags { name } } } }"
             )
 
         assert result.errors is None
-        assert result.data == {"users": [
-            {"name": "Alice", "posts": [
-                {"title": "Hello World", "tags": [{"name": "python"}]},
-                {"title": "GraphQL Guide", "tags": [{"name": "python"}, {"name": "graphql"}]},
-            ]},
-            {"name": "Bob", "posts": [
-                {"title": "Draft Post", "tags": []},
-            ]},
-            {"name": "Charlie", "posts": [
-                {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
-            ]},
-        ]}
+        assert result.data == {
+            "users": [
+                {
+                    "name": "Alice",
+                    "posts": [
+                        {"title": "Hello World", "tags": [{"name": "python"}]},
+                        {
+                            "title": "GraphQL Guide",
+                            "tags": [{"name": "python"}, {"name": "graphql"}],
+                        },
+                    ],
+                },
+                {
+                    "name": "Bob",
+                    "posts": [
+                        {"title": "Draft Post", "tags": []},
+                    ],
+                },
+                {
+                    "name": "Charlie",
+                    "posts": [
+                        {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
+                    ],
+                },
+            ]
+        }
         assert len(ctx) <= 10
 
     def test_no_queries_for_scalar_only(self, orm, seed, User):
@@ -101,14 +120,16 @@ class TestQueryOptimizerEagerLoading:
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
 
         with CaptureQueriesContext(connection) as ctx:
-            result = schema.execute_sync('{ users { name email } }')
+            result = schema.execute_sync("{ users { name email } }")
 
         assert result.errors is None
-        assert result.data == {"users": [
-            {"name": "Alice", "email": "alice@example.com"},
-            {"name": "Bob", "email": "bob@example.com"},
-            {"name": "Charlie", "email": "charlie@test.org"},
-        ]}
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "email": "alice@example.com"},
+                {"name": "Bob", "email": "bob@example.com"},
+                {"name": "Charlie", "email": "charlie@test.org"},
+            ]
+        }
         assert len(ctx) == 1
 
     def test_disable_optimization_blocks_load_extras(self, orm, seed, Post, Tag, User):
@@ -141,19 +162,31 @@ class TestQueryOptimizerEagerLoading:
                 return User.objects.all()  # type: ignore[return-value]
 
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
-        result = schema.execute_sync(
-            '{ users { name posts { title tags { name } } } }'
-        )
+        result = schema.execute_sync("{ users { name posts { title tags { name } } } }")
         assert result.errors is None
-        assert result.data == {"users": [
-            {"name": "Alice", "posts": [
-                {"title": "Hello World", "tags": [{"name": "python"}]},
-                {"title": "GraphQL Guide", "tags": [{"name": "python"}, {"name": "graphql"}]},
-            ]},
-            {"name": "Bob", "posts": [
-                {"title": "Draft Post", "tags": []},
-            ]},
-            {"name": "Charlie", "posts": [
-                {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
-            ]},
-        ]}
+        assert result.data == {
+            "users": [
+                {
+                    "name": "Alice",
+                    "posts": [
+                        {"title": "Hello World", "tags": [{"name": "python"}]},
+                        {
+                            "title": "GraphQL Guide",
+                            "tags": [{"name": "python"}, {"name": "graphql"}],
+                        },
+                    ],
+                },
+                {
+                    "name": "Bob",
+                    "posts": [
+                        {"title": "Draft Post", "tags": []},
+                    ],
+                },
+                {
+                    "name": "Charlie",
+                    "posts": [
+                        {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
+                    ],
+                },
+            ]
+        }

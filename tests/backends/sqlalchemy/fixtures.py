@@ -110,6 +110,7 @@ class _MainQuery:
     @strawberry.field
     def user(self, info: strawberry.types.Info, id: int) -> Optional[UserType]:
         from sqlalchemy.orm import Session
+
         session: Session = info.context["session"]
         return session.get(SAUser, id)
 
@@ -117,8 +118,11 @@ class _MainQuery:
 @strawberry.type
 class _MainMutation:
     @strawberry.mutation
-    def create_post(self, info: strawberry.types.Info, input: CreatePostInput) -> PostType:
+    def create_post(
+        self, info: strawberry.types.Info, input: CreatePostInput
+    ) -> PostType:
         from sqlalchemy.orm import Session
+
         session: Session = info.context["session"]
         post = SAPost(
             title=input.title,
@@ -131,8 +135,11 @@ class _MainMutation:
         return post  # type: ignore[return-value]
 
     @strawberry.mutation
-    def update_post(self, info: strawberry.types.Info, input: UpdatePostInput) -> Optional[PostType]:
+    def update_post(
+        self, info: strawberry.types.Info, input: UpdatePostInput
+    ) -> Optional[PostType]:
         from sqlalchemy.orm import Session
+
         session: Session = info.context["session"]
         post = session.get(SAPost, input.id)
         if post is None:
@@ -141,7 +148,10 @@ class _MainMutation:
             post.title = input.title
         if input.body is not strawberry.UNSET and input.body is not None:
             post.body = input.body
-        if input.is_published is not strawberry.UNSET and input.is_published is not None:
+        if (
+            input.is_published is not strawberry.UNSET
+            and input.is_published is not None
+        ):
             post.is_published = input.is_published
         session.commit()
         return post  # type: ignore[return-value]
@@ -149,6 +159,7 @@ class _MainMutation:
     @strawberry.mutation
     def delete_post(self, info: strawberry.types.Info, id: int) -> bool:
         from sqlalchemy.orm import Session
+
         session: Session = info.context["session"]
         post = session.get(SAPost, id)
         if post is None:
@@ -162,6 +173,7 @@ class _MainMutation:
         self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
     ) -> Optional[PostType]:
         from sqlalchemy.orm import Session
+
         session: Session = info.context["session"]
         post = session.get(SAPost, post_id)
         if post is None:
@@ -317,6 +329,7 @@ multi_type_schema = strawberry.Schema(
 
 # -- Fresh ORM instance (for tests that build their own types) ---------------
 
+
 @pytest.fixture
 def orm():
     return StrawberryORM("sqlalchemy", dialect="sqlite")
@@ -324,17 +337,21 @@ def orm():
 
 # -- Model class fixtures ----------------------------------------------------
 
+
 @pytest.fixture
 def User():
     return SAUser
+
 
 @pytest.fixture
 def Post():
     return SAPost
 
+
 @pytest.fixture
 def Tag():
     return SATag
+
 
 @pytest.fixture
 def Comment():
@@ -342,6 +359,7 @@ def Comment():
 
 
 # -- Session / DB fixtures ---------------------------------------------------
+
 
 @pytest.fixture
 def sa_session():
@@ -355,6 +373,7 @@ def sa_session():
 
 
 # -- Seed fixture (returns instances) ----------------------------------------
+
 
 @pytest.fixture
 def seed(sa_session):
@@ -370,10 +389,30 @@ def seed(sa_session):
     sa_session.add_all([python, graphql, rust])
     sa_session.flush()
 
-    p1 = SAPost(id=1, title="Hello World", body="First post", is_published=True, author_id=1)
-    p2 = SAPost(id=2, title="GraphQL Guide", body="Learn GraphQL", is_published=True, author_id=1)
-    p3 = SAPost(id=3, title="Draft Post", body="Not published yet", is_published=False, author_id=2)
-    p4 = SAPost(id=4, title="Rust Adventures", body="Systems programming", is_published=True, author_id=3)
+    p1 = SAPost(
+        id=1, title="Hello World", body="First post", is_published=True, author_id=1
+    )
+    p2 = SAPost(
+        id=2,
+        title="GraphQL Guide",
+        body="Learn GraphQL",
+        is_published=True,
+        author_id=1,
+    )
+    p3 = SAPost(
+        id=3,
+        title="Draft Post",
+        body="Not published yet",
+        is_published=False,
+        author_id=2,
+    )
+    p4 = SAPost(
+        id=4,
+        title="Rust Adventures",
+        body="Systems programming",
+        is_published=True,
+        author_id=3,
+    )
     sa_session.add_all([p1, p2, p3, p4])
     sa_session.flush()
 
@@ -391,12 +430,18 @@ def seed(sa_session):
     return {
         "users": {"alice": alice, "bob": bob, "charlie": charlie},
         "tags": {"python": python, "graphql": graphql, "rust": rust},
-        "posts": {"hello_world": p1, "graphql_guide": p2, "draft": p3, "rust_adventures": p4},
+        "posts": {
+            "hello_world": p1,
+            "graphql_guide": p2,
+            "draft": p3,
+            "rust_adventures": p4,
+        },
         "comments": {"nice_post": c1, "thanks": c2, "great_guide": c3},
     }
 
 
 # -- Execute fixtures --------------------------------------------------------
+
 
 def _make_executor(target_schema, sa_session):
     def _execute(query, variables=None):
@@ -407,6 +452,7 @@ def _make_executor(target_schema, sa_session):
         )
         assert result.errors is None, f"GraphQL errors: {result.errors}"
         return result.data
+
     return _execute
 
 
@@ -442,12 +488,15 @@ def user_full_type():
 
 # -- Query counter (for optimizer tests) -------------------------------------
 
+
 @pytest.fixture
 def query_counter(sa_session):
     """Track SQL statements executed during a test."""
     queries: list[str] = []
 
-    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    def _before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany
+    ):
         queries.append(statement)
 
     engine = sa_session.bind

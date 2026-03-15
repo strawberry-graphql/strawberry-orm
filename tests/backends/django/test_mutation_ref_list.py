@@ -4,7 +4,8 @@
 def _sort_tags(data):
     """Sort tags by name for deterministic comparison."""
     data["setPostTags"]["tags"] = sorted(
-        data["setPostTags"]["tags"], key=lambda t: t["name"],
+        data["setPostTags"]["tags"],
+        key=lambda t: t["name"],
     )
     return data
 
@@ -18,10 +19,12 @@ class TestMutationRefList:
                 }
             }
         """)
-        assert data == {"setPostTags": {
-            "title": "Draft Post",
-            "tags": [{"name": "python"}],
-        }}
+        assert data == {
+            "setPostTags": {
+                "title": "Draft Post",
+                "tags": [{"name": "python"}],
+            }
+        }
 
     def test_create_inline_tag(self, execute, seed):
         data = execute("""
@@ -31,10 +34,12 @@ class TestMutationRefList:
                 }
             }
         """)
-        assert data == {"setPostTags": {
-            "title": "Draft Post",
-            "tags": [{"name": "new-tag"}],
-        }}
+        assert data == {
+            "setPostTags": {
+                "title": "Draft Post",
+                "tags": [{"name": "new-tag"}],
+            }
+        }
 
     def test_update_inline_tag(self, execute, seed):
         data = execute("""
@@ -80,6 +85,8 @@ class TestMutationRefList:
                 }
             }
         """)
-        assert _sort_tags(data) == {"setPostTags": {
-            "tags": [{"name": "graphql"}, {"name": "python3"}, {"name": "testing"}],
-        }}
+        assert _sort_tags(data) == {
+            "setPostTags": {
+                "tags": [{"name": "graphql"}, {"name": "python3"}, {"name": "testing"}],
+            }
+        }

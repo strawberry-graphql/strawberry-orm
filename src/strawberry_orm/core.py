@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import typing as _typing
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import strawberry
 from strawberry.extensions import SchemaExtension
@@ -36,41 +36,51 @@ def _make_query_resolver(
     info_type = strawberry.types.Info
 
     if filter_type and order_type:
-        def resolver(self: Any, info: Any, filter: Any = None, order: Any = None) -> Any:
+
+        def resolver(
+            self: Any, info: Any, filter: Any = None, order: Any = None
+        ) -> Any:
             query = backend.get_default_queryset(model)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model)
             if order is not None:
                 query = backend.apply_ordering(query, order, model)
             return query
+
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
             "order": Optional[order_type],
         }
     elif filter_type:
+
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             query = backend.get_default_queryset(model)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model)
             return query
+
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
         }
     elif order_type:
+
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
             query = backend.get_default_queryset(model)
             if order is not None:
                 query = backend.apply_ordering(query, order, model)
             return query
+
         resolver.__annotations__ = {
             "info": info_type,
             "order": Optional[order_type],
         }
     else:
+
         def resolver(self: Any, info: Any) -> Any:
             return backend.get_default_queryset(model)
+
         resolver.__annotations__ = {"info": info_type}
 
     return resolver
@@ -170,7 +180,7 @@ class StrawberryORM:
         *,
         filters: Any | None = None,
         order: Any | None = None,
-        load: list[Any] | None = None,
+        load: list[Any] | Callable[..., Any] | None = None,
         only: list[str] | None = None,
         compute: dict[str, Any] | None = None,
         disable_optimization: bool = False,
@@ -180,7 +190,10 @@ class StrawberryORM:
         if filters is not None or order is not None:
             model = _infer_model(filters, order)
             resolver = _make_query_resolver(
-                self._backend, model, filters, order,
+                self._backend,
+                model,
+                filters,
+                order,
             )
             return strawberry.field(
                 resolver=resolver,
@@ -239,14 +252,20 @@ class StrawberryORM:
         update: type | None = None,
         delete: bool = False,
     ) -> type:
-        return self._backend.ref(
-            model, create=create, update=update, delete=delete
-        )
+        return self._backend.ref(model, create=create, update=update, delete=delete)
 
     def apply_ref_list(
-        self, instance: Any, field: str, refs: list[Any], info: Any
+        self,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        *,
+        authorize: Any | None = None,
     ) -> None:
-        return self._backend.apply_ref_list(instance, field, refs, info)
+        return self._backend.apply_ref_list(
+            instance, field, refs, info, authorize=authorize
+        )
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -265,12 +284,15 @@ class StrawberryORM:
 def _create_backend(name: BackendName, **kwargs: Any) -> Backend:
     if name == "django":
         from strawberry_orm.backends.django import DjangoBackend
+
         return DjangoBackend(**kwargs)
     elif name == "sqlalchemy":
         from strawberry_orm.backends.sqlalchemy import SQLAlchemyBackend
+
         return SQLAlchemyBackend(**kwargs)
     elif name == "tortoise":
         from strawberry_orm.backends.tortoise import TortoiseBackend
+
         return TortoiseBackend(**kwargs)
     else:
         raise ValueError(

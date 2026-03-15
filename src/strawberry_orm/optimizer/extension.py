@@ -26,7 +26,9 @@ class OptimizerExtension(SchemaExtension):
     _store: OptimizerStore | None = None
 
     @classmethod
-    def configure(cls, backend: Backend, store: OptimizerStore) -> type[OptimizerExtension]:
+    def configure(
+        cls, backend: Backend, store: OptimizerStore
+    ) -> type[OptimizerExtension]:
         """Return a configured subclass bound to a specific backend/store."""
         return type(
             f"{cls.__name__}_{backend.__class__.__name__}",

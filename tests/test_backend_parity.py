@@ -19,7 +19,11 @@ EXCLUDED_FILES = {
 }
 
 EXCLUDED_METHODS = {
-    ("test_query_error_handling.py", "TestQueryErrorHandling", "test_missing_session_raises_runtime_error"),
+    (
+        "test_query_error_handling.py",
+        "TestQueryErrorHandling",
+        "test_missing_session_raises_runtime_error",
+    ),
 }
 
 
@@ -88,8 +92,8 @@ class TestBackendParity:
                     f"    Django only classes: {sorted(dj_only) or 'none'}"
                 )
 
-        assert not mismatches, (
-            "Test class mismatch between backends!\n" + "\n".join(mismatches)
+        assert not mismatches, "Test class mismatch between backends!\n" + "\n".join(
+            mismatches
         )
 
     def test_same_test_methods(self):
@@ -122,6 +126,6 @@ class TestBackendParity:
                         f"    Django only: {sorted(dj_only) or 'none'}"
                     )
 
-        assert not mismatches, (
-            "Test method mismatch between backends!\n" + "\n".join(mismatches)
+        assert not mismatches, "Test method mismatch between backends!\n" + "\n".join(
+            mismatches
         )

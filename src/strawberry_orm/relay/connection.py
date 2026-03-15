@@ -19,6 +19,7 @@ class ORMListConnection(ListConnection[NodeType]):
     default implementation delegates to strawberry's built-in
     ``ListConnection`` which handles offset-based slicing of any iterable.
     """
+
     pass
 
 

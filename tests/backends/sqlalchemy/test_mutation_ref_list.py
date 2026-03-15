@@ -4,7 +4,8 @@
 def _sort_tags(data):
     """Sort tags by name for deterministic comparison."""
     data["setPostTags"]["tags"] = sorted(
-        data["setPostTags"]["tags"], key=lambda t: t["name"],
+        data["setPostTags"]["tags"],
+        key=lambda t: t["name"],
     )
     return data
 
@@ -18,10 +19,12 @@ class TestMutationRefList:
                 }
             }
         """)
-        assert _sort_tags(data) == {"setPostTags": {
-            "title": "Draft Post",
-            "tags": [{"name": "python"}, {"name": "rust"}],
-        }}
+        assert _sort_tags(data) == {
+            "setPostTags": {
+                "title": "Draft Post",
+                "tags": [{"name": "python"}, {"name": "rust"}],
+            }
+        }
 
     def test_create_inline_tag(self, execute, seed):
         data = execute("""
@@ -32,9 +35,11 @@ class TestMutationRefList:
                 ]) { tags { name } }
             }
         """)
-        assert _sort_tags(data) == {"setPostTags": {
-            "tags": [{"name": "django"}, {"name": "python"}],
-        }}
+        assert _sort_tags(data) == {
+            "setPostTags": {
+                "tags": [{"name": "django"}, {"name": "python"}],
+            }
+        }
 
     def test_update_inline_tag(self, execute, seed):
         data = execute("""
@@ -45,9 +50,11 @@ class TestMutationRefList:
                 ]) { tags { name } }
             }
         """)
-        assert _sort_tags(data) == {"setPostTags": {
-            "tags": [{"name": "gql"}, {"name": "python"}],
-        }}
+        assert _sort_tags(data) == {
+            "setPostTags": {
+                "tags": [{"name": "gql"}, {"name": "python"}],
+            }
+        }
 
     def test_delete_related_tag(self, execute, seed, sa_session, Tag):
         data = execute("""
@@ -82,6 +89,8 @@ class TestMutationRefList:
                 ]) { tags { name } }
             }
         """)
-        assert _sort_tags(data) == {"setPostTags": {
-            "tags": [{"name": "fastapi"}, {"name": "py"}, {"name": "rust"}],
-        }}
+        assert _sort_tags(data) == {
+            "setPostTags": {
+                "tags": [{"name": "fastapi"}, {"name": "py"}, {"name": "rust"}],
+            }
+        }

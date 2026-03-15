@@ -6,6 +6,7 @@ import pytest
 class TestBackendCreation:
     def test_creates_tortoise_backend(self, orm):
         from strawberry_orm.backends.tortoise import TortoiseBackend
+
         assert isinstance(orm.backend, TortoiseBackend)
 
 

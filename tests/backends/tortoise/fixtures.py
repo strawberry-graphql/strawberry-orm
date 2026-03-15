@@ -13,6 +13,7 @@ from tests.backends.tortoise.models import (
 
 # -- Fresh ORM instance -----------------------------------------------------
 
+
 @pytest.fixture
 def orm():
     return StrawberryORM("tortoise")
@@ -20,17 +21,21 @@ def orm():
 
 # -- Model class fixtures ----------------------------------------------------
 
+
 @pytest.fixture
 def User():
     return TortUser
+
 
 @pytest.fixture
 def Post():
     return TortPost
 
+
 @pytest.fixture
 def Tag():
     return TortTag
+
 
 @pytest.fixture
 def Comment():

@@ -16,6 +16,7 @@ import strawberry
 # Base lookups
 # ---------------------------------------------------------------------------
 
+
 @strawberry.input
 class StringLookup:
     exact: Optional[str] = strawberry.UNSET
@@ -52,6 +53,7 @@ class IDLookup:
 # ---------------------------------------------------------------------------
 # Comparison lookups (numeric, date, time, datetime)
 # ---------------------------------------------------------------------------
+
 
 @strawberry.input
 class IntRangeInput:
@@ -96,6 +98,7 @@ class FloatComparisonLookup:
 # ---------------------------------------------------------------------------
 # Date / time lookups
 # ---------------------------------------------------------------------------
+
 
 @strawberry.input
 class DateRangeInput:

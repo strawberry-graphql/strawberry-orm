@@ -12,7 +12,9 @@ class TestQueryFieldHintsRegistration(AbstractTestQueryFieldHintsRegistration):
 
 
 class TestQueryFieldHintsIntegration:
-    def test_load_hint_eager_loads_relationship(self, orm, sa_session, seed, Post, Tag, User):
+    def test_load_hint_eager_loads_relationship(
+        self, orm, sa_session, seed, Post, Tag, User
+    ):
         @orm.type(Tag)
         class TT:
             id: auto
@@ -37,16 +39,21 @@ class TestQueryFieldHintsIntegration:
 
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
         result = schema.execute_sync(
-            '{ posts { title tags { name } } }',
+            "{ posts { title tags { name } } }",
             context_value={"session": sa_session},
         )
         assert result.errors is None
-        assert result.data == {"posts": [
-            {"title": "Hello World", "tags": [{"name": "python"}]},
-            {"title": "GraphQL Guide", "tags": [{"name": "python"}, {"name": "graphql"}]},
-            {"title": "Draft Post", "tags": []},
-            {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
-        ]}
+        assert result.data == {
+            "posts": [
+                {"title": "Hello World", "tags": [{"name": "python"}]},
+                {
+                    "title": "GraphQL Guide",
+                    "tags": [{"name": "python"}, {"name": "graphql"}],
+                },
+                {"title": "Draft Post", "tags": []},
+                {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
+            ]
+        }
 
     def test_disable_optimization_skips_field(self, orm, User):
         @orm.type(User)

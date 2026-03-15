@@ -138,7 +138,10 @@ class _MainMutation:
             post.title = input.title
         if input.body is not strawberry.UNSET and input.body is not None:
             post.body = input.body
-        if input.is_published is not strawberry.UNSET and input.is_published is not None:
+        if (
+            input.is_published is not strawberry.UNSET
+            and input.is_published is not None
+        ):
             post.is_published = input.is_published
         post.save()
         return post  # type: ignore[return-value]
@@ -310,6 +313,7 @@ multi_type_schema = strawberry.Schema(
 
 # -- Fresh ORM instance (for tests that build their own types) ---------------
 
+
 @pytest.fixture
 def orm():
     return StrawberryORM("django")
@@ -317,17 +321,21 @@ def orm():
 
 # -- Model class fixtures ----------------------------------------------------
 
+
 @pytest.fixture
 def User():
     return DjUser
+
 
 @pytest.fixture
 def Post():
     return DjPost
 
+
 @pytest.fixture
 def Tag():
     return DjTag
+
 
 @pytest.fixture
 def Comment():
@@ -335,6 +343,7 @@ def Comment():
 
 
 # -- DB setup fixtures -------------------------------------------------------
+
 
 def _ensure_tables():
     """Create model tables if they don't exist yet."""
@@ -357,9 +366,7 @@ def _flush_tables():
     DjUser.objects.all().delete()
     with connection.cursor() as cursor:
         for table in ("user", "post", "tag", "comment"):
-            cursor.execute(
-                "DELETE FROM sqlite_sequence WHERE name = %s", [table]
-            )
+            cursor.execute("DELETE FROM sqlite_sequence WHERE name = %s", [table])
 
 
 @pytest.fixture(autouse=True)
@@ -372,6 +379,7 @@ def setup_tables(transactional_db):
 
 # -- Seed fixture (returns instances) ----------------------------------------
 
+
 @pytest.fixture
 def seed(setup_tables):
     alice = DjUser.objects.create(id=1, name="Alice", email="alice@example.com")
@@ -382,28 +390,56 @@ def seed(setup_tables):
     graphql_tag = DjTag.objects.create(id=2, name="graphql")
     rust_tag = DjTag.objects.create(id=3, name="rust")
 
-    p1 = DjPost.objects.create(id=1, title="Hello World", body="First post", is_published=True, author=alice)
-    p2 = DjPost.objects.create(id=2, title="GraphQL Guide", body="Learn GraphQL", is_published=True, author=alice)
-    p3 = DjPost.objects.create(id=3, title="Draft Post", body="Not published yet", is_published=False, author=bob)
-    p4 = DjPost.objects.create(id=4, title="Rust Adventures", body="Systems programming", is_published=True, author=charlie)
+    p1 = DjPost.objects.create(
+        id=1, title="Hello World", body="First post", is_published=True, author=alice
+    )
+    p2 = DjPost.objects.create(
+        id=2,
+        title="GraphQL Guide",
+        body="Learn GraphQL",
+        is_published=True,
+        author=alice,
+    )
+    p3 = DjPost.objects.create(
+        id=3,
+        title="Draft Post",
+        body="Not published yet",
+        is_published=False,
+        author=bob,
+    )
+    p4 = DjPost.objects.create(
+        id=4,
+        title="Rust Adventures",
+        body="Systems programming",
+        is_published=True,
+        author=charlie,
+    )
 
     p1.tags.add(python_tag)
     p2.tags.add(python_tag, graphql_tag)
     p4.tags.add(rust_tag)
 
     c1 = DjComment.objects.create(id=1, body="Nice post!", post=p1, author=bob)
-    c2 = DjComment.objects.create(id=2, body="Thanks!", post=p1, author=alice, parent_id=1)
+    c2 = DjComment.objects.create(
+        id=2, body="Thanks!", post=p1, author=alice, parent_id=1
+    )
     c3 = DjComment.objects.create(id=3, body="Great guide", post=p2, author=charlie)
 
     return {
         "users": {"alice": alice, "bob": bob, "charlie": charlie},
         "tags": {"python": python_tag, "graphql": graphql_tag, "rust": rust_tag},
-        "posts": {"hello_world": p1, "graphql_guide": p2, "draft": p3, "rust_adventures": p4},
+        "posts": {
+            "hello_world": p1,
+            "graphql_guide": p2,
+            "draft": p3,
+            "rust_adventures": p4,
+        },
         "comments": {"nice_post": c1, "thanks": c2, "great_guide": c3},
     }
 
 
 # -- Execute fixtures --------------------------------------------------------
+
 
 def _make_executor(target_schema):
     def _execute(query, variables=None):
@@ -413,6 +449,7 @@ def _make_executor(target_schema):
         )
         assert result.errors is None, f"GraphQL errors: {result.errors}"
         return result.data
+
     return _execute
 
 

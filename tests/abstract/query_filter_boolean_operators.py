@@ -46,11 +46,13 @@ class AbstractTestQueryFilterBooleanOperators:
                 ]
             }) { title } }
         """)
-        assert data == {"posts": [
-            {"title": "Hello World"},
-            {"title": "GraphQL Guide"},
-            {"title": "Rust Adventures"},
-        ]}
+        assert data == {
+            "posts": [
+                {"title": "Hello World"},
+                {"title": "GraphQL Guide"},
+                {"title": "Rust Adventures"},
+            ]
+        }
 
     def test_not_any_equals_none_of(self, execute, seed):
         data = execute("""

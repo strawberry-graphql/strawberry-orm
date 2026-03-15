@@ -5,7 +5,16 @@ from __future__ import annotations
 import datetime
 from typing import Optional
 
-from sqlalchemy import ForeignKey, String, Table, Column, Integer, DateTime, Text, Boolean
+from sqlalchemy import (
+    ForeignKey,
+    String,
+    Table,
+    Column,
+    Integer,
+    DateTime,
+    Text,
+    Boolean,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 

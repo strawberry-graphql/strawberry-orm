@@ -83,7 +83,13 @@ class Backend(Protocol):
         ...
 
     def apply_ref_list(
-        self, instance: Any, field: str, refs: list[Any], info: Any
+        self,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        *,
+        authorize: Any | None = None,
     ) -> None:
         """Apply a list of ref operations to *instance*'s *field* relation."""
         ...
@@ -114,8 +120,6 @@ class Backend(Protocol):
         """Return the schema extension class that handles query optimization."""
         ...
 
-    def apply_optimizer_hints(
-        self, store: Any, query: Any, info: Any
-    ) -> Any:
+    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         """Apply field-level hints from *store* onto *query*."""
         ...

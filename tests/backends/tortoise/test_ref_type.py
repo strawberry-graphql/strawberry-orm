@@ -8,6 +8,7 @@ class TestRefType:
     def test_ref_id_only(self, orm):
         class FakeModel:
             __name__ = "Tag"
+
         TagRef = orm.ref(FakeModel)
         assert hasattr(TagRef, "__strawberry_definition__")
 

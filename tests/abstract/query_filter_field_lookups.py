@@ -18,11 +18,13 @@ class AbstractTestQueryFilterFieldLookups:
         data = execute("""
             { posts(filter: { field: { isPublished: { exact: true } } }) { title } }
         """)
-        assert data == {"posts": [
-            {"title": "Hello World"},
-            {"title": "GraphQL Guide"},
-            {"title": "Rust Adventures"},
-        ]}
+        assert data == {
+            "posts": [
+                {"title": "Hello World"},
+                {"title": "GraphQL Guide"},
+                {"title": "Rust Adventures"},
+            ]
+        }
 
     def test_integer_gt(self, execute, seed):
         data = execute("""
@@ -70,11 +72,13 @@ class AbstractTestQueryFilterFieldLookups:
         data = execute("""
             { users(filter: { field: { name: { isNull: false } } }) { name } }
         """)
-        assert data == {"users": [
-            {"name": "Alice"},
-            {"name": "Bob"},
-            {"name": "Charlie"},
-        ]}
+        assert data == {
+            "users": [
+                {"name": "Alice"},
+                {"name": "Bob"},
+                {"name": "Charlie"},
+            ]
+        }
 
     def test_is_null_true(self, execute, seed):
         data = execute("""

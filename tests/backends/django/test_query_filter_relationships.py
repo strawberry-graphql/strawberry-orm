@@ -15,5 +15,7 @@ class TestQueryOrderRelationships(AbstractTestQueryOrderRelationships):
     pass
 
 
-class TestQueryFilterAndOrderRelationships(AbstractTestQueryFilterAndOrderRelationships):
+class TestQueryFilterAndOrderRelationships(
+    AbstractTestQueryFilterAndOrderRelationships
+):
     pass

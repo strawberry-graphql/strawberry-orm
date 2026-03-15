@@ -51,9 +51,7 @@ class Comment(Model):
     body = fields.TextField()
     post = fields.ForeignKeyField("models.Post", related_name="comments")
     author = fields.ForeignKeyField("models.User", related_name="comments")
-    parent = fields.ForeignKeyField(
-        "models.Comment", related_name="replies", null=True
-    )
+    parent = fields.ForeignKeyField("models.Comment", related_name="replies", null=True)
 
     replies: fields.ReverseRelation["Comment"]
 

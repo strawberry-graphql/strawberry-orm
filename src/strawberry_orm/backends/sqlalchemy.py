@@ -24,11 +24,17 @@ class SQLAlchemyBackend:
         dialect: str = "postgresql",
         session_getter: Callable[..., Any] | None = None,
         filter_overrides: dict[type, type] | None = None,
+        max_filter_depth: int = 10,
+        max_filter_branches: int = 50,
+        enable_regex_filters: bool = False,
         **kwargs: Any,
     ) -> None:
         self._dialect = dialect
         self._session_getter = session_getter
         self._filter_overrides = filter_overrides or {}
+        self._max_filter_depth = max_filter_depth
+        self._max_filter_branches = max_filter_branches
+        self._enable_regex_filters = enable_regex_filters
         self._store = OptimizerStore()
         self._type_registry: dict[str, type] = {}
         self._type_querysets: dict[type, Callable[..., Any]] = {}
@@ -64,6 +70,23 @@ class SQLAlchemyBackend:
             rel_names = {rel.key for rel in mapper.relationships}
 
             annotations = getattr(cls, "__annotations__", {}).copy()
+
+            try:
+                import typing as _t
+
+                resolved = _t.get_type_hints(
+                    cls,
+                    localns={
+                        "auto": strawberry.auto,
+                        **{k: v for k, v in vars(cls).items()},
+                    },
+                    include_extras=True,
+                )
+                for k in list(annotations):
+                    if k in resolved:
+                        annotations[k] = resolved[k]
+            except Exception:
+                pass
 
             for field_name in list(annotations):
                 if include and field_name not in include:
@@ -102,10 +125,20 @@ class SQLAlchemyBackend:
                         disable_optimization=val.disable_optimization,
                     )
                     backend._store.register(type_name, attr_name, hints)
-                    try:
-                        delattr(cls, attr_name)
-                    except AttributeError:
-                        pass
+                    if val.permission_classes:
+                        setattr(
+                            cls,
+                            attr_name,
+                            strawberry.field(
+                                permission_classes=val.permission_classes,
+                                description=val.description,
+                            ),
+                        )
+                    else:
+                        try:
+                            delattr(cls, attr_name)
+                        except AttributeError:
+                            pass
                 elif getattr(val, "_orm_auto_field", False):
                     try:
                         delattr(cls, attr_name)
@@ -126,9 +159,18 @@ class SQLAlchemyBackend:
                     continue
                 rel = mapper.relationships[field_name]
                 rel_model = rel.mapper.class_
-                setattr(cls, field_name, _make_sa_rel_resolver(
-                    backend, field_name, model, rel_model, f_type, o_type,
-                ))
+                setattr(
+                    cls,
+                    field_name,
+                    _make_sa_rel_resolver(
+                        backend,
+                        field_name,
+                        model,
+                        rel_model,
+                        f_type,
+                        o_type,
+                    ),
+                )
 
             result = strawberry.type(cls, name=name if name else None)
 
@@ -141,12 +183,17 @@ class SQLAlchemyBackend:
     def input(self, model: type, **kwargs: Any) -> Any:
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
+        exclude_pk = kwargs.get("exclude_pk", True)
         name = kwargs.get("name")
+
+        pk_names = _get_sa_pk_names(model) if exclude_pk else set()
 
         fields_meta = _introspect_sa_model(model)
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         for fname, ftype, is_relation, _rel_model in fields_meta:
+            if fname in pk_names:
+                continue
             if include and fname not in include:
                 continue
             if exclude and fname in exclude:
@@ -252,6 +299,7 @@ class SQLAlchemyBackend:
 
     def field(self, **kwargs: Any) -> Any:
         from strawberry_orm.types import FieldDefinition
+
         hint_keys = {"load", "only", "compute", "disable_optimization"}
         if hint_keys & set(kwargs):
             return FieldDefinition(
@@ -295,7 +343,13 @@ class SQLAlchemyBackend:
         return make_ref_type(model, create=create, update=update, delete=delete)
 
     def apply_ref_list(
-        self, instance: Any, field: str, refs: list[Any], info: Any
+        self,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        *,
+        authorize: Callable[..., bool] | None = None,
     ) -> None:
         from sqlalchemy.orm import Session
 
@@ -311,22 +365,32 @@ class SQLAlchemyBackend:
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
             if ref_id is not strawberry.UNSET and ref_id is not None:
+                if authorize and not authorize("link", target_model, ref_id, info):
+                    continue
                 obj = session.get(target_model, ref_id)
                 if obj is not None:
                     new_related.append(obj)
             elif ref_create is not strawberry.UNSET and ref_create is not None:
+                if authorize and not authorize("create", target_model, None, info):
+                    continue
                 obj = target_model(**_input_to_dict(ref_create))
                 session.add(obj)
                 new_related.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = _input_to_dict(ref_update)
                 pk = data.pop("id")
+                if authorize and not authorize("update", target_model, pk, info):
+                    continue
                 obj = session.get(target_model, pk)
                 if obj is not None:
                     for k, v in data.items():
                         setattr(obj, k, v)
                     new_related.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
+                if authorize and not authorize(
+                    "delete", target_model, ref_delete.id, info
+                ):
+                    continue
                 obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
                     session.delete(obj)
@@ -336,7 +400,13 @@ class SQLAlchemyBackend:
     # -- Query application ----------------------------------------------------
 
     def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        clause = _build_sa_filter(filter_input, model)
+        clause = _build_sa_filter(
+            filter_input,
+            model,
+            max_depth=self._max_filter_depth,
+            max_branches=self._max_filter_branches,
+            enable_regex=self._enable_regex_filters,
+        )
         if clause is not None:
             query = query.where(clause)
         return query
@@ -351,11 +421,13 @@ class SQLAlchemyBackend:
 
     def get_default_queryset(self, model: type) -> Any:
         from sqlalchemy import select
+
         return select(model)
 
     def is_query_object(self, value: Any) -> bool:
         try:
             from sqlalchemy.sql import Select
+
             return isinstance(value, Select)
         except ImportError:
             return False
@@ -365,15 +437,13 @@ class SQLAlchemyBackend:
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
 
-    def apply_optimizer_hints(
-        self, store: Any, query: Any, info: Any
-    ) -> Any:
+    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy.orm import joinedload, selectinload, load_only
 
         try:
             entity = query.column_descriptions[0]["entity"]
-        except (AttributeError, IndexError, KeyError):
+        except AttributeError, IndexError, KeyError:
             return query
 
         mapper = sa_inspect(entity)
@@ -387,7 +457,69 @@ class SQLAlchemyBackend:
             to snake_case to match ORM attribute names."""
             name = node.name.value
             import re
+
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+
+        def _get_nested_criteria(
+            parent_entity: type,
+            field_name: str,
+            related_entity: type,
+        ) -> Any:
+            """Extract WHERE criteria from load callable / nested get_queryset."""
+            from sqlalchemy import select as sa_select
+
+            criteria_parts: list[Any] = []
+
+            get_qs = self._type_querysets.get(related_entity)
+            if get_qs is not None:
+                temp_stmt = get_qs(sa_select(related_entity), info)
+                if temp_stmt.whereclause is not None:
+                    criteria_parts.append(temp_stmt.whereclause)
+
+            type_name = self._type_name_for_model(parent_entity)
+            if type_name and store:
+                hints = store.get(type_name, field_name)
+                if hints and callable(hints.load):
+                    temp_stmt = hints.load(sa_select(related_entity))
+                    if temp_stmt.whereclause is not None:
+                        criteria_parts.append(temp_stmt.whereclause)
+
+            if not criteria_parts:
+                return None
+
+            if len(criteria_parts) == 1:
+                return criteria_parts[0]
+
+            from sqlalchemy import and_ as sa_and
+
+            return sa_and(*criteria_parts)
+
+        def _make_loader(rel_attr: Any, uselist: bool, criteria: Any) -> Any:
+            """Build a joinedload or selectinload, optionally with criteria."""
+            if uselist:
+                if criteria is not None:
+                    return selectinload(rel_attr.and_(criteria))
+                return selectinload(rel_attr)
+            else:
+                if criteria is not None:
+                    return joinedload(rel_attr.and_(criteria))
+                return joinedload(rel_attr)
+
+        def _make_chained_loader(
+            parent_loader: Any,
+            rel_attr: Any,
+            uselist: bool,
+            criteria: Any,
+        ) -> Any:
+            """Chain a nested loader onto parent_loader, optionally with criteria."""
+            if uselist:
+                if criteria is not None:
+                    return parent_loader.selectinload(rel_attr.and_(criteria))
+                return parent_loader.selectinload(rel_attr)
+            else:
+                if criteria is not None:
+                    return parent_loader.joinedload(rel_attr.and_(criteria))
+                return parent_loader.joinedload(rel_attr)
 
         def _apply_loads(stmt: Any, selection_set: Any, current_mapper: Any) -> Any:
             if selection_set is None:
@@ -398,14 +530,18 @@ class SQLAlchemyBackend:
                 if field_name in current_mapper.relationships:
                     rel = current_mapper.relationships[field_name]
                     rel_attr = getattr(current_mapper.entity, field_name)
-                    if rel.uselist:
-                        base_loader = selectinload(rel_attr)
-                    else:
-                        base_loader = joinedload(rel_attr)
+                    criteria = _get_nested_criteria(
+                        current_mapper.entity,
+                        field_name,
+                        rel.mapper.class_,
+                    )
+                    base_loader = _make_loader(rel_attr, rel.uselist, criteria)
 
                     if node.selection_set:
                         child_mapper = sa_inspect(rel.mapper.class_)
-                        nested = _collect_nested_loaders(base_loader, node.selection_set, child_mapper)
+                        nested = _collect_nested_loaders(
+                            base_loader, node.selection_set, child_mapper
+                        )
                         for nl in nested:
                             stmt = stmt.options(nl)
                     else:
@@ -415,23 +551,30 @@ class SQLAlchemyBackend:
                 if type_name and store:
                     hints = store.get(type_name, field_name)
                     if hints and not hints.disable_optimization:
-                        if hints.load:
+                        if hints.load and not callable(hints.load):
                             for rel_name in hints.load:
                                 if rel_name in current_mapper.relationships:
                                     extra_rel = current_mapper.relationships[rel_name]
-                                    extra_attr = getattr(current_mapper.entity, rel_name)
+                                    extra_attr = getattr(
+                                        current_mapper.entity, rel_name
+                                    )
                                     if extra_rel.uselist:
                                         stmt = stmt.options(selectinload(extra_attr))
                                     else:
                                         stmt = stmt.options(joinedload(extra_attr))
                         if hints.only:
-                            cols = [getattr(current_mapper.entity, c) for c in hints.only
-                                    if hasattr(current_mapper.entity, c)]
+                            cols = [
+                                getattr(current_mapper.entity, c)
+                                for c in hints.only
+                                if hasattr(current_mapper.entity, c)
+                            ]
                             if cols:
                                 stmt = stmt.options(load_only(*cols))
             return stmt
 
-        def _collect_nested_loaders(parent_loader: Any, selection_set: Any, child_mapper: Any) -> list[Any]:
+        def _collect_nested_loaders(
+            parent_loader: Any, selection_set: Any, child_mapper: Any
+        ) -> list[Any]:
             """Collect all nested relationship loader chains from a selection set.
 
             Each sibling relationship becomes a separate loader option branching
@@ -447,13 +590,22 @@ class SQLAlchemyBackend:
                     has_child_rels = True
                     rel = child_mapper.relationships[field_name]
                     rel_attr = getattr(child_mapper.entity, field_name)
-                    if rel.uselist:
-                        child_loader = parent_loader.selectinload(rel_attr)
-                    else:
-                        child_loader = parent_loader.joinedload(rel_attr)
+                    criteria = _get_nested_criteria(
+                        child_mapper.entity,
+                        field_name,
+                        rel.mapper.class_,
+                    )
+                    child_loader = _make_chained_loader(
+                        parent_loader,
+                        rel_attr,
+                        rel.uselist,
+                        criteria,
+                    )
                     if node.selection_set:
                         nested_mapper = sa_inspect(rel.mapper.class_)
-                        nested = _collect_nested_loaders(child_loader, node.selection_set, nested_mapper)
+                        nested = _collect_nested_loaders(
+                            child_loader, node.selection_set, nested_mapper
+                        )
                         loaders.extend(nested)
                     else:
                         loaders.append(child_loader)
@@ -464,8 +616,13 @@ class SQLAlchemyBackend:
         for field_node in info.field_nodes:
             query = _apply_loads(query, field_node.selection_set, mapper)
 
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
         session = self._get_session(info)
-        result = session.execute(query).scalars().unique().all()
+        try:
+            result = session.execute(query).scalars().unique().all()
+        except OperationalError, ProgrammingError:
+            raise ValueError("Invalid filter expression") from None
         return list(result)
 
     def _type_name_for_model(self, model: type) -> str | None:
@@ -483,23 +640,37 @@ class SQLAlchemyBackend:
         if isinstance(ctx, dict):
             if "session" in ctx:
                 s = ctx["session"]
-                return s() if callable(s) else s
+                if callable(s):
+                    raise TypeError(
+                        "info.context['session'] is callable. "
+                        "Use session_getter= on the backend instead."
+                    )
+                return s
         else:
             if hasattr(ctx, "session"):
                 s = ctx.session
-                return s() if callable(s) else s
+                if callable(s):
+                    raise TypeError(
+                        "info.context.session is callable. "
+                        "Use session_getter= on the backend instead."
+                    )
+                return s
             if hasattr(ctx, "get_session"):
                 return ctx.get_session()
-        raise RuntimeError("SQLAlchemy backend requires a session_getter or info.context.session")
+        raise RuntimeError(
+            "SQLAlchemy backend requires a session_getter or info.context.session"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_element_type(ann: Any) -> Any:
     """Extract T from list[T]."""
     import typing
+
     if typing.get_origin(ann) is list:
         args = typing.get_args(ann)
         if args:
@@ -524,47 +695,64 @@ def _make_sa_rel_resolver(
     info_type = strawberry.types.Info
 
     if filter_type and order_type:
-        def resolver(self: Any, info: Any, filter: Any = None, order: Any = None) -> Any:
+
+        def resolver(
+            self: Any, info: Any, filter: Any = None, order: Any = None
+        ) -> Any:
             if filter is None and order is None:
                 return getattr(self, fname)
             from sqlalchemy import select
             from sqlalchemy.orm import with_parent
+
             session = backend._get_session(info)
-            stmt = select(rel_model).where(with_parent(self, getattr(parent_model, fname)))
+            stmt = select(rel_model).where(
+                with_parent(self, getattr(parent_model, fname))
+            )
             if filter is not None:
                 stmt = backend.apply_filters(stmt, filter, rel_model)
             if order is not None:
                 stmt = backend.apply_ordering(stmt, order, rel_model)
             return session.execute(stmt).scalars().all()
+
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
             "order": Optional[order_type],
         }
     elif filter_type:
+
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             if filter is None:
                 return getattr(self, fname)
             from sqlalchemy import select
             from sqlalchemy.orm import with_parent
+
             session = backend._get_session(info)
-            stmt = select(rel_model).where(with_parent(self, getattr(parent_model, fname)))
+            stmt = select(rel_model).where(
+                with_parent(self, getattr(parent_model, fname))
+            )
             stmt = backend.apply_filters(stmt, filter, rel_model)
             return session.execute(stmt).scalars().all()
+
         resolver.__annotations__ = {
             "info": info_type,
             "filter": Optional[filter_type],
         }
     else:
+
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
             if order is None:
                 return getattr(self, fname)
             from sqlalchemy import select
             from sqlalchemy.orm import with_parent
+
             session = backend._get_session(info)
-            stmt = select(rel_model).where(with_parent(self, getattr(parent_model, fname)))
+            stmt = select(rel_model).where(
+                with_parent(self, getattr(parent_model, fname))
+            )
             stmt = backend.apply_ordering(stmt, order, rel_model)
             return session.execute(stmt).scalars().all()
+
         resolver.__annotations__ = {
             "info": info_type,
             "order": Optional[order_type],
@@ -592,6 +780,14 @@ _SA_TYPE_MAP: dict[str, type] = {
     "JSON": str,
     "BLOB": bytes,
 }
+
+
+def _get_sa_pk_names(model: type) -> set[str]:
+    """Return the set of primary-key column attribute names for an SA model."""
+    from sqlalchemy import inspect as sa_inspect
+
+    mapper = sa_inspect(model)
+    return {col.key for col in mapper.primary_key}
 
 
 def _introspect_sa_model(
@@ -650,14 +846,31 @@ _LOOKUP_TO_SA_OP: dict[str, str] = {
 }
 
 
-def _build_sa_filter(filter_input: Any, model: type) -> Any:
+def _build_sa_filter(
+    filter_input: Any,
+    model: type,
+    *,
+    max_depth: int = 10,
+    max_branches: int = 50,
+    enable_regex: bool = True,
+    _depth: int = 0,
+) -> Any:
     """Recursively translate a filter input object into a SQLAlchemy BooleanClause."""
     from sqlalchemy import and_, or_, not_
+
+    if _depth > max_depth:
+        raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
 
     if filter_input is None or filter_input is strawberry.UNSET:
         return None
 
     fields = filter_input.__class__.__dataclass_fields__
+    recurse_kw = dict(
+        max_depth=max_depth,
+        max_branches=max_branches,
+        enable_regex=enable_regex,
+        _depth=_depth + 1,
+    )
 
     for key in fields:
         val = getattr(filter_input, key)
@@ -665,27 +878,41 @@ def _build_sa_filter(filter_input: Any, model: type) -> Any:
             continue
 
         if key == "field":
-            return _build_sa_field_clause(val, model)
+            return _build_sa_field_clause(val, model, enable_regex=enable_regex)
         elif key == "all":
-            sub = [_build_sa_filter(f, model) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             return and_(*sub) if sub else None
         elif key == "any":
-            sub = [_build_sa_filter(f, model) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             return or_(*sub) if sub else None
         elif key == "not_":
-            inner = _build_sa_filter(val, model)
+            inner = _build_sa_filter(val, model, **recurse_kw)
             return not_(inner) if inner is not None else None
         elif key == "one_of":
-            sub = [_build_sa_filter(f, model) for f in val]
+            if len(val) > max_branches:
+                raise ValueError(
+                    f"Filter has {len(val)} branches; maximum is {max_branches}"
+                )
+            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
             sub = [s for s in sub if s is not None]
             return or_(*sub) if sub else None
 
     return None
 
 
-def _build_sa_field_clause(field_input: Any, model: type) -> Any:
+def _build_sa_field_clause(
+    field_input: Any, model: type, *, enable_regex: bool = True
+) -> Any:
     """Translate a *Field input (e.g. UserField) into column-level conditions."""
     from sqlalchemy import and_
 
@@ -701,7 +928,7 @@ def _build_sa_field_clause(field_input: Any, model: type) -> Any:
         if column is None:
             continue
 
-        col_clauses = _build_lookup_clauses(column, lookup)
+        col_clauses = _build_lookup_clauses(column, lookup, enable_regex=enable_regex)
         clauses.extend(col_clauses)
 
     if not clauses:
@@ -709,7 +936,14 @@ def _build_sa_field_clause(field_input: Any, model: type) -> Any:
     return and_(*clauses) if len(clauses) > 1 else clauses[0]
 
 
-def _build_lookup_clauses(column: Any, lookup: Any) -> list[Any]:
+def _escape_like(val: str) -> str:
+    """Escape SQL LIKE wildcards so they are treated as literals."""
+    return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _build_lookup_clauses(
+    column: Any, lookup: Any, *, enable_regex: bool = True
+) -> list[Any]:
     """Translate a single lookup object (e.g. StringLookup) into clauses."""
     clauses = []
     fields = lookup.__class__.__dataclass_fields__
@@ -730,18 +964,26 @@ def _build_lookup_clauses(column: Any, lookup: Any) -> list[Any]:
         elif op_name == "contains":
             clauses.append(column.contains(val))
         elif op_name == "i_contains":
-            clauses.append(column.ilike(f"%{val}%"))
+            clauses.append(column.ilike(f"%{_escape_like(val)}%", escape="\\"))
         elif op_name == "starts_with":
             clauses.append(column.startswith(val))
         elif op_name == "i_starts_with":
-            clauses.append(column.ilike(f"{val}%"))
+            clauses.append(column.ilike(f"{_escape_like(val)}%", escape="\\"))
         elif op_name == "ends_with":
             clauses.append(column.endswith(val))
         elif op_name == "i_ends_with":
-            clauses.append(column.ilike(f"%{val}"))
+            clauses.append(column.ilike(f"%{_escape_like(val)}", escape="\\"))
         elif op_name == "regex":
+            if not enable_regex:
+                raise ValueError(
+                    "Regex filters are disabled. Pass enable_regex_filters=True to enable."
+                )
             clauses.append(column.regexp_match(val))
         elif op_name == "i_regex":
+            if not enable_regex:
+                raise ValueError(
+                    "Regex filters are disabled. Pass enable_regex_filters=True to enable."
+                )
             clauses.append(column.regexp_match(val, flags="i"))
         elif op_name in ("exact", "neq", "gt", "gte", "lt", "lte"):
             sa_op = _LOOKUP_TO_SA_OP[op_name]
@@ -753,6 +995,7 @@ def _build_lookup_clauses(column: Any, lookup: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 # Ordering translation
 # ---------------------------------------------------------------------------
+
 
 def _build_sa_ordering(order_input: Any, model: type) -> list[Any]:
     """Translate an order input object into a list of SQLAlchemy order_by clauses."""

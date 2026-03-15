@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import strawberry
 
@@ -36,7 +36,7 @@ auto = strawberry.auto
 class FieldDefinition:
     """Metadata attached to fields created via orm.field()."""
 
-    load: list[Any] | None = None
+    load: list[Any] | Callable[..., Any] | None = None
     only: list[str] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False

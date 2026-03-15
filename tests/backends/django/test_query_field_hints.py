@@ -30,14 +30,19 @@ class TestQueryFieldHintsIntegration:
                 return Post.objects.all()  # type: ignore[return-value]
 
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
-        result = schema.execute_sync('{ posts { title tags { name } } }')
+        result = schema.execute_sync("{ posts { title tags { name } } }")
         assert result.errors is None
-        assert result.data == {"posts": [
-            {"title": "Hello World", "tags": [{"name": "python"}]},
-            {"title": "GraphQL Guide", "tags": [{"name": "python"}, {"name": "graphql"}]},
-            {"title": "Draft Post", "tags": []},
-            {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
-        ]}
+        assert result.data == {
+            "posts": [
+                {"title": "Hello World", "tags": [{"name": "python"}]},
+                {
+                    "title": "GraphQL Guide",
+                    "tags": [{"name": "python"}, {"name": "graphql"}],
+                },
+                {"title": "Draft Post", "tags": []},
+                {"title": "Rust Adventures", "tags": [{"name": "rust"}]},
+            ]
+        }
 
     def test_disable_optimization_skips_field(self, orm, User):
         @orm.type(User)
