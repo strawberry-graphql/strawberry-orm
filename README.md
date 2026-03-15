@@ -33,7 +33,7 @@ pip install "strawberry-orm[sqlalchemy]"
 
 Requirements:
 
-- Python `>=3.10`
+- Python `>=3.12`
 - `strawberry-graphql>=0.311.0`
 
 ## Quick Start
