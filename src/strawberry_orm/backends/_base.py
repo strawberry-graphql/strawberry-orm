@@ -241,6 +241,9 @@ class BaseBackend:
         allowed = {"description", "deprecation_reason", "default", "resolver", "name"}
         return strawberry.field(**{k: v for k, v in kwargs.items() if k in allowed})
 
+    def materialize_query(self, query: Any, info: Any) -> Any:
+        return query
+
     # -- Mutations -----------------------------------------------------------
 
     def create(self, input_type: type, **kwargs: Any) -> Any:

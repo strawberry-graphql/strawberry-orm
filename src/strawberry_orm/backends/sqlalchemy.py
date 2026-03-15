@@ -247,6 +247,9 @@ class SQLAlchemyBackend(BaseBackend):
         except ImportError:
             return False
 
+    def materialize_query(self, query: Any, info: Any) -> Any:
+        return self._execute_stmt(query, info)
+
     # -- Optimizer -----------------------------------------------------------
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:

@@ -122,6 +122,10 @@ class Backend(Protocol):
         """Return ``True`` if *value* is a query object the optimizer can handle."""
         ...
 
+    def materialize_query(self, query: Any, info: Any) -> AwaitableOrValue[list[Any]]:
+        """Evaluate *query* into model instances for resolver-backed fields."""
+        ...
+
     # -- Optimizer -----------------------------------------------------------
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:

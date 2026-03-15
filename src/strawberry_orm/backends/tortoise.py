@@ -317,6 +317,9 @@ class TortoiseBackend(BaseBackend):
         except ImportError:
             return False
 
+    async def materialize_query(self, query: Any, info: Any) -> list[Any]:
+        return list(await query)
+
     # -- Optimizer -----------------------------------------------------------
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:

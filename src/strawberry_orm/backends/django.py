@@ -308,6 +308,9 @@ class DjangoBackend(BaseBackend):
         except ImportError:
             return False
 
+    def materialize_query(self, query: Any, info: Any) -> Any:
+        return run_sync(list, query, thread_sensitive=True)
+
     # -- Optimizer -----------------------------------------------------------
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
