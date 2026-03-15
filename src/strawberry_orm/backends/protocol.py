@@ -6,6 +6,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import AwaitableOrValue
+
 
 @runtime_checkable
 class Backend(Protocol):
@@ -87,7 +89,7 @@ class Backend(Protocol):
         *,
         authorize: Any | None = None,
         mode: str = "replace",
-    ) -> None:
+    ) -> AwaitableOrValue[None]:
         """Apply a list of ref operations to *instance*'s *field* relation.
 
         *mode* controls how the relationship list is updated:
@@ -126,6 +128,8 @@ class Backend(Protocol):
         """Return the schema extension class that handles query optimization."""
         ...
 
-    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+    def apply_optimizer_hints(
+        self, store: Any, query: Any, info: Any
+    ) -> AwaitableOrValue[Any]:
         """Apply field-level hints from *store* onto *query*."""
         ...

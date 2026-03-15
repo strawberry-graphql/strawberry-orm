@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import AwaitableOrValue
 from strawberry_orm.backends.protocol import Backend
 from strawberry_orm.types import FieldDefinition
 
@@ -260,7 +261,7 @@ class StrawberryORM:
         *,
         authorize: Any | None = None,
         mode: str = "replace",
-    ) -> None:
+    ) -> AwaitableOrValue[None]:
         return self._backend.apply_ref_list(
             instance, field, refs, info, authorize=authorize, mode=mode
         )

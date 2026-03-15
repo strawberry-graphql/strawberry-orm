@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from strawberry.extensions import SchemaExtension
+
+from strawberry_orm._async import await_maybe
 
 if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
@@ -48,12 +51,30 @@ class OptimizerExtension(SchemaExtension):
         **kwargs: Any,
     ) -> Any:
         result = _next(root, info, *args, **kwargs)
+        backend = self._backend
+        if (
+            backend is not None
+            and self._store is not None
+            and backend.is_query_object(result)
+        ):
+            result = backend.apply_optimizer_hints(self._store, result, info)
+
+        if isawaitable(result):
+            return self._resolve_async(result, info)
+
+        return result
+
+    async def _resolve_async(self, result: Any, info: Any) -> Any:
+        result = await await_maybe(result)
 
         backend = self._backend
-        if backend is None:
-            return result
-
-        if backend.is_query_object(result) and self._store is not None:
-            result = backend.apply_optimizer_hints(self._store, result, info)
+        if (
+            backend is not None
+            and self._store is not None
+            and backend.is_query_object(result)
+        ):
+            result = await await_maybe(
+                backend.apply_optimizer_hints(self._store, result, info)
+            )
 
         return result

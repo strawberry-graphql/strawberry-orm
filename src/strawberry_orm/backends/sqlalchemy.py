@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import run_sync
 from strawberry_orm.backends._base import (
     BaseBackend,
     _SENSITIVE_PATTERNS,
@@ -181,63 +182,28 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None = None,
         mode: str = "replace",
-    ) -> None:
-        from sqlalchemy.orm import Session
+    ) -> Any:
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._apply_ref_list_async(
+                session,
+                instance,
+                field,
+                refs,
+                info,
+                authorize=authorize,
+                mode=mode,
+            )
 
-        session: Session = self._get_session(info)
-        relationship = getattr(type(instance), field).property
-        target_model = relationship.mapper.class_
-
-        new_related: list[Any] = []
-        to_remove: list[Any] = []
-        for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
-            ref_create = getattr(ref, "create", strawberry.UNSET)
-            ref_update = getattr(ref, "update", strawberry.UNSET)
-            ref_delete = getattr(ref, "delete", strawberry.UNSET)
-
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                if authorize and not authorize("link", target_model, ref_id, info):
-                    continue
-                obj = session.get(target_model, ref_id)
-                if obj is not None:
-                    new_related.append(obj)
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                if authorize and not authorize("create", target_model, None, info):
-                    continue
-                obj = target_model(**input_to_dict(ref_create))
-                session.add(obj)
-                new_related.append(obj)
-            elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = input_to_dict(ref_update)
-                pk = data.pop("id")
-                if authorize and not authorize("update", target_model, pk, info):
-                    continue
-                obj = session.get(target_model, pk)
-                if obj is not None:
-                    for k, v in data.items():
-                        setattr(obj, k, v)
-                    new_related.append(obj)
-            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                if authorize and not authorize(
-                    "delete", target_model, ref_delete.id, info
-                ):
-                    continue
-                obj = session.get(target_model, ref_delete.id)
-                if obj is not None:
-                    to_remove.append(obj)
-                    if self._hard_delete_refs:
-                        session.delete(obj)
-
-        if mode == "patch":
-            existing = list(getattr(instance, field))
-            merged = [o for o in existing if o not in to_remove]
-            for obj in new_related:
-                if obj not in merged:
-                    merged.append(obj)
-            setattr(instance, field, merged)
-        else:
-            setattr(instance, field, new_related)
+        return self._apply_ref_list_sync(
+            session,
+            instance,
+            field,
+            refs,
+            info,
+            authorize,
+            mode,
+        )
 
     # -- Query application ----------------------------------------------------
 
@@ -485,15 +451,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         for field_node in info.field_nodes:
             query = _apply_loads(query, field_node.selection_set, mapper)
-
-        from sqlalchemy.exc import OperationalError, ProgrammingError
-
-        session = self._get_session(info)
-        try:
-            result = session.execute(query).scalars().unique().all()
-        except (OperationalError, ProgrammingError):
-            raise ValueError("Invalid filter expression") from None
-        return list(result)
+        return self._execute_stmt(query, info)
 
     # -- Helpers -------------------------------------------------------------
 
@@ -524,6 +482,171 @@ class SQLAlchemyBackend(BaseBackend):
         raise RuntimeError(
             "SQLAlchemy backend requires a session_getter or info.context.session"
         )
+
+    def _is_async_session(self, session: Any) -> bool:
+        try:
+            from sqlalchemy.ext.asyncio import AsyncSession
+        except ImportError:
+            return False
+
+        return isinstance(session, AsyncSession)
+
+    def _execute_stmt(self, stmt: Any, info: Any) -> Any:
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._execute_stmt_async(session, stmt)
+
+        return self._execute_stmt_sync(session, stmt)
+
+    def _execute_stmt_sync(self, session: Any, stmt: Any) -> list[Any]:
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        try:
+            result = session.execute(stmt)
+        except (OperationalError, ProgrammingError):
+            raise ValueError("Invalid filter expression") from None
+
+        return list(result.scalars().unique().all())
+
+    async def _execute_stmt_async(self, session: Any, stmt: Any) -> list[Any]:
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        try:
+            result = await session.execute(stmt)
+        except (OperationalError, ProgrammingError):
+            raise ValueError("Invalid filter expression") from None
+
+        return list(result.scalars().unique().all())
+
+    def _apply_ref_list_sync(
+        self,
+        session: Any,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        authorize: Callable[..., bool] | None,
+        mode: str,
+    ) -> None:
+        relationship = getattr(type(instance), field).property
+        target_model = relationship.mapper.class_
+
+        new_related: list[Any] = []
+        to_remove: list[Any] = []
+        for ref in refs:
+            ref_id = getattr(ref, "id", strawberry.UNSET)
+            ref_create = getattr(ref, "create", strawberry.UNSET)
+            ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_delete = getattr(ref, "delete", strawberry.UNSET)
+
+            if ref_id is not strawberry.UNSET and ref_id is not None:
+                if authorize and not authorize("link", target_model, ref_id, info):
+                    continue
+                obj = session.get(target_model, ref_id)
+                if obj is not None:
+                    new_related.append(obj)
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
+                if authorize and not authorize("create", target_model, None, info):
+                    continue
+                obj = target_model(**input_to_dict(ref_create))
+                session.add(obj)
+                new_related.append(obj)
+            elif ref_update is not strawberry.UNSET and ref_update is not None:
+                data = input_to_dict(ref_update)
+                pk = data.pop("id")
+                if authorize and not authorize("update", target_model, pk, info):
+                    continue
+                obj = session.get(target_model, pk)
+                if obj is not None:
+                    for k, v in data.items():
+                        setattr(obj, k, v)
+                    new_related.append(obj)
+            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
+                if authorize and not authorize(
+                    "delete", target_model, ref_delete.id, info
+                ):
+                    continue
+                obj = session.get(target_model, ref_delete.id)
+                if obj is not None:
+                    to_remove.append(obj)
+                    if self._hard_delete_refs:
+                        session.delete(obj)
+
+        if mode == "patch":
+            existing = list(getattr(instance, field))
+            merged = [o for o in existing if o not in to_remove]
+            for obj in new_related:
+                if obj not in merged:
+                    merged.append(obj)
+            setattr(instance, field, merged)
+        else:
+            setattr(instance, field, new_related)
+
+    async def _apply_ref_list_async(
+        self,
+        session: Any,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        *,
+        authorize: Callable[..., bool] | None,
+        mode: str,
+    ) -> None:
+        relationship = getattr(type(instance), field).property
+        target_model = relationship.mapper.class_
+
+        new_related: list[Any] = []
+        to_remove: list[Any] = []
+        for ref in refs:
+            ref_id = getattr(ref, "id", strawberry.UNSET)
+            ref_create = getattr(ref, "create", strawberry.UNSET)
+            ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_delete = getattr(ref, "delete", strawberry.UNSET)
+
+            if ref_id is not strawberry.UNSET and ref_id is not None:
+                if authorize and not authorize("link", target_model, ref_id, info):
+                    continue
+                obj = await session.get(target_model, ref_id)
+                if obj is not None:
+                    new_related.append(obj)
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
+                if authorize and not authorize("create", target_model, None, info):
+                    continue
+                obj = target_model(**input_to_dict(ref_create))
+                session.add(obj)
+                new_related.append(obj)
+            elif ref_update is not strawberry.UNSET and ref_update is not None:
+                data = input_to_dict(ref_update)
+                pk = data.pop("id")
+                if authorize and not authorize("update", target_model, pk, info):
+                    continue
+                obj = await session.get(target_model, pk)
+                if obj is not None:
+                    for k, v in data.items():
+                        setattr(obj, k, v)
+                    new_related.append(obj)
+            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
+                if authorize and not authorize(
+                    "delete", target_model, ref_delete.id, info
+                ):
+                    continue
+                obj = await session.get(target_model, ref_delete.id)
+                if obj is not None:
+                    to_remove.append(obj)
+                    if self._hard_delete_refs:
+                        await session.delete(obj)
+
+        if mode == "patch":
+            await session.refresh(instance, [field])
+            existing = list(getattr(instance, field))
+            merged = [o for o in existing if o not in to_remove]
+            for obj in new_related:
+                if obj not in merged:
+                    merged.append(obj)
+            setattr(instance, field, merged)
+        else:
+            setattr(instance, field, new_related)
 
 
 # ---------------------------------------------------------------------------
@@ -561,13 +684,7 @@ def _make_sa_rel_resolver(
         )
 
     def _execute(stmt: Any, info: Any) -> Any:
-        from sqlalchemy.exc import OperationalError, ProgrammingError
-
-        session = backend._get_session(info)
-        try:
-            return session.execute(stmt).scalars().unique().all()
-        except (OperationalError, ProgrammingError):
-            raise ValueError("Invalid filter expression") from None
+        return backend._execute_stmt(stmt, info)
 
     if filter_type and order_type:
 

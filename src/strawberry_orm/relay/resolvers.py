@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Iterable
 
+from strawberry_orm._async import run_sync
+
 if TYPE_CHECKING:
     from strawberry.types import Info
 
@@ -21,15 +23,23 @@ async def resolve_nodes_sqlalchemy(
     ``get_session`` callable).
     """
     from sqlalchemy import select
-    from sqlalchemy.orm import Session
 
-    session: Session = _get_session(info)
+    session = _get_session(info)
     pk_col = _get_pk_column(model)
     ids = list(node_ids)
 
     stmt = select(model).where(pk_col.in_(ids))
-    result = session.execute(stmt)
-    rows = {str(getattr(r, pk_col.key)): r for r in result.scalars().all()}
+    if _is_async_session(session):
+        result = await session.execute(stmt)
+        rows = {str(getattr(r, pk_col.key)): r for r in result.scalars().all()}
+    else:
+        rows = await run_sync(
+            _resolve_nodes_sync,
+            session,
+            stmt,
+            pk_col.key,
+            thread_sensitive=True,
+        )
 
     nodes: list[Any] = []
     for nid in ids:
@@ -78,6 +88,20 @@ def _get_session(info: Any) -> Any:
     raise RuntimeError(
         "SQLAlchemy backend requires info.context.session or info.context.get_session"
     )
+
+
+def _is_async_session(session: Any) -> bool:
+    try:
+        from sqlalchemy.ext.asyncio import AsyncSession
+    except ImportError:
+        return False
+
+    return isinstance(session, AsyncSession)
+
+
+def _resolve_nodes_sync(session: Any, stmt: Any, pk_key: str) -> dict[str, Any]:
+    result = session.execute(stmt)
+    return {str(getattr(row, pk_key)): row for row in result.scalars().all()}
 
 
 def _get_pk_column(model: type) -> Any:

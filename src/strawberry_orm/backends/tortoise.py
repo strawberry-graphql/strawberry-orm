@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import re
 from collections import defaultdict
@@ -11,8 +10,7 @@ from typing import Any
 
 import strawberry
 from strawberry.extensions import SchemaExtension
-
-from strawberry_orm.optimizer import OptimizerStore
+from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import BaseBackend, extract_element_type, input_to_dict
 
@@ -179,15 +177,38 @@ class TortoiseBackend(BaseBackend):
                     )
                 else:
 
-                    def _make_resolver(fname: str, return_ann: Any) -> Any:
-                        def resolver(self: Any) -> Any:
-                            return list(getattr(self, fname))
+                    def _make_resolver(
+                        fname: str,
+                        related_model: type,
+                        return_ann: Any,
+                    ) -> Any:
+                        async def resolver(self: Any, info: Any) -> Any:
+                            rel_value = getattr(self, fname)
+                            qs = (
+                                rel_value.all()
+                                if hasattr(rel_value, "all")
+                                else related_model.filter(
+                                    pk__in=[item.id for item in list(rel_value)]
+                                )
+                            )
+                            qs = self_backend._apply_nested_queryset(  # type: ignore[name-defined]
+                                qs,
+                                type(self),
+                                fname,
+                                related_model,
+                                info,
+                            )
+                            return list(await qs)
 
                         resolver.__name__ = fname
-                        resolver.__annotations__ = {"return": return_ann}
+                        resolver.__annotations__ = {
+                            "info": strawberry.types.Info,
+                            "return": return_ann,
+                        }
                         return strawberry.field(resolver=resolver)
 
-                    setattr(cls, field_name, _make_resolver(field_name, ann))
+                    self_backend = self
+                    setattr(cls, field_name, _make_resolver(field_name, rel_model, ann))
 
             return self._finalize_type(cls, model, type_name, name)
 
@@ -235,30 +256,35 @@ class TortoiseBackend(BaseBackend):
         to_delete_ids: list[Any] = []
 
         for ref in refs:
-            if hasattr(ref, "id") and ref.id is not None:
-                if authorize and not authorize("link", rel_model, ref.id, info):
+            ref_id = getattr(ref, "id", strawberry.UNSET)
+            ref_create = getattr(ref, "create", strawberry.UNSET)
+            ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_delete = getattr(ref, "delete", strawberry.UNSET)
+
+            if ref_id is not strawberry.UNSET and ref_id is not None:
+                if authorize and not authorize("link", rel_model, ref_id, info):
                     continue
-                obj = await rel_model.get(pk=ref.id)
+                obj = await rel_model.get(pk=ref_id)
                 new_related.append(obj)
-            elif hasattr(ref, "create") and ref.create is not None:
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", rel_model, None, info):
                     continue
-                obj = await rel_model.create(**input_to_dict(ref.create))
+                obj = await rel_model.create(**input_to_dict(ref_create))
                 new_related.append(obj)
-            elif hasattr(ref, "update") and ref.update is not None:
-                data = input_to_dict(ref.update)
+            elif ref_update is not strawberry.UNSET and ref_update is not None:
+                data = input_to_dict(ref_update)
                 pk = data.pop("id")
                 if authorize and not authorize("update", rel_model, pk, info):
                     continue
                 await rel_model.filter(pk=pk).update(**data)
                 obj = await rel_model.get(pk=pk)
                 new_related.append(obj)
-            elif hasattr(ref, "delete") and ref.delete is not None:
+            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
-                    "delete", rel_model, ref.delete.id, info
+                    "delete", rel_model, ref_delete.id, info
                 ):
                     continue
-                to_delete_ids.append(ref.delete.id)
+                to_delete_ids.append(ref_delete.id)
 
         if mode == "patch":
             if new_related:
@@ -294,10 +320,7 @@ class TortoiseBackend(BaseBackend):
     # -- Optimizer -----------------------------------------------------------
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
-        return _TortoiseOptimizerExtension.configure(
-            backend=self,
-            store=self._store,
-        )
+        return OptimizerExtension.configure(backend=self, store=self._store)
 
     def _apply_nested_queryset(
         self,
@@ -548,58 +571,6 @@ class TortoiseBackend(BaseBackend):
 
 
 # ---------------------------------------------------------------------------
-# Async optimizer extension for Tortoise
-# ---------------------------------------------------------------------------
-
-
-class _TortoiseOptimizerExtension(SchemaExtension):
-    """Async-aware optimizer extension for the Tortoise backend."""
-
-    _backend: TortoiseBackend | None = None
-    _store: OptimizerStore | None = None
-
-    @classmethod
-    def configure(
-        cls,
-        backend: TortoiseBackend,
-        store: OptimizerStore,
-    ) -> type[_TortoiseOptimizerExtension]:
-        return type(
-            f"{cls.__name__}_TortoiseBackend",
-            (cls,),
-            {"_backend": backend, "_store": store},
-        )
-
-    def on_execute(self) -> Any:
-        yield
-
-    async def resolve(
-        self,
-        _next: Any,
-        root: Any,
-        info: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        result = _next(root, info, *args, **kwargs)
-        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-            result = await result
-
-        backend = self._backend
-        if backend is None:
-            return result
-
-        if backend.is_query_object(result) and self._store is not None:
-            result = await backend.apply_optimizer_hints(
-                self._store,
-                result,
-                info,
-            )
-
-        return result
-
-
-# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -644,17 +615,12 @@ def _make_tortoise_rel_resolver(
         async def resolver(
             self: Any, info: Any, filter: Any = None, order: Any = None
         ) -> Any:
+            qs = _build_qs(self, info)
             if filter is not None:
-                qs = _build_qs(self, info)
                 qs = backend.apply_filters(qs, filter, rel_model)
-                if order is not None:
-                    qs = backend.apply_ordering(qs, order, rel_model)
-                return list(await qs)
             if order is not None:
-                qs = _build_qs(self, info)
                 qs = backend.apply_ordering(qs, order, rel_model)
-                return list(await qs)
-            return list(getattr(self, fname))
+            return list(await qs)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -664,11 +630,10 @@ def _make_tortoise_rel_resolver(
     elif filter_type:
 
         async def resolver(self: Any, info: Any, filter: Any = None) -> Any:
+            qs = _build_qs(self, info)
             if filter is not None:
-                qs = _build_qs(self, info)
                 qs = backend.apply_filters(qs, filter, rel_model)
-                return list(await qs)
-            return list(getattr(self, fname))
+            return list(await qs)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -677,11 +642,10 @@ def _make_tortoise_rel_resolver(
     else:
 
         async def resolver(self: Any, info: Any, order: Any = None) -> Any:
+            qs = _build_qs(self, info)
             if order is not None:
-                qs = _build_qs(self, info)
                 qs = backend.apply_ordering(qs, order, rel_model)
-                return list(await qs)
-            return list(getattr(self, fname))
+            return list(await qs)
 
         resolver.__annotations__ = {
             "info": info_type,

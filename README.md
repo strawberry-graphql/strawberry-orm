@@ -2,8 +2,8 @@
 
 Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.rocks/) on top of Django ORM, SQLAlchemy, and Tortoise ORM.
 
-> **WARNING**
-> `strawberry-orm` is still in **alpha**. Expect breaking changes, incomplete APIs, and release-to-release churn while the package stabilizes.
+> ## WARNING
+> 🟧🟨 `strawberry-orm` is still in **alpha**. Expect breaking changes, incomplete APIs, and release-to-release churn while the package stabilizes. 🟨🟧
 
 `strawberry-orm` helps you keep one Strawberry schema style across multiple ORMs. It focuses on:
 
@@ -87,17 +87,32 @@ That single `users` field will:
 
 ## Backends
 
+`strawberry-orm` follows Strawberry's mixed execution model:
+
+- sync and async schema execution are both supported
+- a resolver can return plain values, backend query objects, or awaitables
+- the optimizer extension handles both sync and async execution paths
+- direct helper APIs such as `apply_ref_list(...)` may be sync or awaitable depending on the backend/session in use
+
+As a rule of thumb:
+
+- Django works in both sync and async Strawberry execution, but custom async resolvers still need `sync_to_async(...)` around direct Django ORM access
+- SQLAlchemy supports both sync `Session` and `AsyncSession`
+- Tortoise is async-first; use async Strawberry execution there
+
 | Backend | Constructor | Notes |
 | --- | --- | --- |
-| Django | `StrawberryORM("django")` | Uses Django querysets directly. |
-| SQLAlchemy | `StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)` | Requires a SQLAlchemy session at resolve time. |
-| Tortoise | `StrawberryORM("tortoise")` | Async ORM; use Strawberry in async mode. |
+| Django | `StrawberryORM("django")` | Uses Django querysets directly; async execution is supported via Strawberry's mixed sync/async model. |
+| SQLAlchemy | `StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)` | Requires a SQLAlchemy `Session` or `AsyncSession` at resolve time. |
+| Tortoise | `StrawberryORM("tortoise")` | Async ORM; use Strawberry's async execution path. |
 
 ### Django
 
 ```python
 orm = StrawberryORM("django")
 ```
+
+When executing the schema asynchronously, custom resolvers that touch Django models directly should still wrap those ORM calls with `sync_to_async(...)`, following the same guidance as `strawberry-django`.
 
 ### SQLAlchemy
 
@@ -118,10 +133,46 @@ SQLAlchemy needs a session when a query is executed. `strawberry-orm` can obtain
 
 If your context stores a callable session factory, pass a `session_getter` instead of putting the callable directly on `info.context`.
 
+Both sync and async sessions are supported:
+
+```python
+# Sync session
+orm = StrawberryORM(
+    "sqlalchemy",
+    dialect="postgresql",
+    session_getter=lambda info: info.context["session"],
+)
+
+# Async session
+orm = StrawberryORM(
+    "sqlalchemy",
+    dialect="postgresql",
+    session_getter=lambda info: info.context["session"],
+)
+
+@strawberry.type
+class Query:
+    @strawberry.field
+    def users(self) -> list[UserType]:
+        return select(User)
+
+# context["session"] can be either Session or AsyncSession
+```
+
 ### Tortoise
 
 ```python
 orm = StrawberryORM("tortoise")
+```
+
+Tortoise resolvers, mutations, and related-list helpers should be used from async Strawberry execution:
+
+```python
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def users(self) -> list[UserType]:
+        return await User.all()
 ```
 
 ### Backend Options
@@ -419,6 +470,17 @@ class Query:
 
 This works with the optimizer extension and with type-level `get_queryset` hooks.
 
+If you execute your schema asynchronously, the same pattern works with async resolvers too:
+
+```python
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def active_users(self, info: strawberry.types.Info) -> list[UserType]:
+        return await User.filter(is_active=True)  # Tortoise
+        # return await sync_to_async(list)(User.objects.filter(is_active=True))  # Django
+```
+
 ---
 
 ## Mutations
@@ -447,6 +509,24 @@ class Mutation:
     @strawberry.mutation
     def update_post(self, info: strawberry.types.Info, input: UpdatePostInput) -> PostType | None:
         ...
+```
+
+Async mutations work too. Use async ORM calls in the resolver body, and await backend helpers when the active backend/session requires it:
+
+```python
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def create_post(
+        self,
+        info: strawberry.types.Info,
+        input: CreatePostInput,
+    ) -> PostType:
+        return await Post.create(
+            title=input.title,
+            body=input.body,
+            author_id=input.author_id,
+        )
 ```
 
 ### Related List Inputs (`orm.ref`)
@@ -483,6 +563,24 @@ def set_post_tags(self, info: strawberry.types.Info, post_id: int, tags: list[Ta
     return post
 ```
 
+Async backends can use the same helper from async mutations:
+
+```python
+@strawberry.mutation
+async def set_post_tags(
+    self,
+    info: strawberry.types.Info,
+    post_id: int,
+    tags: list[TagRef],
+) -> PostType | None:
+    post = await Post.get_or_none(pk=post_id)
+    if post is None:
+        return None
+
+    await orm.apply_ref_list(post, "tags", tags, info)
+    return post
+```
+
 ```graphql
 mutation {
   setPostTags(postId: 1, tags: [
@@ -498,6 +596,13 @@ mutation {
 ```
 
 `apply_ref_list` supports `mode="replace"` (default, replaces the entire list) and `mode="patch"` (only touches mentioned items). An optional `authorize` callback receives `(action, model, obj_id, info)` and returns `bool`.
+
+In practice:
+
+- use it directly in sync Django / sync SQLAlchemy mutations
+- `await` it for Tortoise
+- `await` it for SQLAlchemy when your request context carries an `AsyncSession`
+- in custom async Django resolvers, prefer the same async-safe pattern you already use for direct ORM calls
 
 ---
 

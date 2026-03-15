@@ -8,7 +8,6 @@ drift automatically when a developer adds a test to one backend but not the othe
 import ast
 from pathlib import Path
 
-
 SA_DIR = Path(__file__).parent / "backends" / "sqlalchemy"
 DJ_DIR = Path(__file__).parent / "backends" / "django"
 TORT_DIR = Path(__file__).parent / "backends" / "tortoise"
@@ -17,6 +16,7 @@ EXCLUDED_FILES = {
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
     "test_queryset_detection.py",
+    "test_query_async_session.py",
 }
 
 EXCLUDED_METHODS = {
@@ -27,9 +27,11 @@ EXCLUDED_METHODS = {
     ),
 }
 
+
 TORT_EXCLUDED_FILES = {
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
+    "test_query_async_session.py",
     "test_query_basic.py",
     "test_query_filter_field_lookups.py",
     "test_query_filter_boolean_operators.py",

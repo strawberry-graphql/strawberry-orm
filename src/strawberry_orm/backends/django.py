@@ -9,6 +9,7 @@ from typing import Any, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import run_sync
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import BaseBackend, extract_element_type, input_to_dict
@@ -193,7 +194,8 @@ class DjangoBackend(BaseBackend):
 
                         def _make_resolver(fname: str, return_ann: Any) -> Any:
                             def resolver(self: Any) -> Any:
-                                return list(getattr(self, fname).all())
+                                qs = getattr(self, fname).all()
+                                return run_sync(list, qs, thread_sensitive=True)
 
                             resolver.__name__ = fname
                             resolver.__annotations__ = {"return": return_ann}
@@ -214,55 +216,58 @@ class DjangoBackend(BaseBackend):
         *,
         authorize: Any | None = None,
         mode: str = "replace",
-    ) -> None:
-        manager = getattr(instance, field)
-        rel_model = manager.model
+    ) -> Any:
+        def apply() -> None:
+            manager = getattr(instance, field)
+            rel_model = manager.model
 
-        new_related: list[Any] = []
-        to_delete: list[Any] = []
+            new_related: list[Any] = []
+            to_delete: list[Any] = []
 
-        for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
-            ref_create = getattr(ref, "create", strawberry.UNSET)
-            ref_update = getattr(ref, "update", strawberry.UNSET)
-            ref_delete = getattr(ref, "delete", strawberry.UNSET)
+            for ref in refs:
+                ref_id = getattr(ref, "id", strawberry.UNSET)
+                ref_create = getattr(ref, "create", strawberry.UNSET)
+                ref_update = getattr(ref, "update", strawberry.UNSET)
+                ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                if authorize and not authorize("link", rel_model, ref_id, info):
-                    continue
-                obj = rel_model.objects.get(pk=ref_id)
-                new_related.append(obj)
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                if authorize and not authorize("create", rel_model, None, info):
-                    continue
-                obj = rel_model.objects.create(**input_to_dict(ref_create))
-                new_related.append(obj)
-            elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = input_to_dict(ref_update)
-                pk = data.pop("id")
-                if authorize and not authorize("update", rel_model, pk, info):
-                    continue
-                rel_model.objects.filter(pk=pk).update(**data)
-                obj = rel_model.objects.get(pk=pk)
-                new_related.append(obj)
-            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                if authorize and not authorize(
-                    "delete", rel_model, ref_delete.id, info
-                ):
-                    continue
-                to_delete.append(ref_delete.id)
+                if ref_id is not strawberry.UNSET and ref_id is not None:
+                    if authorize and not authorize("link", rel_model, ref_id, info):
+                        continue
+                    obj = rel_model.objects.get(pk=ref_id)
+                    new_related.append(obj)
+                elif ref_create is not strawberry.UNSET and ref_create is not None:
+                    if authorize and not authorize("create", rel_model, None, info):
+                        continue
+                    obj = rel_model.objects.create(**input_to_dict(ref_create))
+                    new_related.append(obj)
+                elif ref_update is not strawberry.UNSET and ref_update is not None:
+                    data = input_to_dict(ref_update)
+                    pk = data.pop("id")
+                    if authorize and not authorize("update", rel_model, pk, info):
+                        continue
+                    rel_model.objects.filter(pk=pk).update(**data)
+                    obj = rel_model.objects.get(pk=pk)
+                    new_related.append(obj)
+                elif ref_delete is not strawberry.UNSET and ref_delete is not None:
+                    if authorize and not authorize(
+                        "delete", rel_model, ref_delete.id, info
+                    ):
+                        continue
+                    to_delete.append(ref_delete.id)
 
-        if mode == "patch":
-            if new_related:
-                manager.add(*new_related)
-            if to_delete:
-                manager.remove(*rel_model.objects.filter(pk__in=to_delete))
-                if self._hard_delete_refs:
+            if mode == "patch":
+                if new_related:
+                    manager.add(*new_related)
+                if to_delete:
+                    manager.remove(*rel_model.objects.filter(pk__in=to_delete))
+                    if self._hard_delete_refs:
+                        rel_model.objects.filter(pk__in=to_delete).delete()
+            else:
+                manager.set(new_related)
+                if to_delete and self._hard_delete_refs:
                     rel_model.objects.filter(pk__in=to_delete).delete()
-        else:
-            manager.set(new_related)
-            if to_delete and self._hard_delete_refs:
-                rel_model.objects.filter(pk__in=to_delete).delete()
+
+        return run_sync(apply, thread_sensitive=True)
 
     # -- Query application ----------------------------------------------------
 
@@ -311,211 +316,221 @@ class DjangoBackend(BaseBackend):
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         import re
 
-        try:
-            model = query.model
-        except AttributeError:
-            return query
+        def optimize() -> Any:
+            try:
+                model = query.model
+            except AttributeError:
+                return query
 
-        get_qs = self._type_querysets.get(model)
-        if get_qs is not None:
-            query = get_qs(query, info)
-
-        select_related: list[str] = []
-        prefetch_related: list[Any] = []
-
-        def _to_snake(name: str) -> str:
-            return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
-
-        def _get_nested_queryset(
-            parent_model: type,
-            field_name: str,
-            related_model: type,
-        ) -> Any:
-            """Build a custom queryset if the field has a load callable or
-            the related model's type defines get_queryset."""
-            get_qs = self._type_querysets.get(related_model)
-
-            type_name = self._type_name_for_model(parent_model)
-            load_fn = None
-            if type_name and store:
-                hints = store.get(type_name, field_name)
-                if hints and callable(hints.load):
-                    load_fn = hints.load
-
-            if get_qs is None and load_fn is None:
-                return None
-
-            qs = related_model.objects.all()
+            optimized_query = query
+            get_qs = self._type_querysets.get(model)
             if get_qs is not None:
-                qs = get_qs(qs, info)
-            if load_fn is not None:
-                qs = load_fn(qs)
-            return qs
+                optimized_query = get_qs(optimized_query, info)
 
-        def _walk_selections(
-            selection_set: Any,
-            current_model: type,
-            prefix: str = "",
-            in_prefetch: bool = False,
-        ) -> None:
-            if selection_set is None:
-                return
-            meta = current_model._meta  # type: ignore[attr-defined]
-            for node in selection_set.selections:
-                field_name = _to_snake(node.name.value)
-                full_path = f"{prefix}__{field_name}" if prefix else field_name
-                try:
-                    field_obj = meta.get_field(field_name)
-                except Exception:
-                    continue
+            select_related: list[str] = []
+            prefetch_related: list[Any] = []
 
-                field_class_name = type(field_obj).__name__
+            def _to_snake(name: str) -> str:
+                return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
-                if field_class_name in ("ForeignKey", "OneToOneField"):
-                    attname = getattr(field_obj, "attname", None)
-                    if (
-                        attname
-                        and field_name == attname
-                        and field_name != field_obj.name
-                    ):
-                        continue
-                    related_model = field_obj.related_model
-                    custom_qs = _get_nested_queryset(
-                        current_model, field_name, related_model
-                    )
-                    if custom_qs is not None:
-                        from django.db.models import Prefetch
+            def _get_nested_queryset(
+                parent_model: type,
+                field_name: str,
+                related_model: type,
+            ) -> Any:
+                """Build a custom queryset if the field has a load callable or
+                the related model's type defines get_queryset."""
+                get_qs = self._type_querysets.get(related_model)
 
-                        prefetch_related.append(Prefetch(full_path, queryset=custom_qs))
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch=True,
-                            )
-                    elif in_prefetch:
-                        prefetch_related.append(full_path)
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch,
-                            )
-                    else:
-                        select_related.append(full_path)
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch,
-                            )
-                elif field_class_name == "OneToOneRel":
-                    related_model = field_obj.related_model
-                    custom_qs = _get_nested_queryset(
-                        current_model, field_name, related_model
-                    )
-                    if custom_qs is not None:
-                        from django.db.models import Prefetch
-
-                        prefetch_related.append(Prefetch(full_path, queryset=custom_qs))
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch=True,
-                            )
-                    elif in_prefetch:
-                        prefetch_related.append(full_path)
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch,
-                            )
-                    else:
-                        select_related.append(full_path)
-                        if node.selection_set:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch,
-                            )
-                elif field_class_name in (
-                    "ManyToManyField",
-                    "ManyToManyRel",
-                    "ManyToOneRel",
-                ):
-                    related_model = field_obj.related_model
-                    custom_qs = _get_nested_queryset(
-                        current_model, field_name, related_model
-                    )
-                    if custom_qs is not None:
-                        from django.db.models import Prefetch
-
-                        prefetch_related.append(Prefetch(full_path, queryset=custom_qs))
-                    else:
-                        prefetch_related.append(full_path)
-                    if node.selection_set:
-                        _walk_selections(
-                            node.selection_set,
-                            related_model,
-                            full_path,
-                            in_prefetch=True,
-                        )
-
-                type_name = self._type_name_for_model(current_model)
+                type_name = self._type_name_for_model(parent_model)
+                load_fn = None
                 if type_name and store:
                     hints = store.get(type_name, field_name)
-                    if hints and not hints.disable_optimization:
-                        if hints.load and not callable(hints.load):
-                            for rel_name in hints.load:
-                                try:
-                                    rel_field = meta.get_field(rel_name)
-                                except Exception:
-                                    continue
-                                rel_class = type(rel_field).__name__
-                                rel_path = (
-                                    f"{prefix}__{rel_name}" if prefix else rel_name
+                    if hints and callable(hints.load):
+                        load_fn = hints.load
+
+                if get_qs is None and load_fn is None:
+                    return None
+
+                qs = related_model.objects.all()
+                if get_qs is not None:
+                    qs = get_qs(qs, info)
+                if load_fn is not None:
+                    qs = load_fn(qs)
+                return qs
+
+            def _walk_selections(
+                selection_set: Any,
+                current_model: type,
+                prefix: str = "",
+                in_prefetch: bool = False,
+            ) -> None:
+                if selection_set is None:
+                    return
+                meta = current_model._meta  # type: ignore[attr-defined]
+                for node in selection_set.selections:
+                    field_name = _to_snake(node.name.value)
+                    full_path = f"{prefix}__{field_name}" if prefix else field_name
+                    try:
+                        field_obj = meta.get_field(field_name)
+                    except Exception:
+                        continue
+
+                    field_class_name = type(field_obj).__name__
+
+                    if field_class_name in ("ForeignKey", "OneToOneField"):
+                        attname = getattr(field_obj, "attname", None)
+                        if (
+                            attname
+                            and field_name == attname
+                            and field_name != field_obj.name
+                        ):
+                            continue
+                        related_model = field_obj.related_model
+                        custom_qs = _get_nested_queryset(
+                            current_model, field_name, related_model
+                        )
+                        if custom_qs is not None:
+                            from django.db.models import Prefetch
+
+                            prefetch_related.append(
+                                Prefetch(full_path, queryset=custom_qs)
+                            )
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch=True,
                                 )
-                                is_fk = rel_class in (
-                                    "ForeignKey",
-                                    "OneToOneField",
-                                    "OneToOneRel",
+                        elif in_prefetch:
+                            prefetch_related.append(full_path)
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch,
                                 )
-                                if is_fk and not in_prefetch:
-                                    select_related.append(rel_path)
-                                else:
-                                    prefetch_related.append(rel_path)
+                        else:
+                            select_related.append(full_path)
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch,
+                                )
+                    elif field_class_name == "OneToOneRel":
+                        related_model = field_obj.related_model
+                        custom_qs = _get_nested_queryset(
+                            current_model, field_name, related_model
+                        )
+                        if custom_qs is not None:
+                            from django.db.models import Prefetch
 
-        for field_node in info.field_nodes:
-            _walk_selections(field_node.selection_set, model)
+                            prefetch_related.append(
+                                Prefetch(full_path, queryset=custom_qs)
+                            )
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch=True,
+                                )
+                        elif in_prefetch:
+                            prefetch_related.append(full_path)
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch,
+                                )
+                        else:
+                            select_related.append(full_path)
+                            if node.selection_set:
+                                _walk_selections(
+                                    node.selection_set,
+                                    related_model,
+                                    full_path,
+                                    in_prefetch,
+                                )
+                    elif field_class_name in (
+                        "ManyToManyField",
+                        "ManyToManyRel",
+                        "ManyToOneRel",
+                    ):
+                        related_model = field_obj.related_model
+                        custom_qs = _get_nested_queryset(
+                            current_model, field_name, related_model
+                        )
+                        if custom_qs is not None:
+                            from django.db.models import Prefetch
 
-        only_fields: list[str] = []
+                            prefetch_related.append(
+                                Prefetch(full_path, queryset=custom_qs)
+                            )
+                        else:
+                            prefetch_related.append(full_path)
+                        if node.selection_set:
+                            _walk_selections(
+                                node.selection_set,
+                                related_model,
+                                full_path,
+                                in_prefetch=True,
+                            )
 
-        type_name_root = self._type_name_for_model(model)
-        if type_name_root and store:
+                    type_name = self._type_name_for_model(current_model)
+                    if type_name and store:
+                        hints = store.get(type_name, field_name)
+                        if hints and not hints.disable_optimization:
+                            if hints.load and not callable(hints.load):
+                                for rel_name in hints.load:
+                                    try:
+                                        rel_field = meta.get_field(rel_name)
+                                    except Exception:
+                                        continue
+                                    rel_class = type(rel_field).__name__
+                                    rel_path = (
+                                        f"{prefix}__{rel_name}" if prefix else rel_name
+                                    )
+                                    is_fk = rel_class in (
+                                        "ForeignKey",
+                                        "OneToOneField",
+                                        "OneToOneRel",
+                                    )
+                                    if is_fk and not in_prefetch:
+                                        select_related.append(rel_path)
+                                    else:
+                                        prefetch_related.append(rel_path)
+
             for field_node in info.field_nodes:
-                if field_node.selection_set:
-                    for sel in field_node.selection_set.selections:
-                        fname = _to_snake(sel.name.value)
-                        hints = store.get(type_name_root, fname)
-                        if hints and hints.only:
-                            only_fields.extend(hints.only)
+                _walk_selections(field_node.selection_set, model)
 
-        if select_related:
-            query = query.select_related(*select_related)
-        if prefetch_related:
-            query = query.prefetch_related(*prefetch_related)
-        if only_fields:
-            query = query.only(*only_fields)
+            only_fields: list[str] = []
 
-        return list(query)
+            type_name_root = self._type_name_for_model(model)
+            if type_name_root and store:
+                for field_node in info.field_nodes:
+                    if field_node.selection_set:
+                        for sel in field_node.selection_set.selections:
+                            fname = _to_snake(sel.name.value)
+                            hints = store.get(type_name_root, fname)
+                            if hints and hints.only:
+                                only_fields.extend(hints.only)
+
+            if select_related:
+                optimized_query = optimized_query.select_related(*select_related)
+            if prefetch_related:
+                optimized_query = optimized_query.prefetch_related(*prefetch_related)
+            if only_fields:
+                optimized_query = optimized_query.only(*only_fields)
+
+            return list(optimized_query)
+
+        return run_sync(optimize, thread_sensitive=True)
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +546,10 @@ def _make_dj_rel_resolver(
     order_type: Any,
 ) -> Any:
     """Create a Strawberry field for a Django many-relation with filter/order."""
+
+    def _evaluate(qs: Any) -> Any:
+        return run_sync(list, qs, thread_sensitive=True)
+
     if filter_type and order_type:
 
         def resolver(self: Any, filter: Any = None, order: Any = None) -> Any:
@@ -539,7 +558,7 @@ def _make_dj_rel_resolver(
                 qs = backend.apply_filters(qs, filter, rel_model)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model)
-            return list(qs)
+            return _evaluate(qs)
 
         resolver.__annotations__ = {
             "filter": Optional[filter_type],
@@ -551,7 +570,7 @@ def _make_dj_rel_resolver(
             qs = getattr(self, fname).all()
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model)
-            return list(qs)
+            return _evaluate(qs)
 
         resolver.__annotations__ = {"filter": Optional[filter_type]}
     else:
@@ -560,7 +579,7 @@ def _make_dj_rel_resolver(
             qs = getattr(self, fname).all()
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model)
-            return list(qs)
+            return _evaluate(qs)
 
         resolver.__annotations__ = {"order": Optional[list[order_type]]}
 
