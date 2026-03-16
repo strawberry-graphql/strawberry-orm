@@ -17,6 +17,7 @@ EXCLUDED_FILES = {
     "test_query_queryset_detection.py",
     "test_queryset_detection.py",
     "test_query_async_session.py",
+    "test_internal_sqlalchemy_extra_coverage.py",
 }
 
 EXCLUDED_METHODS = {
@@ -32,6 +33,10 @@ TORT_EXCLUDED_FILES = {
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
     "test_query_async_session.py",
+    "test_query_async_optimizer_path.py",
+    "test_query_one_to_one_runtime.py",
+    "test_mutation_node_graph.py",
+    "test_query_e2e_extra.py",
     "test_query_basic.py",
     "test_query_filter_field_lookups.py",
     "test_query_filter_boolean_operators.py",
@@ -51,6 +56,7 @@ TORT_EXCLUDED_FILES = {
     "test_query_optimizer.py",
     "test_backend.py",
     "test_ref_type.py",
+    "test_internal_tortoise_extra_coverage.py",
 }
 
 

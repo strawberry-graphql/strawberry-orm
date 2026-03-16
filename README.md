@@ -20,9 +20,9 @@ Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.r
 uv add strawberry-orm
 
 # With a backend
-uv add strawberry-orm[django]
-uv add strawberry-orm[sqlalchemy]
-uv add strawberry-orm[tortoise]
+uv add "strawberry-orm[django]"
+uv add "strawberry-orm[sqlalchemy]"
+uv add "strawberry-orm[tortoise]"
 ```
 
 You can do the same with `pip`:
@@ -30,6 +30,8 @@ You can do the same with `pip`:
 ```bash
 pip install "strawberry-orm[sqlalchemy]"
 ```
+
+If you are using `zsh`, keep the quotes around extras such as `"strawberry-orm[sqlalchemy]"`. Unquoted square brackets are treated as shell glob syntax before `uv` or `pip` sees the package name.
 
 Requirements:
 
@@ -603,6 +605,143 @@ In practice:
 - `await` it for Tortoise
 - `await` it for SQLAlchemy when your request context carries an `AsyncSession`
 - in custom async Django resolvers, prefer the same async-safe pattern you already use for direct ORM calls
+
+---
+
+### Recursive Node Mutations
+
+`orm.mutations.create_node(...)` and `orm.mutations.update_node(...)` generate catch-all Relay `Node` mutations with recursive nested inputs.
+
+If you want to implement the resolver logic yourself, you can generate the root input types directly with `orm.mutations.create_node_input(...)` and `orm.mutations.update_node_input(...)`:
+
+```python
+import strawberry
+from strawberry import relay
+
+
+@orm.type(User)
+class UserNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+    email: auto
+
+
+@orm.type(Post)
+class PostNode(relay.Node):
+    id: relay.NodeID[int]
+    title: auto
+    body: auto
+
+
+CreateNodeInput = orm.mutations.create_node_input()
+UpdateNodeInput = orm.mutations.update_node_input()
+
+
+@strawberry.type
+class Mutation:
+    create_node = orm.mutations.create_node()
+    update_node = orm.mutations.update_node()
+
+    @strawberry.field
+    def custom_create_node(self, input: CreateNodeInput) -> str:
+        return "implement your own create logic here"
+
+    @strawberry.field
+    def custom_update_node(self, input: UpdateNodeInput) -> str:
+        return "implement your own update logic here"
+```
+
+List relations use `items`, while singular relations use explicit `create` / `update` branches:
+
+```graphql
+mutation {
+  createNode(input: {
+    post: {
+      title: "Hello"
+      body: "World"
+      author: {
+        create: {
+          name: "Alice"
+          email: "alice@example.com"
+        }
+      }
+      tags: {
+        items: [{ create: { name: "python" } }]
+        mode: REPLACE
+        onRemove: DELETE
+      }
+    }
+  }) {
+    __typename
+  }
+}
+```
+
+#### Projection And Policy Config
+
+Pass `project={...}` to restrict recursion depth and configure relation semantics in one dict:
+
+```python
+project = {
+    "post": {
+        "author": {
+            "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
+        },
+        "comments": {
+            "_meta": {
+                "mode": ["PATCH", "REPLACE"],
+                "onRemove": ["DISCONNECT", "DELETE"],
+            },
+            "author": {
+                "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
+            },
+        },
+        "tags": {
+            "_meta": {
+                "mode": "REPLACE",
+                "onRemove": "DELETE",
+            },
+        },
+    },
+    "comment": {
+        "author": {
+            "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
+        },
+    },
+}
+
+
+@strawberry.type
+class Mutation:
+    create_node = orm.mutations.create_node(project=project)
+    update_node = orm.mutations.update_node(project=project)
+```
+
+Rules for the config object:
+
+- Root keys are model names (`post`, `comment`, `user`, ...).
+- Nested keys are relation names available on that model.
+- `_meta` is optional and configures behavior for that relation subtree.
+- Omitted relations still exist as shallow nested inputs, but recursion stops after one more level.
+
+`_meta` supports:
+
+- `mode`: list relation merge strategy (`PATCH` or `REPLACE`)
+- `onRemove`: what to do with removed items from a list relation (`DISCONNECT` or `DELETE`)
+- `onReplace`: what to do with the previous object when replacing a singular relation (`DISCONNECT` or `DELETE`)
+
+The `_meta` values can be either:
+
+- an array of enum strings, which means the GraphQL input exposes that field and the caller may choose from those options
+- a single enum string, which fixes that behavior for the relation and omits the corresponding GraphQL field
+
+Default behavior when a field is exposed but omitted in the mutation input:
+
+- `mode` defaults to `PATCH` when allowed
+- `onRemove` defaults to `DISCONNECT` when allowed
+- `onReplace` defaults to `DISCONNECT` when allowed
+
+If the preferred default is not included in the allowed array, the first configured value is used.
 
 ---
 

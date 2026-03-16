@@ -19,6 +19,10 @@ from strawberry_orm.backends._base import (
 from strawberry_orm.optimizer import OptimizerExtension
 
 
+def _primary_key(value: Any) -> Any:
+    return getattr(value, "id", getattr(value, "pk", None))
+
+
 class SQLAlchemyBackend(BaseBackend):
     """Backend adapter for SQLAlchemy."""
 
@@ -182,6 +186,7 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None = None,
         mode: str = "replace",
+        hard_delete_removed: bool | None = None,
     ) -> Any:
         session = self._get_session(info)
         if self._is_async_session(session):
@@ -193,6 +198,7 @@ class SQLAlchemyBackend(BaseBackend):
                 info,
                 authorize=authorize,
                 mode=mode,
+                hard_delete_removed=hard_delete_removed,
             )
 
         return self._apply_ref_list_sync(
@@ -203,6 +209,7 @@ class SQLAlchemyBackend(BaseBackend):
             info,
             authorize,
             mode,
+            hard_delete_removed,
         )
 
     # -- Query application ----------------------------------------------------
@@ -240,12 +247,9 @@ class SQLAlchemyBackend(BaseBackend):
         return stmt
 
     def is_query_object(self, value: Any) -> bool:
-        try:
-            from sqlalchemy.sql import Select
+        from sqlalchemy.sql import Select
 
-            return isinstance(value, Select)
-        except ImportError:
-            return False
+        return isinstance(value, Select)
 
     def materialize_query(self, query: Any, info: Any) -> Any:
         return self._execute_stmt(query, info)
@@ -487,10 +491,7 @@ class SQLAlchemyBackend(BaseBackend):
         )
 
     def _is_async_session(self, session: Any) -> bool:
-        try:
-            from sqlalchemy.ext.asyncio import AsyncSession
-        except ImportError:
-            return False
+        from sqlalchemy.ext.asyncio import AsyncSession
 
         return isinstance(session, AsyncSession)
 
@@ -530,9 +531,16 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         authorize: Callable[..., bool] | None,
         mode: str,
+        hard_delete_removed: bool | None,
     ) -> None:
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
+        existing_related = list(getattr(instance, field))
+        hard_delete = (
+            self._hard_delete_refs
+            if hard_delete_removed is None
+            else hard_delete_removed
+        )
 
         new_related: list[Any] = []
         to_remove: list[Any] = []
@@ -572,7 +580,7 @@ class SQLAlchemyBackend(BaseBackend):
                 obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
                     to_remove.append(obj)
-                    if self._hard_delete_refs:
+                    if hard_delete:
                         session.delete(obj)
 
         if mode == "patch":
@@ -584,6 +592,11 @@ class SQLAlchemyBackend(BaseBackend):
             setattr(instance, field, merged)
         else:
             setattr(instance, field, new_related)
+            if hard_delete:
+                new_ids = {_primary_key(obj) for obj in new_related}
+                for obj in existing_related:
+                    if _primary_key(obj) not in new_ids:
+                        session.delete(obj)
 
     async def _apply_ref_list_async(
         self,
@@ -595,9 +608,17 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None,
         mode: str,
+        hard_delete_removed: bool | None,
     ) -> None:
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
+        await session.refresh(instance, [field])
+        existing_related = list(getattr(instance, field))
+        hard_delete = (
+            self._hard_delete_refs
+            if hard_delete_removed is None
+            else hard_delete_removed
+        )
 
         new_related: list[Any] = []
         to_remove: list[Any] = []
@@ -637,7 +658,7 @@ class SQLAlchemyBackend(BaseBackend):
                 obj = await session.get(target_model, ref_delete.id)
                 if obj is not None:
                     to_remove.append(obj)
-                    if self._hard_delete_refs:
+                    if hard_delete:
                         await session.delete(obj)
 
         if mode == "patch":
@@ -650,6 +671,11 @@ class SQLAlchemyBackend(BaseBackend):
             setattr(instance, field, merged)
         else:
             setattr(instance, field, new_related)
+            if hard_delete:
+                new_ids = {_primary_key(obj) for obj in new_related}
+                for obj in existing_related:
+                    if _primary_key(obj) not in new_ids:
+                        await session.delete(obj)
 
 
 # ---------------------------------------------------------------------------

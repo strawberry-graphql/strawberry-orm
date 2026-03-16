@@ -48,6 +48,10 @@ _DJANGO_FIELD_MAP: dict[str, type] = {
 }
 
 
+def _primary_key(value: Any) -> Any:
+    return getattr(value, "pk", getattr(value, "id", None))
+
+
 class DjangoBackend(BaseBackend):
     """Backend adapter for Django."""
 
@@ -216,10 +220,17 @@ class DjangoBackend(BaseBackend):
         *,
         authorize: Any | None = None,
         mode: str = "replace",
+        hard_delete_removed: bool | None = None,
     ) -> Any:
         def apply() -> None:
             manager = getattr(instance, field)
             rel_model = manager.model
+            hard_delete = (
+                self._hard_delete_refs
+                if hard_delete_removed is None
+                else hard_delete_removed
+            )
+            existing_related = list(manager.all())
 
             new_related: list[Any] = []
             to_delete: list[Any] = []
@@ -260,12 +271,21 @@ class DjangoBackend(BaseBackend):
                     manager.add(*new_related)
                 if to_delete:
                     manager.remove(*rel_model.objects.filter(pk__in=to_delete))
-                    if self._hard_delete_refs:
+                    if hard_delete:
                         rel_model.objects.filter(pk__in=to_delete).delete()
             else:
                 manager.set(new_related)
-                if to_delete and self._hard_delete_refs:
+                if to_delete and hard_delete:
                     rel_model.objects.filter(pk__in=to_delete).delete()
+                if hard_delete:
+                    new_ids = {_primary_key(obj) for obj in new_related}
+                    removed_ids = [
+                        _primary_key(obj)
+                        for obj in existing_related
+                        if _primary_key(obj) not in new_ids
+                    ]
+                    if removed_ids:
+                        rel_model.objects.filter(pk__in=removed_ids).delete()
 
         return run_sync(apply, thread_sensitive=True)
 
@@ -301,12 +321,9 @@ class DjangoBackend(BaseBackend):
         return qs
 
     def is_query_object(self, value: Any) -> bool:
-        try:
-            from django.db.models import QuerySet
+        from django.db.models import QuerySet
 
-            return isinstance(value, QuerySet)
-        except ImportError:
-            return False
+        return isinstance(value, QuerySet)
 
     def materialize_query(self, query: Any, info: Any) -> Any:
         return run_sync(list, query, thread_sensitive=True)

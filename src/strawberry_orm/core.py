@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from inspect import Parameter, isawaitable
+from functools import wraps
+from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
 import typing as _typing
 from typing import Any, Callable, Literal, Optional
@@ -21,6 +22,7 @@ from strawberry.types.cast import cast as strawberry_cast
 
 from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.backends.protocol import Backend
+from strawberry_orm.mutations import MutationNamespace
 from strawberry_orm.types import FieldDefinition
 
 
@@ -380,14 +382,35 @@ class _AutoConnection:
         if model is None:
             return
 
-        resolver = _make_query_resolver(self._backend, model, filter_type, order_type)
+        base_resolver = _make_query_resolver(
+            self._backend, model, filter_type, order_type
+        )
+        if iscoroutinefunction(getattr(self._backend, "materialize_query", None)):
+
+            @wraps(base_resolver)
+            async def resolver(*args: Any, **kwargs: Any) -> Any:
+                return base_resolver(*args, **kwargs)
+
+        else:
+            resolver = base_resolver
+        node_type = _extract_connection_node(graphql_type)
+        if node_type is not None:
+            resolver.__annotations__["return"] = list[node_type]
+        extensions = list(self._kwargs.get("extensions") or [])
+        extensions.append(
+            _AutoFilterOrderExtension(
+                self._backend,
+                filters=filter_type,
+                order=order_type,
+            )
+        )
         field = relay.connection(
             graphql_type,
             resolver=resolver,
             name=self._kwargs.get("name"),
             description=self._kwargs.get("description"),
             deprecation_reason=self._kwargs.get("deprecation_reason"),
-            extensions=self._kwargs.get("extensions") or (),
+            extensions=extensions,
             max_results=self._kwargs.get("max_results"),
         )
         field._orm_auto_field = True  # type: ignore[attr-defined]
@@ -420,6 +443,7 @@ class StrawberryORM:
     def __init__(self, backend: BackendName, **kwargs: Any) -> None:
         self._backend_name = backend
         self._backend: Backend = _create_backend(backend, **kwargs)
+        self.mutations = MutationNamespace(self._backend)
 
     @property
     def backend(self) -> Backend:
@@ -527,9 +551,16 @@ class StrawberryORM:
         *,
         authorize: Any | None = None,
         mode: str = "replace",
+        hard_delete_removed: bool | None = None,
     ) -> AwaitableOrValue[None]:
         return self._backend.apply_ref_list(
-            instance, field, refs, info, authorize=authorize, mode=mode
+            instance,
+            field,
+            refs,
+            info,
+            authorize=authorize,
+            mode=mode,
+            hard_delete_removed=hard_delete_removed,
         )
 
     # -- Queryset overrides --------------------------------------------------

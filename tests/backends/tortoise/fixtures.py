@@ -5,6 +5,8 @@ from typing import Optional
 import pytest
 import pytest_asyncio
 import strawberry
+from strawberry import relay
+from strawberry.types.cast import cast as strawberry_cast
 from tortoise import Tortoise
 
 from strawberry_orm import StrawberryORM
@@ -159,6 +161,263 @@ main_schema = strawberry.Schema(
 )
 
 
+def _build_node_mutation_schema():
+    node_orm = StrawberryORM("tortoise")
+    node_project = {
+        "post": {
+            "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+            "comments": {
+                "_meta": {
+                    "mode": ["PATCH", "REPLACE"],
+                    "onRemove": ["DISCONNECT", "DELETE"],
+                },
+                "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+            },
+            "tags": {"_meta": {"mode": "REPLACE", "onRemove": "DELETE"}},
+        },
+        "comment": {
+            "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+        },
+    }
+
+    @node_orm.type(TortUser)
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        email: auto
+
+    @node_orm.type(TortTag)
+    class TagNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    @node_orm.type(TortComment)
+    class CommentNode(relay.Node):
+        id: relay.NodeID[int]
+        body: auto
+
+        @strawberry.field
+        async def author(self) -> UserNode:
+            await self.fetch_related("author")
+            return strawberry_cast(UserNode, self.author)
+
+    @node_orm.type(TortPost)
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        body: auto
+        is_published: auto
+
+        @strawberry.field
+        async def author(self) -> UserNode:
+            await self.fetch_related("author")
+            return strawberry_cast(UserNode, self.author)
+
+        @strawberry.field
+        async def tags(self) -> list[TagNode]:
+            return [strawberry_cast(TagNode, tag) for tag in await self.tags.all()]
+
+        @strawberry.field
+        async def comments(self) -> list[CommentNode]:
+            return [
+                strawberry_cast(CommentNode, comment)
+                for comment in await self.comments.all().order_by("id")
+            ]
+
+    @strawberry.type
+    class NodeQuery:
+        @strawberry.field
+        async def users(self) -> list[UserNode]:
+            return [
+                strawberry_cast(UserNode, user)
+                for user in await TortUser.all().order_by("id")
+            ]
+
+        @strawberry.field
+        async def posts(self) -> list[PostNode]:
+            return [
+                strawberry_cast(PostNode, post)
+                for post in await TortPost.all().order_by("id")
+            ]
+
+        @strawberry.field
+        async def comments(self) -> list[CommentNode]:
+            return [
+                strawberry_cast(CommentNode, comment)
+                for comment in await TortComment.all().order_by("id")
+            ]
+
+        @strawberry.field
+        async def tags(self) -> list[TagNode]:
+            return [
+                strawberry_cast(TagNode, tag)
+                for tag in await TortTag.all().order_by("id")
+            ]
+
+    def _selected_root_key(input_obj: object) -> str:
+        for field_name in input_obj.__class__.__dataclass_fields__:
+            if getattr(input_obj, field_name) is not strawberry.UNSET:
+                return field_name
+        raise ValueError("Exactly one root model must be selected")
+
+    CreateNodeInput = node_orm.mutations.create_node_input()
+    UpdateNodeInput = node_orm.mutations.update_node_input()
+
+    @strawberry.type
+    class NodeMutation:
+        create_node = node_orm.mutations.create_node()
+        update_node = node_orm.mutations.update_node()
+        projected_create_node = node_orm.mutations.create_node(project=node_project)
+        projected_update_node = node_orm.mutations.update_node(project=node_project)
+
+        @strawberry.field
+        async def inspect_create_node_input(self, input: CreateNodeInput) -> str:
+            return _selected_root_key(input)
+
+        @strawberry.field
+        async def inspect_update_node_input(self, input: UpdateNodeInput) -> str:
+            return _selected_root_key(input)
+
+    return strawberry.Schema(
+        query=NodeQuery,
+        mutation=NodeMutation,
+        extensions=[node_orm.optimizer_extension()],
+    )
+
+
+# =========================================================================
+# Self-is-model schema
+# =========================================================================
+
+_self_orm = StrawberryORM("tortoise")
+
+
+@_self_orm.type(TortPost)
+class PostWithSummary:
+    id: auto
+    title: auto
+    body: auto
+
+    @strawberry.field
+    def summary(self) -> str:
+        return f"{self.title}: {self.body[:10]}"
+
+    @strawberry.field
+    def title_upper(self) -> str:
+        return self.title.upper()
+
+
+@_self_orm.type(TortUser)
+class UserWithCustom:
+    id: auto
+    name: auto
+    email: auto
+    posts: list[PostWithSummary]
+
+    @strawberry.field
+    def display_name(self) -> str:
+        return f"{self.name} <{self.email}>"
+
+    @strawberry.field
+    async def post_count(self) -> int:
+        return len(await self.posts.all())
+
+
+@strawberry.type
+class _SelfModelQuery:
+    @strawberry.field
+    async def users(self) -> list[UserWithCustom]:
+        return await TortUser.all().order_by("id")  # type: ignore[return-value]
+
+    @strawberry.field
+    async def posts(self) -> list[PostWithSummary]:
+        return await TortPost.all().order_by("id")  # type: ignore[return-value]
+
+
+self_model_schema = strawberry.Schema(
+    query=_SelfModelQuery,
+    extensions=[_self_orm.optimizer_extension()],
+)
+
+
+# =========================================================================
+# Get-queryset schema
+# =========================================================================
+
+_qs_orm = StrawberryORM("tortoise")
+
+
+@_qs_orm.type(TortPost)
+class PublishedPostType:
+    id: auto
+    title: auto
+    is_published: auto
+
+    @classmethod
+    def get_queryset(cls, qs, info):
+        return qs.filter(is_published=True)
+
+
+@_qs_orm.type(TortUser)
+class UnscopedUserType:
+    id: auto
+    name: auto
+
+
+@strawberry.type
+class _GetQuerysetQuery:
+    @strawberry.field
+    def posts(self) -> list[PublishedPostType]:
+        return TortPost.all()  # type: ignore[return-value]
+
+    @strawberry.field
+    def users(self) -> list[UnscopedUserType]:
+        return TortUser.all()  # type: ignore[return-value]
+
+
+get_queryset_schema = strawberry.Schema(
+    query=_GetQuerysetQuery,
+    extensions=[_qs_orm.optimizer_extension()],
+)
+
+
+# =========================================================================
+# Multiple-types schema
+# =========================================================================
+
+_multi_orm = StrawberryORM("tortoise")
+
+
+@_multi_orm.type(TortUser)
+class UserBrief:
+    id: auto
+    name: auto
+
+
+@_multi_orm.type(TortUser)
+class UserFull:
+    id: auto
+    name: auto
+    email: auto
+
+
+@strawberry.type
+class _MultiTypeQuery:
+    @strawberry.field
+    def users_brief(self) -> list[UserBrief]:
+        return TortUser.all()  # type: ignore[return-value]
+
+    @strawberry.field
+    def users_full(self) -> list[UserFull]:
+        return TortUser.all()  # type: ignore[return-value]
+
+
+multi_type_schema = strawberry.Schema(
+    query=_MultiTypeQuery,
+    extensions=[_multi_orm.optimizer_extension()],
+)
+
+
 @pytest_asyncio.fixture
 async def tortoise_db():
     await Tortoise.init(
@@ -271,6 +530,61 @@ def _make_executor(target_schema):
     return _execute
 
 
+def _make_result_executor(target_schema):
+    async def _execute(query, variables=None):
+        return await target_schema.execute(
+            query,
+            variable_values=variables or {},
+        )
+
+    return _execute
+
+
 @pytest_asyncio.fixture
 async def execute(seed):
     return _make_executor(main_schema)
+
+
+@pytest_asyncio.fixture
+async def node_execute(seed):
+    return _make_executor(_build_node_mutation_schema())
+
+
+@pytest_asyncio.fixture
+async def node_execute_result(seed):
+    return _make_result_executor(_build_node_mutation_schema())
+
+
+@pytest_asyncio.fixture
+async def projected_node_execute(seed):
+    return _make_executor(_build_node_mutation_schema())
+
+
+@pytest_asyncio.fixture
+async def projected_node_execute_result(seed):
+    return _make_result_executor(_build_node_mutation_schema())
+
+
+@pytest_asyncio.fixture
+async def self_model_execute(seed):
+    return _make_executor(self_model_schema)
+
+
+@pytest_asyncio.fixture
+async def get_queryset_execute(seed):
+    return _make_executor(get_queryset_schema)
+
+
+@pytest_asyncio.fixture
+async def multi_type_execute(seed):
+    return _make_executor(multi_type_schema)
+
+
+@pytest.fixture
+def user_brief_type():
+    return UserBrief
+
+
+@pytest.fixture
+def user_full_type():
+    return UserFull

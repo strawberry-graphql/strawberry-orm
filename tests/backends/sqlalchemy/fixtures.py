@@ -8,6 +8,8 @@ from typing import Optional
 
 import pytest
 import strawberry
+from strawberry import relay
+from strawberry.types.cast import cast as strawberry_cast
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
@@ -187,6 +189,150 @@ main_schema = strawberry.Schema(
     query=_MainQuery,
     mutation=_MainMutation,
     extensions=[_main_orm.optimizer_extension()],
+)
+
+
+# =========================================================================
+# Node mutation schema
+# =========================================================================
+
+_node_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_node_project = {
+    "post": {
+        "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+        "comments": {
+            "_meta": {
+                "mode": ["PATCH", "REPLACE"],
+                "onRemove": ["DISCONNECT", "DELETE"],
+            },
+            "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+        },
+        "tags": {"_meta": {"mode": "REPLACE", "onRemove": "DELETE"}},
+    },
+    "comment": {
+        "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+    },
+}
+
+
+@_node_orm.type(SAUser)
+class UserNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+    email: auto
+
+
+@_node_orm.type(SATag)
+class TagNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+
+
+@_node_orm.type(SAComment)
+class CommentNode(relay.Node):
+    id: relay.NodeID[int]
+    body: auto
+
+    @strawberry.field
+    def author(self) -> UserNode:
+        return strawberry_cast(UserNode, self.author)
+
+
+@_node_orm.type(SAPost)
+class PostNode(relay.Node):
+    id: relay.NodeID[int]
+    title: auto
+    body: auto
+    is_published: auto
+
+    @strawberry.field
+    def author(self) -> UserNode:
+        return strawberry_cast(UserNode, self.author)
+
+    @strawberry.field
+    def tags(self) -> list[TagNode]:
+        return [strawberry_cast(TagNode, tag) for tag in self.tags]
+
+    @strawberry.field
+    def comments(self) -> list[CommentNode]:
+        return [
+            strawberry_cast(CommentNode, comment)
+            for comment in sorted(self.comments, key=lambda comment: comment.id)
+        ]
+
+
+@strawberry.type
+class _NodeQuery:
+    @strawberry.field
+    def users(self, info: strawberry.types.Info) -> list[UserNode]:
+        session = info.context["session"]
+        return [
+            strawberry_cast(UserNode, user)
+            for user in session.execute(select(SAUser).order_by(SAUser.id))
+            .scalars()
+            .all()
+        ]
+
+    @strawberry.field
+    def posts(self, info: strawberry.types.Info) -> list[PostNode]:
+        session = info.context["session"]
+        return [
+            strawberry_cast(PostNode, post)
+            for post in session.execute(select(SAPost).order_by(SAPost.id))
+            .scalars()
+            .all()
+        ]
+
+    @strawberry.field
+    def comments(self, info: strawberry.types.Info) -> list[CommentNode]:
+        session = info.context["session"]
+        return [
+            strawberry_cast(CommentNode, comment)
+            for comment in session.execute(select(SAComment).order_by(SAComment.id))
+            .scalars()
+            .all()
+        ]
+
+    @strawberry.field
+    def tags(self, info: strawberry.types.Info) -> list[TagNode]:
+        session = info.context["session"]
+        return [
+            strawberry_cast(TagNode, tag)
+            for tag in session.execute(select(SATag).order_by(SATag.id)).scalars().all()
+        ]
+
+
+def _selected_root_key(input_obj: object) -> str:
+    for field_name in input_obj.__class__.__dataclass_fields__:
+        if getattr(input_obj, field_name) is not strawberry.UNSET:
+            return field_name
+    raise ValueError("Exactly one root model must be selected")
+
+
+_CreateNodeInput = _node_orm.mutations.create_node_input()
+_UpdateNodeInput = _node_orm.mutations.update_node_input()
+
+
+@strawberry.type
+class _NodeMutation:
+    create_node = _node_orm.mutations.create_node()
+    update_node = _node_orm.mutations.update_node()
+    projected_create_node = _node_orm.mutations.create_node(project=_node_project)
+    projected_update_node = _node_orm.mutations.update_node(project=_node_project)
+
+    @strawberry.field
+    def inspect_create_node_input(self, input: _CreateNodeInput) -> str:
+        return _selected_root_key(input)
+
+    @strawberry.field
+    def inspect_update_node_input(self, input: _UpdateNodeInput) -> str:
+        return _selected_root_key(input)
+
+
+node_mutation_schema = strawberry.Schema(
+    query=_NodeQuery,
+    mutation=_NodeMutation,
+    extensions=[_node_orm.optimizer_extension()],
 )
 
 
@@ -456,9 +602,40 @@ def _make_executor(target_schema, sa_session):
     return _execute
 
 
+def _make_result_executor(target_schema, sa_session):
+    def _execute(query, variables=None):
+        return target_schema.execute_sync(
+            query,
+            variable_values=variables or {},
+            context_value={"session": sa_session},
+        )
+
+    return _execute
+
+
 @pytest.fixture
 def execute(sa_session):
     return _make_executor(main_schema, sa_session)
+
+
+@pytest.fixture
+def node_execute(sa_session, seed):
+    return _make_executor(node_mutation_schema, sa_session)
+
+
+@pytest.fixture
+def node_execute_result(sa_session, seed):
+    return _make_result_executor(node_mutation_schema, sa_session)
+
+
+@pytest.fixture
+def projected_node_execute(sa_session, seed):
+    return _make_executor(node_mutation_schema, sa_session)
+
+
+@pytest.fixture
+def projected_node_execute_result(sa_session, seed):
+    return _make_result_executor(node_mutation_schema, sa_session)
 
 
 @pytest.fixture

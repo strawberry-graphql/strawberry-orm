@@ -89,6 +89,7 @@ class Backend(Protocol):
         *,
         authorize: Any | None = None,
         mode: str = "replace",
+        hard_delete_removed: bool | None = None,
     ) -> AwaitableOrValue[None]:
         """Apply a list of ref operations to *instance*'s *field* relation.
 

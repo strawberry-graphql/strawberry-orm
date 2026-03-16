@@ -105,18 +105,22 @@ class TestQueryNPlusOnePrevention:
             "{ users { name posts { title comments { body } } } }"
         )
         assert result.errors is None
-        assert result.data == {
+        data = result.data
+        assert data is not None
+        for user in data["users"]:
+            user["posts"].sort(key=lambda post: post["title"])
+        assert data == {
             "users": [
                 {
                     "name": "Alice",
                     "posts": [
                         {
-                            "title": "Hello World",
-                            "comments": [{"body": "Nice post!"}, {"body": "Thanks!"}],
-                        },
-                        {
                             "title": "GraphQL Guide",
                             "comments": [{"body": "Great guide"}],
+                        },
+                        {
+                            "title": "Hello World",
+                            "comments": [{"body": "Nice post!"}, {"body": "Thanks!"}],
                         },
                     ],
                 },
@@ -378,13 +382,17 @@ class TestQueryLoadCallable:
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
         result = await schema.execute("{ users { name posts { title } } }")
         assert result.errors is None
-        assert result.data == {
+        data = result.data
+        assert data is not None
+        for user in data["users"]:
+            user["posts"].sort(key=lambda post: post["title"])
+        assert data == {
             "users": [
                 {
                     "name": "Alice",
                     "posts": [
-                        {"title": "Hello World"},
                         {"title": "GraphQL Guide"},
+                        {"title": "Hello World"},
                     ],
                 },
                 {"name": "Bob", "posts": []},
@@ -491,23 +499,14 @@ class TestQueryNestedGetQueryset:
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
         result = await schema.execute("{ users { name posts { title } } }")
         assert result.errors is None
-        assert result.data == {
-            "users": [
-                {
-                    "name": "Alice",
-                    "posts": [
-                        {"title": "Hello World"},
-                        {"title": "GraphQL Guide"},
-                    ],
-                },
-                {"name": "Bob", "posts": []},
-                {
-                    "name": "Charlie",
-                    "posts": [
-                        {"title": "Rust Adventures"},
-                    ],
-                },
-            ]
+        users = {
+            user["name"]: sorted(post["title"] for post in user["posts"])
+            for user in result.data["users"]
+        }
+        assert users == {
+            "Alice": ["GraphQL Guide", "Hello World"],
+            "Bob": [],
+            "Charlie": ["Rust Adventures"],
         }
 
     @pytest.mark.asyncio

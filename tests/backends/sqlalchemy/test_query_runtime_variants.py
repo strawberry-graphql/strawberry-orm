@@ -1,0 +1,217 @@
+"""Runtime schema variants that exercise public field/connection branches."""
+
+import strawberry
+from strawberry import relay
+
+from strawberry_orm import StrawberryORM
+from strawberry_orm.relay import ORMListConnection
+from strawberry_orm.types import auto
+
+
+class TestQueryRuntimeVariants:
+    def _build_schema(self, User, Post):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        UserFilter = orm.filter(User)
+        UserOrder = orm.order(User)
+        PostFilter = orm.filter(Post)
+        PostOrder = orm.order(Post)
+
+        @orm.type(Post, filters=PostFilter)
+        class FilterablePost:
+            id: auto
+            title: auto
+            is_published: auto
+
+        @orm.type(Post, order=PostOrder)
+        class OrderablePost:
+            id: auto
+            title: auto
+
+        @orm.type(User, filters=UserFilter)
+        class FilterOnlyUser:
+            id: auto
+            name: auto
+
+        @orm.type(User, order=UserOrder)
+        class OrderOnlyUser:
+            id: auto
+            name: auto
+
+        @orm.type(User)
+        class PlainUser:
+            id: auto
+            name: auto
+
+        @orm.type(User)
+        class UserWithFilteredPosts:
+            id: auto
+            name: auto
+            posts: list[FilterablePost]
+
+        @orm.type(User)
+        class UserWithOrderedPosts:
+            id: auto
+            name: auto
+            posts: list[OrderablePost]
+
+        @orm.type(User, filters=UserFilter, order=UserOrder)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            email: auto
+
+        @strawberry.type
+        class Query:
+            filter_only_users: list[FilterOnlyUser] = orm.field()
+            order_only_users: list[OrderOnlyUser] = orm.field()
+            plain_users: list[PlainUser] = orm.field()
+            users_with_filtered_posts: list[UserWithFilteredPosts] = orm.field()
+            users_with_ordered_posts: list[UserWithOrderedPosts] = orm.field()
+            users_connection = orm.connection(ORMListConnection[UserNode])
+
+        return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
+
+    def test_root_auto_fields_support_plain_filter_and_order_variants(
+        self, sa_session, seed, User, Post
+    ):
+        schema = self._build_schema(User, Post)
+        result = schema.execute_sync(
+            """
+            {
+                filterOnlyUsers(filter: { field: { name: { exact: "Alice" } } }) {
+                    name
+                }
+                orderOnlyUsers(order: [{ name: DESC }]) {
+                    name
+                }
+                plainUsers {
+                    name
+                }
+            }
+            """,
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "filterOnlyUsers": [{"name": "Alice"}],
+            "orderOnlyUsers": [
+                {"name": "Charlie"},
+                {"name": "Bob"},
+                {"name": "Alice"},
+            ],
+            "plainUsers": [
+                {"name": "Alice"},
+                {"name": "Bob"},
+                {"name": "Charlie"},
+            ],
+        }
+
+    def test_nested_relations_support_filter_only_and_order_only_variants(
+        self, sa_session, seed, User, Post
+    ):
+        schema = self._build_schema(User, Post)
+        result = schema.execute_sync(
+            """
+            {
+                usersWithFilteredPosts {
+                    name
+                    posts(filter: { field: { isPublished: { exact: true } } }) {
+                        title
+                    }
+                }
+                usersWithOrderedPosts {
+                    name
+                    posts(order: [{ title: DESC }]) {
+                        title
+                    }
+                }
+            }
+            """,
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "usersWithFilteredPosts": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": []},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ],
+            "usersWithOrderedPosts": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": [{"title": "Draft Post"}]},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ],
+        }
+
+    def test_nested_relations_without_arguments_use_prefetched_values(
+        self, sa_session, seed, User, Post
+    ):
+        schema = self._build_schema(User, Post)
+        result = schema.execute_sync(
+            """
+            {
+                usersWithFilteredPosts {
+                    name
+                    posts { title }
+                }
+                usersWithOrderedPosts {
+                    name
+                    posts { title }
+                }
+            }
+            """,
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "usersWithFilteredPosts": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": [{"title": "Draft Post"}]},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ],
+            "usersWithOrderedPosts": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": [{"title": "Draft Post"}]},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ],
+        }
+
+    def test_descriptor_connection_uses_annotation_type(
+        self, sa_session, seed, User, Post
+    ):
+        schema = self._build_schema(User, Post)
+        result = schema.execute_sync(
+            """
+            {
+                usersConnection(order: [{ name: DESC }], first: 2) {
+                    edges {
+                        node { name }
+                    }
+                    pageInfo { hasNextPage }
+                }
+            }
+            """,
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "usersConnection": {
+                "edges": [
+                    {"node": {"name": "Charlie"}},
+                    {"node": {"name": "Bob"}},
+                ],
+                "pageInfo": {"hasNextPage": True},
+            }
+        }

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import datetime
+import importlib
 import re
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 import strawberry
 from strawberry.extensions import SchemaExtension
@@ -37,6 +38,25 @@ _MANY_REL_TYPES = frozenset(
         "BackwardOneToOneRelation",
     }
 )
+
+_QUERY_ORDERINGS: dict[int, list[tuple[str, bool, bool | None, bool | None]]] = {}
+
+
+def _primary_key(value: Any) -> Any:
+    return getattr(value, "id", getattr(value, "pk", None))
+
+
+def _remember_query_ordering(
+    query: Any,
+    orderings: list[tuple[str, bool, bool | None, bool | None]],
+) -> None:
+    _QUERY_ORDERINGS[id(query)] = orderings
+
+
+def _query_orderings(
+    query: Any,
+) -> list[tuple[str, bool, bool | None, bool | None]] | None:
+    return _QUERY_ORDERINGS.get(id(query))
 
 
 class _CustomRel:
@@ -94,26 +114,63 @@ class TortoiseBackend(BaseBackend):
         field on a Tortoise model."""
         meta = model._meta  # type: ignore[attr-defined]
         result: list[tuple[str, type, bool, type | None]] = []
+        seen: set[str] = set()
+
+        module = importlib.import_module(model.__module__)
+
+        def _resolve_related_model(
+            field_obj: Any, annotation: str | None = None
+        ) -> type | None:
+            related_model = getattr(field_obj, "related_model", None)
+            if related_model is not None:
+                return related_model
+
+            model_name = getattr(field_obj, "model_name", None)
+            if isinstance(model_name, str):
+                target_name = model_name.split(".")[-1]
+                return getattr(module, target_name, None)
+
+            if annotation:
+                match = re.search(r"\[\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)", annotation)
+                if match:
+                    return getattr(module, match.group(1), None)
+
+            return None
 
         for name, field_obj in meta.fields_map.items():
             field_class_name = type(field_obj).__name__
 
-            if field_class_name in (
-                "ForeignKeyFieldInstance",
-                "BackwardFKRelation",
-                "ManyToManyFieldInstance",
-                "BackwardOneToOneRelation",
-            ):
-                related_model = (
-                    field_obj.related_model
-                    if hasattr(field_obj, "related_model")
-                    else None
-                )
+            if field_class_name in _MANY_REL_TYPES:
+                related_model = _resolve_related_model(field_obj)
                 result.append((name, Any, True, related_model))
+                seen.add(name)
+                continue
+
+            if field_class_name == "ForeignKeyFieldInstance":
+                related_model = _resolve_related_model(field_obj)
+                result.append((name, Any, True, related_model))
+                seen.add(name)
+                fk_type: type = (
+                    Optional[int] if getattr(field_obj, "null", False) else int
+                )
+                result.append((f"{name}_id", fk_type, False, None))
+                seen.add(f"{name}_id")
                 continue
 
             py_type = _TORTOISE_FIELD_MAP.get(field_class_name, str)
             result.append((name, py_type, False, None))
+            seen.add(name)
+
+        # Reverse relations are often only visible through type annotations
+        # before Tortoise has fully initialized model metadata.
+        for name, annotation in getattr(model, "__annotations__", {}).items():
+            if name in seen or not isinstance(annotation, str):
+                continue
+            if "Relation[" not in annotation:
+                continue
+            related_model = _resolve_related_model(None, annotation)
+            result.append((name, Any, True, related_model))
+            seen.add(name)
 
         return result
 
@@ -198,7 +255,10 @@ class TortoiseBackend(BaseBackend):
                                 related_model,
                                 info,
                             )
-                            return list(await qs)
+                            return _apply_python_ordering(
+                                list(await qs),
+                                _query_orderings(qs),
+                            )
 
                         resolver.__name__ = fname
                         resolver.__annotations__ = {
@@ -231,10 +291,22 @@ class TortoiseBackend(BaseBackend):
     def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[str] = []
+        python_orderings: list[tuple[str, bool, bool | None, bool | None]] = []
         for entry in order_list:
-            clauses.extend(_build_tortoise_ordering(entry))
+            for (
+                col_name,
+                descending,
+                nulls_first,
+                nulls_last,
+            ) in _build_tortoise_ordering(entry):
+                python_orderings.append((col_name, descending, nulls_first, nulls_last))
+                if nulls_first or nulls_last:
+                    continue
+                clauses.append(f"-{col_name}" if descending else col_name)
         if clauses:
             query = query.order_by(*clauses)
+        if python_orderings:
+            _remember_query_ordering(query, python_orderings)
         return query
 
     # -- Related list refs ---------------------------------------------------
@@ -248,9 +320,16 @@ class TortoiseBackend(BaseBackend):
         *,
         authorize: Any | None = None,
         mode: str = "replace",
+        hard_delete_removed: bool | None = None,
     ) -> None:
         manager = getattr(instance, field)
         rel_model = manager.remote_model
+        existing_related = list(await manager.all())
+        hard_delete = (
+            self._hard_delete_refs
+            if hard_delete_removed is None
+            else hard_delete_removed
+        )
 
         new_related: list[Any] = []
         to_delete_ids: list[Any] = []
@@ -292,14 +371,23 @@ class TortoiseBackend(BaseBackend):
             if to_delete_ids:
                 to_remove = await rel_model.filter(pk__in=to_delete_ids)
                 await manager.remove(*to_remove)
-                if self._hard_delete_refs:
+                if hard_delete:
                     await rel_model.filter(pk__in=to_delete_ids).delete()
         else:
             await manager.clear()
             if new_related:
                 await manager.add(*new_related)
-            if to_delete_ids and self._hard_delete_refs:
+            if to_delete_ids and hard_delete:
                 await rel_model.filter(pk__in=to_delete_ids).delete()
+            if hard_delete:
+                new_ids = {_primary_key(obj) for obj in new_related}
+                removed_ids = [
+                    _primary_key(obj)
+                    for obj in existing_related
+                    if _primary_key(obj) not in new_ids
+                ]
+                if removed_ids:
+                    await rel_model.filter(pk__in=removed_ids).delete()
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -310,15 +398,15 @@ class TortoiseBackend(BaseBackend):
         return qs
 
     def is_query_object(self, value: Any) -> bool:
-        try:
-            from tortoise.queryset import QuerySet
+        from tortoise.queryset import QuerySet
 
-            return isinstance(value, QuerySet)
-        except ImportError:
-            return False
+        return isinstance(value, QuerySet)
 
     async def materialize_query(self, query: Any, info: Any) -> list[Any]:
-        return list(await query)
+        return _apply_python_ordering(
+            list(await query),
+            _query_orderings(query),
+        )
 
     # -- Optimizer -----------------------------------------------------------
 
@@ -352,11 +440,15 @@ class TortoiseBackend(BaseBackend):
         query: Any,
         info: Any,
     ) -> Any:
+        orderings = _query_orderings(query)
 
         try:
             model = query.model
         except AttributeError:
-            return list(await query)
+            return _apply_python_ordering(
+                list(await query),
+                orderings,
+            )
 
         get_qs = self._type_querysets.get(model)
         if get_qs is not None:
@@ -508,6 +600,8 @@ class TortoiseBackend(BaseBackend):
             query = query.prefetch_related(*prefetch_paths)
         if only_fields:
             query = query.only(*only_fields)
+        if orderings:
+            _remember_query_ordering(query, orderings)
 
         results = list(await query)
 
@@ -544,6 +638,8 @@ class TortoiseBackend(BaseBackend):
                 qs = qs.prefetch_related(*crel.sub_prefetches)
 
             items = list(await qs)
+            if _query_orderings(qs) is None:
+                items = sorted(items, key=lambda item: getattr(item, "id", 0))
 
             if crel.fk_col is not None:
                 groups: dict[int, list[Any]] = defaultdict(list)
@@ -570,7 +666,19 @@ class TortoiseBackend(BaseBackend):
                     parent_qs = crel.qs_fn(parent_qs)
                     if crel.sub_prefetches:
                         parent_qs = parent_qs.prefetch_related(*crel.sub_prefetches)
-                    setattr(parent, f"_{crel.field_name}", list(await parent_qs))
+                    setattr(
+                        parent,
+                        f"_{crel.field_name}",
+                        _apply_python_ordering(
+                            sorted(
+                                list(await parent_qs),
+                                key=lambda item: getattr(item, "id", 0),
+                            )
+                            if _query_orderings(parent_qs) is None
+                            else list(await parent_qs),
+                            _query_orderings(parent_qs),
+                        ),
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -623,7 +731,10 @@ def _make_tortoise_rel_resolver(
                 qs = backend.apply_filters(qs, filter, rel_model)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model)
-            return list(await qs)
+            return _apply_python_ordering(
+                list(await qs),
+                _query_orderings(qs),
+            )
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -636,7 +747,10 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model)
-            return list(await qs)
+            return _apply_python_ordering(
+                list(await qs),
+                _query_orderings(qs),
+            )
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -648,7 +762,10 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model)
-            return list(await qs)
+            return _apply_python_ordering(
+                list(await qs),
+                _query_orderings(qs),
+            )
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -843,9 +960,38 @@ def _build_tortoise_lookup(
 # ---------------------------------------------------------------------------
 
 
-def _build_tortoise_ordering(order_input: Any) -> list[str]:
-    """Translate an order input into a list of Tortoise order_by strings."""
-    clauses: list[str] = []
+def _apply_python_ordering(
+    items: list[Any],
+    orderings: list[tuple[str, bool, bool | None, bool | None]] | None,
+) -> list[Any]:
+    if not orderings:
+        return items
+
+    ordered = list(items)
+    for col_name, descending, nulls_first, nulls_last in reversed(orderings):
+        null_items = [item for item in ordered if getattr(item, col_name, None) is None]
+        value_items = [
+            item for item in ordered if getattr(item, col_name, None) is not None
+        ]
+        value_items.sort(key=lambda item: getattr(item, col_name), reverse=descending)
+
+        if nulls_first:
+            ordered = null_items + value_items
+        elif nulls_last:
+            ordered = value_items + null_items
+        elif descending:
+            ordered = value_items + null_items
+        else:
+            ordered = null_items + value_items
+
+    return ordered
+
+
+def _build_tortoise_ordering(
+    order_input: Any,
+) -> list[tuple[str, bool, bool | None, bool | None]]:
+    """Translate an order input into Tortoise and Python sort metadata."""
+    clauses: list[tuple[str, bool, bool | None, bool | None]] = []
     fields = order_input.__class__.__dataclass_fields__
 
     for col_name in fields:
@@ -853,10 +999,13 @@ def _build_tortoise_ordering(order_input: Any) -> list[str]:
         if direction is strawberry.UNSET or direction is None:
             continue
         dir_value = direction.value if hasattr(direction, "value") else str(direction)
-
-        if dir_value.startswith("DESC"):
-            clauses.append(f"-{col_name}")
-        else:
-            clauses.append(col_name)
+        clauses.append(
+            (
+                col_name,
+                dir_value.startswith("DESC"),
+                "NULLS_FIRST" in dir_value,
+                "NULLS_LAST" in dir_value,
+            )
+        )
 
     return clauses

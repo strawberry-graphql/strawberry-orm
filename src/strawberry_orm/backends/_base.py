@@ -58,6 +58,7 @@ class BaseBackend:
         self._store = OptimizerStore()
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
         self._type_registry: dict[str, type] = {}
+        self._graphql_type_registry: dict[type, type] = {}
         self._type_querysets: dict[type, Any] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
@@ -312,10 +313,7 @@ class BaseBackend:
         cls.__orm_model__ = model  # type: ignore[attr-defined]
 
         if self._warn_sensitive:
-            excluded = set(exclude or [])
             for field_name in annotations:
-                if field_name in excluded:
-                    continue
                 if _SENSITIVE_PATTERNS.search(field_name):
                     warnings.warn(
                         f"Field '{field_name}' on {model.__name__} looks sensitive "
@@ -350,15 +348,9 @@ class BaseBackend:
                         ),
                     )
                 else:
-                    try:
-                        delattr(cls, attr_name)
-                    except AttributeError:
-                        pass
-            elif getattr(val, "_orm_auto_field", False):
-                try:
                     delattr(cls, attr_name)
-                except AttributeError:
-                    pass
+            elif getattr(val, "_orm_auto_field", False):
+                delattr(cls, attr_name)
 
         return type_name
 
@@ -372,4 +364,5 @@ class BaseBackend:
         """Call ``strawberry.type()`` and register the model in the type registry."""
         result = strawberry.type(cls, name=name if name else None)
         self._type_registry[type_name] = model
+        self._graphql_type_registry[model] = result
         return result

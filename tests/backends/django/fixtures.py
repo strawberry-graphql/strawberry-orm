@@ -11,6 +11,8 @@ from typing import Optional
 
 import pytest
 import strawberry
+from strawberry import relay
+from strawberry.types.cast import cast as strawberry_cast
 from django.db import connection
 
 from strawberry_orm import StrawberryORM
@@ -171,6 +173,135 @@ main_schema = strawberry.Schema(
     query=_MainQuery,
     mutation=_MainMutation,
     extensions=[_main_orm.optimizer_extension()],
+)
+
+
+# =========================================================================
+# Node mutation schema
+# =========================================================================
+
+_node_orm = StrawberryORM("django")
+_node_project = {
+    "post": {
+        "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+        "comments": {
+            "_meta": {
+                "mode": ["PATCH", "REPLACE"],
+                "onRemove": ["DISCONNECT", "DELETE"],
+            },
+            "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+        },
+        "tags": {"_meta": {"mode": "REPLACE", "onRemove": "DELETE"}},
+    },
+    "comment": {
+        "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+    },
+}
+
+
+@_node_orm.type(DjUser)
+class UserNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+    email: auto
+
+
+@_node_orm.type(DjTag)
+class TagNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+
+
+@_node_orm.type(DjComment)
+class CommentNode(relay.Node):
+    id: relay.NodeID[int]
+    body: auto
+
+    @strawberry.field
+    def author(self) -> UserNode:
+        return strawberry_cast(UserNode, self.author)
+
+
+@_node_orm.type(DjPost)
+class PostNode(relay.Node):
+    id: relay.NodeID[int]
+    title: auto
+    body: auto
+    is_published: auto
+
+    @strawberry.field
+    def author(self) -> UserNode:
+        return strawberry_cast(UserNode, self.author)
+
+    @strawberry.field
+    def tags(self) -> list[TagNode]:
+        return [strawberry_cast(TagNode, tag) for tag in self.tags.all()]
+
+    @strawberry.field
+    def comments(self) -> list[CommentNode]:
+        return [
+            strawberry_cast(CommentNode, comment)
+            for comment in self.comments.all().order_by("id")
+        ]
+
+
+@strawberry.type
+class _NodeQuery:
+    @strawberry.field
+    def users(self) -> list[UserNode]:
+        return [
+            strawberry_cast(UserNode, user) for user in DjUser.objects.order_by("id")
+        ]
+
+    @strawberry.field
+    def posts(self) -> list[PostNode]:
+        return [
+            strawberry_cast(PostNode, post) for post in DjPost.objects.order_by("id")
+        ]
+
+    @strawberry.field
+    def comments(self) -> list[CommentNode]:
+        return [
+            strawberry_cast(CommentNode, comment)
+            for comment in DjComment.objects.order_by("id")
+        ]
+
+    @strawberry.field
+    def tags(self) -> list[TagNode]:
+        return [strawberry_cast(TagNode, tag) for tag in DjTag.objects.order_by("id")]
+
+
+def _selected_root_key(input_obj: object) -> str:
+    for field_name in input_obj.__class__.__dataclass_fields__:
+        if getattr(input_obj, field_name) is not strawberry.UNSET:
+            return field_name
+    raise ValueError("Exactly one root model must be selected")
+
+
+_CreateNodeInput = _node_orm.mutations.create_node_input()
+_UpdateNodeInput = _node_orm.mutations.update_node_input()
+
+
+@strawberry.type
+class _NodeMutation:
+    create_node = _node_orm.mutations.create_node()
+    update_node = _node_orm.mutations.update_node()
+    projected_create_node = _node_orm.mutations.create_node(project=_node_project)
+    projected_update_node = _node_orm.mutations.update_node(project=_node_project)
+
+    @strawberry.field
+    def inspect_create_node_input(self, input: _CreateNodeInput) -> str:
+        return _selected_root_key(input)
+
+    @strawberry.field
+    def inspect_update_node_input(self, input: _UpdateNodeInput) -> str:
+        return _selected_root_key(input)
+
+
+node_mutation_schema = strawberry.Schema(
+    query=_NodeQuery,
+    mutation=_NodeMutation,
+    extensions=[_node_orm.optimizer_extension()],
 )
 
 
@@ -453,9 +584,39 @@ def _make_executor(target_schema):
     return _execute
 
 
+def _make_result_executor(target_schema):
+    def _execute(query, variables=None):
+        return target_schema.execute_sync(
+            query,
+            variable_values=variables or {},
+        )
+
+    return _execute
+
+
 @pytest.fixture
 def execute(seed):
     return _make_executor(main_schema)
+
+
+@pytest.fixture
+def node_execute(seed):
+    return _make_executor(node_mutation_schema)
+
+
+@pytest.fixture
+def node_execute_result(seed):
+    return _make_result_executor(node_mutation_schema)
+
+
+@pytest.fixture
+def projected_node_execute(seed):
+    return _make_executor(node_mutation_schema)
+
+
+@pytest.fixture
+def projected_node_execute_result(seed):
+    return _make_result_executor(node_mutation_schema)
 
 
 @pytest.fixture
