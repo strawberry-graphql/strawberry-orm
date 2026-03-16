@@ -1,15 +1,15 @@
-name: Create GitHub Release
+name: Release and Publish
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
+  id-token: write
 
 jobs:
   release:
-    name: Create release from package version
+    name: Create GitHub release and publish to PyPI
     runs-on: ubuntu-latest
 
     steps:
@@ -68,12 +68,8 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            --target "${{ github.sha }}"
+            --target "${{ github.sha }}" \
+            dist/*
 
-      - name: Dispatch publish workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run "Publish to PyPI" \
-            --ref main \
-            -f tag="$TAG"
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1
