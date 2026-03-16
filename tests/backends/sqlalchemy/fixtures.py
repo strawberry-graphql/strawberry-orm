@@ -261,7 +261,7 @@ class PostNode(relay.Node):
         ]
 
 
-@strawberry.type
+@strawberry.type(name="Query")
 class _NodeQuery:
     @strawberry.field
     def users(self, info: strawberry.types.Info) -> list[UserNode]:
@@ -309,16 +309,22 @@ def _selected_root_key(input_obj: object) -> str:
     raise ValueError("Exactly one root model must be selected")
 
 
-_CreateNodeInput = _node_orm.mutations.create_node_input()
-_UpdateNodeInput = _node_orm.mutations.update_node_input()
+_CreateNodeInput = _node_orm.mutations.create_node_input(name="CreateNodeInput")
+_UpdateNodeInput = _node_orm.mutations.update_node_input(name="UpdateNodeInput")
 
 
-@strawberry.type
+@strawberry.type(name="Mutation")
 class _NodeMutation:
-    create_node = _node_orm.mutations.create_node()
-    update_node = _node_orm.mutations.update_node()
-    projected_create_node = _node_orm.mutations.create_node(project=_node_project)
-    projected_update_node = _node_orm.mutations.update_node(project=_node_project)
+    create_node = _node_orm.mutations.create_node(input_name="CreateNodeInput")
+    update_node = _node_orm.mutations.update_node(input_name="UpdateNodeInput")
+    projected_create_node = _node_orm.mutations.create_node(
+        project=_node_project,
+        input_name="ProjectedCreateNodeInput",
+    )
+    projected_update_node = _node_orm.mutations.update_node(
+        project=_node_project,
+        input_name="ProjectedUpdateNodeInput",
+    )
 
     @strawberry.field
     def inspect_create_node_input(self, input: _CreateNodeInput) -> str:

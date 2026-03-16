@@ -182,7 +182,9 @@ def _seed_sqlalchemy() -> Any:
 
 
 def _load_schema(backend: Backend, name: str) -> Any:
-    attr = f"{name}_schema"
+    # Use the node-mutation demo schema for the main example so GraphiQL exposes
+    # create_node/update_node alongside the standard query surface.
+    attr = "node_mutation_schema" if name == "main" else f"{name}_schema"
 
     if backend == Backend.django:
         _configure_django()

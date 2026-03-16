@@ -170,30 +170,39 @@ class MutationNamespace:
         *,
         models: Iterable[type] | None = None,
         project: dict[str, Any] | None = None,
+        name: str | None = None,
     ) -> type:
         selected_models = self._resolve_root_models(models)
         root_projects = self._normalize_root_project(selected_models, project)
-        return self._root_input_type("create", selected_models, root_projects)
+        return self._root_input_type(
+            "create", selected_models, root_projects, name=name
+        )
 
     def update_node_input(
         self,
         *,
         models: Iterable[type] | None = None,
         project: dict[str, Any] | None = None,
+        name: str | None = None,
     ) -> type:
         selected_models = self._resolve_root_models(models)
         root_projects = self._normalize_root_project(selected_models, project)
-        return self._root_input_type("update", selected_models, root_projects)
+        return self._root_input_type(
+            "update", selected_models, root_projects, name=name
+        )
 
     def create_node(
         self,
         *,
         models: Iterable[type] | None = None,
         project: dict[str, Any] | None = None,
+        input_name: str | None = None,
         description: str | None = None,
     ) -> Any:
         factory = self
-        input_type = self.create_node_input(models=models, project=project)
+        input_type = self.create_node_input(
+            models=models, project=project, name=input_name
+        )
 
         if self._backend.__class__.__name__ == "TortoiseBackend":
 
@@ -221,10 +230,13 @@ class MutationNamespace:
         *,
         models: Iterable[type] | None = None,
         project: dict[str, Any] | None = None,
+        input_name: str | None = None,
         description: str | None = None,
     ) -> Any:
         factory = self
-        input_type = self.update_node_input(models=models, project=project)
+        input_type = self.update_node_input(
+            models=models, project=project, name=input_name
+        )
 
         if self._backend.__class__.__name__ == "TortoiseBackend":
 
@@ -409,16 +421,19 @@ class MutationNamespace:
         operation: str,
         models: tuple[type, ...],
         root_projects: dict[str, Any],
+        *,
+        name: str | None = None,
     ) -> type:
         cache = (
             self._root_create_inputs
             if operation == "create"
             else self._root_update_inputs
         )
-        cache_key = tuple(
-            (model, self._project_signature(root_projects[_model_key(model)]))
+        root_signature = tuple(
+            (model.__name__, self._project_signature(root_projects[_model_key(model)]))
             for model in models
         )
+        cache_key = (root_signature, name)
         if cache_key in cache:
             return cache[cache_key]
 
@@ -433,13 +448,12 @@ class MutationNamespace:
             ) | None
             defaults[key] = strawberry.UNSET
 
-        root_signature = tuple(
-            (model.__name__, self._project_signature(root_projects[_model_key(model)]))
-            for model in models
-        )
         root_suffix = self._signature_suffix(root_signature)
+        class_name = name or (
+            f"{'Create' if operation == 'create' else 'Update'}NodeInput{root_suffix}"
+        )
         cls = type(
-            f"{'Create' if operation == 'create' else 'Update'}NodeInput{root_suffix}",
+            class_name,
             (),
             {"__annotations__": annotations, **defaults},
         )

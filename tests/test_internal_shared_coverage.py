@@ -6,6 +6,7 @@ from typing import Optional
 
 import pytest
 import strawberry
+from strawberry import relay
 
 from strawberry_orm import StrawberryORM, make_field
 from strawberry_orm._async import await_maybe
@@ -209,3 +210,24 @@ class TestInternalSharedCoverage:
             ns._select_model_payload(
                 RootInput(a=1, b=2), SimpleNamespace(__mutation_models__={})
             )
+
+    def test_node_input_allows_explicit_root_type_names(self):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+
+        @strawberry.type
+        class UserNode(relay.Node):
+            id: strawberry.ID
+
+        orm.backend._graphql_type_registry[SAUser] = UserNode
+
+        create_input = orm.mutations.create_node_input(
+            models=[SAUser],
+            name="CreateNodeInput",
+        )
+        update_input = orm.mutations.update_node_input(
+            models=[SAUser],
+            name="UpdateNodeInput",
+        )
+
+        assert create_input.__name__ == "CreateNodeInput"
+        assert update_input.__name__ == "UpdateNodeInput"

@@ -224,7 +224,7 @@ def _build_node_mutation_schema():
                 for comment in await self.comments.all().order_by("id")
             ]
 
-    @strawberry.type
+    @strawberry.type(name="Query")
     class NodeQuery:
         @strawberry.field
         async def users(self) -> list[UserNode]:
@@ -260,15 +260,21 @@ def _build_node_mutation_schema():
                 return field_name
         raise ValueError("Exactly one root model must be selected")
 
-    CreateNodeInput = node_orm.mutations.create_node_input()
-    UpdateNodeInput = node_orm.mutations.update_node_input()
+    CreateNodeInput = node_orm.mutations.create_node_input(name="CreateNodeInput")
+    UpdateNodeInput = node_orm.mutations.update_node_input(name="UpdateNodeInput")
 
-    @strawberry.type
+    @strawberry.type(name="Mutation")
     class NodeMutation:
-        create_node = node_orm.mutations.create_node()
-        update_node = node_orm.mutations.update_node()
-        projected_create_node = node_orm.mutations.create_node(project=node_project)
-        projected_update_node = node_orm.mutations.update_node(project=node_project)
+        create_node = node_orm.mutations.create_node(input_name="CreateNodeInput")
+        update_node = node_orm.mutations.update_node(input_name="UpdateNodeInput")
+        projected_create_node = node_orm.mutations.create_node(
+            project=node_project,
+            input_name="ProjectedCreateNodeInput",
+        )
+        projected_update_node = node_orm.mutations.update_node(
+            project=node_project,
+            input_name="ProjectedUpdateNodeInput",
+        )
 
         @strawberry.field
         async def inspect_create_node_input(self, input: CreateNodeInput) -> str:
