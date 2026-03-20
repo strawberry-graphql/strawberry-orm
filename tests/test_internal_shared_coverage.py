@@ -187,16 +187,6 @@ class TestInternalSharedCoverage:
         with pytest.raises(ValueError, match="exactly one of create or update"):
             ns._resolve_single_wrapper(SingleWrapper(create=1, update=2))
 
-        @strawberry.input
-        class ListWrapper:
-            items: list[int] | None = None
-
-        ListWrapper.__relation_policy__ = {
-            "default_mode": "PATCH",
-            "default_on_remove": "DISCONNECT",
-        }
-        with pytest.raises(ValueError, match="require items"):
-            ns._resolve_list_wrapper(ListWrapper(items=None))
         assert ns._child_project(_PROJECT_UNBOUNDED, "anything") == _PROJECT_UNBOUNDED
         assert ns._child_project(_PROJECT_SHALLOW, "anything") == _PROJECT_LEAF
         assert ns._child_project({"relations": {}}, "anything") == _PROJECT_SHALLOW

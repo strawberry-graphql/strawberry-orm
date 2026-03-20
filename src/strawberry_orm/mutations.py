@@ -17,37 +17,40 @@ def make_ref_type(
     *,
     create: type | None = None,
     update: type | None = None,
+    unlink: bool = False,
     delete: bool = False,
     name: str | None = None,
 ) -> type:
     """Generate a ``@oneOf`` input type for managing a related list.
 
     The returned Strawberry input has up to four ``@oneOf`` variants:
-    - ``id`` (always): link an existing object by ID.
+    - ``update`` (always): link an existing object by ID, optionally updating
+      its fields.  When no *update* type is provided a minimal ``{id: ID}``
+      link-only type is generated automatically.
     - ``create`` (opt-in): create a new object inline.
-    - ``update`` (opt-in): update an existing object in-place (input must have ``id``).
-    - ``delete`` (opt-in): unlink an existing object. Backends may optionally
-      hard-delete it when explicitly configured to do so.
+    - ``unlink`` (opt-in): remove an existing object from the relation.
+    - ``delete`` (opt-in): hard-delete an existing object.
     """
     type_name = name or f"{model.__name__}Ref"
-    annotations: dict[str, Any] = {
-        "id": strawberry.ID | None,
-    }
-    defaults: dict[str, Any] = {
-        "id": strawberry.UNSET,
-    }
+    annotations: dict[str, Any] = {}
+    defaults: dict[str, Any] = {}
 
     if create is not None:
         annotations["create"] = create | None
         defaults["create"] = strawberry.UNSET
 
-    if update is not None:
-        annotations["update"] = update | None
-        defaults["update"] = strawberry.UNSET
+    if update is None:
+        update = _make_id_only_input(f"{type_name}LinkInput")
+    annotations["update"] = update | None
+    defaults["update"] = strawberry.UNSET
+
+    if unlink:
+        unlink_type = _make_id_only_input(f"{type_name}UnlinkInput")
+        annotations["unlink"] = unlink_type | None
+        defaults["unlink"] = strawberry.UNSET
 
     if delete:
-        delete_type_name = f"{type_name}DeleteInput"
-        delete_type = _make_delete_input(delete_type_name)
+        delete_type = _make_id_only_input(f"{type_name}DeleteInput")
         annotations["delete"] = delete_type | None
         defaults["delete"] = strawberry.UNSET
 
@@ -56,7 +59,7 @@ def make_ref_type(
     return strawberry.input(cls, one_of=True)
 
 
-def _make_delete_input(name: str) -> type:
+def _make_id_only_input(name: str) -> type:
     ns: dict[str, Any] = {
         "__annotations__": {"id": strawberry.ID},
     }
@@ -87,12 +90,6 @@ _PROJECT_LEAF = "__leaf__"
 
 
 @strawberry.enum
-class RelationListMode(Enum):
-    PATCH = "PATCH"
-    REPLACE = "REPLACE"
-
-
-@strawberry.enum
 class RelationRemovalPolicy(Enum):
     DISCONNECT = "DISCONNECT"
     DELETE = "DELETE"
@@ -111,8 +108,6 @@ class RelationSpec:
 
 @dataclass(frozen=True)
 class RelationPolicy:
-    mode_options: tuple[str, ...] | None = None
-    on_remove_options: tuple[str, ...] | None = None
     on_replace_options: tuple[str, ...] | None = None
 
 
@@ -321,39 +316,15 @@ class MutationNamespace:
 
         policy = RelationPolicy()
         if meta:
-            allowed_meta_keys = {"mode", "onRemove", "onReplace"}
+            allowed_meta_keys = {"onReplace"}
             unknown_meta_keys = sorted(set(meta) - allowed_meta_keys)
             if unknown_meta_keys:
                 raise ValueError(
                     f"Unknown _meta key(s) for model {model.__name__}: "
                     f"{', '.join(unknown_meta_keys)}"
                 )
-            if "mode" in meta:
-                policy = RelationPolicy(
-                    mode_options=self._normalize_enum_options(
-                        meta["mode"],
-                        allowed=("PATCH", "REPLACE"),
-                        field_name="mode",
-                        model_name=model.__name__,
-                    ),
-                    on_remove_options=policy.on_remove_options,
-                    on_replace_options=policy.on_replace_options,
-                )
-            if "onRemove" in meta:
-                policy = RelationPolicy(
-                    mode_options=policy.mode_options,
-                    on_remove_options=self._normalize_enum_options(
-                        meta["onRemove"],
-                        allowed=("DISCONNECT", "DELETE"),
-                        field_name="onRemove",
-                        model_name=model.__name__,
-                    ),
-                    on_replace_options=policy.on_replace_options,
-                )
             if "onReplace" in meta:
                 policy = RelationPolicy(
-                    mode_options=policy.mode_options,
-                    on_remove_options=policy.on_remove_options,
                     on_replace_options=self._normalize_enum_options(
                         meta["onReplace"],
                         allowed=("DISCONNECT", "DELETE"),
@@ -547,14 +518,8 @@ class MutationNamespace:
                     )
                     defaults[field_name] = strawberry.UNSET
                 else:
-                    annotations[field_name] = (
-                        self._list_relation_input(
-                            model,
-                            spec,
-                            child_project,
-                        )
-                        | None
-                    )
+                    ref = self._list_relation_ref_type(model, spec, child_project)
+                    annotations[field_name] = list[ref] | None
                     defaults[field_name] = strawberry.UNSET
 
         cls.__annotations__ = annotations
@@ -610,7 +575,7 @@ class MutationNamespace:
         self._single_ops[cache_key] = result
         return result
 
-    def _list_relation_input(
+    def _list_relation_ref_type(
         self,
         owner_model: type,
         spec: RelationSpec,
@@ -620,51 +585,19 @@ class MutationNamespace:
         if cache_key in self._list_ops:
             return self._list_ops[cache_key]
 
-        cls = type(
-            f"{owner_model.__name__}{spec.name.title()}NodeListInput"
-            f"{self._project_suffix(child_project)}",
-            (),
-            {},
-        )
-        self._list_ops[cache_key] = cls
         ref_type = make_ref_type(
             spec.related_model,
             create=self._create_input(spec.related_model, child_project),
             update=self._update_input(spec.related_model, child_project),
+            unlink=True,
             delete=True,
             name=(
                 f"{owner_model.__name__}{spec.name.title()}Ref"
                 f"{self._project_suffix(child_project)}"
             ),
         )
-        cls.__annotations__ = {
-            "items": list[ref_type],
-        }
-        policy = (
-            RelationPolicy()
-            if child_project in (_PROJECT_UNBOUNDED, _PROJECT_SHALLOW, _PROJECT_LEAF)
-            else child_project["_meta"]
-        )
-        mode_options = policy.mode_options or ("PATCH", "REPLACE")
-        on_remove_options = policy.on_remove_options or ("DISCONNECT", "DELETE")
-        cls.__relation_policy__ = {  # type: ignore[attr-defined]
-            "mode_options": mode_options,
-            "on_remove_options": on_remove_options,
-            "default_mode": self._default_option(mode_options, "PATCH"),
-            "default_on_remove": self._default_option(on_remove_options, "DISCONNECT"),
-        }
-        if len(mode_options) > 1:
-            cls.__annotations__["mode"] = RelationListMode | None
-            cls.mode = strawberry.UNSET
-        if len(on_remove_options) > 1:
-            cls.__annotations__["on_remove"] = RelationRemovalPolicy | None
-            cls.on_remove = strawberry.field(
-                default=strawberry.UNSET,
-                name="onRemove",
-            )
-        result = strawberry.input(cls)
-        self._list_ops[cache_key] = result
-        return result
+        self._list_ops[cache_key] = ref_type
+        return ref_type
 
     def _relation_specs(self, model: type) -> dict[str, RelationSpec]:
         if model in self._relation_cache:
@@ -734,24 +667,6 @@ class MutationNamespace:
             )
         operation, payload = selected[0]
         return operation, payload, on_replace_value
-
-    def _resolve_list_wrapper(self, wrapper: Any) -> tuple[list[Any], str, str]:
-        values = _input_values(wrapper)
-        policy = wrapper.__class__.__relation_policy__
-        items = values.get("items")
-        if items is None:
-            raise ValueError("List relation inputs require items")
-        mode = values.get("mode", strawberry.UNSET)
-        if mode is strawberry.UNSET or mode is None:
-            mode_value = policy["default_mode"]
-        else:
-            mode_value = mode.value
-        on_remove = values.get("on_remove", strawberry.UNSET)
-        if on_remove is strawberry.UNSET or on_remove is None:
-            on_remove_value = policy["default_on_remove"]
-        else:
-            on_remove_value = on_remove.value
-        return items, mode_value, on_remove_value
 
     def _create_sync(
         self,
@@ -934,54 +849,20 @@ class MutationNamespace:
             await _async_delete_instance(self._backend, current, info)
 
     def _apply_many_sync(
-        self, instance: Any, spec: RelationSpec, wrapper: Any, info: Any
+        self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
     ) -> None:
-        items, mode_value, on_remove = self._resolve_list_wrapper(wrapper)
-        mode = "replace" if mode_value == "REPLACE" else "patch"
         if spec.relation_mode == "many_to_many":
-            self._backend.apply_ref_list(
-                instance,
-                spec.name,
-                items,
-                info,
-                mode=mode,
-                hard_delete_removed=on_remove == "DELETE",
-            )
+            self._backend.apply_ref_list(instance, spec.name, refs, info)
             return
-
-        self._apply_reverse_many_sync(
-            instance,
-            spec,
-            items,
-            info,
-            mode_value == "REPLACE",
-            on_remove == "DELETE",
-        )
+        self._apply_reverse_many_sync(instance, spec, refs, info)
 
     async def _apply_many_async(
-        self, instance: Any, spec: RelationSpec, wrapper: Any, info: Any
+        self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
     ) -> None:
-        items, mode_value, on_remove = self._resolve_list_wrapper(wrapper)
-        mode = "replace" if mode_value == "REPLACE" else "patch"
         if spec.relation_mode == "many_to_many":
-            await self._backend.apply_ref_list(
-                instance,
-                spec.name,
-                items,
-                info,
-                mode=mode,
-                hard_delete_removed=on_remove == "DELETE",
-            )
+            await self._backend.apply_ref_list(instance, spec.name, refs, info)
             return
-
-        await self._apply_reverse_many_async(
-            instance,
-            spec,
-            items,
-            info,
-            mode_value == "REPLACE",
-            on_remove == "DELETE",
-        )
+        await self._apply_reverse_many_async(instance, spec, refs, info)
 
     def _apply_reverse_many_sync(
         self,
@@ -989,73 +870,50 @@ class MutationNamespace:
         spec: RelationSpec,
         refs: list[Any],
         info: Any,
-        replace: bool,
-        delete_previous: bool,
     ) -> None:
-        existing = _sync_get_many_related(self._backend, instance, spec.name, info)
-        existing_by_id = {_primary_key_value(obj): obj for obj in existing}
-        kept_ids: set[Any] = set()
-
         for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                child = _sync_load_instance(
-                    self._backend, spec.related_model, ref_id, info
-                )
-                if child is None:
-                    continue
-                setattr(child, spec.remote_attr, instance)
-                _sync_save_instance(self._backend, child, info)
-                kept_ids.add(_primary_key_value(child))
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                child = self._create_sync(
+            if ref_create is not strawberry.UNSET and ref_create is not None:
+                self._create_sync(
                     spec.related_model,
                     ref_create,
                     info,
                     parent_link=(spec.remote_attr, instance),
                 )
-                kept_ids.add(_primary_key_value(child))
             elif ref_update is not strawberry.UNSET and ref_update is not None:
-                child = self._update_sync(
+                update_values = _input_values(ref_update)
+                raw_id = update_values.get("id")
+                child = _sync_load_instance(
+                    self._backend, spec.related_model, raw_id, info
+                )
+                if child is None:
+                    continue
+                self._update_sync(
                     spec.related_model,
                     ref_update,
                     info,
                     parent_link=(spec.remote_attr, instance),
                 )
-                kept_ids.add(_primary_key_value(child))
+            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
+                child = _sync_load_instance(
+                    self._backend, spec.related_model, ref_unlink.id, info
+                )
+                if child is not None:
+                    self._detach_reverse_sync(child, spec, info)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 child = _sync_load_instance(
                     self._backend, spec.related_model, ref_delete.id, info
                 )
-                if child is None:
-                    continue
-                if delete_previous:
+                if child is not None:
                     _sync_delete_instance(self._backend, child, info)
                     if self._backend.__class__.__name__ == "SQLAlchemyBackend":
                         related = getattr(instance, spec.name, None)
                         if isinstance(related, list) and child in related:
                             related.remove(child)
-                else:
-                    self._detach_reverse_sync(child, spec, info)
-
-        if not replace:
-            return
-
-        for child_id, child in existing_by_id.items():
-            if child_id in kept_ids:
-                continue
-            if delete_previous:
-                _sync_delete_instance(self._backend, child, info)
-                if self._backend.__class__.__name__ == "SQLAlchemyBackend":
-                    related = getattr(instance, spec.name, None)
-                    if isinstance(related, list) and child in related:
-                        related.remove(child)
-            else:
-                self._detach_reverse_sync(child, spec, info)
 
     async def _apply_reverse_many_async(
         self,
@@ -1063,67 +921,46 @@ class MutationNamespace:
         spec: RelationSpec,
         refs: list[Any],
         info: Any,
-        replace: bool,
-        delete_previous: bool,
     ) -> None:
-        existing = await _async_get_many_related(
-            self._backend, instance, spec.name, info
-        )
-        existing_by_id = {_primary_key_value(obj): obj for obj in existing}
-        kept_ids: set[Any] = set()
-
         for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                child = await _async_load_instance(
-                    self._backend, spec.related_model, ref_id, info
-                )
-                if child is None:
-                    continue
-                setattr(child, spec.remote_attr, instance)
-                await _async_save_instance(self._backend, child, info)
-                kept_ids.add(_primary_key_value(child))
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                child = await self._create_async(
+            if ref_create is not strawberry.UNSET and ref_create is not None:
+                await self._create_async(
                     spec.related_model,
                     ref_create,
                     info,
                     parent_link=(spec.remote_attr, instance),
                 )
-                kept_ids.add(_primary_key_value(child))
             elif ref_update is not strawberry.UNSET and ref_update is not None:
-                child = await self._update_async(
+                update_values = _input_values(ref_update)
+                raw_id = update_values.get("id")
+                child = await _async_load_instance(
+                    self._backend, spec.related_model, raw_id, info
+                )
+                if child is None:
+                    continue
+                await self._update_async(
                     spec.related_model,
                     ref_update,
                     info,
                     parent_link=(spec.remote_attr, instance),
                 )
-                kept_ids.add(_primary_key_value(child))
+            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
+                child = await _async_load_instance(
+                    self._backend, spec.related_model, ref_unlink.id, info
+                )
+                if child is not None:
+                    await self._detach_reverse_async(child, spec, info)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 child = await _async_load_instance(
                     self._backend, spec.related_model, ref_delete.id, info
                 )
-                if child is None:
-                    continue
-                if delete_previous:
+                if child is not None:
                     await _async_delete_instance(self._backend, child, info)
-                else:
-                    await self._detach_reverse_async(child, spec, info)
-
-        if not replace:
-            return
-
-        for child_id, child in existing_by_id.items():
-            if child_id in kept_ids:
-                continue
-            if delete_previous:
-                await _async_delete_instance(self._backend, child, info)
-            else:
-                await self._detach_reverse_async(child, spec, info)
 
     def _detach_reverse_sync(self, child: Any, spec: RelationSpec, info: Any) -> None:
         if not spec.nullable:

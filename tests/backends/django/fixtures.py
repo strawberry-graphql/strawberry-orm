@@ -82,7 +82,7 @@ class CreateTagInput:
 @strawberry.input
 class UpdateTagInput:
     id: strawberry.ID
-    name: str
+    name: str | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -101,7 +101,9 @@ class UpdatePostInput:
     is_published: Optional[bool] = strawberry.UNSET
 
 
-TagRef = _main_orm.ref(DjTag, create=CreateTagInput, update=UpdateTagInput, delete=True)
+TagRef = _main_orm.ref(
+    DjTag, create=CreateTagInput, update=UpdateTagInput, unlink=True, delete=True
+)
 
 
 @strawberry.type
@@ -185,13 +187,9 @@ _node_project = {
     "post": {
         "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
         "comments": {
-            "_meta": {
-                "mode": ["PATCH", "REPLACE"],
-                "onRemove": ["DISCONNECT", "DELETE"],
-            },
             "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
         },
-        "tags": {"_meta": {"mode": "REPLACE", "onRemove": "DELETE"}},
+        "tags": {},
     },
     "comment": {
         "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},

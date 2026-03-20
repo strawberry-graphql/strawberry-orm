@@ -34,7 +34,7 @@ class TestAsyncExecution:
         result = await main_schema.execute(
             """
             mutation {
-                setPostTags(postId: 2, tags: [{ id: "3" }]) {
+                setPostTags(postId: 2, tags: [{ update: { id: "3" } }]) {
                     tags { name }
                 }
             }
@@ -42,4 +42,5 @@ class TestAsyncExecution:
             context_value={"session": sa_session},
         )
         assert result.errors is None
-        assert result.data == {"setPostTags": {"tags": [{"name": "rust"}]}}
+        tag_names = sorted(t["name"] for t in result.data["setPostTags"]["tags"])
+        assert "rust" in tag_names

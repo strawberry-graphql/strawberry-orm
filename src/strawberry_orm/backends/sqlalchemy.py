@@ -185,8 +185,6 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         *,
         authorize: Callable[..., bool] | None = None,
-        mode: str = "replace",
-        hard_delete_removed: bool | None = None,
     ) -> Any:
         session = self._get_session(info)
         if self._is_async_session(session):
@@ -197,8 +195,6 @@ class SQLAlchemyBackend(BaseBackend):
                 refs,
                 info,
                 authorize=authorize,
-                mode=mode,
-                hard_delete_removed=hard_delete_removed,
             )
 
         return self._apply_ref_list_sync(
@@ -208,8 +204,6 @@ class SQLAlchemyBackend(BaseBackend):
             refs,
             info,
             authorize,
-            mode,
-            hard_delete_removed,
         )
 
     # -- Query application ----------------------------------------------------
@@ -539,38 +533,26 @@ class SQLAlchemyBackend(BaseBackend):
         refs: list[Any],
         info: Any,
         authorize: Callable[..., bool] | None,
-        mode: str,
-        hard_delete_removed: bool | None,
     ) -> None:
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
-        existing_related = list(getattr(instance, field))
-        hard_delete = (
-            self._hard_delete_refs
-            if hard_delete_removed is None
-            else hard_delete_removed
-        )
 
-        new_related: list[Any] = []
+        to_add: list[Any] = []
         to_remove: list[Any] = []
+        to_delete: list[Any] = []
+
         for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                if authorize and not authorize("link", target_model, ref_id, info):
-                    continue
-                obj = session.get(target_model, ref_id)
-                if obj is not None:
-                    new_related.append(obj)
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
+            if ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 obj = target_model(**input_to_dict(ref_create))
                 session.add(obj)
-                new_related.append(obj)
+                to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
                 pk = data.pop("id")
@@ -580,7 +562,15 @@ class SQLAlchemyBackend(BaseBackend):
                 if obj is not None:
                     for k, v in data.items():
                         setattr(obj, k, v)
-                    new_related.append(obj)
+                    to_add.append(obj)
+            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
+                if authorize and not authorize(
+                    "unlink", target_model, ref_unlink.id, info
+                ):
+                    continue
+                obj = session.get(target_model, ref_unlink.id)
+                if obj is not None:
+                    to_remove.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
                     "delete", target_model, ref_delete.id, info
@@ -588,24 +578,16 @@ class SQLAlchemyBackend(BaseBackend):
                     continue
                 obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
-                    to_remove.append(obj)
-                    if hard_delete:
-                        session.delete(obj)
+                    to_delete.append(obj)
 
-        if mode == "patch":
-            existing = list(getattr(instance, field))
-            merged = [o for o in existing if o not in to_remove]
-            for obj in new_related:
-                if obj not in merged:
-                    merged.append(obj)
-            setattr(instance, field, merged)
-        else:
-            setattr(instance, field, new_related)
-            if hard_delete:
-                new_ids = {_primary_key(obj) for obj in new_related}
-                for obj in existing_related:
-                    if _primary_key(obj) not in new_ids:
-                        session.delete(obj)
+        existing = list(getattr(instance, field))
+        merged = [o for o in existing if o not in to_remove and o not in to_delete]
+        for obj in to_add:
+            if obj not in merged:
+                merged.append(obj)
+        setattr(instance, field, merged)
+        for obj in to_delete:
+            session.delete(obj)
 
     async def _apply_ref_list_async(
         self,
@@ -616,39 +598,26 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         *,
         authorize: Callable[..., bool] | None,
-        mode: str,
-        hard_delete_removed: bool | None,
     ) -> None:
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
-        await session.refresh(instance, [field])
-        existing_related = list(getattr(instance, field))
-        hard_delete = (
-            self._hard_delete_refs
-            if hard_delete_removed is None
-            else hard_delete_removed
-        )
 
-        new_related: list[Any] = []
+        to_add: list[Any] = []
         to_remove: list[Any] = []
+        to_delete: list[Any] = []
+
         for ref in refs:
-            ref_id = getattr(ref, "id", strawberry.UNSET)
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_id is not strawberry.UNSET and ref_id is not None:
-                if authorize and not authorize("link", target_model, ref_id, info):
-                    continue
-                obj = await session.get(target_model, ref_id)
-                if obj is not None:
-                    new_related.append(obj)
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
+            if ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 obj = target_model(**input_to_dict(ref_create))
                 session.add(obj)
-                new_related.append(obj)
+                to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
                 pk = data.pop("id")
@@ -658,7 +627,15 @@ class SQLAlchemyBackend(BaseBackend):
                 if obj is not None:
                     for k, v in data.items():
                         setattr(obj, k, v)
-                    new_related.append(obj)
+                    to_add.append(obj)
+            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
+                if authorize and not authorize(
+                    "unlink", target_model, ref_unlink.id, info
+                ):
+                    continue
+                obj = await session.get(target_model, ref_unlink.id)
+                if obj is not None:
+                    to_remove.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
                     "delete", target_model, ref_delete.id, info
@@ -666,25 +643,17 @@ class SQLAlchemyBackend(BaseBackend):
                     continue
                 obj = await session.get(target_model, ref_delete.id)
                 if obj is not None:
-                    to_remove.append(obj)
-                    if hard_delete:
-                        await session.delete(obj)
+                    to_delete.append(obj)
 
-        if mode == "patch":
-            await session.refresh(instance, [field])
-            existing = list(getattr(instance, field))
-            merged = [o for o in existing if o not in to_remove]
-            for obj in new_related:
-                if obj not in merged:
-                    merged.append(obj)
-            setattr(instance, field, merged)
-        else:
-            setattr(instance, field, new_related)
-            if hard_delete:
-                new_ids = {_primary_key(obj) for obj in new_related}
-                for obj in existing_related:
-                    if _primary_key(obj) not in new_ids:
-                        await session.delete(obj)
+        await session.refresh(instance, [field])
+        existing = list(getattr(instance, field))
+        merged = [o for o in existing if o not in to_remove and o not in to_delete]
+        for obj in to_add:
+            if obj not in merged:
+                merged.append(obj)
+        setattr(instance, field, merged)
+        for obj in to_delete:
+            await session.delete(obj)
 
 
 # ---------------------------------------------------------------------------

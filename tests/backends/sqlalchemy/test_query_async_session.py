@@ -163,7 +163,7 @@ class TestAsyncSessionMutations:
         result = await schema.execute(
             """
             mutation {
-                setPostTags(postId: 3, tags: [{ id: "1" }, { id: "3" }]) {
+                setPostTags(postId: 3, tags: [{ update: { id: "1" } }, { update: { id: "3" } }]) {
                     name
                 }
             }
@@ -177,7 +177,7 @@ class TestAsyncSessionMutations:
         ]
 
     @pytest.mark.asyncio
-    async def test_apply_ref_list_async_supports_create_update_and_replace(
+    async def test_apply_ref_list_async_supports_create_update_and_delete(
         self, async_seed
     ):
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
@@ -189,7 +189,7 @@ class TestAsyncSessionMutations:
         @strawberry.input
         class UpdateTagInput:
             id: strawberry.ID
-            name: str
+            name: str | None = strawberry.UNSET
 
         @orm.type(SATag)
         class TagType:
@@ -203,7 +203,11 @@ class TestAsyncSessionMutations:
             tags: list[TagType]
 
         TagRef = orm.ref(
-            SATag, create=CreateTagInput, update=UpdateTagInput, delete=True
+            SATag,
+            create=CreateTagInput,
+            update=UpdateTagInput,
+            unlink=True,
+            delete=True,
         )
 
         @strawberry.type
@@ -214,19 +218,12 @@ class TestAsyncSessionMutations:
         @strawberry.type
         class Mutation:
             @strawberry.mutation
-            async def replace_post_tags(
+            async def modify_post_tags(
                 self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
             ) -> list[TagType]:
                 post = await info.context["session"].get(SAPost, post_id)
                 assert post is not None
-                await orm.apply_ref_list(
-                    post,
-                    "tags",
-                    tags,
-                    info,
-                    mode="replace",
-                    hard_delete_removed=True,
-                )
+                await orm.apply_ref_list(post, "tags", tags, info)
                 await info.context["session"].commit()
                 await info.context["session"].refresh(post, ["tags"])
                 return post.tags  # type: ignore[return-value]
@@ -240,11 +237,12 @@ class TestAsyncSessionMutations:
         result = await schema.execute(
             """
             mutation {
-                replacePostTags(
+                modifyPostTags(
                     postId: 2
                     tags: [
                         { update: { id: "1", name: "python-async" } }
                         { create: { name: "fresh-async" } }
+                        { delete: { id: "2" } }
                     ]
                 ) {
                     name
@@ -254,7 +252,7 @@ class TestAsyncSessionMutations:
             context_value={"session": async_seed},
         )
         assert result.errors is None
-        assert sorted(result.data["replacePostTags"], key=lambda tag: tag["name"]) == [
+        assert sorted(result.data["modifyPostTags"], key=lambda tag: tag["name"]) == [
             {"name": "fresh-async"},
             {"name": "python-async"},
         ]
@@ -262,10 +260,6 @@ class TestAsyncSessionMutations:
         query_result = await schema.execute(
             """
             {
-                posts {
-                    title
-                    tags { name }
-                }
                 tags {
                     name
                 }
@@ -274,18 +268,13 @@ class TestAsyncSessionMutations:
             context_value={"session": async_seed},
         )
         assert query_result.errors is None
-        posts = {
-            post["title"]: sorted(tag["name"] for tag in post["tags"])
-            for post in query_result.data["posts"]
-        }
-        assert posts["GraphQL Guide"] == ["fresh-async", "python-async"]
         all_tag_names = sorted(tag["name"] for tag in query_result.data["tags"])
         assert "graphql" not in all_tag_names
         assert "fresh-async" in all_tag_names
         assert "python-async" in all_tag_names
 
     @pytest.mark.asyncio
-    async def test_apply_ref_list_async_supports_delete_in_patch_mode(self, async_seed):
+    async def test_apply_ref_list_async_supports_delete_and_create(self, async_seed):
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
 
         @strawberry.input
@@ -313,19 +302,12 @@ class TestAsyncSessionMutations:
         @strawberry.type
         class Mutation:
             @strawberry.mutation
-            async def patch_post_tags(
+            async def modify_post_tags(
                 self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
             ) -> list[TagType]:
                 post = await info.context["session"].get(SAPost, post_id)
                 assert post is not None
-                await orm.apply_ref_list(
-                    post,
-                    "tags",
-                    tags,
-                    info,
-                    mode="patch",
-                    hard_delete_removed=True,
-                )
+                await orm.apply_ref_list(post, "tags", tags, info)
                 await info.context["session"].commit()
                 await info.context["session"].refresh(post, ["tags"])
                 return post.tags  # type: ignore[return-value]
@@ -338,7 +320,7 @@ class TestAsyncSessionMutations:
         result = await schema.execute(
             """
             mutation {
-                patchPostTags(
+                modifyPostTags(
                     postId: 1
                     tags: [
                         { delete: { id: "1" } }
@@ -352,15 +334,11 @@ class TestAsyncSessionMutations:
             context_value={"session": async_seed},
         )
         assert result.errors is None
-        assert result.data["patchPostTags"] == [{"name": "patched-async"}]
+        assert result.data["modifyPostTags"] == [{"name": "patched-async"}]
 
         query_result = await schema.execute(
             """
             {
-                posts {
-                    title
-                    tags { name }
-                }
                 tags {
                     name
                 }
@@ -369,11 +347,6 @@ class TestAsyncSessionMutations:
             context_value={"session": async_seed},
         )
         assert query_result.errors is None
-        posts = {
-            post["title"]: sorted(tag["name"] for tag in post["tags"])
-            for post in query_result.data["posts"]
-        }
-        assert posts["Hello World"] == ["patched-async"]
         all_tag_names = sorted(tag["name"] for tag in query_result.data["tags"])
         assert "python" not in all_tag_names
         assert "patched-async" in all_tag_names

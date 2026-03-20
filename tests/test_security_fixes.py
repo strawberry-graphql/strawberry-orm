@@ -609,7 +609,11 @@ class TestFix8_RefListAuthorizationHook:
             return True
 
         role_ref_type = self.orm.ref(Role)
-        ref = role_ref_type(id="1")
+        update_type = role_ref_type.__dataclass_fields__["update"].type
+        actual_type = (
+            update_type.__args__[0] if hasattr(update_type, "__args__") else update_type
+        )
+        ref = role_ref_type(update=actual_type(id="1"))
 
         account = self.session.get(Account, 1)
 
@@ -632,8 +636,8 @@ class TestFix8_RefListAuthorizationHook:
             raise
 
         assert len(log) > 0, "Authorizer was not called"
-        assert log[0][0] in ("link", "read", "get"), (
-            f"Expected action like 'link'; got {log[0][0]}"
+        assert log[0][0] in ("link", "read", "get", "update"), (
+            f"Expected action like 'link' or 'update'; got {log[0][0]}"
         )
 
     def test_authorize_rejection_prevents_link(self):
@@ -643,7 +647,11 @@ class TestFix8_RefListAuthorizationHook:
             return False
 
         role_ref_type = self.orm.ref(Role)
-        ref = role_ref_type(id="1")
+        update_type = role_ref_type.__dataclass_fields__["update"].type
+        actual_type = (
+            update_type.__args__[0] if hasattr(update_type, "__args__") else update_type
+        )
+        ref = role_ref_type(update=actual_type(id="1"))
 
         account = self.session.get(Account, 1)
 
@@ -674,20 +682,24 @@ class TestFix8_RefListAuthorizationHook:
 # =========================================================================
 
 
-class TestFix8B_RefDeleteDefaults:
-    def _delete_ref(self, ref_id):
-        class DeletePayload:
-            id = ref_id
+class TestFix8B_RefExplicitUnlinkAndDelete:
+    def _unlink_ref(self, orm, ref_id):
+        ref_type = orm.ref(Role, unlink=True)
+        unlink_type = ref_type.__dataclass_fields__["unlink"].type
+        actual_type = (
+            unlink_type.__args__[0] if hasattr(unlink_type, "__args__") else unlink_type
+        )
+        return ref_type(unlink=actual_type(id=str(ref_id)))
 
-        class RefOp:
-            id = strawberry.UNSET
-            create = strawberry.UNSET
-            update = strawberry.UNSET
-            delete = DeletePayload()
+    def _delete_ref(self, orm, ref_id):
+        ref_type = orm.ref(Role, delete=True)
+        delete_type = ref_type.__dataclass_fields__["delete"].type
+        actual_type = (
+            delete_type.__args__[0] if hasattr(delete_type, "__args__") else delete_type
+        )
+        return ref_type(delete=actual_type(id=str(ref_id)))
 
-        return RefOp()
-
-    def test_delete_unlinks_without_hard_delete(self, seeded):
+    def test_unlink_removes_from_relation_without_hard_delete(self, seeded):
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
         account = seeded.get(Account, 1)
         role = seeded.get(Role, 1)
@@ -700,17 +712,16 @@ class TestFix8B_RefDeleteDefaults:
         orm.apply_ref_list(
             account,
             "groups",
-            [self._delete_ref(1)],
+            [self._unlink_ref(orm, 1)],
             FakeInfo(),
-            mode="patch",
         )
         seeded.flush()
 
         assert seeded.get(Role, 1) is not None
         assert list(account.groups) == []
 
-    def test_delete_can_hard_delete_when_opted_in(self, seeded):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", hard_delete_refs=True)
+    def test_delete_hard_deletes_the_row(self, seeded):
+        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
         account = seeded.get(Account, 1)
         role = seeded.get(Role, 1)
         account.groups.append(role)
@@ -722,9 +733,8 @@ class TestFix8B_RefDeleteDefaults:
         orm.apply_ref_list(
             account,
             "groups",
-            [self._delete_ref(1)],
+            [self._delete_ref(orm, 1)],
             FakeInfo(),
-            mode="patch",
         )
         seeded.flush()
 

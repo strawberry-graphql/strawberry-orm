@@ -88,14 +88,12 @@ class Backend(Protocol):
         info: Any,
         *,
         authorize: Any | None = None,
-        mode: str = "replace",
-        hard_delete_removed: bool | None = None,
     ) -> AwaitableOrValue[None]:
         """Apply a list of ref operations to *instance*'s *field* relation.
 
-        *mode* controls how the relationship list is updated:
-        - ``"replace"`` (default): the entire relationship list is replaced
-        - ``"patch"``: only the mentioned items are added/removed/updated
+        Each ref is a ``@oneOf`` input with exactly one of ``create``,
+        ``update`` (link + optional field updates), ``unlink`` (remove from
+        relation), or ``delete`` (hard-delete the row).
         """
         ...
 

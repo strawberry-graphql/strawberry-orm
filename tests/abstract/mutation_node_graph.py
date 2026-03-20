@@ -22,22 +22,18 @@ class AbstractTestNodeGraphMutations:
                                 email: "dana@example.com"
                             }
                         }
-                        tags: {
-                            items: [{ create: { name: "node-tag" } }]
-                        }
-                        comments: {
-                            items: [{
-                                create: {
-                                    body: "Root comment"
-                                    author: {
-                                        create: {
-                                            name: "Eve"
-                                            email: "eve@example.com"
-                                        }
+                        tags: [{ create: { name: "node-tag" } }]
+                        comments: [{
+                            create: {
+                                body: "Root comment"
+                                author: {
+                                    create: {
+                                        name: "Eve"
+                                        email: "eve@example.com"
                                     }
                                 }
-                            }]
-                        }
+                            }
+                        }]
                     }
                 }) {
                     __typename
@@ -175,18 +171,14 @@ class AbstractTestNodeGraphMutations:
         )
         assert data == {"inspectUpdateNodeInput": "comment"}
 
-    def test_update_node_replace_can_delete_removed_relations(self, node_execute, seed):
+    def test_update_node_m2m_tags_delete(self, node_execute, seed):
         data = node_execute(
             """
             mutation {
                 updateNode(input: {
                     post: {
                         id: "4"
-                        tags: {
-                            items: [{ create: { name: "replacement-tag" } }]
-                            mode: REPLACE
-                            onRemove: DELETE
-                        }
+                        tags: [{ delete: { id: "3" } }]
                     }
                 }) {
                     __typename
@@ -202,13 +194,12 @@ class AbstractTestNodeGraphMutations:
             "updateNode": {
                 "__typename": "PostNode",
                 "title": "Rust Adventures",
-                "tags": [{"name": "replacement-tag"}],
+                "tags": [],
             }
         }
 
         query_data = node_execute("{ tags { name } }")
         tag_names = {entry["name"] for entry in query_data["tags"]}
-        assert "replacement-tag" in tag_names
         assert "rust" not in tag_names
 
     def test_update_node_reverse_many_can_link_existing_child(self, node_execute, seed):
@@ -218,10 +209,7 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     post: {
                         id: "1"
-                        comments: {
-                            items: [{ id: "3" }]
-                            mode: PATCH
-                        }
+                        comments: [{ update: { id: "3" } }]
                     }
                 }) {
                     __typename
@@ -254,15 +242,12 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     post: {
                         id: "1"
-                        comments: {
-                            items: [{
-                                update: {
-                                    id: "1"
-                                    body: "Nice post through post"
-                                }
-                            }]
-                            mode: PATCH
-                        }
+                        comments: [{
+                            update: {
+                                id: "1"
+                                body: "Nice post through post"
+                            }
+                        }]
                     }
                 }) {
                     __typename
@@ -282,7 +267,7 @@ class AbstractTestNodeGraphMutations:
         query_data = node_execute("{ comments { body } }")
         assert {"body": "Nice post through post"} in query_data["comments"]
 
-    def test_update_node_reverse_many_delete_item_can_delete_child(
+    def test_update_node_reverse_many_delete_hard_deletes_child(
         self, node_execute, seed
     ):
         data = node_execute(
@@ -291,11 +276,7 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     post: {
                         id: "2"
-                        comments: {
-                            items: [{ delete: { id: "3" } }]
-                            mode: PATCH
-                            onRemove: DELETE
-                        }
+                        comments: [{ delete: { id: "3" } }]
                     }
                 }) {
                     __typename
@@ -319,44 +300,7 @@ class AbstractTestNodeGraphMutations:
         comment_bodies = {comment["body"] for comment in query_data["comments"]}
         assert "Great guide" not in comment_bodies
 
-    def test_update_node_reverse_many_replace_deletes_unmentioned_children(
-        self, node_execute, seed
-    ):
-        data = node_execute(
-            """
-            mutation {
-                updateNode(input: {
-                    post: {
-                        id: "2"
-                        comments: {
-                            items: []
-                            mode: REPLACE
-                            onRemove: DELETE
-                        }
-                    }
-                }) {
-                    __typename
-                    ... on PostNode {
-                        title
-                        comments { body }
-                    }
-                }
-            }
-            """
-        )
-        assert data == {
-            "updateNode": {
-                "__typename": "PostNode",
-                "title": "GraphQL Guide",
-                "comments": [],
-            }
-        }
-
-        query_data = node_execute("{ comments { body } }")
-        comment_bodies = {comment["body"] for comment in query_data["comments"]}
-        assert "Great guide" not in comment_bodies
-
-    def test_update_node_reverse_many_disconnect_rejected_for_non_nullable_relation(
+    def test_update_node_reverse_many_unlink_rejected_for_non_nullable_relation(
         self, node_execute_result, seed
     ):
         result = node_execute_result(
@@ -365,11 +309,7 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     post: {
                         id: "2"
-                        comments: {
-                            items: [{ delete: { id: "3" } }]
-                            mode: PATCH
-                            onRemove: DISCONNECT
-                        }
+                        comments: [{ unlink: { id: "3" } }]
                     }
                 }) {
                     __typename
@@ -389,11 +329,10 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     post: {
                         id: "1"
-                        comments: {
-                            items: [{ id: "999" }, { delete: { id: "999" } }]
-                            mode: PATCH
-                            onRemove: DELETE
-                        }
+                        comments: [
+                            { update: { id: "999" } },
+                            { delete: { id: "999" } }
+                        ]
                     }
                 }) {
                     __typename
@@ -413,7 +352,7 @@ class AbstractTestNodeGraphMutations:
             }
         }
 
-    def test_update_node_reverse_many_can_disconnect_nullable_children(
+    def test_update_node_reverse_many_can_unlink_nullable_children(
         self, node_execute, execute, seed
     ):
         data = node_execute(
@@ -422,11 +361,7 @@ class AbstractTestNodeGraphMutations:
                 updateNode(input: {
                     comment: {
                         id: "1"
-                        replies: {
-                            items: [{ delete: { id: "2" } }]
-                            mode: PATCH
-                            onRemove: DISCONNECT
-                        }
+                        replies: [{ unlink: { id: "2" } }]
                     }
                 }) {
                     __typename
@@ -496,22 +431,18 @@ class AbstractTestNodeGraphMutations:
                             }
                             onReplace: DELETE
                         }
-                        comments: {
-                            items: [{
-                                create: {
-                                    body: "Projected Comment"
-                                    author: {
-                                        create: {
-                                            name: "Projected Eve"
-                                            email: "projected-eve@example.com"
-                                        }
-                                        onReplace: DELETE
+                        comments: [{
+                            create: {
+                                body: "Projected Comment"
+                                author: {
+                                    create: {
+                                        name: "Projected Eve"
+                                        email: "projected-eve@example.com"
                                     }
+                                    onReplace: DELETE
                                 }
-                            }]
-                            mode: REPLACE
-                            onRemove: DELETE
-                        }
+                            }
+                        }]
                     }
                 }) {
                     __typename
@@ -583,9 +514,10 @@ class AbstractTestNodeGraphMutations:
                 projectedUpdateNode(input: {
                     post: {
                         id: "4"
-                        tags: {
-                            items: [{ create: { name: "projected-replacement-tag" } }]
-                        }
+                        tags: [
+                            { create: { name: "projected-replacement-tag" } }
+                            { delete: { id: "3" } }
+                        ]
                     }
                 }) {
                     __typename
@@ -624,28 +556,24 @@ class AbstractTestNodeGraphMutations:
                             create: {
                                 name: "Dana"
                                 email: "dana@example.com"
-                                posts: {
-                                    items: [{
-                                        create: {
-                                            title: "Too Deep"
-                                            body: "Still blocked"
-                                            author: {
-                                                create: {
-                                                    name: "Nope"
-                                                    email: "nope@example.com"
-                                                    posts: {
-                                                        items: [{
-                                                            create: {
-                                                                title: "Blocked Again"
-                                                                body: "Now really too deep"
-                                                            }
-                                                        }]
+                                posts: [{
+                                    create: {
+                                        title: "Too Deep"
+                                        body: "Still blocked"
+                                        author: {
+                                            create: {
+                                                name: "Nope"
+                                                email: "nope@example.com"
+                                                posts: [{
+                                                    create: {
+                                                        title: "Blocked Again"
+                                                        body: "Now really too deep"
                                                     }
-                                                }
+                                                }]
                                             }
                                         }
-                                    }]
-                                }
+                                    }
+                                }]
                             }
                         }
                     }

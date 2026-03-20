@@ -17,7 +17,9 @@ class TestMutationRefList:
         data = await execute(
             """
             mutation {
-                setPostTags(postId: 3, tags: [{ id: "1" }, { id: "3" }]) {
+                setPostTags(postId: 3, tags: [
+                    { update: { id: "1" } }, { update: { id: "3" } }
+                ]) {
                     title tags { name }
                 }
             }
@@ -36,7 +38,7 @@ class TestMutationRefList:
             """
             mutation {
                 setPostTags(postId: 1, tags: [
-                    { id: "1" },
+                    { update: { id: "1" } },
                     { create: { name: "django" } }
                 ]) { tags { name } }
             }
@@ -54,7 +56,7 @@ class TestMutationRefList:
             """
             mutation {
                 setPostTags(postId: 2, tags: [
-                    { id: "1" },
+                    { update: { id: "1" } },
                     { update: { id: "2", name: "gql" } }
                 ]) { tags { name } }
             }
@@ -67,13 +69,13 @@ class TestMutationRefList:
         }
 
     @pytest.mark.asyncio
-    async def test_delete_related_tag(self, execute, seed, Tag):
+    async def test_unlink_related_tag(self, execute, seed, Tag):
         data = await execute(
             """
             mutation {
                 setPostTags(postId: 2, tags: [
-                    { id: "1" },
-                    { delete: { id: "2" } }
+                    { update: { id: "1" } },
+                    { unlink: { id: "2" } }
                 ]) { tags { name } }
             }
             """
@@ -83,17 +85,20 @@ class TestMutationRefList:
         assert tag2 is not None
 
     @pytest.mark.asyncio
-    async def test_replace_all_tags(self, execute, seed):
+    async def test_delete_related_tag(self, execute, seed, Tag):
         data = await execute(
             """
             mutation {
-                setPostTags(postId: 2, tags: [{ id: "3" }]) {
-                    tags { name }
-                }
+                setPostTags(postId: 2, tags: [
+                    { update: { id: "1" } },
+                    { delete: { id: "2" } }
+                ]) { tags { name } }
             }
             """
         )
-        assert data == {"setPostTags": {"tags": [{"name": "rust"}]}}
+        assert data == {"setPostTags": {"tags": [{"name": "python"}]}}
+        tag2 = await Tag.get_or_none(pk=2)
+        assert tag2 is None
 
     @pytest.mark.asyncio
     async def test_mixed_operations(self, execute, seed):
@@ -101,7 +106,7 @@ class TestMutationRefList:
             """
             mutation {
                 setPostTags(postId: 1, tags: [
-                    { id: "3" },
+                    { update: { id: "3" } },
                     { create: { name: "fastapi" } },
                     { update: { id: "1", name: "py" } }
                 ]) { tags { name } }

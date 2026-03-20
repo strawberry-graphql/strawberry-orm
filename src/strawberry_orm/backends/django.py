@@ -219,73 +219,55 @@ class DjangoBackend(BaseBackend):
         info: Any,
         *,
         authorize: Any | None = None,
-        mode: str = "replace",
-        hard_delete_removed: bool | None = None,
     ) -> Any:
         def apply() -> None:
             manager = getattr(instance, field)
             rel_model = manager.model
-            hard_delete = (
-                self._hard_delete_refs
-                if hard_delete_removed is None
-                else hard_delete_removed
-            )
-            existing_related = list(manager.all())
 
-            new_related: list[Any] = []
-            to_delete: list[Any] = []
+            to_add: list[Any] = []
+            to_unlink: list[Any] = []
+            to_delete_ids: list[Any] = []
 
             for ref in refs:
-                ref_id = getattr(ref, "id", strawberry.UNSET)
                 ref_create = getattr(ref, "create", strawberry.UNSET)
                 ref_update = getattr(ref, "update", strawberry.UNSET)
+                ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
                 ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-                if ref_id is not strawberry.UNSET and ref_id is not None:
-                    if authorize and not authorize("link", rel_model, ref_id, info):
-                        continue
-                    obj = rel_model.objects.get(pk=ref_id)
-                    new_related.append(obj)
-                elif ref_create is not strawberry.UNSET and ref_create is not None:
+                if ref_create is not strawberry.UNSET and ref_create is not None:
                     if authorize and not authorize("create", rel_model, None, info):
                         continue
                     obj = rel_model.objects.create(**input_to_dict(ref_create))
-                    new_related.append(obj)
+                    to_add.append(obj)
                 elif ref_update is not strawberry.UNSET and ref_update is not None:
                     data = input_to_dict(ref_update)
                     pk = data.pop("id")
                     if authorize and not authorize("update", rel_model, pk, info):
                         continue
-                    rel_model.objects.filter(pk=pk).update(**data)
+                    if data:
+                        rel_model.objects.filter(pk=pk).update(**data)
                     obj = rel_model.objects.get(pk=pk)
-                    new_related.append(obj)
+                    to_add.append(obj)
+                elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
+                    if authorize and not authorize(
+                        "unlink", rel_model, ref_unlink.id, info
+                    ):
+                        continue
+                    to_unlink.append(ref_unlink.id)
                 elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                     if authorize and not authorize(
                         "delete", rel_model, ref_delete.id, info
                     ):
                         continue
-                    to_delete.append(ref_delete.id)
+                    to_delete_ids.append(ref_delete.id)
 
-            if mode == "patch":
-                if new_related:
-                    manager.add(*new_related)
-                if to_delete:
-                    manager.remove(*rel_model.objects.filter(pk__in=to_delete))
-                    if hard_delete:
-                        rel_model.objects.filter(pk__in=to_delete).delete()
-            else:
-                manager.set(new_related)
-                if to_delete and hard_delete:
-                    rel_model.objects.filter(pk__in=to_delete).delete()
-                if hard_delete:
-                    new_ids = {_primary_key(obj) for obj in new_related}
-                    removed_ids = [
-                        _primary_key(obj)
-                        for obj in existing_related
-                        if _primary_key(obj) not in new_ids
-                    ]
-                    if removed_ids:
-                        rel_model.objects.filter(pk__in=removed_ids).delete()
+            if to_add:
+                manager.add(*to_add)
+            if to_unlink:
+                manager.remove(*rel_model.objects.filter(pk__in=to_unlink))
+            if to_delete_ids:
+                manager.remove(*rel_model.objects.filter(pk__in=to_delete_ids))
+                rel_model.objects.filter(pk__in=to_delete_ids).delete()
 
         return run_sync(apply, thread_sensitive=True)
 

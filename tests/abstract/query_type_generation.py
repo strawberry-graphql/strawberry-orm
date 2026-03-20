@@ -55,9 +55,12 @@ class AbstractTestQueryTypeGeneration:
         ext = orm.optimizer_extension()
         assert isinstance(ext, type)
 
-    def test_ref_id_only(self, orm, Tag):
+    def test_ref_update_only(self, orm, Tag):
         TagRef = orm.ref(Tag)
-        assert hasattr(TagRef, "__strawberry_definition__")
+        definition = TagRef.__strawberry_definition__
+        field_names = [f.name for f in definition.fields]
+        assert "update" in field_names
+        assert "id" not in field_names
 
     def test_ref_with_create(self, orm, Tag):
         @strawberry.input
@@ -67,14 +70,15 @@ class AbstractTestQueryTypeGeneration:
         TagRef = orm.ref(Tag, create=CreateTagInput)
         definition = TagRef.__strawberry_definition__
         field_names = [f.name for f in definition.fields]
-        assert "id" in field_names
+        assert "update" in field_names
         assert "create" in field_names
 
-    def test_ref_with_delete(self, orm, Tag):
-        TagRef = orm.ref(Tag, delete=True)
+    def test_ref_with_unlink_and_delete(self, orm, Tag):
+        TagRef = orm.ref(Tag, unlink=True, delete=True)
         definition = TagRef.__strawberry_definition__
         field_names = [f.name for f in definition.fields]
-        assert "id" in field_names
+        assert "update" in field_names
+        assert "unlink" in field_names
         assert "delete" in field_names
 
 

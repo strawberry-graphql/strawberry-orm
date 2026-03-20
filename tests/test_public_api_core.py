@@ -88,7 +88,7 @@ class TestPublicApiCore:
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
 
         TagRef = orm.ref(SAUser, delete=True)
-        assert "id" in TagRef.__dataclass_fields__
+        assert "update" in TagRef.__dataclass_fields__
         assert "delete" in TagRef.__dataclass_fields__
 
         query = orm.get_default_queryset(SAUser)

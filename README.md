@@ -151,9 +151,10 @@ That gives you:
 # Manage related tags on a post
 mutation {
   setPostTags(postId: 1, tags: [
-    { id: "2" }
+    { update: { id: "2" } }
     { create: { name: "new-tag" } }
-    { delete: { id: "3" } }
+    { unlink: { id: "3" } }
+    { delete: { id: "4" } }
   ]) {
     tags { id name }
   }
@@ -166,7 +167,7 @@ mutation {
       title: "Hello"
       body: "World"
       author: { create: { name: "Alice", email: "alice@example.com" } }
-      tags: { items: [{ create: { name: "python" } }], mode: REPLACE }
+      tags: [{ create: { name: "python" } }]
     }
   }) { __typename }
 }
@@ -196,7 +197,6 @@ Shared options:
 | `default_query_limit` | `None` | Default limit for auto-generated list queries. |
 | `exclude_sensitive_fields` | `True` | Excludes sensitive-looking fields from generated input/filter/order types. |
 | `warn_sensitive` | `True` | Warns when sensitive-looking fields are exposed on output types. |
-| `hard_delete_refs` | `False` | Makes `apply_ref_list(..., delete=...)` delete rows instead of unlinking. |
 | `max_filter_depth` | `10` | Caps recursive filter nesting. |
 | `max_filter_branches` | `50` | Caps `all` / `any` / `oneOf` branch count. |
 | `max_in_list_size` | `500` | Caps `inList` / `notInList` size. |
@@ -508,27 +508,37 @@ CreateTagInput = orm.input(Tag, include=["name"])
 @strawberry.input
 class UpdateTagInput:
     id: strawberry.ID
-    name: str
+    name: str | None = strawberry.UNSET
 
-TagRef = orm.ref(Tag, create=CreateTagInput, update=UpdateTagInput, delete=True)
+TagRef = orm.ref(Tag, create=CreateTagInput, update=UpdateTagInput, unlink=True, delete=True)
 ```
 
-Each ref can be one of `{ id }` (link), `{ create }`, `{ update }`, or `{ delete }` (unlink, or hard-delete if `hard_delete_refs=True`).
+Each ref is a `@oneOf` with these keys:
 
-Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. It supports `mode="replace"` (default) and `mode="patch"`, and an optional `authorize` callback `(action, model, obj_id, info) -> bool`.
+- `update` — link an existing object by ID, or update its fields. Always present (an ID-only input is auto-generated if no custom `update` type is provided).
+- `create` — create a new related object (present when `create=` is provided).
+- `unlink` — remove the object from the relation without deleting it (present when `unlink=True`).
+- `delete` — hard-delete the related row (present when `delete=True`).
+
+All list mutations use **patch semantics**: only the items you mention are affected; existing related objects not listed are left untouched.
+
+Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. An optional `authorize` callback `(action, model, obj_id, info) -> bool` can be provided for per-operation authorization.
 
 ```graphql
 mutation {
   setPostTags(postId: 1, tags: [
-    { id: "2" }
+    { update: { id: "2" } }
     { update: { id: "1", name: "python3" } }
     { create: { name: "new-tag" } }
-    { delete: { id: "3" } }
+    { unlink: { id: "3" } }
+    { delete: { id: "4" } }
   ]) {
     tags { id name }
   }
 }
 ```
+
+> **Note:** Whether the order of items in the list affects the final ordering of the relation is an implementation detail that each backend must maintain.
 
 ### Recursive Node Mutations
 
@@ -554,15 +564,13 @@ mutation {
       title: "Hello"
       body: "World"
       author: { create: { name: "Alice", email: "alice@example.com" } }
-      tags: {
-        items: [{ create: { name: "python" } }]
-        mode: REPLACE
-        onRemove: DELETE
-      }
+      tags: [{ create: { name: "python" } }]
     }
   }) { __typename }
 }
 ```
+
+List relations are flat arrays of ref operations (same `@oneOf` shape as `orm.ref`). Patch semantics apply — only mentioned items are affected.
 
 Generate only the input types (without the resolver) via `orm.mutations.create_node_input()` and `orm.mutations.update_node_input()`.
 
@@ -578,15 +586,9 @@ project = {
             "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
         },
         "comments": {
-            "_meta": {
-                "mode": ["PATCH", "REPLACE"],
-                "onRemove": ["DISCONNECT", "DELETE"],
-            },
             "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
         },
-        "tags": {
-            "_meta": {"mode": "REPLACE", "onRemove": "DELETE"},
-        },
+        "tags": {},
     },
     "comment": {
         "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
@@ -608,13 +610,9 @@ Rules:
 
 `_meta` supports:
 
-| Key | Values | Meaning |
-| --- | --- | --- |
-| `mode` | `PATCH`, `REPLACE` | List relation merge strategy. |
-| `onRemove` | `DISCONNECT`, `DELETE` | Action for removed items from a list relation. |
-| `onReplace` | `DISCONNECT`, `DELETE` | Action for the previous object when replacing a singular relation. |
+- `onReplace` — `"DISCONNECT"` or `"DELETE"`, or an array of both to expose a choice. Controls what happens to the previous object when replacing a singular (FK) relation. Default: `DISCONNECT`.
 
-Values can be a single string (fixes behavior, omits the GraphQL field) or an array of strings (exposes a choice to the caller). Defaults when omitted: `mode=PATCH`, `onRemove=DISCONNECT`, `onReplace=DISCONNECT`.
+Values can be a single string (fixes behavior, omits the GraphQL field) or an array of strings (exposes a choice to the caller).
 
 </details>
 
@@ -797,7 +795,7 @@ class Mutation:
 - `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
 - String regex filters are disabled by default
 - Filter depth, branch count, and `inList` size are capped
-- `orm.ref(..., delete=True)` unlinks by default; hard deletes require `hard_delete_refs=True`
+- `orm.ref()` provides explicit `unlink` (remove from relation) and `delete` (hard-delete) operations — both opt-in via `unlink=True` and `delete=True`
 
 **Your responsibility:**
 

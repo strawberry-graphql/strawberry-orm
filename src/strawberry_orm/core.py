@@ -538,9 +538,12 @@ class StrawberryORM:
         *,
         create: type | None = None,
         update: type | None = None,
+        unlink: bool = False,
         delete: bool = False,
     ) -> type:
-        return self._backend.ref(model, create=create, update=update, delete=delete)
+        return self._backend.ref(
+            model, create=create, update=update, unlink=unlink, delete=delete
+        )
 
     def apply_ref_list(
         self,
@@ -550,8 +553,6 @@ class StrawberryORM:
         info: Any,
         *,
         authorize: Any | None = None,
-        mode: str = "replace",
-        hard_delete_removed: bool | None = None,
     ) -> AwaitableOrValue[None]:
         return self._backend.apply_ref_list(
             instance,
@@ -559,8 +560,6 @@ class StrawberryORM:
             refs,
             info,
             authorize=authorize,
-            mode=mode,
-            hard_delete_removed=hard_delete_removed,
         )
 
     # -- Queryset overrides --------------------------------------------------

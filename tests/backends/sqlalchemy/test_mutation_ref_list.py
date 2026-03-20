@@ -1,4 +1,4 @@
-"""Ref-list mutation tests: link, create inline, update inline, delete, replace, mixed."""
+"""Ref-list mutation tests: link, create inline, update inline, unlink, delete, mixed."""
 
 
 def _sort_tags(data):
@@ -14,7 +14,9 @@ class TestMutationRefList:
     def test_link_existing_tags(self, execute, seed):
         data = execute("""
             mutation {
-                setPostTags(postId: 3, tags: [{ id: "1" }, { id: "3" }]) {
+                setPostTags(postId: 3, tags: [
+                    { update: { id: "1" } }, { update: { id: "3" } }
+                ]) {
                     title tags { name }
                 }
             }
@@ -30,7 +32,7 @@ class TestMutationRefList:
         data = execute("""
             mutation {
                 setPostTags(postId: 1, tags: [
-                    { id: "1" },
+                    { update: { id: "1" } },
                     { create: { name: "django" } }
                 ]) { tags { name } }
             }
@@ -45,7 +47,7 @@ class TestMutationRefList:
         data = execute("""
             mutation {
                 setPostTags(postId: 2, tags: [
-                    { id: "1" },
+                    { update: { id: "1" } },
                     { update: { id: "2", name: "gql" } }
                 ]) { tags { name } }
             }
@@ -56,12 +58,12 @@ class TestMutationRefList:
             }
         }
 
-    def test_delete_related_tag(self, execute, seed, sa_session, Tag):
+    def test_unlink_related_tag(self, execute, seed, sa_session, Tag):
         data = execute("""
             mutation {
                 setPostTags(postId: 2, tags: [
-                    { id: "1" },
-                    { delete: { id: "2" } }
+                    { update: { id: "1" } },
+                    { unlink: { id: "2" } }
                 ]) { tags { name } }
             }
         """)
@@ -69,21 +71,25 @@ class TestMutationRefList:
         tag2 = sa_session.get(Tag, 2)
         assert tag2 is not None
 
-    def test_replace_all_tags(self, execute, seed):
+    def test_delete_related_tag(self, execute, seed, sa_session, Tag):
         data = execute("""
             mutation {
-                setPostTags(postId: 2, tags: [{ id: "3" }]) {
-                    tags { name }
-                }
+                setPostTags(postId: 2, tags: [
+                    { update: { id: "1" } },
+                    { delete: { id: "2" } }
+                ]) { tags { name } }
             }
         """)
-        assert data == {"setPostTags": {"tags": [{"name": "rust"}]}}
+        assert data == {"setPostTags": {"tags": [{"name": "python"}]}}
+        sa_session.expire_all()
+        tag2 = sa_session.get(Tag, 2)
+        assert tag2 is None
 
     def test_mixed_operations(self, execute, seed):
         data = execute("""
             mutation {
                 setPostTags(postId: 1, tags: [
-                    { id: "3" },
+                    { update: { id: "3" } },
                     { create: { name: "fastapi" } },
                     { update: { id: "1", name: "py" } }
                 ]) { tags { name } }

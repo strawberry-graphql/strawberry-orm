@@ -71,7 +71,7 @@ class CreateTagInput:
 @strawberry.input
 class UpdateTagInput:
     id: strawberry.ID
-    name: str
+    name: str | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -94,6 +94,7 @@ TagRef = _main_orm.ref(
     TortTag,
     create=CreateTagInput,
     update=UpdateTagInput,
+    unlink=True,
     delete=True,
 )
 
@@ -167,13 +168,9 @@ def _build_node_mutation_schema():
         "post": {
             "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
             "comments": {
-                "_meta": {
-                    "mode": ["PATCH", "REPLACE"],
-                    "onRemove": ["DISCONNECT", "DELETE"],
-                },
                 "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
             },
-            "tags": {"_meta": {"mode": "REPLACE", "onRemove": "DELETE"}},
+            "tags": {},
         },
         "comment": {
             "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},

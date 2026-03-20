@@ -288,7 +288,11 @@ class TestVulnB_DjangoRefListAuthorizationBypass:
             return True
 
         group_ref = orm.ref(AuditGroup)
-        ref = group_ref(id="1")
+        update_type = group_ref.__dataclass_fields__["update"].type
+        actual_type = (
+            update_type.__args__[0] if hasattr(update_type, "__args__") else update_type
+        )
+        ref = group_ref(update=actual_type(id="1"))
         user = seeded.get(AuditUser, 1)
 
         class FakeInfo:
@@ -568,7 +572,11 @@ class TestVulnO_RefIdTypeCoercion:
         """Non-numeric string ID should fail gracefully, not crash."""
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
         group_ref = orm.ref(AuditGroup)
-        ref = group_ref(id="not-a-number")
+        update_type = group_ref.__dataclass_fields__["update"].type
+        actual_type = (
+            update_type.__args__[0] if hasattr(update_type, "__args__") else update_type
+        )
+        ref = group_ref(update=actual_type(id="not-a-number"))
 
         user = seeded.get(AuditUser, 1)
 
@@ -786,8 +794,8 @@ class TestAdvisory3_DefaultQueryLimit:
 class TestAdvisory4_RefListPatchMode:
     """apply_ref_list mode='patch' should not replace the entire list."""
 
-    def test_sa_patch_mode_preserves_existing(self, engine, seeded):
-        """mode='patch' should add new refs without removing existing ones."""
+    def test_sa_patch_semantics_preserves_existing(self, engine, seeded):
+        """Patch semantics should add new refs without removing existing ones."""
         orm = StrawberryORM("sqlalchemy", dialect="sqlite")
         user = seeded.get(AuditUser, 1)
         group1 = seeded.get(AuditGroup, 1)
@@ -796,50 +804,24 @@ class TestAdvisory4_RefListPatchMode:
         assert len(user.groups) == 1
 
         group_ref = orm.ref(AuditGroup)
-        ref = group_ref(id="2")
+        update_type = group_ref.__dataclass_fields__["update"].type
+        actual_type = (
+            update_type.__args__[0] if hasattr(update_type, "__args__") else update_type
+        )
+        ref = group_ref(update=actual_type(id="2"))
 
         class FakeInfo:
             context = {"session": seeded}
 
-        orm.apply_ref_list(user, "groups", [ref], FakeInfo(), mode="patch")
+        orm.apply_ref_list(user, "groups", [ref], FakeInfo())
         seeded.flush()
 
         group_ids = sorted(g.id for g in user.groups)
         assert 1 in group_ids, (
-            f"mode='patch' should preserve existing group 1. Got: {group_ids}"
+            f"Patch semantics should preserve existing group 1. Got: {group_ids}"
         )
-        assert 2 in group_ids, f"mode='patch' should add new group 2. Got: {group_ids}"
-
-    def test_sa_replace_mode_replaces_all(self, engine, seeded):
-        """mode='replace' (default) should replace the entire list."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
-        user = seeded.get(AuditUser, 1)
-        group1 = seeded.get(AuditGroup, 1)
-        user.groups.append(group1)
-        seeded.flush()
-        assert len(user.groups) == 1
-
-        group_ref = orm.ref(AuditGroup)
-        ref = group_ref(id="2")
-
-        class FakeInfo:
-            context = {"session": seeded}
-
-        orm.apply_ref_list(user, "groups", [ref], FakeInfo(), mode="replace")
-        seeded.flush()
-
-        group_ids = [g.id for g in user.groups]
-        assert group_ids == [2], f"mode='replace' should replace all. Got: {group_ids}"
-
-    def test_protocol_has_mode_param(self):
-        """The protocol should have a mode parameter."""
-        import inspect
-        from strawberry_orm.backends.protocol import Backend
-
-        sig = inspect.signature(Backend.apply_ref_list)
-        params = list(sig.parameters.keys())
-        assert "mode" in params, (
-            f"Backend.apply_ref_list should have 'mode' param. Got: {params}"
+        assert 2 in group_ids, (
+            f"Patch semantics should add new group 2. Got: {group_ids}"
         )
 
 

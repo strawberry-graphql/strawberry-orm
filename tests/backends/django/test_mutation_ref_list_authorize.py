@@ -16,7 +16,7 @@ def schema_execute():
 
 @pytest.fixture
 def build_ref_list_authorize_schema():
-    def _build(Post, Tag, *, authorizer, mode, hard_delete_removed):
+    def _build(Post, Tag, *, authorizer):
         orm = StrawberryORM("django")
 
         @strawberry.input
@@ -26,9 +26,11 @@ def build_ref_list_authorize_schema():
         @strawberry.input
         class UpdateTagInput:
             id: strawberry.ID
-            name: str
+            name: str | None = strawberry.UNSET
 
-        TagRef = orm.ref(Tag, create=CreateTagInput, update=UpdateTagInput, delete=True)
+        TagRef = orm.ref(
+            Tag, create=CreateTagInput, update=UpdateTagInput, unlink=True, delete=True
+        )
 
         @orm.type(Tag)
         class TagType:
@@ -52,8 +54,6 @@ def build_ref_list_authorize_schema():
                     tags,
                     info,
                     authorize=authorizer,
-                    mode=mode,
-                    hard_delete_removed=hard_delete_removed,
                 )
                 return list(post.tags.order_by("id"))  # type: ignore[return-value]
 

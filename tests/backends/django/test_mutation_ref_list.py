@@ -1,4 +1,4 @@
-"""Related list mutation (orm.ref) tests: link, create, update, delete, mixed."""
+"""Related list mutation (orm.ref) tests: link, create, update, unlink, delete, mixed."""
 
 
 def _sort_tags(data):
@@ -14,7 +14,7 @@ class TestMutationRefList:
     def test_link_existing_tags(self, execute, seed):
         data = execute("""
             mutation {
-                setPostTags(postId: 3, tags: [{ id: "1" }]) {
+                setPostTags(postId: 3, tags: [{ update: { id: "1" } }]) {
                     title tags { name }
                 }
             }
@@ -53,6 +53,16 @@ class TestMutationRefList:
         """)
         assert data == {"setPostTags": {"tags": [{"name": "python3"}]}}
 
+    def test_unlink_related_tag(self, execute, seed):
+        data = execute("""
+            mutation {
+                setPostTags(postId: 1, tags: [{ unlink: { id: "1" } }]) {
+                    tags { name }
+                }
+            }
+        """)
+        assert data == {"setPostTags": {"tags": []}}
+
     def test_delete_related_tag(self, execute, seed):
         data = execute("""
             mutation {
@@ -63,21 +73,11 @@ class TestMutationRefList:
         """)
         assert data == {"setPostTags": {"tags": []}}
 
-    def test_replace_all_tags(self, execute, seed):
-        data = execute("""
-            mutation {
-                setPostTags(postId: 2, tags: [{ id: "3" }]) {
-                    tags { name }
-                }
-            }
-        """)
-        assert data == {"setPostTags": {"tags": [{"name": "rust"}]}}
-
     def test_mixed_operations(self, execute, seed):
         data = execute("""
             mutation {
                 setPostTags(postId: 2, tags: [
-                    { id: "2" },
+                    { update: { id: "2" } },
                     { create: { name: "testing" } },
                     { update: { id: "1", name: "python3" } }
                 ]) {

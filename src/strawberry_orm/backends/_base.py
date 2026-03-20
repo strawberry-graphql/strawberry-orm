@@ -68,7 +68,6 @@ class BaseBackend:
         self._exclude_sensitive_fields: bool = kwargs.get(
             "exclude_sensitive_fields", True
         )
-        self._hard_delete_refs: bool = kwargs.get("hard_delete_refs", False)
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
 
     # -- Abstract / hook methods (override in subclasses) --------------------
@@ -418,9 +417,12 @@ class BaseBackend:
         *,
         create: type | None = None,
         update: type | None = None,
+        unlink: bool = False,
         delete: bool = False,
     ) -> type:
-        return make_ref_type(model, create=create, update=update, delete=delete)
+        return make_ref_type(
+            model, create=create, update=update, unlink=unlink, delete=delete
+        )
 
     # -- Shared helpers ------------------------------------------------------
 
