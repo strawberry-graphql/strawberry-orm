@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import typing
 import warnings
@@ -59,6 +60,8 @@ class BaseBackend:
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
         self._type_registry: dict[str, type] = {}
         self._graphql_type_registry: dict[type, type] = {}
+        self._filter_registry: dict[type, type] = {}
+        self._projected_filter_cache: dict[tuple[type, Any], type] = {}
         self._type_querysets: dict[type, Any] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
@@ -137,15 +140,40 @@ class BaseBackend:
         model = model_or_type
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
+        project: dict[str, Any] | None = kwargs.get("project")
 
         enable_regex = getattr(self, "_enable_regex_filters", False)
 
         fields_meta = self._introspect_model(model)
 
+        if project is not None:
+            relation_names = {
+                fname for fname, _, is_rel, _ in fields_meta if is_rel
+            }
+            unknown = set(project.keys()) - relation_names
+            if unknown:
+                raise ValueError(
+                    f"Unknown relation(s) in project for {model.__name__}: "
+                    f"{', '.join(sorted(unknown))}"
+                )
+
+        # Check the projected-filter cache for projected (non-default) calls.
+        if project is not None:
+            cache_key = (model, self._filter_project_signature(project))
+            cached = self._projected_filter_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        suffix = self._filter_project_suffix(project)
+
         field_annotations: dict[str, Any] = {}
         field_defaults: dict[str, Any] = {}
 
-        for fname, ftype, is_relation, _rel_model in fields_meta:
+        object_annotations: dict[str, Any] = {}
+        object_defaults: dict[str, Any] = {}
+        relation_models: dict[str, type] = {}
+
+        for fname, ftype, is_relation, rel_model in fields_meta:
             if include and fname not in include:
                 continue
             if exclude and fname in exclude:
@@ -153,6 +181,19 @@ class BaseBackend:
             if self._exclude_generated_sensitive_field(fname, include):
                 continue
             if is_relation:
+                if rel_model is None:
+                    continue
+                if project is not None and fname not in project:
+                    continue
+                sub_project = project[fname] if project is not None else None
+                if sub_project is not None:
+                    rel_filter = self._get_projected_filter(rel_model, sub_project)
+                else:
+                    rel_filter = self._filter_registry.get(rel_model)
+                if rel_filter is not None:
+                    object_annotations[fname] = Optional[rel_filter]
+                    object_defaults[fname] = strawberry.UNSET
+                    relation_models[fname] = rel_model
                 continue
             lookup_type = self._filter_overrides.get(ftype) or TYPE_TO_LOOKUP.get(ftype)
             if lookup_type is not None:
@@ -161,15 +202,20 @@ class BaseBackend:
                 field_annotations[fname] = Optional[lookup_type]
                 field_defaults[fname] = strawberry.UNSET
 
-        field_type_name = f"{model.__name__}Field"
-        field_ns: dict[str, Any] = {
-            "__annotations__": field_annotations,
-            **field_defaults,
-        }
-        field_cls = type(field_type_name, (), field_ns)
-        FieldType = strawberry.input(field_cls, one_of=True)
+        # Reuse the existing FieldType when creating a projected variant.
+        base_filter = self._filter_registry.get(model)
+        if project is not None and base_filter is not None and hasattr(base_filter, "_field_type"):
+            FieldType = base_filter._field_type
+        else:
+            field_type_name = f"{model.__name__}Field{suffix}"
+            field_ns: dict[str, Any] = {
+                "__annotations__": field_annotations,
+                **field_defaults,
+            }
+            field_cls = type(field_type_name, (), field_ns)
+            FieldType = strawberry.input(field_cls, one_of=True)
 
-        filter_type_name = f"{model.__name__}Filter"
+        filter_type_name = f"{model.__name__}Filter{suffix}"
         filter_ns: dict[str, Any] = {
             "__annotations__": {"field": Optional[FieldType]},
             "field": strawberry.UNSET,
@@ -185,10 +231,76 @@ class BaseBackend:
         FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
         FilterCls.one_of = strawberry.UNSET
 
+        if object_annotations:
+            obj_type_name = f"{model.__name__}Object{suffix}"
+            obj_ns: dict[str, Any] = {
+                "__annotations__": object_annotations,
+                **object_defaults,
+            }
+            obj_cls = type(obj_type_name, (), obj_ns)
+            ObjectType = strawberry.input(obj_cls, one_of=True)
+            FilterCls.__annotations__["object"] = Optional[ObjectType]
+            FilterCls.object = strawberry.UNSET
+
         FilterType = strawberry.input(FilterCls, one_of=True)
         FilterType._field_type = FieldType  # type: ignore[attr-defined]
         FilterType.__orm_model__ = model  # type: ignore[attr-defined]
+        if object_annotations:
+            FilterType._object_type = ObjectType  # type: ignore[attr-defined]
+            FilterType._relation_models = relation_models  # type: ignore[attr-defined]
+
+        if project is None:
+            self._filter_registry[model] = FilterType
+        else:
+            self._projected_filter_cache[cache_key] = FilterType
         return FilterType
+
+    # -- Filter project helpers ------------------------------------------------
+
+    def _get_projected_filter(self, model: type, sub_project: dict[str, Any]) -> Any:
+        """Return a filter type for *model* constrained by *sub_project*.
+
+        If *sub_project* is empty the returned filter has no ``object`` type
+        (leaf).  Otherwise only the relations listed in *sub_project* are
+        exposed, each recursively constrained by their own sub-project.
+        """
+        sig = self._filter_project_signature(sub_project)
+        cache_key = (model, sig)
+        cached = self._projected_filter_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not sub_project:
+            base = self._filter_registry.get(model)
+            if base is not None and not hasattr(base, "_object_type"):
+                self._projected_filter_cache[cache_key] = base
+                return base
+        result = self.filter(model, project=sub_project)
+        return result
+
+    @staticmethod
+    def _filter_project_signature(project: dict[str, Any] | None) -> Any:
+        """Turn a project dict into a hashable, comparable value."""
+        if project is None:
+            return None
+        if not project:
+            return ()
+        return tuple(
+            sorted(
+                (k, BaseBackend._filter_project_signature(v))
+                for k, v in project.items()
+            )
+        )
+
+    @staticmethod
+    def _filter_project_suffix(project: dict[str, Any] | None) -> str:
+        """Short hash suffix for projected type names (empty for default)."""
+        sig = BaseBackend._filter_project_signature(project)
+        if sig is None:
+            return ""
+        if not sig:
+            return "_leaf"
+        digest = hashlib.sha1(repr(sig).encode("utf-8")).hexdigest()[:8]
+        return f"_{digest}"
 
     def order(self, model_or_type: type, **kwargs: Any) -> Any:
         model = model_or_type

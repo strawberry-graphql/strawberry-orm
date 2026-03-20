@@ -636,6 +636,7 @@ def _build_django_filter(
     enable_regex: bool = False,
     max_in_list_size: int = 500,
     _depth: int = 0,
+    _prefix: str = "",
 ) -> Any:
     from django.db.models import Q
 
@@ -652,6 +653,7 @@ def _build_django_filter(
         enable_regex=enable_regex,
         max_in_list_size=max_in_list_size,
         _depth=_depth + 1,
+        _prefix=_prefix,
     )
 
     for key in fields:
@@ -662,9 +664,25 @@ def _build_django_filter(
         if key == "field":
             return _build_django_field_clause(
                 val,
+                prefix=_prefix,
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
             )
+        elif key == "object":
+            obj_fields = val.__class__.__dataclass_fields__
+            for rel_name in obj_fields:
+                nested_filter = getattr(val, rel_name)
+                if nested_filter is strawberry.UNSET or nested_filter is None:
+                    continue
+                return _build_django_filter(
+                    nested_filter,
+                    max_depth=max_depth,
+                    max_branches=max_branches,
+                    enable_regex=enable_regex,
+                    max_in_list_size=max_in_list_size,
+                    _depth=_depth + 1,
+                    _prefix=f"{_prefix}{rel_name}__",
+                )
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -708,6 +726,7 @@ def _build_django_filter(
 def _build_django_field_clause(
     field_input: Any,
     *,
+    prefix: str = "",
     enable_regex: bool = False,
     max_in_list_size: int = 500,
 ) -> Any:
@@ -722,7 +741,7 @@ def _build_django_field_clause(
             continue
 
         col_q = _build_django_lookup(
-            col_name,
+            f"{prefix}{col_name}",
             lookup,
             enable_regex=enable_regex,
             max_in_list_size=max_in_list_size,

@@ -880,6 +880,20 @@ def _build_sa_filter(
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
             )
+        elif key == "object":
+            obj_fields = val.__class__.__dataclass_fields__
+            for rel_name in obj_fields:
+                nested_filter = getattr(val, rel_name)
+                if nested_filter is strawberry.UNSET or nested_filter is None:
+                    continue
+                relationship_prop = getattr(model, rel_name)
+                rel_model = relationship_prop.property.mapper.class_
+                inner = _build_sa_filter(nested_filter, rel_model, **recurse_kw)
+                if inner is not None:
+                    if relationship_prop.property.uselist:
+                        return relationship_prop.any(inner)
+                    else:
+                        return relationship_prop.has(inner)
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(

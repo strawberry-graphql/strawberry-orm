@@ -390,6 +390,104 @@ Typical string lookups: `exact`, `neq`, `contains`, `iContains`, `startsWith`, `
 
 Regex lookups (`regex`, `iRegex`) are disabled by default. Enable with `enable_regex_filters=True`.
 
+#### Object Traversal
+
+When filters are registered for related models, the generated filter gains an `object` key that lets you filter parent rows based on conditions on their related objects:
+
+```python
+UserFilter = orm.filter(User)
+PostFilter = orm.filter(Post)   # Post has an "author" relation to User
+```
+
+```graphql
+{
+  posts(filter: {
+    object: { author: { field: { name: { exact: "Alice" } } } }
+  }) {
+    title
+  }
+}
+```
+
+Object traversal composes with boolean operators:
+
+```graphql
+{
+  posts(filter: {
+    all: [
+      { field: { isPublished: { exact: true } } }
+      { object: { author: { field: { name: { exact: "Alice" } } } } }
+    ]
+  }) { title }
+}
+```
+
+Multi-level traversal works when the intermediate models also have registered filters:
+
+```python
+UserFilter = orm.filter(User)
+PostFilter = orm.filter(Post)
+CommentFilter = orm.filter(Comment)  # Comment -> Post -> User
+```
+
+```graphql
+# Find comments on posts written by Alice
+{
+  comments(filter: {
+    object: { post: {
+      object: { author: { field: { name: { exact: "Alice" } } } }
+    } }
+  }) { body }
+}
+```
+
+The `object` type is `@oneOf`, so each filter entry names exactly one relation.
+
+Relations only appear in `object` if their target model already has a registered filter at the time `orm.filter()` is called. Register child model filters before parent model filters.
+
+#### Filter Projection
+
+By default every relation with a registered filter appears in `object`. Pass `project={...}` to `orm.filter()` to control exactly which relations are exposed and how deep traversal can go:
+
+```python
+UserFilter  = orm.filter(User)
+TagFilter   = orm.filter(Tag)
+CommentFilter = orm.filter(Comment)
+
+# Only expose "author" in the object type — tags and comments are excluded
+PostFilter = orm.filter(Post, project={"author": {}})
+```
+
+```graphql
+# This works (author is projected)
+{ posts(filter: { object: { author: { field: { name: { exact: "Alice" } } } } }) { title } }
+
+# This would be a schema error (tags is not projected)
+{ posts(filter: { object: { tags: { field: { name: { exact: "python" } } } } }) { title } }
+```
+
+Sub-project dicts control nested traversal. An empty dict `{}` means "include this relation but don't allow further object traversal from it". A non-empty dict lists which of the related model's relations are reachable:
+
+```python
+# Allow Comment -> post, and from post -> author (but not post -> tags)
+CommentFilter = orm.filter(Comment, project={
+    "post": {
+        "author": {},
+    },
+})
+```
+
+Summary:
+
+| `project` value | Behavior |
+| --- | --- |
+| `None` (default) | Auto-include all relations with registered filters |
+| `{}` | No `object` type at all (scalar lookups only) |
+| `{"rel": {}}` | Include `rel` as a leaf (no further traversal from it) |
+| `{"rel": {"nested": {}}}` | Include `rel` and allow traversal to `nested` from it |
+
+Projected filters are cached internally and do not overwrite the global filter registry, so you can create multiple projected variants of the same model's filter for different schema entry points.
+
 ### Ordering
 
 Generate an order input:

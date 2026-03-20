@@ -42,6 +42,8 @@ TORT_EXCLUDED_FILES = {
     "test_query_filter_boolean_operators.py",
     "test_query_filter_nested_conditions.py",
     "test_query_filter_relationships.py",
+    "test_query_filter_object_traversal.py",
+    "test_query_filter_object_project.py",
     "test_query_order_direction_and_nulls.py",
     "test_query_auto_resolution.py",
     "test_query_type_generation.py",
