@@ -42,7 +42,7 @@ class TestRelayConnectionFilteringAndOrdering:
             query UsersConnection($after: String) {
                 usersConnection(
                     filter: { field: { email: { contains: "example.com" } } }
-                    order: [{ name: DESC }]
+                    order: [{ field: { name: DESC } }]
                     first: 1
                     after: $after
                 ) {
@@ -108,7 +108,7 @@ class TestRelayConnectionFilteringAndOrdering:
         result = schema.execute_sync(
             """
                 {
-                    usersConnection(order: [{ name: DESC }], first: 2) {
+                    usersConnection(order: [{ field: { name: DESC } }], first: 2) {
                         edges {
                             node { name }
                         }
@@ -135,7 +135,7 @@ class TestRelayConnectionFilteringAndOrdering:
                 {
                     users(
                         filter: { field: { email: { contains: "example.com" } } }
-                        order: [{ name: DESC }]
+                        order: [{ field: { name: DESC } }]
                     ) {
                         name
                         email

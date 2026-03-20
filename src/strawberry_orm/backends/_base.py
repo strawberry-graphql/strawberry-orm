@@ -62,6 +62,7 @@ class BaseBackend:
         self._graphql_type_registry: dict[type, type] = {}
         self._filter_registry: dict[type, type] = {}
         self._projected_filter_cache: dict[tuple[type, Any], type] = {}
+        self._order_registry: dict[type, type] = {}
         self._type_querysets: dict[type, Any] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
@@ -147,9 +148,7 @@ class BaseBackend:
         fields_meta = self._introspect_model(model)
 
         if project is not None:
-            relation_names = {
-                fname for fname, _, is_rel, _ in fields_meta if is_rel
-            }
+            relation_names = {fname for fname, _, is_rel, _ in fields_meta if is_rel}
             unknown = set(project.keys()) - relation_names
             if unknown:
                 raise ValueError(
@@ -204,7 +203,11 @@ class BaseBackend:
 
         # Reuse the existing FieldType when creating a projected variant.
         base_filter = self._filter_registry.get(model)
-        if project is not None and base_filter is not None and hasattr(base_filter, "_field_type"):
+        if (
+            project is not None
+            and base_filter is not None
+            and hasattr(base_filter, "_field_type")
+        ):
             FieldType = base_filter._field_type
         else:
             field_type_name = f"{model.__name__}Field{suffix}"
@@ -308,10 +311,15 @@ class BaseBackend:
         exclude = kwargs.get("exclude")
 
         fields_meta = self._introspect_model(model)
-        annotations: dict[str, Any] = {}
-        defaults: dict[str, Any] = {}
 
-        for fname, _ftype, is_relation, _rel_model in fields_meta:
+        field_annotations: dict[str, Any] = {}
+        field_defaults: dict[str, Any] = {}
+
+        object_annotations: dict[str, Any] = {}
+        object_defaults: dict[str, Any] = {}
+        relation_models: dict[str, type] = {}
+
+        for fname, _ftype, is_relation, rel_model in fields_meta:
             if include and fname not in include:
                 continue
             if exclude and fname in exclude:
@@ -319,16 +327,50 @@ class BaseBackend:
             if self._exclude_generated_sensitive_field(fname, include):
                 continue
             if is_relation:
+                if rel_model is not None:
+                    rel_order = self._order_registry.get(rel_model)
+                    if rel_order is not None:
+                        object_annotations[fname] = Optional[rel_order]
+                        object_defaults[fname] = strawberry.UNSET
+                        relation_models[fname] = rel_model
                 continue
-            annotations[fname] = Optional[Ordering]
-            defaults[fname] = strawberry.UNSET
+            field_annotations[fname] = Optional[Ordering]
+            field_defaults[fname] = strawberry.UNSET
 
-        type_name = f"{model.__name__}Order"
-        ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
-        cls = type(type_name, (), ns)
-        result = strawberry.input(cls, one_of=True)
-        result.__orm_model__ = model  # type: ignore[attr-defined]
-        return result
+        field_type_name = f"{model.__name__}OrderField"
+        field_ns: dict[str, Any] = {
+            "__annotations__": field_annotations,
+            **field_defaults,
+        }
+        field_cls = type(field_type_name, (), field_ns)
+        OrderFieldType = strawberry.input(field_cls, one_of=True)
+
+        order_type_name = f"{model.__name__}Order"
+        order_ns: dict[str, Any] = {
+            "__annotations__": {"field": Optional[OrderFieldType]},
+            "field": strawberry.UNSET,
+        }
+        OrderCls = type(order_type_name, (), order_ns)
+
+        if object_annotations:
+            obj_type_name = f"{model.__name__}OrderObject"
+            obj_ns: dict[str, Any] = {
+                "__annotations__": object_annotations,
+                **object_defaults,
+            }
+            obj_cls = type(obj_type_name, (), obj_ns)
+            OrderObjectType = strawberry.input(obj_cls, one_of=True)
+            OrderCls.__annotations__["object"] = Optional[OrderObjectType]
+            OrderCls.object = strawberry.UNSET
+
+        OrderType = strawberry.input(OrderCls, one_of=True)
+        OrderType._field_type = OrderFieldType  # type: ignore[attr-defined]
+        OrderType.__orm_model__ = model  # type: ignore[attr-defined]
+        if object_annotations:
+            OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
+            OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        self._order_registry[model] = OrderType
+        return OrderType
 
     # -- Fields --------------------------------------------------------------
 

@@ -1007,20 +1007,46 @@ def _apply_python_ordering(
 
 
 def _build_tortoise_ordering(
-    order_input: Any,
+    order_input: Any, _prefix: str = ""
 ) -> list[tuple[str, bool, bool | None, bool | None]]:
     """Translate an order input into Tortoise and Python sort metadata."""
     clauses: list[tuple[str, bool, bool | None, bool | None]] = []
     fields = order_input.__class__.__dataclass_fields__
 
+    for key in fields:
+        val = getattr(order_input, key)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        if key == "field":
+            clauses.extend(_build_tortoise_order_field(val, _prefix))
+        elif key == "object":
+            obj_fields = val.__class__.__dataclass_fields__
+            for rel_name in obj_fields:
+                nested = getattr(val, rel_name)
+                if nested is strawberry.UNSET or nested is None:
+                    continue
+                clauses.extend(
+                    _build_tortoise_ordering(nested, _prefix=f"{_prefix}{rel_name}__")
+                )
+
+    return clauses
+
+
+def _build_tortoise_order_field(
+    field_input: Any, prefix: str = ""
+) -> list[tuple[str, bool, bool | None, bool | None]]:
+    clauses: list[tuple[str, bool, bool | None, bool | None]] = []
+    fields = field_input.__class__.__dataclass_fields__
+
     for col_name in fields:
-        direction = getattr(order_input, col_name)
+        direction = getattr(field_input, col_name)
         if direction is strawberry.UNSET or direction is None:
             continue
         dir_value = direction.value if hasattr(direction, "value") else str(direction)
         clauses.append(
             (
-                col_name,
+                f"{prefix}{col_name}",
                 dir_value.startswith("DESC"),
                 "NULLS_FIRST" in dir_value,
                 "NULLS_LAST" in dir_value,

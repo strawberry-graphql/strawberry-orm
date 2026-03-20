@@ -104,7 +104,7 @@ class TestAsyncSessionExecution:
             {
                 users {
                     name
-                    posts(order: [{ title: DESC }]) {
+                    posts(order: [{ field: { title: DESC } }]) {
                         title
                     }
                 }

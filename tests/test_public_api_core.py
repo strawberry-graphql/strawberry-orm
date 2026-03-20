@@ -102,9 +102,10 @@ class TestPublicApiCore:
             UserFilter(field=UserField(name=StringLookup(exact="Alice"))),
             SAUser,
         )
+        OrderField = UserOrder._field_type  # type: ignore[attr-defined]
         ordered = orm.apply_ordering(
             filtered,
-            [UserOrder(name=Ordering.ASC)],
+            [UserOrder(field=OrderField(name=Ordering.ASC))],
             SAUser,
         )
         data = sa_session.execute(ordered).scalars().all()

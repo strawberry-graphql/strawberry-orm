@@ -69,9 +69,7 @@ _projected_schema = strawberry.Schema(
 
 
 def _execute(query, variables=None, expect_errors=False):
-    result = _projected_schema.execute_sync(
-        query, variable_values=variables or {}
-    )
+    result = _projected_schema.execute_sync(query, variable_values=variables or {})
     if expect_errors:
         return result
     assert result.errors is None, f"GraphQL errors: {result.errors}"

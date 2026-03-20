@@ -69,7 +69,7 @@ class TestInternalBackendCoverage:
                 RegexLookup(i_regex="a.*"),
                 enable_regex=False,
             )
-        assert _build_sa_ordering(InvalidOrderInput(), User) == []
+        assert _build_sa_ordering(InvalidOrderInput(), User) == ([], [])
 
     def test_query_object_helpers_handle_fallback_values(self, sa_session):
         backend = SQLAlchemyBackend(dialect="sqlite")

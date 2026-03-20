@@ -60,7 +60,7 @@ class TestQueryErrorHandling:
 class TestQueryOrderDirection:
     @pytest.mark.asyncio
     async def test_order_by_name_asc(self, execute, seed):
-        data = await execute("{ users(order: [{ name: ASC }]) { name } }")
+        data = await execute("{ users(order: [{ field: { name: ASC } }]) { name } }")
         assert data == {
             "users": [
                 {"name": "Alice"},
@@ -71,7 +71,7 @@ class TestQueryOrderDirection:
 
     @pytest.mark.asyncio
     async def test_order_by_name_desc(self, execute, seed):
-        data = await execute("{ users(order: [{ name: DESC }]) { name } }")
+        data = await execute("{ users(order: [{ field: { name: DESC } }]) { name } }")
         assert data == {
             "users": [
                 {"name": "Charlie"},
@@ -82,7 +82,7 @@ class TestQueryOrderDirection:
 
     @pytest.mark.asyncio
     async def test_order_by_title_asc(self, execute, seed):
-        data = await execute("{ posts(order: [{ title: ASC }]) { title } }")
+        data = await execute("{ posts(order: [{ field: { title: ASC } }]) { title } }")
         assert data == {
             "posts": [
                 {"title": "Draft Post"},
@@ -98,7 +98,7 @@ class TestQueryOrderDirection:
             """
             { posts(
                 filter: { field: { isPublished: { exact: true } } },
-                order: [{ title: DESC }]
+                order: [{ field: { title: DESC } }]
             ) { title } }
             """
         )
@@ -116,7 +116,7 @@ class TestQueryOrderDirection:
             """
             { users(
                 filter: { field: { email: { contains: "example" } } },
-                order: [{ name: DESC }]
+                order: [{ field: { name: DESC } }]
             ) { name email } }
             """
         )
@@ -132,7 +132,7 @@ class TestQueryOrderTieBreaking:
     @pytest.mark.asyncio
     async def test_tie_break_published_then_title(self, execute, seed):
         data = await execute(
-            "{ posts(order: [{ isPublished: DESC }, { title: ASC }]) { title isPublished } }"
+            "{ posts(order: [{ field: { isPublished: DESC } }, { field: { title: ASC } }]) { title isPublished } }"
         )
         assert data == {
             "posts": [
@@ -146,7 +146,7 @@ class TestQueryOrderTieBreaking:
     @pytest.mark.asyncio
     async def test_tie_break_published_then_title_desc(self, execute, seed):
         data = await execute(
-            "{ posts(order: [{ isPublished: DESC }, { title: DESC }]) { title isPublished } }"
+            "{ posts(order: [{ field: { isPublished: DESC } }, { field: { title: DESC } }]) { title isPublished } }"
         )
         assert data == {
             "posts": [
@@ -808,7 +808,7 @@ class TestQueryOrderRelationships:
             """
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: [{ title: ASC }]) { title }
+                posts(order: [{ field: { title: ASC } }]) { title }
             } }
             """
         )
@@ -830,7 +830,7 @@ class TestQueryOrderRelationships:
             """
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: [{ title: DESC }]) { title }
+                posts(order: [{ field: { title: DESC } }]) { title }
             } }
             """
         )
@@ -852,7 +852,7 @@ class TestQueryOrderRelationships:
             """
             { posts(filter: { field: { title: { exact: "GraphQL Guide" } } }) {
                 title
-                tags(order: [{ name: DESC }]) { name }
+                tags(order: [{ field: { name: DESC } }]) { name }
             } }
             """
         )
@@ -871,7 +871,7 @@ class TestQueryOrderRelationships:
             """
             { posts(filter: { field: { title: { exact: "GraphQL Guide" } } }) {
                 title
-                tags(order: [{ name: ASC }]) { name }
+                tags(order: [{ field: { name: ASC } }]) { name }
             } }
             """
         )
@@ -890,7 +890,7 @@ class TestQueryOrderRelationships:
             """
             { posts(filter: { field: { title: { exact: "Hello World" } } }) {
                 title
-                comments(order: [{ body: ASC }]) { body }
+                comments(order: [{ field: { body: ASC } }]) { body }
             } }
             """
         )
@@ -913,7 +913,7 @@ class TestQueryFilterAndOrderRelationships:
                 name
                 posts(
                     filter: { field: { isPublished: { exact: true } } },
-                    order: [{ title: DESC }]
+                    order: [{ field: { title: DESC } }]
                 ) { title }
             } }
             """
@@ -938,7 +938,7 @@ class TestQueryFilterAndOrderRelationships:
                 title
                 comments(
                     filter: { field: { body: { neq: "Thanks!" } } },
-                    order: [{ id: ASC }]
+                    order: [{ field: { id: ASC } }]
                 ) { body }
             } }
             """
@@ -951,11 +951,11 @@ class TestQueryFilterAndOrderRelationships:
     async def test_multiple_users_with_nested_filter_and_order(self, execute, seed):
         data = await execute(
             """
-            { users(order: [{ name: ASC }]) {
+            { users(order: [{ field: { name: ASC } }]) {
                 name
                 posts(
                     filter: { field: { isPublished: { exact: true } } },
-                    order: [{ title: ASC }]
+                    order: [{ field: { title: ASC } }]
                 ) { title }
             } }
             """
@@ -980,10 +980,10 @@ class TestQueryFilterAndOrderRelationships:
             """
             { users(filter: { field: { name: { exact: "Alice" } } }) {
                 name
-                posts(order: [{ title: ASC }]) {
+                posts(order: [{ field: { title: ASC } }]) {
                     title
-                    comments(order: [{ body: ASC }]) { body }
-                    tags(order: [{ name: ASC }]) { name }
+                    comments(order: [{ field: { body: ASC } }]) { body }
+                    tags(order: [{ field: { name: ASC } }]) { name }
                 }
             } }
             """

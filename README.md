@@ -2,53 +2,42 @@
 
 Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.rocks/) on top of Django ORM, SQLAlchemy, and Tortoise ORM.
 
-> ## WARNING
-> 🟧🟨 `strawberry-orm` is still in **alpha**. Expect breaking changes, incomplete APIs, and release-to-release churn while the package stabilizes. 🟨🟧
+> **Warning** — `strawberry-orm` is still in **alpha**. Expect breaking changes and incomplete APIs while the package stabilizes.
 
-`strawberry-orm` helps you keep one Strawberry schema style across multiple ORMs. It focuses on:
+## Contents
 
-- model-backed Strawberry types
-- generated input, filter, and order types
-- list fields that expose filtering and ordering automatically
-- query optimization hooks to reduce N+1 queries
-- helpers for related-list mutation inputs
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Backends](#backends)
+- [Defining Types](#defining-types)
+- [Filters and Ordering](#filters-and-ordering)
+- [Mutations](#mutations)
+- [Relay Integration](#relay-integration)
+- [Query Optimization](#query-optimization)
+- [Async Usage](#async-usage)
+- [Security](#security)
+- [Public Exports](#public-exports)
 
 ## Installation
 
 ```bash
-# Base package
-uv add strawberry-orm
-
-# With a backend
-uv add "strawberry-orm[django]"
-uv add "strawberry-orm[sqlalchemy]"
-uv add "strawberry-orm[tortoise]"
+uv add "strawberry-orm[sqlalchemy]"   # or [django] or [tortoise]
 ```
 
-You can do the same with `pip`:
+Or with pip:
 
 ```bash
 pip install "strawberry-orm[sqlalchemy]"
 ```
 
-If you are using `zsh`, keep the quotes around extras such as `"strawberry-orm[sqlalchemy]"`. Unquoted square brackets are treated as shell glob syntax before `uv` or `pip` sees the package name.
-
-Requirements:
-
-- Python `>=3.12`
-- `strawberry-graphql>=0.311.0`
+Requires Python `>=3.12` and `strawberry-graphql>=0.311.0`.
 
 ## Quick Start
 
-1. Create a backend instance.
-2. Generate Strawberry types from ORM models with `@orm.type(...)`.
-3. Generate filter/order types from the same models.
-4. Expose list fields with `orm.field()`.
-5. Add `orm.optimizer_extension()` to the schema.
+A blog API with users, posts, tags, and comments — covering types, relations, queryset scoping, optimizer hints, filters, ordering, object traversal, mutations, ref lists, recursive node mutations, and the query optimizer:
 
 ```python
 import strawberry
-
 from strawberry_orm import StrawberryORM, auto
 
 orm = StrawberryORM(
@@ -57,148 +46,171 @@ orm = StrawberryORM(
     session_getter=lambda info: info.context["session"],
 )
 
-UserFilter = orm.filter(User)
-UserOrder = orm.order(User)
+# -- Filters and ordering (register leaf models first) -----------------------
 
+UserFilter = orm.filter(User)
+UserOrder  = orm.order(User)
+TagFilter  = orm.filter(Tag)
+TagOrder   = orm.order(Tag)
+
+CommentFilter = orm.filter(Comment)
+PostFilter    = orm.filter(Post)      # picks up author/tags/comments relations
+PostOrder     = orm.order(Post)
+
+# -- Types -------------------------------------------------------------------
 
 @orm.type(User, filters=UserFilter, order=UserOrder)
 class UserType:
     id: auto
     name: auto
     email: auto
+    posts: list["PostType"]
 
+@orm.type(Tag, filters=TagFilter, order=TagOrder)
+class TagType:
+    id: auto
+    name: auto
+
+@orm.type(Comment, filters=CommentFilter)
+class CommentType:
+    id: auto
+    body: auto
+
+@orm.type(Post, filters=PostFilter, order=PostOrder)
+class PostType:
+    id: auto
+    title: auto
+    body: auto
+    is_published: auto
+    author: UserType
+    tags: list[TagType] = orm.field(load=lambda qs: qs.order_by("name"))
+    comments: list[CommentType]
+
+    @classmethod
+    def get_queryset(cls, qs, info):
+        return qs.filter(is_published=True)   # works on all backends
+
+# -- Mutations ---------------------------------------------------------------
+
+CreatePostInput = orm.input(Post, include=["title", "body", "author_id"])
+CreateTagInput  = orm.input(Tag, include=["name"])
+TagRef = orm.ref(Tag, create=CreateTagInput, delete=True)
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    def create_post(self, input: CreatePostInput) -> PostType:
+        post = Post(title=input.title, body=input.body, author_id=input.author_id)
+        ...
+        return post
+
+    @strawberry.mutation
+    def set_post_tags(self, post_id: int, tags: list[TagRef]) -> PostType:
+        post = ...
+        orm.apply_ref_list(post, "tags", tags)
+        return post
+
+    # Recursive node mutation — creates a post with nested relations in one call
+    create_node = orm.mutations.create_node()
+    update_node = orm.mutations.update_node()
+
+# -- Schema ------------------------------------------------------------------
 
 @strawberry.type
 class Query:
     users: list[UserType] = orm.field()
-
+    posts: list[PostType] = orm.field()
 
 schema = strawberry.Schema(
     query=Query,
+    mutation=Mutation,
     extensions=[orm.optimizer_extension()],
 )
 ```
 
-That single `users` field will:
+That gives you:
 
-- start from the backend's default queryset for `User`
-- accept `filter` and `order` arguments automatically because `UserType` carries them
-- let the optimizer eagerly load related data based on the GraphQL selection set
+```graphql
+# Filter posts by a related author's name, ordered by title
+{
+  posts(
+    filter: {
+      all: [
+        { field: { isPublished: { exact: true } } }
+        { object: { author: { field: { name: { exact: "Alice" } } } } }
+      ]
+    }
+    order: [{ field: { title: ASC } }]
+  ) {
+    title
+    author { name }
+    tags { name }
+  }
+}
+
+# Manage related tags on a post
+mutation {
+  setPostTags(postId: 1, tags: [
+    { id: "2" }
+    { create: { name: "new-tag" } }
+    { delete: { id: "3" } }
+  ]) {
+    tags { id name }
+  }
+}
+
+# Create a post with nested author and tags in one recursive mutation
+mutation {
+  createNode(input: {
+    post: {
+      title: "Hello"
+      body: "World"
+      author: { create: { name: "Alice", email: "alice@example.com" } }
+      tags: { items: [{ create: { name: "python" } }], mode: REPLACE }
+    }
+  }) { __typename }
+}
+```
 
 ---
 
 ## Backends
 
-`strawberry-orm` follows Strawberry's mixed execution model:
-
-- sync and async schema execution are both supported
-- a resolver can return plain values, backend query objects, or awaitables
-- the optimizer extension handles both sync and async execution paths
-- direct helper APIs such as `apply_ref_list(...)` may be sync or awaitable depending on the backend/session in use
-
-As a rule of thumb:
-
-- Django works in both sync and async Strawberry execution, but custom async resolvers still need `sync_to_async(...)` around direct Django ORM access
-- SQLAlchemy supports both sync `Session` and `AsyncSession`
-- Tortoise is async-first; use async Strawberry execution there
-
 | Backend | Constructor | Notes |
 | --- | --- | --- |
-| Django | `StrawberryORM("django")` | Uses Django querysets directly; async execution is supported via Strawberry's mixed sync/async model. |
-| SQLAlchemy | `StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)` | Requires a SQLAlchemy `Session` or `AsyncSession` at resolve time. |
-| Tortoise | `StrawberryORM("tortoise")` | Async ORM; use Strawberry's async execution path. |
+| Django | `StrawberryORM("django")` | Uses Django querysets directly. |
+| SQLAlchemy | `StrawberryORM("sqlalchemy", dialect="...", session_getter=...)` | Requires a `Session` or `AsyncSession` at resolve time. |
+| Tortoise | `StrawberryORM("tortoise")` | Async ORM; use async Strawberry execution. |
 
-### Django
+- **Django** — sync and async schema execution both work. Custom async resolvers that touch the ORM directly still need `sync_to_async(...)`.
+- **SQLAlchemy** — the session is resolved from `session_getter`, `info.context["session"]`, `info.context.session`, or `info.context.get_session()`. Both sync and async sessions are supported.
+- **Tortoise** — async-first. Use `await` in resolvers and mutations.
 
-```python
-orm = StrawberryORM("django")
-```
-
-When executing the schema asynchronously, custom resolvers that touch Django models directly should still wrap those ORM calls with `sync_to_async(...)`, following the same guidance as `strawberry-django`.
-
-### SQLAlchemy
-
-```python
-orm = StrawberryORM(
-    "sqlalchemy",
-    dialect="postgresql",
-    session_getter=lambda info: info.context["session"],
-)
-```
-
-SQLAlchemy needs a session when a query is executed. `strawberry-orm` can obtain it from either:
-
-- `session_getter=...`
-- `info.context["session"]`
-- `info.context.session`
-- `info.context.get_session()`
-
-If your context stores a callable session factory, pass a `session_getter` instead of putting the callable directly on `info.context`.
-
-Both sync and async sessions are supported:
-
-```python
-# Sync session
-orm = StrawberryORM(
-    "sqlalchemy",
-    dialect="postgresql",
-    session_getter=lambda info: info.context["session"],
-)
-
-# Async session
-orm = StrawberryORM(
-    "sqlalchemy",
-    dialect="postgresql",
-    session_getter=lambda info: info.context["session"],
-)
-
-@strawberry.type
-class Query:
-    @strawberry.field
-    def users(self) -> list[UserType]:
-        return select(User)
-
-# context["session"] can be either Session or AsyncSession
-```
-
-### Tortoise
-
-```python
-orm = StrawberryORM("tortoise")
-```
-
-Tortoise resolvers, mutations, and related-list helpers should be used from async Strawberry execution:
-
-```python
-@strawberry.type
-class Query:
-    @strawberry.field
-    async def users(self) -> list[UserType]:
-        return await User.all()
-```
-
-### Backend Options
+<details>
+<summary>Backend options reference</summary>
 
 Shared options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `default_query_limit` | `None` | Adds a default limit to list queries created from the backend default queryset. |
+| `default_query_limit` | `None` | Default limit for auto-generated list queries. |
 | `exclude_sensitive_fields` | `True` | Excludes sensitive-looking fields from generated input/filter/order types. |
-| `warn_sensitive` | `True` | Emits warnings when sensitive-looking fields are exposed on generated output types. |
-| `hard_delete_refs` | `False` | Makes `apply_ref_list(..., delete=...)` delete related rows instead of only unlinking them. |
+| `warn_sensitive` | `True` | Warns when sensitive-looking fields are exposed on output types. |
+| `hard_delete_refs` | `False` | Makes `apply_ref_list(..., delete=...)` delete rows instead of unlinking. |
 | `max_filter_depth` | `10` | Caps recursive filter nesting. |
-| `max_filter_branches` | `50` | Caps the total number of `all` / `any` / `oneOf` branches. |
-| `max_in_list_size` | `500` | Caps `inList` / `notInList` filter size. |
+| `max_filter_branches` | `50` | Caps `all` / `any` / `oneOf` branch count. |
+| `max_in_list_size` | `500` | Caps `inList` / `notInList` size. |
 | `enable_regex_filters` | `False` | Enables `regex` and `iRegex` string lookups. |
 
-SQLAlchemy-only options:
+SQLAlchemy-only:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `dialect` | `"postgresql"` | Chooses SQLAlchemy dialect-specific behavior. |
-| `session_getter` | `None` | Returns the session for the current request. |
+| `dialect` | `"postgresql"` | SQLAlchemy dialect. |
+| `session_getter` | `None` | Callable returning the session for the current request. |
 | `filter_overrides` | `{}` | Maps Python types to custom lookup input types. |
+
+</details>
 
 ---
 
@@ -206,11 +218,8 @@ SQLAlchemy-only options:
 
 ### `@orm.type(Model)`
 
-Use `@orm.type(Model)` to turn an ORM model into a Strawberry object type.
-
 ```python
 from strawberry_orm import auto
-
 
 @orm.type(User)
 class UserType:
@@ -219,25 +228,13 @@ class UserType:
     email: auto
 ```
 
-`auto` is an alias for `strawberry.auto`. The backend inspects the model and fills in the Python type for each field.
+`auto` is an alias for `strawberry.auto`. The backend inspects the model and resolves the Python type for each field.
 
-Keyword arguments:
-
-- `include=[...]`
-- `exclude=[...]`
-- `name="CustomGraphQLTypeName"`
-- `filters=UserFilter`
-- `order=UserOrder`
+Keyword arguments: `include`, `exclude`, `name`, `filters`, `order`.
 
 ```python
-@orm.type(User, include=["id", "name"], name="PublicUser")
+@orm.type(User, exclude=["password_hash", "api_key"], name="PublicUser")
 class PublicUserType:
-    id: auto
-    name: auto
-
-
-@orm.type(User, exclude=["password_hash", "api_key"])
-class SafeUserType:
     id: auto
     name: auto
     email: auto
@@ -248,12 +245,6 @@ class SafeUserType:
 Reference other generated types directly. The backend auto-generates resolvers for relationship fields:
 
 ```python
-@orm.type(Tag)
-class TagType:
-    id: auto
-    name: auto
-
-
 @orm.type(Post)
 class PostType:
     id: auto
@@ -261,11 +252,50 @@ class PostType:
     tags: list[TagType]
 ```
 
-If the nested type carries `filters` and/or `order`, list relations expose those arguments too.
+If the nested type carries `filters` and/or `order`, list relations expose those arguments automatically.
+
+### List Fields and Explicit Resolvers
+
+`orm.field()` builds a list resolver from the model attached to the return type:
+
+```python
+@strawberry.type
+class Query:
+    users: list[UserType] = orm.field()
+```
+
+For custom scoping, return a backend query object from a regular Strawberry resolver:
+
+```python
+@strawberry.type
+class Query:
+    @strawberry.field
+    def active_users(self, info: strawberry.types.Info) -> list[UserType]:
+        return select(User).where(User.is_active.is_(True))  # SQLAlchemy
+        # return User.objects.filter(is_active=True)         # Django
+        # return User.filter(is_active=True)                 # Tortoise
+```
+
+### Type-Level Queryset Scoping
+
+Define a `get_queryset` classmethod to scope the model query centrally:
+
+```python
+@orm.type(Post)
+class PublishedPostType:
+    id: auto
+    title: auto
+
+    @classmethod
+    def get_queryset(cls, qs, info):
+        return qs.filter(is_published=True)
+```
+
+Useful for soft-delete filtering, multi-tenant scoping, and authorization-aware model filters.
 
 ### Custom Strawberry Fields
 
-You can mix generated fields with plain Strawberry fields:
+Mix generated fields with plain Strawberry fields:
 
 ```python
 @orm.type(User)
@@ -279,44 +309,16 @@ class UserType:
         return f"{self.name} <{self.email}>"
 ```
 
-### Type-Level Queryset Scoping
+### `orm.input(Model)` and `orm.partial(Model)`
 
-Define a `get_queryset` classmethod on a type to scope the model query centrally. When the optimizer extension is installed and a resolver returns a backend query object, `get_queryset` is applied automatically.
-
-```python
-@orm.type(Post)
-class PublishedPostType:
-    id: auto
-    title: auto
-    is_published: auto
-
-    @classmethod
-    def get_queryset(cls, qs, info):
-        return qs.filter(is_published=True)  # Django / Tortoise style
-        # return qs.where(Post.is_published == True)        # SQLAlchemy style
-```
-
-This is useful for soft-delete filtering, multi-tenant scoping, "published only" content types, and reusable authorization-aware model filters.
-
-### `orm.input(Model)`
-
-Generates a Strawberry input type from model metadata.
+Generate input types from model metadata:
 
 ```python
 CreateUserInput = orm.input(User, include=["name", "email"])
-```
-
-Generated input fields are optional (defaulting to `strawberry.UNSET`), skip relations, exclude primary keys by default, and exclude sensitive-looking fields unless explicitly included.
-
-Keyword arguments: `include`, `exclude`, `exclude_pk=False`, `name`.
-
-### `orm.partial(Model)`
-
-```python
 UpdateUserInput = orm.partial(User, include=["name", "email"])
 ```
 
-Same logic as `input()` with a default name like `UserPartialInput`. Useful for patch-style update payloads.
+`input()` and `partial()` share the same signature: `include`, `exclude`, `exclude_pk` (default `True`), `name`. Fields are optional (defaulting to `strawberry.UNSET`), skip relations, exclude primary keys by default, and exclude sensitive-looking fields unless explicitly included.
 
 ---
 
@@ -352,37 +354,26 @@ List fields returning `UserType` then accept a `filter` argument:
 Filters are recursive `@oneOf` trees supporting `field`, `all`, `any`, `not`, and `oneOf`:
 
 ```graphql
-# OR condition
-{
-  users(filter: {
-    any: [
-      { field: { name: { exact: "Alice" } } }
-      { field: { name: { exact: "Bob" } } }
-    ]
-  }) { name }
-}
+# OR
+{ users(filter: { any: [
+    { field: { name: { exact: "Alice" } } }
+    { field: { name: { exact: "Bob" } } }
+] }) { name } }
 
-# AND condition
-{
-  posts(filter: {
-    all: [
-      { field: { authorId: { exact: 1 } } }
-      { field: { isPublished: { exact: true } } }
-    ]
-  }) { title }
-}
+# AND
+{ posts(filter: { all: [
+    { field: { authorId: { exact: 1 } } }
+    { field: { isPublished: { exact: true } } }
+] }) { title } }
 
-# NOT condition
-{
-  users(filter: {
+# NOT
+{ users(filter: {
     not: { field: { email: { contains: "example.com" } } }
-  }) { name }
-}
+}) { name } }
 ```
 
-#### Built-in Lookup Types
-
-The package exports reusable lookup inputs:
+<details>
+<summary>Built-in lookup types</summary>
 
 `StringLookup`, `BooleanLookup`, `IDLookup`, `IntComparisonLookup`, `FloatComparisonLookup`, `DateComparisonLookup`, `TimeComparisonLookup`, `DateTimeComparisonLookup`
 
@@ -390,9 +381,11 @@ Typical string lookups: `exact`, `neq`, `contains`, `iContains`, `startsWith`, `
 
 Regex lookups (`regex`, `iRegex`) are disabled by default. Enable with `enable_regex_filters=True`.
 
+</details>
+
 #### Object Traversal
 
-When filters are registered for related models, the generated filter gains an `object` key that lets you filter parent rows based on conditions on their related objects:
+When filters are registered for related models, the generated filter gains an `object` key for filtering by conditions on related objects:
 
 ```python
 UserFilter = orm.filter(User)
@@ -403,35 +396,14 @@ PostFilter = orm.filter(Post)   # Post has an "author" relation to User
 {
   posts(filter: {
     object: { author: { field: { name: { exact: "Alice" } } } }
-  }) {
-    title
-  }
-}
-```
-
-Object traversal composes with boolean operators:
-
-```graphql
-{
-  posts(filter: {
-    all: [
-      { field: { isPublished: { exact: true } } }
-      { object: { author: { field: { name: { exact: "Alice" } } } } }
-    ]
   }) { title }
 }
 ```
 
-Multi-level traversal works when the intermediate models also have registered filters:
-
-```python
-UserFilter = orm.filter(User)
-PostFilter = orm.filter(Post)
-CommentFilter = orm.filter(Comment)  # Comment -> Post -> User
-```
+Object traversal composes with boolean operators and supports multi-level nesting when intermediate models also have registered filters:
 
 ```graphql
-# Find comments on posts written by Alice
+# Comments on posts written by Alice
 {
   comments(filter: {
     object: { post: {
@@ -441,162 +413,81 @@ CommentFilter = orm.filter(Comment)  # Comment -> Post -> User
 }
 ```
 
-The `object` type is `@oneOf`, so each filter entry names exactly one relation.
-
-Relations only appear in `object` if their target model already has a registered filter at the time `orm.filter()` is called. Register child model filters before parent model filters.
+The `object` type is `@oneOf`. Relations only appear in `object` if their target model already has a registered filter at the time `orm.filter()` is called -- register leaf models first.
 
 #### Filter Projection
 
-By default every relation with a registered filter appears in `object`. Pass `project={...}` to `orm.filter()` to control exactly which relations are exposed and how deep traversal can go:
+Pass `project={...}` to control which relations appear in `object` and how deep traversal can go:
 
 ```python
-UserFilter  = orm.filter(User)
-TagFilter   = orm.filter(Tag)
+UserFilter    = orm.filter(User)
+TagFilter     = orm.filter(Tag)
 CommentFilter = orm.filter(Comment)
 
-# Only expose "author" in the object type — tags and comments are excluded
-PostFilter = orm.filter(Post, project={"author": {}})
+PostFilter = orm.filter(Post, project={"author": {}})  # only author, not tags/comments
 ```
 
-```graphql
-# This works (author is projected)
-{ posts(filter: { object: { author: { field: { name: { exact: "Alice" } } } } }) { title } }
-
-# This would be a schema error (tags is not projected)
-{ posts(filter: { object: { tags: { field: { name: { exact: "python" } } } } }) { title } }
-```
-
-Sub-project dicts control nested traversal. An empty dict `{}` means "include this relation but don't allow further object traversal from it". A non-empty dict lists which of the related model's relations are reachable:
+Sub-project dicts control nested traversal. `{}` means "include as a leaf" (no further object traversal). A non-empty dict lists reachable relations:
 
 ```python
-# Allow Comment -> post, and from post -> author (but not post -> tags)
 CommentFilter = orm.filter(Comment, project={
-    "post": {
-        "author": {},
-    },
+    "post": {"author": {}},   # Comment -> post -> author (but not post -> tags)
 })
 ```
-
-Summary:
 
 | `project` value | Behavior |
 | --- | --- |
 | `None` (default) | Auto-include all relations with registered filters |
-| `{}` | No `object` type at all (scalar lookups only) |
-| `{"rel": {}}` | Include `rel` as a leaf (no further traversal from it) |
-| `{"rel": {"nested": {}}}` | Include `rel` and allow traversal to `nested` from it |
+| `{}` | No `object` type (scalar lookups only) |
+| `{"rel": {}}` | Include `rel` as a leaf |
+| `{"rel": {"nested": {}}}` | Include `rel`, allow traversal to `nested` from it |
 
-Projected filters are cached internally and do not overwrite the global filter registry, so you can create multiple projected variants of the same model's filter for different schema entry points.
+Projected filters are cached internally and do not overwrite the global filter registry.
 
 ### Ordering
-
-Generate an order input:
 
 ```python
 UserOrder = orm.order(User)
 ```
 
-The generated type is a `@oneOf` input — each entry specifies exactly one column.
-The `order` argument is a **list**, where position determines tie-break priority:
+Each order entry is a `@oneOf` input with a `field` key (for scalar columns) or an `object` key (for related models). Position in the list determines tie-break priority:
 
 ```graphql
 {
-  users(order: [{ name: ASC }, { email: DESC }]) {
+  users(order: [{ field: { name: ASC } }, { field: { email: DESC } }]) {
     name
     email
   }
 }
 ```
 
-This sorts by `name` ascending first, then breaks ties by `email` descending.
+Supported values: `ASC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST`.
 
-Supported values from the `Ordering` enum: `ASC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST`.
+#### Order by Related Object
 
-Filters and ordering can be combined:
+When order types are registered for related models, the generated order gains an `object` key that lets you sort by fields on related objects — mirroring the [filter object traversal](#object-traversal) structure:
 
 ```graphql
 {
-  posts(
-    filter: { field: { isPublished: { exact: true } } }
-    order: [{ title: DESC }]
-  ) {
+  posts(order: [
+    { object: { author: { field: { name: ASC } } } }
+    { field: { title: DESC } }
+  ]) {
     title
   }
 }
 ```
 
----
-
-## Queries
-
-### Automatic List Fields
-
-If a field returns `list[SomeType]`, `orm.field()` builds the resolver from the model attached to that type:
-
-```python
-@orm.type(User, filters=UserFilter, order=UserOrder)
-class UserType:
-    id: auto
-    name: auto
-    email: auto
-
-
-@strawberry.type
-class Query:
-    users: list[UserType] = orm.field()
-```
-
-You can also supply filter and order types explicitly:
-
-```python
-@strawberry.type
-class Query:
-    users: list[UserType] = orm.field(filters=UserFilter, order=UserOrder)
-```
-
-### Explicit Resolvers
-
-For custom scoping, join logic, or backend-specific behavior, return a backend query object from a normal Strawberry resolver:
-
-```python
-@strawberry.type
-class Query:
-    @strawberry.field
-    def active_users(self, info: strawberry.types.Info) -> list[UserType]:
-        return select(User).where(User.is_active.is_(True))  # SQLAlchemy
-        # return User.objects.filter(is_active=True)         # Django
-        # return User.filter(is_active=True)                 # Tortoise
-```
-
-This works with the optimizer extension and with type-level `get_queryset` hooks.
-
-If you execute your schema asynchronously, the same pattern works with async resolvers too:
-
-```python
-@strawberry.type
-class Query:
-    @strawberry.field
-    async def active_users(self, info: strawberry.types.Info) -> list[UserType]:
-        return await User.filter(is_active=True)  # Tortoise
-        # return await sync_to_async(list)(User.objects.filter(is_active=True))  # Django
-```
+Registration order matters: define related orders *before* the parent (e.g. `orm.order(User)` before `orm.order(Post)`).
 
 ---
 
 ## Mutations
 
-Write plain `@strawberry.mutation` resolvers and use `strawberry-orm` for the generated input types:
+Write plain `@strawberry.mutation` resolvers and use `strawberry-orm` for generated input types:
 
 ```python
 CreatePostInput = orm.input(Post, include=["title", "body", "author_id"])
-
-
-@strawberry.input
-class UpdatePostInput:
-    id: int
-    title: str | None = strawberry.UNSET
-    body: str | None = strawberry.UNSET
-
 
 @strawberry.type
 class Mutation:
@@ -605,28 +496,6 @@ class Mutation:
         post = Post(title=input.title, body=input.body, author_id=input.author_id)
         ...
         return post
-
-    @strawberry.mutation
-    def update_post(self, info: strawberry.types.Info, input: UpdatePostInput) -> PostType | None:
-        ...
-```
-
-Async mutations work too. Use async ORM calls in the resolver body, and await backend helpers when the active backend/session requires it:
-
-```python
-@strawberry.type
-class Mutation:
-    @strawberry.mutation
-    async def create_post(
-        self,
-        info: strawberry.types.Info,
-        input: CreatePostInput,
-    ) -> PostType:
-        return await Post.create(
-            title=input.title,
-            body=input.body,
-            author_id=input.author_id,
-        )
 ```
 
 ### Related List Inputs (`orm.ref`)
@@ -636,50 +505,17 @@ class Mutation:
 ```python
 CreateTagInput = orm.input(Tag, include=["name"])
 
-
 @strawberry.input
 class UpdateTagInput:
     id: strawberry.ID
     name: str
 
-
 TagRef = orm.ref(Tag, create=CreateTagInput, update=UpdateTagInput, delete=True)
 ```
 
-Each ref in the list can be one of:
+Each ref can be one of `{ id }` (link), `{ create }`, `{ update }`, or `{ delete }` (unlink, or hard-delete if `hard_delete_refs=True`).
 
-- `{ id: "1" }` — link an existing row
-- `{ create: { ... } }` — create a related row inline
-- `{ update: { id: "...", ... } }` — update an existing related row
-- `{ delete: { id: "..." } }` — unlink (or delete if `hard_delete_refs=True`)
-
-Apply ref operations in a mutation:
-
-```python
-@strawberry.mutation
-def set_post_tags(self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]) -> PostType | None:
-    post = ...
-    orm.apply_ref_list(post, "tags", tags, info)
-    return post
-```
-
-Async backends can use the same helper from async mutations:
-
-```python
-@strawberry.mutation
-async def set_post_tags(
-    self,
-    info: strawberry.types.Info,
-    post_id: int,
-    tags: list[TagRef],
-) -> PostType | None:
-    post = await Post.get_or_none(pk=post_id)
-    if post is None:
-        return None
-
-    await orm.apply_ref_list(post, "tags", tags, info)
-    return post
-```
+Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. It supports `mode="replace"` (default) and `mode="patch"`, and an optional `authorize` callback `(action, model, obj_id, info) -> bool`.
 
 ```graphql
 mutation {
@@ -689,67 +525,27 @@ mutation {
     { create: { name: "new-tag" } }
     { delete: { id: "3" } }
   ]) {
-    id
     tags { id name }
   }
 }
 ```
 
-`apply_ref_list` supports `mode="replace"` (default, replaces the entire list) and `mode="patch"` (only touches mentioned items). An optional `authorize` callback receives `(action, model, obj_id, info)` and returns `bool`.
-
-In practice:
-
-- use it directly in sync Django / sync SQLAlchemy mutations
-- `await` it for Tortoise
-- `await` it for SQLAlchemy when your request context carries an `AsyncSession`
-- in custom async Django resolvers, prefer the same async-safe pattern you already use for direct ORM calls
-
----
-
 ### Recursive Node Mutations
 
-`orm.mutations.create_node(...)` and `orm.mutations.update_node(...)` generate catch-all Relay `Node` mutations with recursive nested inputs.
-
-If you want to implement the resolver logic yourself, you can generate the root input types directly with `orm.mutations.create_node_input(...)` and `orm.mutations.update_node_input(...)`:
+`orm.mutations.create_node()` and `orm.mutations.update_node()` generate catch-all Relay `Node` mutations with recursive nested inputs:
 
 ```python
-import strawberry
-from strawberry import relay
-
-
-@orm.type(User)
-class UserNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-    email: auto
-
-
 @orm.type(Post)
 class PostNode(relay.Node):
     id: relay.NodeID[int]
     title: auto
     body: auto
 
-
-CreateNodeInput = orm.mutations.create_node_input()
-UpdateNodeInput = orm.mutations.update_node_input()
-
-
 @strawberry.type
 class Mutation:
     create_node = orm.mutations.create_node()
     update_node = orm.mutations.update_node()
-
-    @strawberry.field
-    def custom_create_node(self, input: CreateNodeInput) -> str:
-        return "implement your own create logic here"
-
-    @strawberry.field
-    def custom_update_node(self, input: UpdateNodeInput) -> str:
-        return "implement your own update logic here"
 ```
-
-List relations use `items`, while singular relations use explicit `create` / `update` branches:
 
 ```graphql
 mutation {
@@ -757,27 +553,23 @@ mutation {
     post: {
       title: "Hello"
       body: "World"
-      author: {
-        create: {
-          name: "Alice"
-          email: "alice@example.com"
-        }
-      }
+      author: { create: { name: "Alice", email: "alice@example.com" } }
       tags: {
         items: [{ create: { name: "python" } }]
         mode: REPLACE
         onRemove: DELETE
       }
     }
-  }) {
-    __typename
-  }
+  }) { __typename }
 }
 ```
 
-#### Projection And Policy Config
+Generate only the input types (without the resolver) via `orm.mutations.create_node_input()` and `orm.mutations.update_node_input()`.
 
-Pass `project={...}` to restrict recursion depth and configure relation semantics in one dict:
+<details>
+<summary>Mutation projection and policy config</summary>
+
+Pass `project={...}` to restrict recursion depth and configure relation semantics:
 
 ```python
 project = {
@@ -790,24 +582,16 @@ project = {
                 "mode": ["PATCH", "REPLACE"],
                 "onRemove": ["DISCONNECT", "DELETE"],
             },
-            "author": {
-                "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
-            },
+            "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
         },
         "tags": {
-            "_meta": {
-                "mode": "REPLACE",
-                "onRemove": "DELETE",
-            },
+            "_meta": {"mode": "REPLACE", "onRemove": "DELETE"},
         },
     },
     "comment": {
-        "author": {
-            "_meta": {"onReplace": ["DISCONNECT", "DELETE"]},
-        },
+        "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
     },
 }
-
 
 @strawberry.type
 class Mutation:
@@ -815,31 +599,97 @@ class Mutation:
     update_node = orm.mutations.update_node(project=project)
 ```
 
-Rules for the config object:
+Rules:
 
-- Root keys are model names (`post`, `comment`, `user`, ...).
-- Nested keys are relation names available on that model.
-- `_meta` is optional and configures behavior for that relation subtree.
-- Omitted relations still exist as shallow nested inputs, but recursion stops after one more level.
+- Root keys are model names (`post`, `comment`, ...).
+- Nested keys are relation names on that model.
+- `_meta` configures behavior for that relation subtree.
+- Omitted relations still appear as shallow inputs (one more level, then stop).
 
 `_meta` supports:
 
-- `mode`: list relation merge strategy (`PATCH` or `REPLACE`)
-- `onRemove`: what to do with removed items from a list relation (`DISCONNECT` or `DELETE`)
-- `onReplace`: what to do with the previous object when replacing a singular relation (`DISCONNECT` or `DELETE`)
+| Key | Values | Meaning |
+| --- | --- | --- |
+| `mode` | `PATCH`, `REPLACE` | List relation merge strategy. |
+| `onRemove` | `DISCONNECT`, `DELETE` | Action for removed items from a list relation. |
+| `onReplace` | `DISCONNECT`, `DELETE` | Action for the previous object when replacing a singular relation. |
 
-The `_meta` values can be either:
+Values can be a single string (fixes behavior, omits the GraphQL field) or an array of strings (exposes a choice to the caller). Defaults when omitted: `mode=PATCH`, `onRemove=DISCONNECT`, `onReplace=DISCONNECT`.
 
-- an array of enum strings, which means the GraphQL input exposes that field and the caller may choose from those options
-- a single enum string, which fixes that behavior for the relation and omits the corresponding GraphQL field
+</details>
 
-Default behavior when a field is exposed but omitted in the mutation input:
+---
 
-- `mode` defaults to `PATCH` when allowed
-- `onRemove` defaults to `DISCONNECT` when allowed
-- `onReplace` defaults to `DISCONNECT` when allowed
+## Relay Integration
 
-If the preferred default is not included in the allowed array, the first configured value is used.
+`strawberry-orm` works with [Strawberry's Relay support](https://strawberry.rocks/docs/guides/relay) for cursor-based pagination and global node identification.
+
+### Relay Node Types
+
+Extend `relay.Node` instead of a plain Strawberry type. Use `relay.NodeID` for the id field:
+
+```python
+from strawberry import relay
+from strawberry_orm import StrawberryORM, auto
+
+orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+
+UserFilter = orm.filter(User)
+UserOrder  = orm.order(User)
+
+@orm.type(User, filters=UserFilter, order=UserOrder)
+class UserNode(relay.Node):
+    id: relay.NodeID[int]
+    name: auto
+    email: auto
+```
+
+### Connection Fields
+
+Use `orm.connection()` with `ORMListConnection` to create paginated connection fields. Filters and ordering from the node type are automatically wired in:
+
+```python
+from collections.abc import Iterable
+from strawberry_orm.relay import ORMListConnection
+
+@strawberry.type
+class Query:
+    @orm.connection(ORMListConnection[UserNode])
+    def users_connection(self) -> Iterable[UserNode]:
+        return orm.get_default_queryset(User)
+```
+
+This gives you:
+
+```graphql
+{
+  usersConnection(
+    filter: { field: { email: { contains: "example.com" } } }
+    order: [{ field: { name: DESC } }]
+    first: 10
+    after: "YXJyYXljb25uZWN0aW9uOjk="
+  ) {
+    edges {
+      cursor
+      node { name email }
+    }
+    pageInfo {
+      hasNextPage
+      hasPreviousPage
+      startCursor
+      endCursor
+    }
+  }
+}
+```
+
+Filters and ordering are applied *before* pagination, so the connection always slices from a correctly filtered and sorted result set.
+
+`orm.connection()` accepts the same keyword arguments as `relay.connection()` — `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`.
+
+### Node Mutations
+
+`orm.mutations.create_node()` and `orm.mutations.update_node()` generate catch-all Relay Node mutations with recursive nested inputs. See [Recursive Node Mutations](#recursive-node-mutations) for full documentation.
 
 ---
 
@@ -855,12 +705,7 @@ schema = strawberry.Schema(
 )
 ```
 
-The optimizer:
-
-- executes backend query objects returned by your resolvers
-- eager-loads relations based on the GraphQL selection set
-- applies field-level hints registered through `orm.field(...)`
-- honors type-level `get_queryset` hooks
+The optimizer executes backend query objects returned by resolvers, eager-loads relations based on the GraphQL selection set, applies field-level hints, and honors `get_queryset` hooks.
 
 ### Field Hints
 
@@ -877,16 +722,16 @@ class PostType:
 
 | Argument | Meaning |
 | --- | --- |
-| `load=[...]` | Extra eager-load paths to apply. |
-| `load=callable` | A callable that customises the queryset for a related field (see below). |
+| `load=[...]` | Extra eager-load paths. |
+| `load=callable` | Custom queryset for a related field (see below). |
 | `only=[...]` | Restrict loaded columns. |
-| `compute={...}` | Register computed-column hints for the optimizer store. |
+| `compute={...}` | Computed-column hints for the optimizer store. |
 | `disable_optimization=True` | Skip optimization for that field. |
 | `description="..."` | Forward a field description to Strawberry. |
 
 ### Custom Querysets on Related Fields (`load=callable`)
 
-When `load` is a callable instead of a list, it receives the default queryset for the related model and returns a modified queryset. This lets you filter, reorder, or limit related objects from the parent level:
+When `load` is a callable, it receives the default queryset and returns a modified one:
 
 ```python
 @orm.type(User)
@@ -898,43 +743,12 @@ class UserType:
     )
 ```
 
-How each backend applies the callable:
-
-- **Django** — wraps the relation in a `Prefetch` object with the custom queryset.
-- **SQLAlchemy** — extracts `WHERE` criteria from the modified `select()` and applies them via `relationship.and_(...)`.
-- **Tortoise** — performs a separate batch query filtered by parent IDs and assigns results back to each parent instance.
-
-This composes with type-level `get_queryset`. If the related type defines `get_queryset` *and* the field has a `load` callable, both are applied (type-level first, then the field-level callable):
-
-```python
-@orm.type(Post)
-class PublishedPostType:
-    id: auto
-    title: auto
-
-    @classmethod
-    def get_queryset(cls, qs, info):
-        return qs.filter(is_published=True)
-
-
-@orm.type(User)
-class UserType:
-    id: auto
-    name: auto
-    posts: list[PublishedPostType] = orm.field(
-        load=lambda qs: qs.order_by("-created_at")
-    )
-```
-
-The optimizer handles batching, so this avoids N+1 queries even with custom filtering.
+This composes with `get_queryset` (type-level first, then field-level). The optimizer handles batching to avoid N+1 queries.
 
 ### Field Permissions
 
-Use `make_field(...)` to attach Strawberry permission classes to a generated field:
-
 ```python
 from strawberry_orm import make_field
-
 
 @orm.type(User)
 class UserType:
@@ -945,23 +759,52 @@ class UserType:
 
 ---
 
+## Async Usage
+
+`strawberry-orm` supports both sync and async execution. The same schema code works everywhere -- the only difference is how you call ORM APIs in resolvers:
+
+| Backend | Pattern |
+| --- | --- |
+| Django | Sync by default. Wrap direct ORM calls with `sync_to_async(...)` in async resolvers. |
+| SQLAlchemy | Pass a sync `Session` or `AsyncSession` via `session_getter`. Both work transparently. |
+| Tortoise | Async-first. Use `async def` resolvers and `await` ORM calls. |
+
+```python
+# Tortoise example
+@strawberry.type
+class Query:
+    @strawberry.field
+    async def users(self) -> list[UserType]:
+        return await User.all()
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def create_post(self, input: CreatePostInput) -> PostType:
+        return await Post.create(title=input.title, body=input.body)
+```
+
+`apply_ref_list` is sync for Django/sync-SQLAlchemy and awaitable for Tortoise/async-SQLAlchemy.
+
+---
+
 ## Security
 
 `strawberry-orm` has safety-focused defaults, but you still need to make deliberate schema choices.
 
 **Defaults:**
 
-- `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields such as `password_hash`, `api_key`, `role`, and `is_admin` by default
+- `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
 - String regex filters are disabled by default
-- Filter depth, branch count, and `inList` size are capped by default
+- Filter depth, branch count, and `inList` size are capped
 - `orm.ref(..., delete=True)` unlinks by default; hard deletes require `hard_delete_refs=True`
 
-**Caveats:**
+**Your responsibility:**
 
-- `orm.type()` does not auto-hide sensitive output fields. It warns by default, but you must still use `exclude=[...]` or permission classes to protect them.
-- List queries are unbounded unless you set `default_query_limit=...`
+- `orm.type()` does not auto-hide sensitive output fields — use `exclude=[...]` or permission classes
+- List queries are unbounded unless you set `default_query_limit`
 - `apply_ref_list()` only enforces authorization if you provide an `authorize` callback
-- GraphQL introspection, auth, and query-complexity limits are still your application's responsibility
+- GraphQL introspection, auth, and query-complexity limits are your application's concern
 
 A production-oriented configuration:
 
@@ -980,8 +823,6 @@ orm = StrawberryORM(
 ---
 
 ## Public Exports
-
-Top-level exports from `strawberry_orm`:
 
 `StrawberryORM`, `auto`, `make_field`, `make_ref_type`, `Ordering`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, and the built-in lookup input classes from `strawberry_orm.filters`.
 

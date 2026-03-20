@@ -230,8 +230,17 @@ class SQLAlchemyBackend(BaseBackend):
     def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[Any] = []
+        joins: list[Any] = []
         for entry in order_list:
-            clauses.extend(_build_sa_ordering(entry, model))
+            entry_clauses, entry_joins = _build_sa_ordering(entry, model)
+            clauses.extend(entry_clauses)
+            joins.extend(entry_joins)
+        seen: set[str] = set()
+        for join_prop in joins:
+            key = str(join_prop)
+            if key not in seen:
+                seen.add(key)
+                query = query.join(join_prop, isouter=True)
         if clauses:
             query = query.order_by(*clauses)
         return query
@@ -1031,15 +1040,47 @@ def _build_lookup_clauses(
 # ---------------------------------------------------------------------------
 
 
-def _build_sa_ordering(order_input: Any, model: type) -> list[Any]:
-    """Translate an order input object into a list of SQLAlchemy order_by clauses."""
-    from sqlalchemy import asc, desc
+def _build_sa_ordering(order_input: Any, model: type) -> tuple[list[Any], list[Any]]:
+    """Translate an order input into SQLAlchemy ``order_by`` clauses and joins.
 
-    clauses = []
+    Returns ``(clauses, joins)`` where *joins* is a list of relationship
+    attributes that must be joined before the clauses can be applied.
+    """
+    clauses: list[Any] = []
+    joins: list[Any] = []
     fields = order_input.__class__.__dataclass_fields__
 
+    for key in fields:
+        val = getattr(order_input, key)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        if key == "field":
+            clauses.extend(_build_sa_order_field(val, model))
+        elif key == "object":
+            obj_fields = val.__class__.__dataclass_fields__
+            for rel_name in obj_fields:
+                nested = getattr(val, rel_name)
+                if nested is strawberry.UNSET or nested is None:
+                    continue
+                relationship_prop = getattr(model, rel_name)
+                rel_model = relationship_prop.property.mapper.class_
+                joins.append(relationship_prop)
+                sub_clauses, sub_joins = _build_sa_ordering(nested, rel_model)
+                clauses.extend(sub_clauses)
+                joins.extend(sub_joins)
+
+    return clauses, joins
+
+
+def _build_sa_order_field(field_input: Any, model: type) -> list[Any]:
+    from sqlalchemy import asc, desc
+
+    clauses: list[Any] = []
+    fields = field_input.__class__.__dataclass_fields__
+
     for col_name in fields:
-        direction = getattr(order_input, col_name)
+        direction = getattr(field_input, col_name)
         if direction is strawberry.UNSET or direction is None:
             continue
 

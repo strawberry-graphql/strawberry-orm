@@ -166,14 +166,16 @@ class AbstractTestQueryIncludeExclude:
 
     def test_order_include(self, orm, User):
         UserOrder = orm.order(User, include=["name"])
-        definition = UserOrder.__strawberry_definition__
+        field_type = UserOrder._field_type
+        definition = field_type.__strawberry_definition__
         field_names = {f.name for f in definition.fields}
         assert "name" in field_names
         assert "email" not in field_names
 
     def test_order_exclude(self, orm, User):
         UserOrder = orm.order(User, exclude=["email", "created_at"])
-        definition = UserOrder.__strawberry_definition__
+        field_type = UserOrder._field_type
+        definition = field_type.__strawberry_definition__
         field_names = {f.name for f in definition.fields}
         assert "name" in field_names
         assert "email" not in field_names

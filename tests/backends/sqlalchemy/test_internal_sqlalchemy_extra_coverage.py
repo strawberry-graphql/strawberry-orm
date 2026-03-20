@@ -79,4 +79,4 @@ class TestInternalSqlalchemyExtraCoverage:
             FlagModel.enabled, RegexLookup(i_regex="x"), enable_regex=True
         )
         assert len(clause) == 1
-        assert _build_sa_ordering(MissingOrder(), FlagModel) == []
+        assert _build_sa_ordering(MissingOrder(), FlagModel) == ([], [])

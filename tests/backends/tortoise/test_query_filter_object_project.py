@@ -72,9 +72,7 @@ _projected_schema = strawberry.Schema(
 @pytest_asyncio.fixture
 async def execute_projected(seed):
     async def _execute(query, variables=None, expect_errors=False):
-        result = await _projected_schema.execute(
-            query, variable_values=variables or {}
-        )
+        result = await _projected_schema.execute(query, variable_values=variables or {})
         if expect_errors:
             return result
         assert result.errors is None, f"GraphQL errors: {result.errors}"

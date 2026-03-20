@@ -804,26 +804,56 @@ def _build_django_lookup(
 # ---------------------------------------------------------------------------
 
 
-def _build_django_ordering(order_input: Any) -> list[str]:
-    clauses: list[str] = []
+def _build_django_ordering(order_input: Any, _prefix: str = "") -> list[Any]:
+    from django.db.models import F
+
+    clauses: list[Any] = []
     fields = order_input.__class__.__dataclass_fields__
 
+    for key in fields:
+        val = getattr(order_input, key)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        if key == "field":
+            clauses.extend(_build_django_order_field(val, _prefix))
+        elif key == "object":
+            obj_fields = val.__class__.__dataclass_fields__
+            for rel_name in obj_fields:
+                nested = getattr(val, rel_name)
+                if nested is strawberry.UNSET or nested is None:
+                    continue
+                clauses.extend(
+                    _build_django_ordering(nested, _prefix=f"{_prefix}{rel_name}__")
+                )
+
+    return clauses
+
+
+def _build_django_order_field(field_input: Any, prefix: str = "") -> list[Any]:
+    from django.db.models import F
+
+    clauses: list[Any] = []
+    fields = field_input.__class__.__dataclass_fields__
+
     for col_name in fields:
-        direction = getattr(order_input, col_name)
+        direction = getattr(field_input, col_name)
         if direction is strawberry.UNSET or direction is None:
             continue
 
         dir_value = direction.value if hasattr(direction, "value") else str(direction)
 
-        from django.db.models import F
-
         nulls_first = True if "NULLS_FIRST" in dir_value else None
         nulls_last = True if "NULLS_LAST" in dir_value else None
 
         if dir_value.startswith("DESC"):
-            expr = F(col_name).desc(nulls_first=nulls_first, nulls_last=nulls_last)
+            expr = F(f"{prefix}{col_name}").desc(
+                nulls_first=nulls_first, nulls_last=nulls_last
+            )
         else:
-            expr = F(col_name).asc(nulls_first=nulls_first, nulls_last=nulls_last)
+            expr = F(f"{prefix}{col_name}").asc(
+                nulls_first=nulls_first, nulls_last=nulls_last
+            )
         clauses.append(expr)
 
     return clauses

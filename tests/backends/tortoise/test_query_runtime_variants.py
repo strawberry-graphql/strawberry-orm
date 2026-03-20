@@ -83,7 +83,7 @@ class TestQueryRuntimeVariants:
                 filterOnlyUsers(filter: { field: { name: { exact: "Alice" } } }) {
                     name
                 }
-                orderOnlyUsers(order: [{ name: DESC }]) {
+                orderOnlyUsers(order: [{ field: { name: DESC } }]) {
                     name
                 }
                 plainUsers {
@@ -123,7 +123,7 @@ class TestQueryRuntimeVariants:
                 }
                 usersWithOrderedPosts {
                     name
-                    posts(order: [{ title: DESC }]) {
+                    posts(order: [{ field: { title: DESC } }]) {
                         title
                     }
                 }
@@ -191,7 +191,7 @@ class TestQueryRuntimeVariants:
         result = await schema.execute(
             """
             {
-                usersConnection(order: [{ name: DESC }], first: 2) {
+                usersConnection(order: [{ field: { name: DESC } }], first: 2) {
                     edges {
                         node { name }
                     }
