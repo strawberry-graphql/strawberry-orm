@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 import typing
 import warnings
+from collections.abc import Callable
 from typing import Any, Optional
 
 import strawberry
 
-from strawberry_orm.filters import TYPE_TO_LOOKUP, StringLookup, StringLookupNoRegex
+from strawberry_orm.filters import (
+    _CUSTOM_FILTER_ATTR,
+    _CUSTOM_ORDER_ATTR,
+    TYPE_TO_LOOKUP,
+    StringLookup,
+    StringLookupNoRegex,
+)
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
 from strawberry_orm.types import Ordering
@@ -23,6 +31,29 @@ _SENSITIVE_PATTERNS = re.compile(
     r"superuser|permission|role)",
     re.IGNORECASE,
 )
+
+
+_KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
+_KNOWN_ORDER_KEYS = frozenset({"field", "object"})
+
+
+def invoke_custom_callback(
+    callback: Callable[..., Any],
+    instance: Any,
+    *,
+    query: Any,
+    value: Any,
+    info: Any = None,
+) -> Any:
+    """Call a user-defined ``@filter_field`` / ``@order_field`` callback.
+
+    The callback is inspected once to determine whether it accepts ``info``.
+    """
+    sig = inspect.signature(callback)
+    kwargs: dict[str, Any] = {"value": value, "query": query}
+    if "info" in sig.parameters:
+        kwargs["info"] = info
+    return callback(instance, **kwargs)
 
 
 def extract_element_type(ann: Any) -> Any:
@@ -57,6 +88,7 @@ class BaseBackend:
 
     def __init__(self, **kwargs: Any) -> None:
         self._store = OptimizerStore()
+        self._repos: dict[type, type] = {}
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
         self._type_registry: dict[str, type] = {}
         self._graphql_type_registry: dict[type, type] = {}
@@ -69,6 +101,16 @@ class BaseBackend:
             "exclude_sensitive_fields", True
         )
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
+
+    def get_repo(self, model: type) -> Any | None:
+        """Return an instantiated repo for *model*, or ``None``."""
+        repo_cls = self._repos.get(model)
+        if repo_cls is None:
+            return None
+        repo = repo_cls(self)
+        if repo.model is None:
+            repo.model = model
+        return repo
 
     # -- Abstract / hook methods (override in subclasses) --------------------
 
@@ -368,6 +410,284 @@ class BaseBackend:
         if object_annotations:
             OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        self._order_registry[model] = OrderType
+        return OrderType
+
+    # -- Custom filter / order types -----------------------------------------
+
+    def filter_type(
+        self,
+        model: type,
+        *,
+        include: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> Callable[[type], type]:
+        """Decorator that builds a ``@oneOf`` filter input from a user class.
+
+        ``auto`` annotations are expanded to the standard lookup type for
+        the corresponding model column.  Methods decorated with
+        ``@filter_field`` become additional top-level keys on the filter
+        input alongside ``field``, ``object``, ``all``, ``any``, ``not``,
+        and ``one_of``.
+        """
+
+        def decorator(cls: type) -> type:
+            return self._build_custom_filter_type(
+                cls, model, include=include, exclude=exclude
+            )
+
+        return decorator
+
+    def _build_custom_filter_type(
+        self,
+        cls: type,
+        model: type,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+    ) -> type:
+        enable_regex = getattr(self, "_enable_regex_filters", False)
+        fields_meta = self._introspect_model(model)
+        col_types = {
+            fname: ftype for fname, ftype, is_rel, _ in fields_meta if not is_rel
+        }
+        rel_info = {
+            fname: rel
+            for fname, _, is_rel, rel in fields_meta
+            if is_rel and rel is not None
+        }
+
+        user_annotations = typing.get_type_hints(cls, include_extras=True)
+
+        field_annotations: dict[str, Any] = {}
+        field_defaults: dict[str, Any] = {}
+        object_annotations: dict[str, Any] = {}
+        object_defaults: dict[str, Any] = {}
+        relation_models: dict[str, type] = {}
+        custom_filter_annotations: dict[str, Any] = {}
+        custom_filter_defaults: dict[str, Any] = {}
+        custom_filters: dict[str, Callable[..., Any]] = {}
+
+        for fname, ann in user_annotations.items():
+            if include and fname not in include:
+                continue
+            if exclude and fname in exclude:
+                continue
+            if ann is strawberry.auto:
+                if fname in col_types:
+                    ftype = col_types[fname]
+                    lookup_type = self._filter_overrides.get(
+                        ftype
+                    ) or TYPE_TO_LOOKUP.get(ftype)
+                    if lookup_type is not None:
+                        if lookup_type is StringLookup and not enable_regex:
+                            lookup_type = StringLookupNoRegex
+                        field_annotations[fname] = Optional[lookup_type]
+                        field_defaults[fname] = strawberry.UNSET
+                elif fname in rel_info:
+                    rel_model = rel_info[fname]
+                    rel_filter = self._filter_registry.get(rel_model)
+                    if rel_filter is not None:
+                        object_annotations[fname] = Optional[rel_filter]
+                        object_defaults[fname] = strawberry.UNSET
+                        relation_models[fname] = rel_model
+
+        for attr_name in list(vars(cls)):
+            method = getattr(cls, attr_name, None)
+            if callable(method) and getattr(method, _CUSTOM_FILTER_ATTR, False):
+                sig = inspect.signature(method)
+                params = list(sig.parameters.values())
+                value_param = None
+                for p in params:
+                    if p.name == "value":
+                        value_param = p
+                        break
+                if (
+                    value_param is None
+                    or value_param.annotation is inspect.Parameter.empty
+                ):
+                    raise TypeError(
+                        f"@filter_field method '{attr_name}' must have a "
+                        f"'value' parameter with a type annotation."
+                    )
+                value_type = value_param.annotation
+                custom_filter_annotations[attr_name] = Optional[value_type]
+                custom_filter_defaults[attr_name] = strawberry.UNSET
+                custom_filters[attr_name] = method
+
+        field_type_name = f"{model.__name__}Field"
+        if field_annotations:
+            field_ns: dict[str, Any] = {
+                "__annotations__": field_annotations,
+                **field_defaults,
+            }
+            field_cls = type(field_type_name, (), field_ns)
+            FieldType = strawberry.input(field_cls, one_of=True)
+        else:
+            FieldType = None
+
+        filter_type_name = f"{model.__name__}Filter"
+        filter_ns: dict[str, Any] = {"__annotations__": {}}
+        if FieldType is not None:
+            filter_ns["__annotations__"]["field"] = Optional[FieldType]
+            filter_ns["field"] = strawberry.UNSET
+
+        if object_annotations:
+            obj_type_name = f"{model.__name__}Object"
+            obj_ns: dict[str, Any] = {
+                "__annotations__": object_annotations,
+                **object_defaults,
+            }
+            obj_cls = type(obj_type_name, (), obj_ns)
+            ObjectType = strawberry.input(obj_cls, one_of=True)
+            filter_ns["__annotations__"]["object"] = Optional[ObjectType]
+            filter_ns["object"] = strawberry.UNSET
+
+        for cname, cann in custom_filter_annotations.items():
+            filter_ns["__annotations__"][cname] = cann
+            filter_ns[cname] = custom_filter_defaults[cname]
+
+        FilterCls = type(filter_type_name, (), filter_ns)
+
+        FilterCls.__annotations__["all"] = Optional[list[FilterCls]]
+        FilterCls.__annotations__["any"] = Optional[list[FilterCls]]
+        FilterCls.__annotations__["not_"] = Optional[FilterCls]
+        FilterCls.__annotations__["one_of"] = Optional[list[FilterCls]]
+        FilterCls.all = strawberry.UNSET
+        FilterCls.any = strawberry.UNSET
+        FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
+        FilterCls.one_of = strawberry.UNSET
+
+        FilterType = strawberry.input(FilterCls, one_of=True)
+        FilterType.__orm_model__ = model  # type: ignore[attr-defined]
+        if FieldType is not None:
+            FilterType._field_type = FieldType  # type: ignore[attr-defined]
+        if object_annotations:
+            FilterType._object_type = ObjectType  # type: ignore[attr-defined]
+            FilterType._relation_models = relation_models  # type: ignore[attr-defined]
+        if custom_filters:
+            FilterType._custom_filters = custom_filters  # type: ignore[attr-defined]
+
+        self._filter_registry[model] = FilterType
+        return FilterType
+
+    def order_type(
+        self,
+        model: type,
+        *,
+        include: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> Callable[[type], type]:
+        """Decorator that builds a ``@oneOf`` order input from a user class.
+
+        ``auto`` annotations are expanded to ``Optional[Ordering]``.
+        Methods decorated with ``@order_field`` become additional top-level
+        keys on the order input alongside ``field`` and ``object``.
+        """
+
+        def decorator(cls: type) -> type:
+            return self._build_custom_order_type(
+                cls, model, include=include, exclude=exclude
+            )
+
+        return decorator
+
+    def _build_custom_order_type(
+        self,
+        cls: type,
+        model: type,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+    ) -> type:
+        fields_meta = self._introspect_model(model)
+        col_types = {
+            fname: ftype for fname, ftype, is_rel, _ in fields_meta if not is_rel
+        }
+        rel_info = {
+            fname: rel
+            for fname, _, is_rel, rel in fields_meta
+            if is_rel and rel is not None
+        }
+
+        user_annotations = typing.get_type_hints(cls, include_extras=True)
+
+        field_annotations: dict[str, Any] = {}
+        field_defaults: dict[str, Any] = {}
+        object_annotations: dict[str, Any] = {}
+        object_defaults: dict[str, Any] = {}
+        relation_models: dict[str, type] = {}
+        custom_order_annotations: dict[str, Any] = {}
+        custom_order_defaults: dict[str, Any] = {}
+        custom_orders: dict[str, Callable[..., Any]] = {}
+
+        for fname, ann in user_annotations.items():
+            if include and fname not in include:
+                continue
+            if exclude and fname in exclude:
+                continue
+            if ann is strawberry.auto:
+                if fname in col_types:
+                    field_annotations[fname] = Optional[Ordering]
+                    field_defaults[fname] = strawberry.UNSET
+                elif fname in rel_info:
+                    rel_model = rel_info[fname]
+                    rel_order = self._order_registry.get(rel_model)
+                    if rel_order is not None:
+                        object_annotations[fname] = Optional[rel_order]
+                        object_defaults[fname] = strawberry.UNSET
+                        relation_models[fname] = rel_model
+
+        for attr_name in list(vars(cls)):
+            method = getattr(cls, attr_name, None)
+            if callable(method) and getattr(method, _CUSTOM_ORDER_ATTR, False):
+                custom_order_annotations[attr_name] = Optional[Ordering]
+                custom_order_defaults[attr_name] = strawberry.UNSET
+                custom_orders[attr_name] = method
+
+        field_type_name = f"{model.__name__}OrderField"
+        if field_annotations:
+            field_ns: dict[str, Any] = {
+                "__annotations__": field_annotations,
+                **field_defaults,
+            }
+            field_cls = type(field_type_name, (), field_ns)
+            OrderFieldType = strawberry.input(field_cls, one_of=True)
+        else:
+            OrderFieldType = None
+
+        order_type_name = f"{model.__name__}Order"
+        order_ns: dict[str, Any] = {"__annotations__": {}}
+        if OrderFieldType is not None:
+            order_ns["__annotations__"]["field"] = Optional[OrderFieldType]
+            order_ns["field"] = strawberry.UNSET
+
+        if object_annotations:
+            obj_type_name = f"{model.__name__}OrderObject"
+            obj_ns: dict[str, Any] = {
+                "__annotations__": object_annotations,
+                **object_defaults,
+            }
+            obj_cls = type(obj_type_name, (), obj_ns)
+            OrderObjectType = strawberry.input(obj_cls, one_of=True)
+            order_ns["__annotations__"]["object"] = Optional[OrderObjectType]
+            order_ns["object"] = strawberry.UNSET
+
+        for cname, cann in custom_order_annotations.items():
+            order_ns["__annotations__"][cname] = cann
+            order_ns[cname] = custom_order_defaults[cname]
+
+        OrderCls = type(order_type_name, (), order_ns)
+        OrderType = strawberry.input(OrderCls, one_of=True)
+        OrderType.__orm_model__ = model  # type: ignore[attr-defined]
+        if OrderFieldType is not None:
+            OrderType._field_type = OrderFieldType  # type: ignore[attr-defined]
+        if object_annotations:
+            OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
+            OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        if custom_orders:
+            OrderType._custom_orders = custom_orders  # type: ignore[attr-defined]
+
         self._order_registry[model] = OrderType
         return OrderType
 

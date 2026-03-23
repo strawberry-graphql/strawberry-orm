@@ -6,7 +6,8 @@ from asgiref.sync import sync_to_async
 
 from strawberry_orm import StrawberryORM
 from tests.backends.django.fixtures import main_schema
-from tests.backends.django.models import Post as DjPost, Tag as DjTag
+from tests.backends.django.models import Post as DjPost
+from tests.backends.django.models import Tag as DjTag
 
 
 class TestAsyncExecution:

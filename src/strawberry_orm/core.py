@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import typing as _typing
+from collections.abc import Callable
 from functools import wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
-import typing as _typing
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Literal, Optional
 
 import strawberry
 from strawberry import relay
@@ -24,7 +25,6 @@ from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.backends.protocol import Backend
 from strawberry_orm.mutations import MutationNamespace
 from strawberry_orm.types import FieldDefinition
-
 
 BackendName = Literal["django", "sqlalchemy", "tortoise"]
 
@@ -441,8 +441,19 @@ class StrawberryORM:
     """
 
     def __init__(self, backend: BackendName, **kwargs: Any) -> None:
+        from strawberry_orm.repo import AbstractRepo
+
         self._backend_name = backend
+        repos: dict[type, type[AbstractRepo]] | None = kwargs.pop("repos", None)  # type: ignore[type-arg]
+        policy = kwargs.pop("policy", None)
         self._backend: Backend = _create_backend(backend, **kwargs)
+        self._backend._repos = repos or {}  # type: ignore[attr-defined]
+
+        if policy is not None and not repos:
+            from strawberry_orm.policy import _policy_to_repos
+
+            self._backend._repos = _policy_to_repos(policy)  # type: ignore[attr-defined]
+
         self.mutations = MutationNamespace(self._backend)
 
     @property
@@ -465,6 +476,12 @@ class StrawberryORM:
 
     def order(self, model_or_type: type, **kwargs: Any) -> Any:
         return self._backend.order(model_or_type, **kwargs)
+
+    def filter_type(self, model: type, **kwargs: Any) -> Any:
+        return self._backend.filter_type(model, **kwargs)
+
+    def order_type(self, model: type, **kwargs: Any) -> Any:
+        return self._backend.order_type(model, **kwargs)
 
     # -- Fields --------------------------------------------------------------
 

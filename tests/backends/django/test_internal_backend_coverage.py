@@ -1,9 +1,9 @@
 """Focused backend-adapter coverage for exact helper branches."""
 
+from types import SimpleNamespace
+
 import pytest
 import strawberry
-
-from types import SimpleNamespace
 
 from strawberry_orm.backends.django import (
     DjangoBackend,
@@ -23,10 +23,10 @@ class EmptyFilterGroup:
 
 class TestInternalBackendCoverage:
     def test_filter_helpers_handle_none_and_empty_groups(self):
-        assert _build_django_filter(None) is None
-        assert _build_django_filter(EmptyFilterGroup(all=[])) is None
-        assert _build_django_filter(EmptyFilterGroup(any=[])) is None
-        assert _build_django_filter(EmptyFilterGroup(one_of=[])) is None
+        assert _build_django_filter(None) == (None, None)
+        assert _build_django_filter(EmptyFilterGroup(all=[])) == (None, None)
+        assert _build_django_filter(EmptyFilterGroup(any=[])) == (None, None)
+        assert _build_django_filter(EmptyFilterGroup(one_of=[])) == (None, None)
 
         with pytest.raises(ValueError, match="maximum is 0"):
             _build_django_filter(
@@ -60,5 +60,5 @@ class TestInternalBackendCoverage:
         assert backend.is_query_object(qs) is True
         assert filtered is qs
         assert ordered is qs
-        assert _build_django_filter(EmptyFilterGroup()) is None
+        assert _build_django_filter(EmptyFilterGroup()) == (None, None)
         assert str(_build_django_field_clause(EmptyFilterGroup())) == "(AND: )"

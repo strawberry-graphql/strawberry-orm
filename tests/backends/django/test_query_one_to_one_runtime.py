@@ -1,7 +1,5 @@
 """One-to-one query shapes that exercise optimizer relation branches."""
 
-from typing import Optional
-
 import pytest
 import strawberry
 from django.db import connection, models
@@ -55,10 +53,10 @@ class TestQueryOneToOneRuntime:
         class UserType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
             @strawberry.field
-            def profile(self) -> Optional[ProfileType]:
+            def profile(self) -> ProfileType | None:
                 try:
                     return type(self).profile.__get__(self, type(self))
                 except profile_model.DoesNotExist:
@@ -93,10 +91,10 @@ class TestQueryOneToOneRuntime:
         class AuthorType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
             @strawberry.field
-            def profile(self) -> Optional[ProfileType]:
+            def profile(self) -> ProfileType | None:
                 try:
                     return type(self).profile.__get__(self, type(self))
                 except profile_model.DoesNotExist:
@@ -146,10 +144,10 @@ class TestQueryOneToOneRuntime:
         class UserType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
             @strawberry.field
-            def profile(self) -> Optional[ProfileType]:
+            def profile(self) -> ProfileType | None:
                 try:
                     return type(self).profile.__get__(self, type(self))
                 except profile_model.DoesNotExist:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 import typer
 
@@ -49,10 +49,17 @@ def _configure_django() -> None:
 
 def _seed_django() -> None:
     from django.db import connection
+
     from tests.backends.django.models import (
         Comment as DjComment,
+    )
+    from tests.backends.django.models import (
         Post as DjPost,
+    )
+    from tests.backends.django.models import (
         Tag as DjTag,
+    )
+    from tests.backends.django.models import (
         User as DjUser,
     )
 
@@ -113,6 +120,7 @@ def _seed_django() -> None:
 def _seed_sqlalchemy() -> Any:
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+
     from tests.backends.sqlalchemy.models import Base, Comment, Post, Tag, User
 
     engine = create_engine("sqlite:///:memory:")
@@ -211,7 +219,7 @@ def _load_schema(backend: Backend, name: str) -> Any:
 
 @app.command()
 def show(
-    schema_name: Optional[str] = typer.Argument(
+    schema_name: str | None = typer.Argument(
         None,
         help=f"Schema to display. Choices: {', '.join(SCHEMA_NAMES)}. "
         "Omit to list available schemas.",
@@ -240,6 +248,7 @@ def show(
         else:
             from sqlalchemy import create_engine
             from sqlalchemy.orm import sessionmaker
+
             from tests.backends.sqlalchemy.models import Base
 
             engine = create_engine("sqlite:///:memory:")

@@ -100,7 +100,7 @@ class TestQueryOneToOneRuntime:
         class UserType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
         @strawberry.type
         class Query:
@@ -134,7 +134,7 @@ class TestQueryOneToOneRuntime:
         class AuthorType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
         @orm.type(Post)
         class PostType:
@@ -181,7 +181,7 @@ class TestQueryOneToOneRuntime:
         class UserType:
             id: auto
             name: auto
-            profile: Optional[ProfileType]
+            profile: ProfileType | None
 
         @strawberry.type
         class Query:

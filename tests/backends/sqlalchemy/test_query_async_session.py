@@ -10,8 +10,14 @@ from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.fixtures import main_schema
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
+)
+from tests.backends.sqlalchemy.models import (
     Post as SAPost,
+)
+from tests.backends.sqlalchemy.models import (
     Tag as SATag,
+)
+from tests.backends.sqlalchemy.models import (
     User as SAUser,
 )
 

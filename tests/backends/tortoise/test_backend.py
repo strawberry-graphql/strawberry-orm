@@ -1,7 +1,5 @@
 """Backend creation and optimizer extension tests."""
 
-import pytest
-
 
 class TestBackendCreation:
     def test_creates_tortoise_backend(self, orm):

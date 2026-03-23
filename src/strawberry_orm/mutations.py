@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-import hashlib
-from typing import Any, Iterable, Literal
+from typing import Any, Literal
 
 import strawberry
 from strawberry import relay
@@ -675,11 +676,18 @@ class MutationNamespace:
         info: Any,
         parent_link: tuple[str, Any] | None = None,
     ) -> Any:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(model)
         scalar_values, relation_values = self._split_payload(model, payload)
         relation_specs = self._relation_specs(model)
 
         if parent_link is not None:
             scalar_values[parent_link[0]] = parent_link[1]
+
+        if repo is not None:
+            scalar_values = repo.on_before_create(scalar_values, info)
+        _check_auth(repo, "can_create", scalar_values, info)
 
         for field_name, wrapper in list(relation_values.items()):
             spec = relation_specs[field_name]
@@ -695,7 +703,10 @@ class MutationNamespace:
                 scalar_values[field_name] = related
                 relation_values.pop(field_name)
 
-        instance = _sync_create_instance(self._backend, model, scalar_values, info)
+        if repo is not None:
+            instance = repo._create(model, scalar_values, info)
+        else:
+            instance = _sync_create_instance(self._backend, model, scalar_values, info)
 
         for field_name, wrapper in relation_values.items():
             spec = relation_specs[field_name]
@@ -704,7 +715,14 @@ class MutationNamespace:
             else:
                 self._apply_many_sync(instance, spec, wrapper, info)
 
-        _sync_save_instance(self._backend, instance, info)
+        if repo is not None:
+            repo._save(instance, info)
+        else:
+            _sync_save_instance(self._backend, instance, info)
+
+        if repo is not None:
+            repo.on_after_create(instance, info)
+
         return instance
 
     def _update_sync(
@@ -714,11 +732,22 @@ class MutationNamespace:
         info: Any,
         parent_link: tuple[str, Any] | None = None,
     ) -> Any:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(model)
         scalar_values, relation_values = self._split_payload(model, payload)
         raw_id = scalar_values.pop("id", None)
-        instance = _sync_load_instance(self._backend, model, raw_id, info)
+
+        if repo is not None:
+            instance = repo._get(model, raw_id, info)
+        else:
+            instance = _sync_load_instance(self._backend, model, raw_id, info)
         if instance is None:
             raise ValueError(f"{model.__name__} with id={raw_id} does not exist")
+
+        if repo is not None:
+            scalar_values = repo.on_before_update(instance, scalar_values, info)
+        _check_auth(repo, "can_update", instance, scalar_values, info)
 
         if parent_link is not None:
             setattr(instance, parent_link[0], parent_link[1])
@@ -734,7 +763,14 @@ class MutationNamespace:
             else:
                 self._apply_many_sync(instance, spec, wrapper, info)
 
-        _sync_save_instance(self._backend, instance, info)
+        if repo is not None:
+            repo._save(instance, info)
+        else:
+            _sync_save_instance(self._backend, instance, info)
+
+        if repo is not None:
+            repo.on_after_update(instance, info)
+
         return instance
 
     async def _create_async(
@@ -744,11 +780,18 @@ class MutationNamespace:
         info: Any,
         parent_link: tuple[str, Any] | None = None,
     ) -> Any:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(model)
         scalar_values, relation_values = self._split_payload(model, payload)
         relation_specs = self._relation_specs(model)
 
         if parent_link is not None:
             scalar_values[parent_link[0]] = parent_link[1]
+
+        if repo is not None:
+            scalar_values = repo.on_before_create(scalar_values, info)
+        _check_auth(repo, "can_create", scalar_values, info)
 
         for field_name, wrapper in list(relation_values.items()):
             spec = relation_specs[field_name]
@@ -766,9 +809,12 @@ class MutationNamespace:
                 scalar_values[field_name] = related
                 relation_values.pop(field_name)
 
-        instance = await _async_create_instance(
-            self._backend, model, scalar_values, info
-        )
+        if repo is not None:
+            instance = await repo._create_async(model, scalar_values, info)
+        else:
+            instance = await _async_create_instance(
+                self._backend, model, scalar_values, info
+            )
 
         for field_name, wrapper in relation_values.items():
             spec = relation_specs[field_name]
@@ -777,7 +823,14 @@ class MutationNamespace:
             else:
                 await self._apply_many_async(instance, spec, wrapper, info)
 
-        await _async_save_instance(self._backend, instance, info)
+        if repo is not None:
+            await repo._save_async(instance, info)
+        else:
+            await _async_save_instance(self._backend, instance, info)
+
+        if repo is not None:
+            repo.on_after_create(instance, info)
+
         return instance
 
     async def _update_async(
@@ -787,11 +840,22 @@ class MutationNamespace:
         info: Any,
         parent_link: tuple[str, Any] | None = None,
     ) -> Any:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(model)
         scalar_values, relation_values = self._split_payload(model, payload)
         raw_id = scalar_values.pop("id", None)
-        instance = await _async_load_instance(self._backend, model, raw_id, info)
+
+        if repo is not None:
+            instance = await repo._get_async(model, raw_id, info)
+        else:
+            instance = await _async_load_instance(self._backend, model, raw_id, info)
         if instance is None:
             raise ValueError(f"{model.__name__} with id={raw_id} does not exist")
+
+        if repo is not None:
+            scalar_values = repo.on_before_update(instance, scalar_values, info)
+        _check_auth(repo, "can_update", instance, scalar_values, info)
 
         if parent_link is not None:
             setattr(instance, parent_link[0], parent_link[1])
@@ -807,12 +871,22 @@ class MutationNamespace:
             else:
                 await self._apply_many_async(instance, spec, wrapper, info)
 
-        await _async_save_instance(self._backend, instance, info)
+        if repo is not None:
+            await repo._save_async(instance, info)
+        else:
+            await _async_save_instance(self._backend, instance, info)
+
+        if repo is not None:
+            repo.on_after_update(instance, info)
+
         return instance
 
     def _apply_single_sync(
         self, instance: Any, spec: RelationSpec, wrapper: Any, info: Any
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(spec.related_model)
         operation, payload, on_replace = self._resolve_single_wrapper(wrapper)
         current = getattr(instance, spec.name, None)
         related = (
@@ -820,18 +894,30 @@ class MutationNamespace:
             if operation == "create"
             else self._update_sync(spec.related_model, payload, info)
         )
+        _check_auth(repo, "can_link", instance, spec.name, related, info)
         setattr(instance, spec.name, related)
-        _sync_save_instance(self._backend, instance, info)
+        if repo is not None:
+            repo._save(instance, info)
+        else:
+            _sync_save_instance(self._backend, instance, info)
         if (
             on_replace == "DELETE"
             and current is not None
             and _primary_key_value(current) != _primary_key_value(related)
         ):
-            _sync_delete_instance(self._backend, current, info)
+            _check_auth(repo, "can_delete", current, info)
+            if repo is not None:
+                repo.on_before_delete(current, info)
+                repo._delete(current, info)
+            else:
+                _sync_delete_instance(self._backend, current, info)
 
     async def _apply_single_async(
         self, instance: Any, spec: RelationSpec, wrapper: Any, info: Any
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(spec.related_model)
         operation, payload, on_replace = self._resolve_single_wrapper(wrapper)
         current = getattr(instance, spec.name, None)
         related = (
@@ -839,14 +925,23 @@ class MutationNamespace:
             if operation == "create"
             else await self._update_async(spec.related_model, payload, info)
         )
+        _check_auth(repo, "can_link", instance, spec.name, related, info)
         setattr(instance, spec.name, related)
-        await _async_save_instance(self._backend, instance, info)
+        if repo is not None:
+            await repo._save_async(instance, info)
+        else:
+            await _async_save_instance(self._backend, instance, info)
         if (
             on_replace == "DELETE"
             and current is not None
             and _primary_key_value(current) != _primary_key_value(related)
         ):
-            await _async_delete_instance(self._backend, current, info)
+            _check_auth(repo, "can_delete", current, info)
+            if repo is not None:
+                repo.on_before_delete(current, info)
+                await repo._delete_async(current, info)
+            else:
+                await _async_delete_instance(self._backend, current, info)
 
     def _apply_many_sync(
         self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
@@ -871,6 +966,10 @@ class MutationNamespace:
         refs: list[Any],
         info: Any,
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(spec.related_model)
+
         for ref in refs:
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
@@ -887,9 +986,12 @@ class MutationNamespace:
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 update_values = _input_values(ref_update)
                 raw_id = update_values.get("id")
-                child = _sync_load_instance(
-                    self._backend, spec.related_model, raw_id, info
-                )
+                if repo is not None:
+                    child = repo._get(spec.related_model, raw_id, info)
+                else:
+                    child = _sync_load_instance(
+                        self._backend, spec.related_model, raw_id, info
+                    )
                 if child is None:
                     continue
                 self._update_sync(
@@ -899,17 +1001,29 @@ class MutationNamespace:
                     parent_link=(spec.remote_attr, instance),
                 )
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                child = _sync_load_instance(
-                    self._backend, spec.related_model, ref_unlink.id, info
-                )
+                if repo is not None:
+                    child = repo._get(spec.related_model, ref_unlink.id, info)
+                else:
+                    child = _sync_load_instance(
+                        self._backend, spec.related_model, ref_unlink.id, info
+                    )
                 if child is not None:
+                    _check_auth(repo, "can_unlink", instance, spec.name, child, info)
                     self._detach_reverse_sync(child, spec, info)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                child = _sync_load_instance(
-                    self._backend, spec.related_model, ref_delete.id, info
-                )
+                if repo is not None:
+                    child = repo._get(spec.related_model, ref_delete.id, info)
+                else:
+                    child = _sync_load_instance(
+                        self._backend, spec.related_model, ref_delete.id, info
+                    )
                 if child is not None:
-                    _sync_delete_instance(self._backend, child, info)
+                    _check_auth(repo, "can_delete", child, info)
+                    if repo is not None:
+                        repo.on_before_delete(child, info)
+                        repo._delete(child, info)
+                    else:
+                        _sync_delete_instance(self._backend, child, info)
                     if self._backend.__class__.__name__ == "SQLAlchemyBackend":
                         related = getattr(instance, spec.name, None)
                         if isinstance(related, list) and child in related:
@@ -922,6 +1036,10 @@ class MutationNamespace:
         refs: list[Any],
         info: Any,
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        repo = self._backend.get_repo(spec.related_model)
+
         for ref in refs:
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
@@ -938,9 +1056,12 @@ class MutationNamespace:
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 update_values = _input_values(ref_update)
                 raw_id = update_values.get("id")
-                child = await _async_load_instance(
-                    self._backend, spec.related_model, raw_id, info
-                )
+                if repo is not None:
+                    child = await repo._get_async(spec.related_model, raw_id, info)
+                else:
+                    child = await _async_load_instance(
+                        self._backend, spec.related_model, raw_id, info
+                    )
                 if child is None:
                     continue
                 await self._update_async(
@@ -950,17 +1071,33 @@ class MutationNamespace:
                     parent_link=(spec.remote_attr, instance),
                 )
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                child = await _async_load_instance(
-                    self._backend, spec.related_model, ref_unlink.id, info
-                )
+                if repo is not None:
+                    child = await repo._get_async(
+                        spec.related_model, ref_unlink.id, info
+                    )
+                else:
+                    child = await _async_load_instance(
+                        self._backend, spec.related_model, ref_unlink.id, info
+                    )
                 if child is not None:
+                    _check_auth(repo, "can_unlink", instance, spec.name, child, info)
                     await self._detach_reverse_async(child, spec, info)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                child = await _async_load_instance(
-                    self._backend, spec.related_model, ref_delete.id, info
-                )
+                if repo is not None:
+                    child = await repo._get_async(
+                        spec.related_model, ref_delete.id, info
+                    )
+                else:
+                    child = await _async_load_instance(
+                        self._backend, spec.related_model, ref_delete.id, info
+                    )
                 if child is not None:
-                    await _async_delete_instance(self._backend, child, info)
+                    _check_auth(repo, "can_delete", child, info)
+                    if repo is not None:
+                        repo.on_before_delete(child, info)
+                        await repo._delete_async(child, info)
+                    else:
+                        await _async_delete_instance(self._backend, child, info)
 
     def _detach_reverse_sync(self, child: Any, spec: RelationSpec, info: Any) -> None:
         if not spec.nullable:
@@ -968,7 +1105,11 @@ class MutationNamespace:
                 f"Cannot detach non-nullable relation '{spec.name}' without delete_previous=True"
             )
         setattr(child, spec.remote_attr, None)
-        _sync_save_instance(self._backend, child, info)
+        repo = self._backend.get_repo(spec.related_model)
+        if repo is not None:
+            repo._save(child, info)
+        else:
+            _sync_save_instance(self._backend, child, info)
 
     async def _detach_reverse_async(
         self, child: Any, spec: RelationSpec, info: Any
@@ -978,7 +1119,11 @@ class MutationNamespace:
                 f"Cannot detach non-nullable relation '{spec.name}' without delete_previous=True"
             )
         setattr(child, spec.remote_attr, None)
-        await _async_save_instance(self._backend, child, info)
+        repo = self._backend.get_repo(spec.related_model)
+        if repo is not None:
+            await repo._save_async(child, info)
+        else:
+            await _async_save_instance(self._backend, child, info)
 
 
 def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
@@ -1115,10 +1260,8 @@ def _sync_create_instance(
 
 def _sync_load_instance(backend: Any, model: type, raw_id: Any, info: Any) -> Any:
     if backend.__class__.__name__ == "DjangoBackend":
-        try:
-            return model.objects.get(pk=raw_id)
-        except model.DoesNotExist:
-            return None
+        qs = model.objects.all()
+        return qs.filter(pk=raw_id).first()
 
     session = backend._get_session(info)
     return session.get(model, int(raw_id))

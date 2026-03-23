@@ -11,9 +11,15 @@ from typing import Any, Optional
 
 import strawberry
 from strawberry.extensions import SchemaExtension
+
 from strawberry_orm.optimizer import OptimizerExtension
 
-from ._base import BaseBackend, extract_element_type, input_to_dict
+from ._base import (
+    BaseBackend,
+    extract_element_type,
+    input_to_dict,
+    invoke_custom_callback,
+)
 
 _TORTOISE_FIELD_MAP: dict[str, type] = {
     "IntField": int,
@@ -277,8 +283,9 @@ class TortoiseBackend(BaseBackend):
     # -- Query application ----------------------------------------------------
 
     def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        q_obj = _build_tortoise_filter(
+        q_obj, query = _build_tortoise_filter(
             filter_input,
+            query=query,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -293,12 +300,13 @@ class TortoiseBackend(BaseBackend):
         clauses: list[str] = []
         python_orderings: list[tuple[str, bool, bool | None, bool | None]] = []
         for entry in order_list:
+            entry_orderings, query = _build_tortoise_ordering(entry, query=query)
             for (
                 col_name,
                 descending,
                 nulls_first,
                 nulls_last,
-            ) in _build_tortoise_ordering(entry):
+            ) in entry_orderings:
                 python_orderings.append((col_name, descending, nulls_first, nulls_last))
                 if nulls_first or nulls_last:
                     continue
@@ -320,8 +328,11 @@ class TortoiseBackend(BaseBackend):
         *,
         authorize: Any | None = None,
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
         manager = getattr(instance, field)
         rel_model = manager.remote_model
+        repo = self.get_repo(rel_model) if not authorize else None
 
         to_add: list[Any] = []
         to_unlink_ids: list[Any] = []
@@ -336,29 +347,50 @@ class TortoiseBackend(BaseBackend):
             if ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", rel_model, None, info):
                     continue
-                obj = await rel_model.create(**input_to_dict(ref_create))
+                data = input_to_dict(ref_create)
+                _check_auth(repo, "can_create", data, info)
+                obj = await rel_model.create(**data)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
                 pk = data.pop("id")
                 if authorize and not authorize("update", rel_model, pk, info):
                     continue
-                if data:
-                    await rel_model.filter(pk=pk).update(**data)
-                obj = await rel_model.get(pk=pk)
-                to_add.append(obj)
+                if repo is not None:
+                    obj = await repo._get_async(rel_model, pk, info)
+                else:
+                    obj = await rel_model.filter(pk=pk).first()
+                if obj is not None:
+                    _check_auth(repo, "can_update", obj, data, info)
+                    _check_auth(repo, "can_link", instance, field, obj, info)
+                    if data:
+                        await rel_model.filter(pk=pk).update(**data)
+                        obj = await rel_model.get(pk=pk)
+                    to_add.append(obj)
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                 if authorize and not authorize(
                     "unlink", rel_model, ref_unlink.id, info
                 ):
                     continue
-                to_unlink_ids.append(ref_unlink.id)
+                if repo is not None:
+                    obj = await repo._get_async(rel_model, ref_unlink.id, info)
+                else:
+                    obj = await rel_model.filter(pk=ref_unlink.id).first()
+                if obj is not None:
+                    _check_auth(repo, "can_unlink", instance, field, obj, info)
+                    to_unlink_ids.append(ref_unlink.id)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
                     "delete", rel_model, ref_delete.id, info
                 ):
                     continue
-                to_delete_ids.append(ref_delete.id)
+                if repo is not None:
+                    obj = await repo._get_async(rel_model, ref_delete.id, info)
+                else:
+                    obj = await rel_model.filter(pk=ref_delete.id).first()
+                if obj is not None:
+                    _check_auth(repo, "can_delete", obj, info)
+                    to_delete_ids.append(ref_delete.id)
 
         if to_add:
             await manager.add(*to_add)
@@ -779,24 +811,28 @@ _LOOKUP_TO_TORTOISE: dict[str, str] = {
 def _build_tortoise_filter(
     filter_input: Any,
     *,
+    query: Any = None,
+    info: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = False,
     max_in_list_size: int = 500,
     _depth: int = 0,
     _prefix: str = "",
-) -> Any:
-    """Recursively translate a filter input into a Tortoise Q object."""
-    from tortoise.queryset import Q
+) -> tuple[Any, Any]:
+    """Return ``(Q_clause | None, query)``."""
 
     if _depth > max_depth:
         raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
 
     if filter_input is None or filter_input is strawberry.UNSET:
-        return None
+        return None, query
 
     fields = filter_input.__class__.__dataclass_fields__
+    custom_filters = getattr(type(filter_input), "_custom_filters", {})
     recurse_kw = dict(
+        query=query,
+        info=info,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -811,12 +847,13 @@ def _build_tortoise_filter(
             continue
 
         if key == "field":
-            return _build_tortoise_field_clause(
+            clause = _build_tortoise_field_clause(
                 val,
                 prefix=_prefix,
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
             )
+            return clause, query
         elif key == "object":
             obj_fields = val.__class__.__dataclass_fields__
             for rel_name in obj_fields:
@@ -825,6 +862,8 @@ def _build_tortoise_filter(
                     continue
                 return _build_tortoise_filter(
                     nested_filter,
+                    query=query,
+                    info=info,
                     max_depth=max_depth,
                     max_branches=max_branches,
                     enable_regex=enable_regex,
@@ -837,45 +876,69 @@ def _build_tortoise_filter(
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_tortoise_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            if not sub:
-                return None
-            result = sub[0]
-            for s in sub[1:]:
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_tortoise_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            if not clauses:
+                return None, query
+            result = clauses[0]
+            for s in clauses[1:]:
                 result = result & s
-            return result
+            return result, query
         elif key == "any":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_tortoise_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            if not sub:
-                return None
-            result = sub[0]
-            for s in sub[1:]:
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_tortoise_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            if not clauses:
+                return None, query
+            result = clauses[0]
+            for s in clauses[1:]:
                 result = result | s
-            return result
+            return result, query
         elif key == "not_":
-            inner = _build_tortoise_filter(val, **recurse_kw)
-            return ~inner if inner is not None else None
+            inner, query = _build_tortoise_filter(val, **{**recurse_kw, "query": query})
+            return (~inner if inner is not None else None), query
         elif key == "one_of":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_tortoise_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            if not sub:
-                return None
-            result = sub[0]
-            for s in sub[1:]:
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_tortoise_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            if not clauses:
+                return None, query
+            result = clauses[0]
+            for s in clauses[1:]:
                 result = result | s
-            return result
+            return result, query
+        elif key in custom_filters:
+            query = invoke_custom_callback(
+                custom_filters[key],
+                filter_input,
+                query=query,
+                value=val,
+                info=info,
+            )
+            return None, query
 
-    return None
+    return None, query
 
 
 def _build_tortoise_field_clause(
@@ -977,9 +1040,7 @@ def _apply_python_ordering(
 
         if nulls_first:
             ordered = null_items + value_items
-        elif nulls_last:
-            ordered = value_items + null_items
-        elif descending:
+        elif nulls_last or descending:
             ordered = value_items + null_items
         else:
             ordered = null_items + value_items
@@ -988,11 +1049,16 @@ def _apply_python_ordering(
 
 
 def _build_tortoise_ordering(
-    order_input: Any, _prefix: str = ""
-) -> list[tuple[str, bool, bool | None, bool | None]]:
-    """Translate an order input into Tortoise and Python sort metadata."""
+    order_input: Any,
+    _prefix: str = "",
+    *,
+    query: Any = None,
+    info: Any = None,
+) -> tuple[list[tuple[str, bool, bool | None, bool | None]], Any]:
+    """Return ``(ordering_tuples, query)``."""
     clauses: list[tuple[str, bool, bool | None, bool | None]] = []
     fields = order_input.__class__.__dataclass_fields__
+    custom_orders = getattr(type(order_input), "_custom_orders", {})
 
     for key in fields:
         val = getattr(order_input, key)
@@ -1007,11 +1073,23 @@ def _build_tortoise_ordering(
                 nested = getattr(val, rel_name)
                 if nested is strawberry.UNSET or nested is None:
                     continue
-                clauses.extend(
-                    _build_tortoise_ordering(nested, _prefix=f"{_prefix}{rel_name}__")
+                sub_clauses, query = _build_tortoise_ordering(
+                    nested,
+                    _prefix=f"{_prefix}{rel_name}__",
+                    query=query,
+                    info=info,
                 )
+                clauses.extend(sub_clauses)
+        elif key in custom_orders:
+            query = invoke_custom_callback(
+                custom_orders[key],
+                order_input,
+                query=query,
+                value=val,
+                info=info,
+            )
 
-    return clauses
+    return clauses, query
 
 
 def _build_tortoise_order_field(

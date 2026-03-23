@@ -8,10 +8,6 @@ Run with:
     pytest tests/test_security_fixes.py -v
 """
 
-import sys
-import textwrap
-from typing import Optional
-
 import pytest
 import strawberry
 from sqlalchemy import (
@@ -21,7 +17,6 @@ from sqlalchemy import (
     Integer,
     String,
     Table,
-    Text,
     create_engine,
     event,
     select,
@@ -29,7 +24,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
-    Session,
     mapped_column,
     relationship,
     sessionmaker,
@@ -37,7 +31,6 @@ from sqlalchemy.orm import (
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
-
 
 # =========================================================================
 # Shared models (used by multiple test classes)
@@ -277,7 +270,6 @@ class TestFix3_FutureAnnotationsCompat:
         }
         cls = type("StringAnnotUser", (), ns)
         # Make `auto` resolvable in the class's module namespace
-        import strawberry_orm.types
 
         try:
             Decorated = orm.type(Account)(cls)
@@ -523,8 +515,9 @@ class TestFix7_PermissionClassesApplied:
     generated strawberry field so that Strawberry enforces them."""
 
     def test_permission_classes_on_field_definition(self):
-        from strawberry_orm.types import FieldDefinition
         from strawberry.permission import BasePermission
+
+        from strawberry_orm.types import FieldDefinition
 
         class DenyAll(BasePermission):
             message = "denied"
@@ -548,7 +541,7 @@ class TestFix7_PermissionClassesApplied:
         @strawberry.type
         class Q:
             @strawberry.field
-            def account(self, info: strawberry.types.Info) -> Optional[AT]:
+            def account(self, info: strawberry.types.Info) -> AT | None:
                 return None
 
         schema = strawberry.Schema(query=Q)

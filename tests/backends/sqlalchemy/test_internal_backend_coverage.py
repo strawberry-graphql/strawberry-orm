@@ -6,14 +6,14 @@ import pytest
 import strawberry
 from sqlalchemy import text
 
+from strawberry_orm import Ordering
 from strawberry_orm.backends.sqlalchemy import (
     SQLAlchemyBackend,
+    _build_lookup_clauses,
     _build_sa_field_clause,
     _build_sa_filter,
-    _build_lookup_clauses,
     _build_sa_ordering,
 )
-from strawberry_orm import Ordering
 
 
 @strawberry.input
@@ -43,10 +43,10 @@ class InvalidOrderInput:
 
 class TestInternalBackendCoverage:
     def test_filter_helpers_handle_none_and_empty_groups(self, User):
-        assert _build_sa_filter(None, User) is None
-        assert _build_sa_filter(EmptyFilterGroup(all=[]), User) is None
-        assert _build_sa_filter(EmptyFilterGroup(any=[]), User) is None
-        assert _build_sa_filter(EmptyFilterGroup(one_of=[]), User) is None
+        assert _build_sa_filter(None, User) == (None, None)
+        assert _build_sa_filter(EmptyFilterGroup(all=[]), User) == (None, None)
+        assert _build_sa_filter(EmptyFilterGroup(any=[]), User) == (None, None)
+        assert _build_sa_filter(EmptyFilterGroup(one_of=[]), User) == (None, None)
         assert _build_sa_field_clause(InvalidFieldInput(), User) is None
 
         with pytest.raises(ValueError, match="maximum is 0"):
@@ -69,7 +69,7 @@ class TestInternalBackendCoverage:
                 RegexLookup(i_regex="a.*"),
                 enable_regex=False,
             )
-        assert _build_sa_ordering(InvalidOrderInput(), User) == ([], [])
+        assert _build_sa_ordering(InvalidOrderInput(), User) == ([], [], None)
 
     def test_query_object_helpers_handle_fallback_values(self, sa_session):
         backend = SQLAlchemyBackend(dialect="sqlite")

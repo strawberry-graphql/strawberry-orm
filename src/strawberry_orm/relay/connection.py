@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Generic, Iterable, TypeVar
+from typing import TypeVar
 
-import strawberry
 from strawberry import relay
 from strawberry.relay import Connection, Edge, ListConnection, PageInfo
 

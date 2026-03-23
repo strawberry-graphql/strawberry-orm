@@ -1,6 +1,5 @@
 """Ref type generation tests for the Tortoise backend."""
 
-import pytest
 import strawberry
 
 

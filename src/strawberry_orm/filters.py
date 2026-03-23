@@ -12,7 +12,6 @@ from decimal import Decimal
 
 import strawberry
 
-
 # ---------------------------------------------------------------------------
 # Base lookups
 # ---------------------------------------------------------------------------
@@ -190,3 +189,53 @@ TYPE_TO_LOOKUP: dict[type, type] = {
     datetime.time: TimeComparisonLookup,
     datetime.datetime: DateTimeComparisonLookup,
 }
+
+
+# ---------------------------------------------------------------------------
+# Custom filter / order field decorators
+# ---------------------------------------------------------------------------
+
+_CUSTOM_FILTER_ATTR = "_orm_custom_filter"
+_CUSTOM_ORDER_ATTR = "_orm_custom_order"
+
+
+def filter_field(func):
+    """Mark a method as a custom filter handler.
+
+    The decorated method must accept ``(self, value: <type>, query)`` and
+    return the modified query object.  An optional ``info`` parameter will
+    receive the Strawberry ``Info`` when present in the signature.
+
+    Usage inside an ``@orm.filter_type(Model)`` class::
+
+        @orm.filter_type(User)
+        class UserFilter:
+            name: auto
+
+            @filter_field
+            def search(self, value: str, query):
+                return query.where(...)
+    """
+    func._orm_custom_filter = True
+    return func
+
+
+def order_field(func):
+    """Mark a method as a custom order handler.
+
+    The decorated method must accept ``(self, value: Ordering, query)`` and
+    return the modified query object.  An optional ``info`` parameter will
+    receive the Strawberry ``Info`` when present in the signature.
+
+    Usage inside an ``@orm.order_type(Model)`` class::
+
+        @orm.order_type(User)
+        class UserOrder:
+            name: auto
+
+            @order_field
+            def post_count(self, value: Ordering, query):
+                ...
+    """
+    func._orm_custom_order = True
+    return func

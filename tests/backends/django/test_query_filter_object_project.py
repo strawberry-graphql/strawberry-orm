@@ -10,8 +10,14 @@ from tests.abstract.query_filter_object_project import (
 )
 from tests.backends.django.models import (
     Comment as DjComment,
+)
+from tests.backends.django.models import (
     Post as DjPost,
+)
+from tests.backends.django.models import (
     Tag as DjTag,
+)
+from tests.backends.django.models import (
     User as DjUser,
 )
 

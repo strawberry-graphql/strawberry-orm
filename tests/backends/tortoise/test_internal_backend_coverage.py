@@ -7,10 +7,10 @@ import strawberry
 
 from strawberry_orm.backends.tortoise import (
     TortoiseBackend,
-    _CustomRel,
     _apply_python_ordering,
     _build_tortoise_filter,
     _build_tortoise_lookup,
+    _CustomRel,
     _get_reverse_fk_field,
 )
 
@@ -51,11 +51,11 @@ class ParentWithoutId:
 
 class TestInternalBackendCoverage:
     def test_filter_helpers_handle_none_and_empty_groups(self, Post, Comment):
-        assert _build_tortoise_filter(None) is None
-        assert _build_tortoise_filter(EmptyFilterGroup()) is None
-        assert _build_tortoise_filter(EmptyFilterGroup(all=[])) is None
-        assert _build_tortoise_filter(EmptyFilterGroup(any=[])) is None
-        assert _build_tortoise_filter(EmptyFilterGroup(one_of=[])) is None
+        assert _build_tortoise_filter(None) == (None, None)
+        assert _build_tortoise_filter(EmptyFilterGroup()) == (None, None)
+        assert _build_tortoise_filter(EmptyFilterGroup(all=[])) == (None, None)
+        assert _build_tortoise_filter(EmptyFilterGroup(any=[])) == (None, None)
+        assert _build_tortoise_filter(EmptyFilterGroup(one_of=[])) == (None, None)
 
         with pytest.raises(ValueError, match="maximum is 0"):
             _build_tortoise_filter(

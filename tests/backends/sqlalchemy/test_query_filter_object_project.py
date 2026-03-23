@@ -2,8 +2,6 @@
 
 import pytest
 import strawberry
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
@@ -12,10 +10,15 @@ from tests.abstract.query_filter_object_project import (
     AbstractTestFilterProjectTypeGeneration,
 )
 from tests.backends.sqlalchemy.models import (
-    Base as SABase,
     Comment as SAComment,
+)
+from tests.backends.sqlalchemy.models import (
     Post as SAPost,
+)
+from tests.backends.sqlalchemy.models import (
     Tag as SATag,
+)
+from tests.backends.sqlalchemy.models import (
     User as SAUser,
 )
 

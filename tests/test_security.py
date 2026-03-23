@@ -5,24 +5,14 @@ IDOR / authorization bypass, ILIKE wildcard injection, regex injection,
 unbounded query depth, and error information leakage.
 """
 
-import re
-import time
-from typing import Optional
-
 import pytest
 import strawberry
 from sqlalchemy import (
-    Column,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Table,
-    Text,
     Boolean,
+    ForeignKey,
+    String,
+    Text,
     create_engine,
-    event,
-    select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -35,7 +25,6 @@ from sqlalchemy.orm import (
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
-
 
 # =========================================================================
 # Models
@@ -101,7 +90,7 @@ class Query:
     notes: list[SecretNoteType] = orm.field()
 
     @strawberry.field
-    def user(self, info: strawberry.types.Info, id: int) -> Optional[SecretUserType]:
+    def user(self, info: strawberry.types.Info, id: int) -> SecretUserType | None:
         session: Session = info.context["session"]
         return session.get(SecretUser, id)
 
@@ -117,10 +106,10 @@ class CreateUserInput:
 @strawberry.input
 class UpdateUserInput:
     id: int
-    username: Optional[str] = strawberry.UNSET
-    email: Optional[str] = strawberry.UNSET
-    password_hash: Optional[str] = strawberry.UNSET
-    is_admin: Optional[bool] = strawberry.UNSET
+    username: str | None = strawberry.UNSET
+    email: str | None = strawberry.UNSET
+    password_hash: str | None = strawberry.UNSET
+    is_admin: bool | None = strawberry.UNSET
 
 
 @strawberry.type
@@ -143,7 +132,7 @@ class Mutation:
     @strawberry.mutation
     def update_user(
         self, info: strawberry.types.Info, input: UpdateUserInput
-    ) -> Optional[SecretUserType]:
+    ) -> SecretUserType | None:
         session: Session = info.context["session"]
         user = session.get(SecretUser, input.id)
         if user is None:

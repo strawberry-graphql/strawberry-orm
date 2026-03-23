@@ -1,7 +1,5 @@
 """All fixtures for Tortoise backend tests."""
 
-from typing import Optional
-
 import pytest
 import pytest_asyncio
 import strawberry
@@ -13,8 +11,14 @@ from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
 from tests.backends.tortoise.models import (
     Comment as TortComment,
+)
+from tests.backends.tortoise.models import (
     Post as TortPost,
+)
+from tests.backends.tortoise.models import (
     Tag as TortTag,
+)
+from tests.backends.tortoise.models import (
     User as TortUser,
 )
 
@@ -36,7 +40,7 @@ class CommentType:
     body: auto
     post_id: int
     author_id: int
-    parent_id: Optional[int]
+    parent_id: int | None
 
 
 @_main_orm.type(TortTag, filters=TagFilter, order=TagOrder)
@@ -85,9 +89,9 @@ class CreatePostInput:
 @strawberry.input
 class UpdatePostInput:
     id: int
-    title: Optional[str] = strawberry.UNSET
-    body: Optional[str] = strawberry.UNSET
-    is_published: Optional[bool] = strawberry.UNSET
+    title: str | None = strawberry.UNSET
+    body: str | None = strawberry.UNSET
+    is_published: bool | None = strawberry.UNSET
 
 
 TagRef = _main_orm.ref(
@@ -106,7 +110,7 @@ class _MainQuery:
     comments: list[CommentType] = _main_orm.field()
 
     @strawberry.field
-    async def user(self, id: int) -> Optional[UserType]:
+    async def user(self, id: int) -> UserType | None:
         return await TortUser.get_or_none(pk=id)  # type: ignore[return-value]
 
 
@@ -123,7 +127,7 @@ class _MainMutation:
         return post  # type: ignore[return-value]
 
     @strawberry.mutation
-    async def update_post(self, input: UpdatePostInput) -> Optional[PostType]:
+    async def update_post(self, input: UpdatePostInput) -> PostType | None:
         post = await TortPost.get_or_none(pk=input.id)
         if post is None:
             return None
@@ -147,7 +151,7 @@ class _MainMutation:
     @strawberry.mutation
     async def set_post_tags(
         self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
-    ) -> Optional[PostType]:
+    ) -> PostType | None:
         post = await TortPost.get_or_none(pk=post_id)
         if post is None:
             return None

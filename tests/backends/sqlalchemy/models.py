@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import datetime
-from typing import Optional
 
 from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
     ForeignKey,
+    Integer,
     String,
     Table,
-    Column,
-    Integer,
-    DateTime,
     Text,
-    Boolean,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -81,13 +80,13 @@ class Comment(Base):
     body: Mapped[str] = mapped_column(Text)
     post_id: Mapped[int] = mapped_column(ForeignKey("post.id"))
     author_id: Mapped[int] = mapped_column(ForeignKey("user.id"))
-    parent_id: Mapped[Optional[int]] = mapped_column(
+    parent_id: Mapped[int | None] = mapped_column(
         ForeignKey("comment.id"), nullable=True
     )
 
     post: Mapped[Post] = relationship(back_populates="comments")
     author: Mapped[User] = relationship(back_populates="comments")
-    parent: Mapped[Optional[Comment]] = relationship(
+    parent: Mapped[Comment | None] = relationship(
         remote_side=[id], back_populates="replies"
     )
     replies: Mapped[list[Comment]] = relationship(back_populates="parent")

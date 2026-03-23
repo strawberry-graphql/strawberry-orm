@@ -2,8 +2,6 @@
 with custom queryset overrides, load=[...] field hints, load callables, and
 nested get_queryset application for the Tortoise backend."""
 
-import asyncio
-
 import pytest
 import pytest_asyncio
 import strawberry
@@ -28,7 +26,7 @@ async def tortoise_db():
 
 @pytest_asyncio.fixture
 async def seed(tortoise_db):
-    from tests.backends.tortoise.models import User, Post, Tag, Comment
+    from tests.backends.tortoise.models import Comment, Post, Tag, User
 
     alice = await User.create(id=1, name="Alice", email="alice@example.com")
     bob = await User.create(id=2, name="Bob", email="bob@example.com")

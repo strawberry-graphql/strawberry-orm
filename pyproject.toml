@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.6.0"
+version = "0.7.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -67,7 +67,8 @@ select = [
     "SIM", # flake8-simplify
 ]
 ignore = [
-    "E501", # line too long (handled by formatter)
+    "E501",  # line too long (handled by formatter)
+    "UP046", # Generic[M] needed for runtime introspection via get_original_bases
 ]
 
 [tool.ruff.lint.isort]

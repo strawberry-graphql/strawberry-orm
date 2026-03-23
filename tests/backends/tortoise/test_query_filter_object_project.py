@@ -11,8 +11,14 @@ from tests.abstract.query_filter_object_project import (
 )
 from tests.backends.tortoise.models import (
     Comment as TortComment,
+)
+from tests.backends.tortoise.models import (
     Post as TortPost,
+)
+from tests.backends.tortoise.models import (
     Tag as TortTag,
+)
+from tests.backends.tortoise.models import (
     User as TortUser,
 )
 

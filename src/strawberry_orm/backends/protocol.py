@@ -39,6 +39,14 @@ class Backend(Protocol):
         """Generate an ordering input for a model or Strawberry type."""
         ...
 
+    def filter_type(self, model: type, **kwargs: Any) -> Any:
+        """Return a decorator that builds a filter input with custom fields."""
+        ...
+
+    def order_type(self, model: type, **kwargs: Any) -> Any:
+        """Return a decorator that builds an order input with custom fields."""
+        ...
+
     # -- Fields --------------------------------------------------------------
 
     def field(self, **kwargs: Any) -> Any:

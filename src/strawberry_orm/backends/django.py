@@ -12,7 +12,12 @@ from strawberry.extensions import SchemaExtension
 from strawberry_orm._async import run_sync
 from strawberry_orm.optimizer import OptimizerExtension
 
-from ._base import BaseBackend, extract_element_type, input_to_dict
+from ._base import (
+    BaseBackend,
+    extract_element_type,
+    input_to_dict,
+    invoke_custom_callback,
+)
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
     "AutoField": int,
@@ -220,9 +225,12 @@ class DjangoBackend(BaseBackend):
         *,
         authorize: Any | None = None,
     ) -> Any:
+        from strawberry_orm.repo import _check_auth
+
         def apply() -> None:
             manager = getattr(instance, field)
             rel_model = manager.model
+            repo = self.get_repo(rel_model) if not authorize else None
 
             to_add: list[Any] = []
             to_unlink: list[Any] = []
@@ -237,29 +245,51 @@ class DjangoBackend(BaseBackend):
                 if ref_create is not strawberry.UNSET and ref_create is not None:
                     if authorize and not authorize("create", rel_model, None, info):
                         continue
-                    obj = rel_model.objects.create(**input_to_dict(ref_create))
+                    data = input_to_dict(ref_create)
+                    _check_auth(repo, "can_create", data, info)
+                    obj = rel_model.objects.create(**data)
                     to_add.append(obj)
                 elif ref_update is not strawberry.UNSET and ref_update is not None:
                     data = input_to_dict(ref_update)
                     pk = data.pop("id")
                     if authorize and not authorize("update", rel_model, pk, info):
                         continue
-                    if data:
-                        rel_model.objects.filter(pk=pk).update(**data)
-                    obj = rel_model.objects.get(pk=pk)
-                    to_add.append(obj)
+                    if repo is not None:
+                        obj = repo._get(rel_model, pk, info)
+                    else:
+                        obj = rel_model.objects.filter(pk=pk).first()
+                    if obj is not None:
+                        _check_auth(repo, "can_update", obj, data, info)
+                        _check_auth(repo, "can_link", instance, field, obj, info)
+                        if data:
+                            for k, v in data.items():
+                                setattr(obj, k, v)
+                            obj.save()
+                        to_add.append(obj)
                 elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                     if authorize and not authorize(
                         "unlink", rel_model, ref_unlink.id, info
                     ):
                         continue
-                    to_unlink.append(ref_unlink.id)
+                    if repo is not None:
+                        obj = repo._get(rel_model, ref_unlink.id, info)
+                    else:
+                        obj = rel_model.objects.filter(pk=ref_unlink.id).first()
+                    if obj is not None:
+                        _check_auth(repo, "can_unlink", instance, field, obj, info)
+                        to_unlink.append(ref_unlink.id)
                 elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                     if authorize and not authorize(
                         "delete", rel_model, ref_delete.id, info
                     ):
                         continue
-                    to_delete_ids.append(ref_delete.id)
+                    if repo is not None:
+                        obj = repo._get(rel_model, ref_delete.id, info)
+                    else:
+                        obj = rel_model.objects.filter(pk=ref_delete.id).first()
+                    if obj is not None:
+                        _check_auth(repo, "can_delete", obj, info)
+                        to_delete_ids.append(ref_delete.id)
 
             if to_add:
                 manager.add(*to_add)
@@ -274,8 +304,9 @@ class DjangoBackend(BaseBackend):
     # -- Query application ----------------------------------------------------
 
     def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        q_obj = _build_django_filter(
+        q_obj, query = _build_django_filter(
             filter_input,
+            query=query,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -289,7 +320,8 @@ class DjangoBackend(BaseBackend):
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[Any] = []
         for entry in order_list:
-            clauses.extend(_build_django_ordering(entry))
+            entry_clauses, query = _build_django_ordering(entry, query=query)
+            clauses.extend(entry_clauses)
         if clauses:
             query = query.order_by(*clauses)
         return query
@@ -613,23 +645,29 @@ _LOOKUP_TO_DJANGO: dict[str, str] = {
 def _build_django_filter(
     filter_input: Any,
     *,
+    query: Any = None,
+    info: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = False,
     max_in_list_size: int = 500,
     _depth: int = 0,
     _prefix: str = "",
-) -> Any:
+) -> tuple[Any, Any]:
+    """Return ``(Q_clause | None, query)``."""
     from django.db.models import Q
 
     if _depth > max_depth:
         raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
 
     if filter_input is None or filter_input is strawberry.UNSET:
-        return None
+        return None, query
 
     fields = filter_input.__class__.__dataclass_fields__
+    custom_filters = getattr(type(filter_input), "_custom_filters", {})
     recurse_kw = dict(
+        query=query,
+        info=info,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -644,12 +682,13 @@ def _build_django_filter(
             continue
 
         if key == "field":
-            return _build_django_field_clause(
+            clause = _build_django_field_clause(
                 val,
                 prefix=_prefix,
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
             )
+            return clause, query
         elif key == "object":
             obj_fields = val.__class__.__dataclass_fields__
             for rel_name in obj_fields:
@@ -658,6 +697,8 @@ def _build_django_filter(
                     continue
                 return _build_django_filter(
                     nested_filter,
+                    query=query,
+                    info=info,
                     max_depth=max_depth,
                     max_branches=max_branches,
                     enable_regex=enable_regex,
@@ -670,39 +711,60 @@ def _build_django_filter(
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_django_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            result = Q()
-            for s in sub:
-                result &= s
-            return result if sub else None
+            combined = Q()
+            has_clause = False
+            for f in val:
+                sub_clause, query = _build_django_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    combined &= sub_clause
+                    has_clause = True
+            return (combined if has_clause else None), query
         elif key == "any":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_django_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            result = Q()
-            for i, s in enumerate(sub):
-                result = s if i == 0 else result | s
-            return result if sub else None
+            combined = Q()
+            has_clause = False
+            for i, f in enumerate(val):
+                sub_clause, query = _build_django_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    combined = sub_clause if not has_clause else combined | sub_clause
+                    has_clause = True
+            return (combined if has_clause else None), query
         elif key == "not_":
-            inner = _build_django_filter(val, **recurse_kw)
-            return ~inner if inner is not None else None
+            inner, query = _build_django_filter(val, **{**recurse_kw, "query": query})
+            return (~inner if inner is not None else None), query
         elif key == "one_of":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_django_filter(f, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            result = Q()
-            for i, s in enumerate(sub):
-                result = s if i == 0 else result | s
-            return result if sub else None
+            combined = Q()
+            has_clause = False
+            for i, f in enumerate(val):
+                sub_clause, query = _build_django_filter(
+                    f, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    combined = sub_clause if not has_clause else combined | sub_clause
+                    has_clause = True
+            return (combined if has_clause else None), query
+        elif key in custom_filters:
+            query = invoke_custom_callback(
+                custom_filters[key],
+                filter_input,
+                query=query,
+                value=val,
+                info=info,
+            )
+            return None, query
 
-    return None
+    return None, query
 
 
 def _build_django_field_clause(
@@ -786,11 +848,17 @@ def _build_django_lookup(
 # ---------------------------------------------------------------------------
 
 
-def _build_django_ordering(order_input: Any, _prefix: str = "") -> list[Any]:
-    from django.db.models import F
-
+def _build_django_ordering(
+    order_input: Any,
+    _prefix: str = "",
+    *,
+    query: Any = None,
+    info: Any = None,
+) -> tuple[list[Any], Any]:
+    """Return ``(order_clauses, query)``."""
     clauses: list[Any] = []
     fields = order_input.__class__.__dataclass_fields__
+    custom_orders = getattr(type(order_input), "_custom_orders", {})
 
     for key in fields:
         val = getattr(order_input, key)
@@ -805,11 +873,20 @@ def _build_django_ordering(order_input: Any, _prefix: str = "") -> list[Any]:
                 nested = getattr(val, rel_name)
                 if nested is strawberry.UNSET or nested is None:
                     continue
-                clauses.extend(
-                    _build_django_ordering(nested, _prefix=f"{_prefix}{rel_name}__")
+                sub_clauses, query = _build_django_ordering(
+                    nested, _prefix=f"{_prefix}{rel_name}__", query=query, info=info
                 )
+                clauses.extend(sub_clauses)
+        elif key in custom_orders:
+            query = invoke_custom_callback(
+                custom_orders[key],
+                order_input,
+                query=query,
+                value=val,
+                info=info,
+            )
 
-    return clauses
+    return clauses, query
 
 
 def _build_django_order_field(field_input: Any, prefix: str = "") -> list[Any]:

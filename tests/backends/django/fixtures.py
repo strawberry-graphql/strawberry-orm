@@ -7,23 +7,26 @@ NOTE: Django must be configured before this module is imported.
 conftest.py handles that via settings.configure() + django.setup().
 """
 
-from typing import Optional
-
 import pytest
 import strawberry
+from django.db import connection
 from strawberry import relay
 from strawberry.types.cast import cast as strawberry_cast
-from django.db import connection
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
 from tests.backends.django.models import (
     Comment as DjComment,
+)
+from tests.backends.django.models import (
     Post as DjPost,
+)
+from tests.backends.django.models import (
     Tag as DjTag,
+)
+from tests.backends.django.models import (
     User as DjUser,
 )
-
 
 # =========================================================================
 # Main schema
@@ -96,9 +99,9 @@ class CreatePostInput:
 @strawberry.input
 class UpdatePostInput:
     id: int
-    title: Optional[str] = strawberry.UNSET
-    body: Optional[str] = strawberry.UNSET
-    is_published: Optional[bool] = strawberry.UNSET
+    title: str | None = strawberry.UNSET
+    body: str | None = strawberry.UNSET
+    is_published: bool | None = strawberry.UNSET
 
 
 TagRef = _main_orm.ref(
@@ -113,7 +116,7 @@ class _MainQuery:
     comments: list[CommentType] = _main_orm.field()
 
     @strawberry.field
-    def user(self, id: int) -> Optional[UserType]:
+    def user(self, id: int) -> UserType | None:
         try:
             return DjUser.objects.get(pk=id)  # type: ignore[return-value]
         except DjUser.DoesNotExist:
@@ -133,7 +136,7 @@ class _MainMutation:
         return post  # type: ignore[return-value]
 
     @strawberry.mutation
-    def update_post(self, input: UpdatePostInput) -> Optional[PostType]:
+    def update_post(self, input: UpdatePostInput) -> PostType | None:
         try:
             post = DjPost.objects.get(pk=input.id)
         except DjPost.DoesNotExist:
@@ -162,7 +165,7 @@ class _MainMutation:
     @strawberry.mutation
     def set_post_tags(
         self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
-    ) -> Optional[PostType]:
+    ) -> PostType | None:
         try:
             post = DjPost.objects.get(pk=post_id)
         except DjPost.DoesNotExist:

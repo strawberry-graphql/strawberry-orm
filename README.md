@@ -11,6 +11,7 @@ Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.r
 - [Backends](#backends)
 - [Defining Types](#defining-types)
 - [Filters and Ordering](#filters-and-ordering)
+- [Custom Filters and Ordering](#custom-filters-and-ordering)
 - [Mutations](#mutations)
 - [Relay Integration](#relay-integration)
 - [Query Optimization](#query-optimization)
@@ -94,7 +95,7 @@ class PostType:
 
 CreatePostInput = orm.input(Post, include=["title", "body", "author_id"])
 CreateTagInput  = orm.input(Tag, include=["name"])
-TagRef = orm.ref(Tag, create=CreateTagInput, delete=True)
+TagRef = orm.ref(Tag, create=CreateTagInput, unlink=True, delete=True)
 
 @strawberry.type
 class Mutation:
@@ -482,6 +483,217 @@ Registration order matters: define related orders *before* the parent (e.g. `orm
 
 ---
 
+## Custom Filters and Ordering
+
+`orm.filter()` and `orm.order()` auto-generate types from model introspection. When you need filter logic that goes beyond column lookups — full-text search across multiple fields, subquery-based conditions, or ordering by computed values — use `orm.filter_type()` and `orm.order_type()` with the `@filter_field` and `@order_field` decorators.
+
+### Custom Filter Types
+
+`orm.filter_type(Model)` is a class decorator. Annotate fields with `auto` for standard lookups (identical to what `orm.filter()` generates). Add methods decorated with `@filter_field` for custom logic:
+
+```python
+from strawberry_orm import StrawberryORM, filter_field, auto
+
+orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+
+@orm.filter_type(User)
+class UserFilter:
+    name: auto          # standard StringLookup
+    email: auto         # standard StringLookup
+
+    @filter_field
+    def search(self, value: str, query):
+        """Full-text search across name and email."""
+        from sqlalchemy import or_
+        return query.where(
+            or_(User.name.ilike(f"%{value}%"), User.email.ilike(f"%{value}%"))
+        )
+
+    @filter_field
+    def has_posts(self, value: bool, query):
+        """Filter users who have (or lack) any posts."""
+        from sqlalchemy import func, select
+        subq = (
+            select(func.count(Post.id))
+            .where(Post.author_id == User.id)
+            .correlate(User)
+            .scalar_subquery()
+        )
+        if value:
+            return query.where(subq > 0)
+        return query.where(subq == 0)
+```
+
+Each `@filter_field` method must:
+
+- Have a `value` parameter with a **type annotation** — this becomes the GraphQL input type for the field.
+- Have a `query` parameter — receives the backend's native query object (Django `QuerySet`, SQLAlchemy `Select`, or Tortoise `QuerySet`).
+- Return the modified query.
+- Optionally accept an `info` parameter to receive the Strawberry `Info` context.
+
+The generated GraphQL input places custom fields as top-level keys alongside `field`, `object`, `all`, `any`, `not`, and `oneOf`:
+
+```graphql
+input UserFilter @oneOf {
+  field: UserField           # auto-generated scalar lookups
+  object: UserObject         # auto-generated relation lookups (if any)
+  search: String             # custom
+  hasPosts: Boolean          # custom
+  all: [UserFilter!]
+  any: [UserFilter!]
+  not: UserFilter
+  oneOf: [UserFilter!]
+}
+```
+
+Since filters are `@oneOf`, combine custom filters with standard lookups using `all` or `any`:
+
+```graphql
+{
+  users(filter: { all: [
+    { search: "john" },
+    { field: { email: { contains: "example.com" } } }
+  ] }) {
+    name
+    email
+  }
+}
+```
+
+### Custom Order Types
+
+`orm.order_type(Model)` works the same way. `auto` fields get the standard `Ordering` enum. Methods decorated with `@order_field` receive a `value` of type `Ordering` (ASC, DESC, etc.) and return the modified query:
+
+```python
+from strawberry_orm import order_field
+from strawberry_orm.types import Ordering
+
+@orm.order_type(User)
+class UserOrder:
+    name: auto          # standard Ordering (ASC/DESC/...)
+
+    @order_field
+    def post_count(self, value: Ordering, query):
+        """Order users by how many posts they have."""
+        from sqlalchemy import func
+        query = query.outerjoin(Post, Post.author_id == User.id).group_by(User.id)
+        col = func.count(Post.id)
+        if "DESC" in value.value:
+            return query.order_by(col.desc())
+        return query.order_by(col.asc())
+```
+
+The generated GraphQL input:
+
+```graphql
+input UserOrder @oneOf {
+  field: UserOrderField      # auto-generated
+  object: UserOrderObject    # auto-generated (if relations exist)
+  postCount: Ordering        # custom
+}
+```
+
+Custom and standard orders compose naturally in the order list:
+
+```graphql
+{
+  users(order: [
+    { postCount: DESC },
+    { field: { name: ASC } }
+  ]) {
+    name
+  }
+}
+```
+
+### Using Custom Types
+
+Custom filter and order types are used exactly like auto-generated ones:
+
+```python
+@orm.type(User, filters=UserFilter, order=UserOrder)
+class UserType:
+    id: auto
+    name: auto
+    email: auto
+
+@strawberry.type
+class Query:
+    @orm.field()
+    def users(self) -> list[UserType]:
+        return orm.get_default_queryset(User)
+```
+
+They also work with Relay connections and `orm.connection()`.
+
+### Backend-Specific Examples
+
+The query manipulation inside `@filter_field` and `@order_field` methods is backend-specific since it operates on native query objects. Here are equivalent examples for each backend:
+
+<details>
+<summary>Django</summary>
+
+```python
+from django.db.models import Q, Count, F
+
+@orm.filter_type(User)
+class UserFilter:
+    name: auto
+
+    @filter_field
+    def search(self, value: str, query):
+        return query.filter(Q(name__icontains=value) | Q(email__icontains=value))
+
+@orm.order_type(User)
+class UserOrder:
+    name: auto
+
+    @order_field
+    def post_count(self, value: Ordering, query):
+        query = query.annotate(_post_count=Count("posts"))
+        dir_value = value.value
+        if dir_value.startswith("DESC"):
+            return query.order_by(F("_post_count").desc())
+        return query.order_by(F("_post_count").asc())
+```
+
+</details>
+
+<details>
+<summary>Tortoise</summary>
+
+```python
+from tortoise.queryset import Q
+from tortoise.functions import Count
+
+@orm.filter_type(User)
+class UserFilter:
+    name: auto
+
+    @filter_field
+    def search(self, value: str, query):
+        return query.filter(Q(name__icontains=value) | Q(email__icontains=value))
+
+@orm.order_type(User)
+class UserOrder:
+    name: auto
+
+    @order_field
+    def post_count(self, value: Ordering, query):
+        query = query.annotate(_post_count=Count("posts"))
+        if value.value.startswith("DESC"):
+            return query.order_by("-_post_count")
+        return query.order_by("_post_count")
+```
+
+</details>
+
+### Combining with `orm.filter()` / `orm.order()`
+
+`orm.filter()` and `orm.order()` remain available for fully auto-generated types. Use `orm.filter_type()` and `orm.order_type()` only when you need custom logic. The types produced by both APIs are interchangeable in all contexts — `orm.type(Model, filters=..., order=...)`, `orm.field(filters=..., order=...)`, and `orm.connection()`.
+
+---
+
 ## Mutations
 
 Write plain `@strawberry.mutation` resolvers and use `strawberry-orm` for generated input types:
@@ -822,7 +1034,7 @@ orm = StrawberryORM(
 
 ## Public Exports
 
-`StrawberryORM`, `auto`, `make_field`, `make_ref_type`, `Ordering`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, and the built-in lookup input classes from `strawberry_orm.filters`.
+`StrawberryORM`, `auto`, `make_field`, `make_ref_type`, `Ordering`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
 
 ## License
 

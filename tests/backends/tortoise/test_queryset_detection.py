@@ -1,7 +1,5 @@
 """Queryset detection tests for the Tortoise backend."""
 
-import pytest
-
 
 class TestQuerysetDetection:
     def test_rejects_plain_value(self, orm):

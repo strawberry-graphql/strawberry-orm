@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import strawberry
 from strawberry.extensions import SchemaExtension
 
-from strawberry_orm._async import run_sync
 from strawberry_orm.backends._base import (
-    BaseBackend,
     _SENSITIVE_PATTERNS,
+    BaseBackend,
     extract_element_type,
     input_to_dict,
+    invoke_custom_callback,
 )
 from strawberry_orm.optimizer import OptimizerExtension
 
@@ -209,9 +210,10 @@ class SQLAlchemyBackend(BaseBackend):
     # -- Query application ----------------------------------------------------
 
     def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        clause = _build_sa_filter(
+        clause, query = _build_sa_filter(
             filter_input,
             model,
+            query=query,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -226,7 +228,9 @@ class SQLAlchemyBackend(BaseBackend):
         clauses: list[Any] = []
         joins: list[Any] = []
         for entry in order_list:
-            entry_clauses, entry_joins = _build_sa_ordering(entry, model)
+            entry_clauses, entry_joins, query = _build_sa_ordering(
+                entry, model, query=query
+            )
             clauses.extend(entry_clauses)
             joins.extend(entry_joins)
         seen: set[str] = set()
@@ -285,7 +289,7 @@ class SQLAlchemyBackend(BaseBackend):
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy.orm import joinedload, selectinload, load_only
+        from sqlalchemy.orm import joinedload, load_only, selectinload
 
         try:
             entity = query.column_descriptions[0]["entity"]
@@ -534,8 +538,11 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         authorize: Callable[..., bool] | None,
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
+        repo = self.get_repo(target_model) if not authorize else None
 
         to_add: list[Any] = []
         to_remove: list[Any] = []
@@ -550,7 +557,9 @@ class SQLAlchemyBackend(BaseBackend):
             if ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
-                obj = target_model(**input_to_dict(ref_create))
+                data = input_to_dict(ref_create)
+                _check_auth(repo, "can_create", data, info)
+                obj = target_model(**data)
                 session.add(obj)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
@@ -558,8 +567,13 @@ class SQLAlchemyBackend(BaseBackend):
                 pk = data.pop("id")
                 if authorize and not authorize("update", target_model, pk, info):
                     continue
-                obj = session.get(target_model, pk)
+                if repo is not None:
+                    obj = repo._get(target_model, pk, info)
+                else:
+                    obj = session.get(target_model, pk)
                 if obj is not None:
+                    _check_auth(repo, "can_update", obj, data, info)
+                    _check_auth(repo, "can_link", instance, field, obj, info)
                     for k, v in data.items():
                         setattr(obj, k, v)
                     to_add.append(obj)
@@ -568,16 +582,24 @@ class SQLAlchemyBackend(BaseBackend):
                     "unlink", target_model, ref_unlink.id, info
                 ):
                     continue
-                obj = session.get(target_model, ref_unlink.id)
+                if repo is not None:
+                    obj = repo._get(target_model, ref_unlink.id, info)
+                else:
+                    obj = session.get(target_model, ref_unlink.id)
                 if obj is not None:
+                    _check_auth(repo, "can_unlink", instance, field, obj, info)
                     to_remove.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
                     "delete", target_model, ref_delete.id, info
                 ):
                     continue
-                obj = session.get(target_model, ref_delete.id)
+                if repo is not None:
+                    obj = repo._get(target_model, ref_delete.id, info)
+                else:
+                    obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
+                    _check_auth(repo, "can_delete", obj, info)
                     to_delete.append(obj)
 
         existing = list(getattr(instance, field))
@@ -599,8 +621,11 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None,
     ) -> None:
+        from strawberry_orm.repo import _check_auth
+
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
+        repo = self.get_repo(target_model) if not authorize else None
 
         to_add: list[Any] = []
         to_remove: list[Any] = []
@@ -615,7 +640,9 @@ class SQLAlchemyBackend(BaseBackend):
             if ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
-                obj = target_model(**input_to_dict(ref_create))
+                data = input_to_dict(ref_create)
+                _check_auth(repo, "can_create", data, info)
+                obj = target_model(**data)
                 session.add(obj)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
@@ -623,8 +650,13 @@ class SQLAlchemyBackend(BaseBackend):
                 pk = data.pop("id")
                 if authorize and not authorize("update", target_model, pk, info):
                     continue
-                obj = await session.get(target_model, pk)
+                if repo is not None:
+                    obj = await repo._get_async(target_model, pk, info)
+                else:
+                    obj = await session.get(target_model, pk)
                 if obj is not None:
+                    _check_auth(repo, "can_update", obj, data, info)
+                    _check_auth(repo, "can_link", instance, field, obj, info)
                     for k, v in data.items():
                         setattr(obj, k, v)
                     to_add.append(obj)
@@ -633,16 +665,24 @@ class SQLAlchemyBackend(BaseBackend):
                     "unlink", target_model, ref_unlink.id, info
                 ):
                     continue
-                obj = await session.get(target_model, ref_unlink.id)
+                if repo is not None:
+                    obj = await repo._get_async(target_model, ref_unlink.id, info)
+                else:
+                    obj = await session.get(target_model, ref_unlink.id)
                 if obj is not None:
+                    _check_auth(repo, "can_unlink", instance, field, obj, info)
                     to_remove.append(obj)
             elif ref_delete is not strawberry.UNSET and ref_delete is not None:
                 if authorize and not authorize(
                     "delete", target_model, ref_delete.id, info
                 ):
                     continue
-                obj = await session.get(target_model, ref_delete.id)
+                if repo is not None:
+                    obj = await repo._get_async(target_model, ref_delete.id, info)
+                else:
+                    obj = await session.get(target_model, ref_delete.id)
                 if obj is not None:
+                    _check_auth(repo, "can_delete", obj, info)
                     to_delete.append(obj)
 
         await session.refresh(instance, [field])
@@ -771,6 +811,15 @@ def _get_sa_pk_names(model: type) -> set[str]:
     return {col.key for col in mapper.primary_key}
 
 
+def _get_sa_pk_column(model: type) -> Any:
+    """Return the primary-key column attribute for scoped queries."""
+    from sqlalchemy import inspect as sa_inspect
+
+    mapper = sa_inspect(model)
+    pk_col = mapper.primary_key[0]
+    return getattr(model, pk_col.key)
+
+
 def _introspect_sa_model(
     model: type,
 ) -> list[tuple[str, type, bool, type | None]]:
@@ -822,23 +871,28 @@ def _build_sa_filter(
     filter_input: Any,
     model: type,
     *,
+    query: Any = None,
+    info: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = True,
     max_in_list_size: int = 500,
     _depth: int = 0,
-) -> Any:
-    """Recursively translate a filter input object into a SQLAlchemy BooleanClause."""
-    from sqlalchemy import and_, or_, not_
+) -> tuple[Any, Any]:
+    """Return ``(clause | None, query)``."""
+    from sqlalchemy import and_, not_, or_
 
     if _depth > max_depth:
         raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
 
     if filter_input is None or filter_input is strawberry.UNSET:
-        return None
+        return None, query
 
     fields = filter_input.__class__.__dataclass_fields__
+    custom_filters = getattr(type(filter_input), "_custom_filters", {})
     recurse_kw = dict(
+        query=query,
+        info=info,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -852,12 +906,13 @@ def _build_sa_filter(
             continue
 
         if key == "field":
-            return _build_sa_field_clause(
+            clause = _build_sa_field_clause(
                 val,
                 model,
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
             )
+            return clause, query
         elif key == "object":
             obj_fields = val.__class__.__dataclass_fields__
             for rel_name in obj_fields:
@@ -866,41 +921,69 @@ def _build_sa_filter(
                     continue
                 relationship_prop = getattr(model, rel_name)
                 rel_model = relationship_prop.property.mapper.class_
-                inner = _build_sa_filter(nested_filter, rel_model, **recurse_kw)
+                inner, query = _build_sa_filter(
+                    nested_filter, rel_model, **{**recurse_kw, "query": query}
+                )
                 if inner is not None:
                     if relationship_prop.property.uselist:
-                        return relationship_prop.any(inner)
+                        return relationship_prop.any(inner), query
                     else:
-                        return relationship_prop.has(inner)
+                        return relationship_prop.has(inner), query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            return and_(*sub) if sub else None
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_sa_filter(
+                    f, model, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            return (and_(*clauses) if clauses else None), query
         elif key == "any":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            return or_(*sub) if sub else None
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_sa_filter(
+                    f, model, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            return (or_(*clauses) if clauses else None), query
         elif key == "not_":
-            inner = _build_sa_filter(val, model, **recurse_kw)
-            return not_(inner) if inner is not None else None
+            inner, query = _build_sa_filter(
+                val, model, **{**recurse_kw, "query": query}
+            )
+            return (not_(inner) if inner is not None else None), query
         elif key == "one_of":
             if len(val) > max_branches:
                 raise ValueError(
                     f"Filter has {len(val)} branches; maximum is {max_branches}"
                 )
-            sub = [_build_sa_filter(f, model, **recurse_kw) for f in val]
-            sub = [s for s in sub if s is not None]
-            return or_(*sub) if sub else None
+            clauses = []
+            for f in val:
+                sub_clause, query = _build_sa_filter(
+                    f, model, **{**recurse_kw, "query": query}
+                )
+                if sub_clause is not None:
+                    clauses.append(sub_clause)
+            return (or_(*clauses) if clauses else None), query
+        elif key in custom_filters:
+            query = invoke_custom_callback(
+                custom_filters[key],
+                filter_input,
+                query=query,
+                value=val,
+                info=info,
+            )
+            return None, query
 
-    return None
+    return None, query
 
 
 def _build_sa_field_clause(
@@ -1009,15 +1092,18 @@ def _build_lookup_clauses(
 # ---------------------------------------------------------------------------
 
 
-def _build_sa_ordering(order_input: Any, model: type) -> tuple[list[Any], list[Any]]:
-    """Translate an order input into SQLAlchemy ``order_by`` clauses and joins.
-
-    Returns ``(clauses, joins)`` where *joins* is a list of relationship
-    attributes that must be joined before the clauses can be applied.
-    """
+def _build_sa_ordering(
+    order_input: Any,
+    model: type,
+    *,
+    query: Any = None,
+    info: Any = None,
+) -> tuple[list[Any], list[Any], Any]:
+    """Return ``(clauses, joins, query)``."""
     clauses: list[Any] = []
     joins: list[Any] = []
     fields = order_input.__class__.__dataclass_fields__
+    custom_orders = getattr(type(order_input), "_custom_orders", {})
 
     for key in fields:
         val = getattr(order_input, key)
@@ -1035,11 +1121,21 @@ def _build_sa_ordering(order_input: Any, model: type) -> tuple[list[Any], list[A
                 relationship_prop = getattr(model, rel_name)
                 rel_model = relationship_prop.property.mapper.class_
                 joins.append(relationship_prop)
-                sub_clauses, sub_joins = _build_sa_ordering(nested, rel_model)
+                sub_clauses, sub_joins, query = _build_sa_ordering(
+                    nested, rel_model, query=query, info=info
+                )
                 clauses.extend(sub_clauses)
                 joins.extend(sub_joins)
+        elif key in custom_orders:
+            query = invoke_custom_callback(
+                custom_orders[key],
+                order_input,
+                query=query,
+                value=val,
+                info=info,
+            )
 
-    return clauses, joins
+    return clauses, joins, query
 
 
 def _build_sa_order_field(field_input: Any, model: type) -> list[Any]:

@@ -11,8 +11,6 @@ Run with:
 # NOTE: Do NOT use `from __future__ import annotations` here.
 # Strawberry needs concrete type objects at schema construction time.
 
-from typing import Optional
-
 import pytest
 import strawberry
 from sqlalchemy import (
@@ -25,7 +23,6 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
-    select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -38,7 +35,6 @@ from sqlalchemy.orm import (
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
-
 
 # =========================================================================
 # Shared models
@@ -304,6 +300,7 @@ class TestVulnB_DjangoRefListAuthorizationBypass:
     def test_django_apply_ref_list_source_has_authorize_checks(self):
         """Verify Django backend's apply_ref_list actually uses authorize."""
         import inspect
+
         from strawberry_orm.backends.django import DjangoBackend
 
         source = inspect.getsource(DjangoBackend.apply_ref_list)
@@ -333,6 +330,7 @@ class TestVulnC_TortoiseRefListAuthorizationBypass:
     def test_tortoise_apply_ref_list_source_has_authorize_checks(self):
         """Verify Tortoise backend's apply_ref_list actually uses authorize."""
         import inspect
+
         from strawberry_orm.backends.tortoise import TortoiseBackend
 
         source = inspect.getsource(TortoiseBackend.apply_ref_list)
@@ -361,6 +359,7 @@ class TestVulnD_DjangoFilterNoDepthLimit:
 
     def test_django_filter_builder_has_depth_param(self):
         import inspect
+
         from strawberry_orm.backends.django import _build_django_filter
 
         sig = inspect.signature(_build_django_filter)
@@ -377,6 +376,7 @@ class TestVulnD_TortoiseFilterNoDepthLimit:
 
     def test_tortoise_filter_builder_has_depth_param(self):
         import inspect
+
         from strawberry_orm.backends.tortoise import _build_tortoise_filter
 
         sig = inspect.signature(_build_tortoise_filter)
@@ -398,6 +398,7 @@ class TestVulnE_DjangoRegexAlwaysEnabled:
 
     def test_django_backend_has_enable_regex_option(self):
         import inspect
+
         from strawberry_orm.backends.django import DjangoBackend
 
         sig = inspect.signature(DjangoBackend.__init__)
@@ -413,6 +414,7 @@ class TestVulnE_TortoiseRegexAlwaysEnabled:
 
     def test_tortoise_backend_has_enable_regex_option(self):
         import inspect
+
         from strawberry_orm.backends.tortoise import TortoiseBackend
 
         sig = inspect.signature(TortoiseBackend.__init__)
@@ -433,6 +435,7 @@ class TestVulnF_BaseInputIncludesPKs:
 
     def test_base_backend_input_has_exclude_pk(self):
         import inspect
+
         from strawberry_orm.backends._base import BaseBackend
 
         source = inspect.getsource(BaseBackend.input)
@@ -622,6 +625,7 @@ class TestVulnQ_TortoiseRegexInLookupMap:
     def test_tortoise_lookup_has_regex_handling(self):
         """Check if Tortoise filter builder handles regex lookups."""
         import inspect
+
         from strawberry_orm.backends.tortoise import _build_tortoise_lookup
 
         source = inspect.getsource(_build_tortoise_lookup)
@@ -853,8 +857,6 @@ class TestAdvisory5_StringLookupNoRegex:
         filt = orm.filter(AuditUser)
         field_type = filt._field_type
         username_ann = field_type.__dataclass_fields__["username"]
-
-        from strawberry_orm.filters import StringLookupNoRegex
 
         actual_type = username_ann.type
         if hasattr(actual_type, "__args__"):

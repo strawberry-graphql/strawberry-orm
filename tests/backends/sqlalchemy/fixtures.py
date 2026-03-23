@@ -4,25 +4,30 @@ Module-level objects:  orm instances, type classes, schemas.
 Pytest fixtures:       session, seed, model classes, execute helpers, orm factory.
 """
 
-from typing import Optional
-
 import pytest
 import strawberry
-from strawberry import relay
-from strawberry.types.cast import cast as strawberry_cast
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
+from strawberry import relay
+from strawberry.types.cast import cast as strawberry_cast
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
+)
+from tests.backends.sqlalchemy.models import (
     Comment as SAComment,
+)
+from tests.backends.sqlalchemy.models import (
     Post as SAPost,
+)
+from tests.backends.sqlalchemy.models import (
     Tag as SATag,
+)
+from tests.backends.sqlalchemy.models import (
     User as SAUser,
 )
-
 
 # =========================================================================
 # Main schema
@@ -95,9 +100,9 @@ class CreatePostInput:
 @strawberry.input
 class UpdatePostInput:
     id: int
-    title: Optional[str] = strawberry.UNSET
-    body: Optional[str] = strawberry.UNSET
-    is_published: Optional[bool] = strawberry.UNSET
+    title: str | None = strawberry.UNSET
+    body: str | None = strawberry.UNSET
+    is_published: bool | None = strawberry.UNSET
 
 
 TagRef = _main_orm.ref(
@@ -112,7 +117,7 @@ class _MainQuery:
     comments: list[CommentType] = _main_orm.field()
 
     @strawberry.field
-    def user(self, info: strawberry.types.Info, id: int) -> Optional[UserType]:
+    def user(self, info: strawberry.types.Info, id: int) -> UserType | None:
         from sqlalchemy.orm import Session
 
         session: Session = info.context["session"]
@@ -141,7 +146,7 @@ class _MainMutation:
     @strawberry.mutation
     def update_post(
         self, info: strawberry.types.Info, input: UpdatePostInput
-    ) -> Optional[PostType]:
+    ) -> PostType | None:
         from sqlalchemy.orm import Session
 
         session: Session = info.context["session"]
@@ -175,7 +180,7 @@ class _MainMutation:
     @strawberry.mutation
     def set_post_tags(
         self, info: strawberry.types.Info, post_id: int, tags: list[TagRef]
-    ) -> Optional[PostType]:
+    ) -> PostType | None:
         from sqlalchemy.orm import Session
 
         session: Session = info.context["session"]

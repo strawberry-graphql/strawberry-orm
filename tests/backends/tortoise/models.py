@@ -12,8 +12,8 @@ class User(Model):
     email = fields.CharField(max_length=200)
     created_at = fields.DatetimeField(auto_now_add=True)
 
-    posts: fields.ReverseRelation["Post"]
-    comments: fields.ReverseRelation["Comment"]
+    posts: fields.ReverseRelation[Post]
+    comments: fields.ReverseRelation[Comment]
 
     class Meta:
         table = "user"
@@ -27,10 +27,10 @@ class Post(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     author = fields.ForeignKeyField("models.User", related_name="posts")
 
-    tags: fields.ManyToManyRelation["Tag"] = fields.ManyToManyField(
+    tags: fields.ManyToManyRelation[Tag] = fields.ManyToManyField(
         "models.Tag", related_name="posts", through="post_tag"
     )
-    comments: fields.ReverseRelation["Comment"]
+    comments: fields.ReverseRelation[Comment]
 
     class Meta:
         table = "post"
@@ -53,7 +53,7 @@ class Comment(Model):
     author = fields.ForeignKeyField("models.User", related_name="comments")
     parent = fields.ForeignKeyField("models.Comment", related_name="replies", null=True)
 
-    replies: fields.ReverseRelation["Comment"]
+    replies: fields.ReverseRelation[Comment]
 
     class Meta:
         table = "comment"

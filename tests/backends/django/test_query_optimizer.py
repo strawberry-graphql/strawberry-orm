@@ -1,8 +1,8 @@
 """Optimizer tests: verify the optimizer adds eager loads and prevents N+1 queries."""
 
 import strawberry
-from django.test.utils import CaptureQueriesContext
 from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
 from strawberry_orm.types import auto
 

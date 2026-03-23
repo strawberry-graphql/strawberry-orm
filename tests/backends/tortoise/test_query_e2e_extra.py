@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from tests.abstract.query_field_hints import AbstractTestQueryFieldHintsRegistration
 from tests.abstract.query_type_generation import (
     AbstractTestQueryCustomName,

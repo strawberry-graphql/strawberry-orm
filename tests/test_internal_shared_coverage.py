@@ -19,11 +19,11 @@ from strawberry_orm.core import (
     _resolve_orm_metadata,
     _unwrap_optional_annotation,
 )
-from strawberry_orm.mutations import MutationNamespace
 from strawberry_orm.mutations import (
     _PROJECT_LEAF,
     _PROJECT_SHALLOW,
     _PROJECT_UNBOUNDED,
+    MutationNamespace,
 )
 from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.models import User as SAUser

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from strawberry_orm import (
     BooleanLookup,
-    FloatComparisonLookup,
     IntComparisonLookup,
     Ordering,
     StringLookup,
