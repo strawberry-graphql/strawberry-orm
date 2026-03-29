@@ -47,9 +47,17 @@ class TestInternalSharedCoverage:
         assert _unwrap_optional_annotation(Optional[int]) is int
         assert _unwrap_optional_annotation(int | str | None) == int | str | None
         assert _extract_connection_node(int) is None
-        assert _resolve_orm_metadata(int) == (None, None, None)
-        assert _resolve_orm_metadata(SimpleNamespace()) == (None, None, None)
+        assert _resolve_orm_metadata(int) == (None, None, None, None, None)
+        assert _resolve_orm_metadata(SimpleNamespace()) == (
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         assert _resolve_orm_metadata(list[type("PlainType", (), {})]) == (
+            None,
+            None,
             None,
             None,
             None,

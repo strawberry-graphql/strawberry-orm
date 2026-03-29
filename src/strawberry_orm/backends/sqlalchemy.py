@@ -12,16 +12,35 @@ from strawberry.extensions import SchemaExtension
 
 from strawberry_orm.backends._base import (
     _SENSITIVE_PATTERNS,
+    AggregateMeta,
     BaseBackend,
     extract_element_type,
     input_to_dict,
     invoke_custom_callback,
+    requested_aggregates,
 )
 from strawberry_orm.optimizer import OptimizerExtension
+from strawberry_orm.types import DateGroupByInterval
 
 
 def _primary_key(value: Any) -> Any:
     return getattr(value, "id", getattr(value, "pk", None))
+
+
+def _invoke_aggregate_handler(
+    handler: Callable[..., Any],
+    columns: Any,
+    *,
+    info: Any = None,
+) -> Any:
+    """Call a ``@aggregate_field`` handler with ``(self, columns)``."""
+    import inspect as _inspect
+
+    sig = _inspect.signature(handler)
+    kwargs: dict[str, Any] = {}
+    if "info" in sig.parameters:
+        kwargs["info"] = info
+    return handler(None, columns, **kwargs)
 
 
 class SQLAlchemyBackend(BaseBackend):
@@ -65,6 +84,8 @@ class SQLAlchemyBackend(BaseBackend):
         name = kwargs.get("name")
         filters = kwargs.get("filters")
         order = kwargs.get("order")
+        group = kwargs.get("group")
+        aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
             from sqlalchemy import inspect as sa_inspect
@@ -113,6 +134,8 @@ class SQLAlchemyBackend(BaseBackend):
                 name=name,
                 filters=filters,
                 order=order,
+                group=group,
+                aggregate=aggregate,
             )
 
             # SA-specific: relation resolvers for list fields
@@ -242,6 +265,201 @@ class SQLAlchemyBackend(BaseBackend):
         if clauses:
             query = query.order_by(*clauses)
         return query
+
+    # -- Grouping / aggregation -----------------------------------------------
+
+    def apply_aggregation(
+        self, query: Any, info: Any, aggregate_meta: AggregateMeta
+    ) -> Any:
+        from sqlalchemy import func, select
+
+        requested = requested_aggregates(info, "aggregates") or {}
+        if not requested and not aggregate_meta.custom_fields:
+            return aggregate_meta.aggregates_type(count=0)
+
+        model = aggregate_meta.model
+        subq = query.subquery()
+        agg_cols: list[Any] = []
+
+        if requested.get("count"):
+            agg_cols.append(func.count().label("_count"))
+        for func_name, sql_func in [
+            ("sum", func.sum),
+            ("avg", func.avg),
+            ("min", func.min),
+            ("max", func.max),
+        ]:
+            for fname in requested.get(func_name, []):
+                col = subq.c.get(fname)
+                if col is not None:
+                    agg_cols.append(sql_func(col).label(f"_{func_name}_{fname}"))
+
+        for field_name, handler, _rtype in aggregate_meta.custom_fields:
+            expr = _invoke_aggregate_handler(handler, subq.c, info=info)
+            if expr is not None:
+                agg_cols.append(expr.label(f"_custom_{field_name}"))
+
+        if not agg_cols:
+            return aggregate_meta.aggregates_type(count=0)
+
+        stmt = select(*agg_cols).select_from(subq)
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._apply_aggregation_async(
+                session, stmt, aggregate_meta, requested
+            )
+        result = session.execute(stmt)
+        row = result.one()
+        return aggregate_meta.build_aggregates(row, requested)
+
+    async def _apply_aggregation_async(
+        self, session: Any, stmt: Any, meta: AggregateMeta, requested: dict
+    ) -> Any:
+        result = await session.execute(stmt)
+        row = result.one()
+        return meta.build_aggregates(row, requested)
+
+    def apply_grouping(
+        self,
+        query: Any,
+        group_by_input: Any,
+        info: Any,
+        aggregate_meta: AggregateMeta,
+        *,
+        order_input: Any | None = None,
+    ) -> list[Any]:
+        from sqlalchemy import select
+
+        model = aggregate_meta.model
+        group_by_list = (
+            group_by_input if isinstance(group_by_input, list) else [group_by_input]
+        )
+
+        subq = query.subquery()
+
+        group_cols, group_key_fields = _extract_sa_group_columns(
+            group_by_list, model, subq
+        )
+        aggregate_meta.group_key_fields = group_key_fields
+
+        if not group_cols:
+            return []
+
+        requested = requested_aggregates(info, "groups.aggregates") or {}
+        agg_cols = _build_sa_agg_cols(
+            model,
+            requested,
+            subq,
+            custom_fields=aggregate_meta.custom_fields,
+            info=info,
+        )
+
+        stmt = select(*group_cols, *agg_cols).select_from(subq).group_by(*group_cols)
+
+        if order_input:
+            order_clauses = _extract_overlapping_order(
+                order_input, set(group_key_fields), model, subq
+            )
+            if order_clauses:
+                stmt = stmt.order_by(*order_clauses)
+
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._apply_grouping_async(
+                session, stmt, aggregate_meta, requested, group_key_fields
+            )
+
+        result = session.execute(stmt)
+        rows = result.all()
+        return [
+            _build_sa_group(row, aggregate_meta, requested, group_key_fields)
+            for row in rows
+        ]
+
+    async def _apply_grouping_async(
+        self, session, stmt, meta, requested, group_key_fields
+    ):
+        result = await session.execute(stmt)
+        rows = result.all()
+        return [_build_sa_group(row, meta, requested, group_key_fields) for row in rows]
+
+    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
+        key_fields = group_key.__class__.__dataclass_fields__
+        for fname in key_fields:
+            val = getattr(group_key, fname, None)
+            if val is not None:
+                col = getattr(query.column_descriptions[0]["entity"], fname, None)
+                if col is not None:
+                    query = query.where(col == val)
+        return query
+
+    def batch_group_items(
+        self,
+        query: Any,
+        group_key_fields: list[str],
+        info: Any,
+        model: type,
+        *,
+        per_group_limit: int,
+        order_input: Any | None = None,
+    ) -> dict[tuple, list[Any]]:
+        from collections import defaultdict
+
+        from sqlalchemy import func, select
+
+        key_cols = [getattr(model, k) for k in group_key_fields]
+        if order_input:
+            order_clauses = _build_sa_order_from_input(order_input, model)
+        else:
+            pk_col = _get_sa_pk_column(model)
+            order_clauses = [pk_col]
+
+        rn = (
+            func.row_number()
+            .over(
+                partition_by=key_cols,
+                order_by=order_clauses,
+            )
+            .label("_rn")
+        )
+
+        subq = query.add_columns(rn).subquery()
+        ranked_stmt = select(model).from_statement(
+            select(subq).where(subq.c._rn <= per_group_limit)
+        )
+
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._batch_group_items_async(
+                session, ranked_stmt, group_key_fields, model
+            )
+
+        result = session.execute(ranked_stmt)
+        rows = list(result.scalars().unique().all())
+
+        items_by_key: dict[tuple, list[Any]] = defaultdict(list)
+        for row in rows:
+            key = tuple(
+                str(getattr(row, k)) if getattr(row, k) is not None else None
+                for k in group_key_fields
+            )
+            items_by_key[key].append(row)
+        return dict(items_by_key)
+
+    async def _batch_group_items_async(self, session, stmt, group_key_fields, model):
+        from collections import defaultdict
+
+        result = await session.execute(stmt)
+        rows = list(result.scalars().unique().all())
+
+        items_by_key: dict[tuple, list[Any]] = defaultdict(list)
+        for row in rows:
+            key = tuple(
+                str(getattr(row, k)) if getattr(row, k) is not None else None
+                for k in group_key_fields
+            )
+            items_by_key[key].append(row)
+        return dict(items_by_key)
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -1136,6 +1354,198 @@ def _build_sa_ordering(
             )
 
     return clauses, joins, query
+
+
+def _resolve_sa_column(col_name: str, model: type, subq: Any = None) -> Any:
+    """Get a column from the subquery (if given) or the model."""
+    if subq is not None:
+        return subq.c.get(col_name)
+    return getattr(model, col_name, None)
+
+
+def _extract_sa_group_columns(
+    group_by_list: list[Any], model: type, subq: Any = None
+) -> tuple[list[Any], list[str]]:
+    """Extract SQLAlchemy column expressions and field names from group-by input."""
+    from sqlalchemy import func
+
+    cols: list[Any] = []
+    key_fields: list[str] = []
+    seen: set[str] = set()
+
+    for entry in group_by_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            val = getattr(field_val, col_name)
+            if val is strawberry.UNSET or val is None:
+                continue
+            if col_name in seen:
+                continue
+            seen.add(col_name)
+
+            column = _resolve_sa_column(col_name, model, subq)
+            if column is None:
+                continue
+
+            if hasattr(val, "interval"):
+                interval = val.interval
+                if interval == DateGroupByInterval.DAY:
+                    expr = func.date(column)
+                elif interval == DateGroupByInterval.WEEK:
+                    expr = func.strftime("%Y-%W", column)
+                elif interval == DateGroupByInterval.MONTH:
+                    expr = func.strftime("%Y-%m", column)
+                elif interval == DateGroupByInterval.QUARTER:
+                    expr = func.strftime(
+                        "%Y-Q",
+                        column,
+                    )
+                elif interval == DateGroupByInterval.YEAR:
+                    expr = func.strftime("%Y", column)
+                else:
+                    expr = column
+                cols.append(expr.label(col_name))
+            else:
+                cols.append(column.label(col_name))
+            key_fields.append(col_name)
+
+    return cols, key_fields
+
+
+def _build_sa_agg_cols(
+    model: type,
+    requested: dict[str, Any],
+    subq: Any = None,
+    *,
+    custom_fields: list[tuple[str, Any, type]] | None = None,
+    info: Any = None,
+) -> list[Any]:
+    """Build aggregate column expressions based on requested aggregates."""
+    from sqlalchemy import func
+
+    agg_cols: list[Any] = []
+    if requested.get("count"):
+        agg_cols.append(func.count().label("_count"))
+    for func_name, sql_func in [
+        ("sum", func.sum),
+        ("avg", func.avg),
+        ("min", func.min),
+        ("max", func.max),
+    ]:
+        for fname in requested.get(func_name, []):
+            col = _resolve_sa_column(fname, model, subq)
+            if col is not None:
+                agg_cols.append(sql_func(col).label(f"_{func_name}_{fname}"))
+    if custom_fields:
+        columns = subq.c if subq is not None else None
+        if columns is not None:
+            for field_name, handler, _rtype in custom_fields:
+                expr = _invoke_aggregate_handler(handler, columns, info=info)
+                if expr is not None:
+                    agg_cols.append(expr.label(f"_custom_{field_name}"))
+    return agg_cols
+
+
+def _build_sa_group(
+    row: Any,
+    meta: Any,
+    requested: dict[str, Any],
+    group_key_fields: list[str],
+) -> Any:
+    """Build a group instance from a SQL row."""
+    key = meta.build_group_key(row, group_key_fields)
+    aggregates = meta.build_aggregates(row, requested)
+
+    group_cls = type(
+        "_Group",
+        (),
+        {
+            "key": key,
+            "aggregates": aggregates,
+            "edge_indices": [],
+            "_items_nodes": None,
+            "_orm_base_query": None,
+            "_orm_backend": None,
+            "_orm_model": None,
+        },
+    )
+    return group_cls()
+
+
+def _extract_overlapping_order(
+    order_input: Any,
+    group_field_names: set[str],
+    model: type,
+    subq: Any = None,
+) -> list[Any]:
+    """Extract ORDER BY clauses for group fields that overlap with root order."""
+    from sqlalchemy import asc, desc
+
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[Any] = []
+
+    for entry in order_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            direction = getattr(field_val, col_name)
+            if direction is strawberry.UNSET or direction is None:
+                continue
+            if col_name not in group_field_names:
+                continue
+            column = _resolve_sa_column(col_name, model, subq)
+            if column is None:
+                continue
+            dir_value = (
+                direction.value if hasattr(direction, "value") else str(direction)
+            )
+            if dir_value.startswith("ASC"):
+                clauses.append(asc(column))
+            else:
+                clauses.append(desc(column))
+
+    return clauses
+
+
+def _build_sa_order_from_input(order_input: Any, model: type) -> list[Any]:
+    """Convert an order input into SQLAlchemy ORDER BY clauses."""
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[Any] = []
+    for entry in order_list:
+        clauses.extend(_build_sa_order_field_clauses(entry, model))
+    if not clauses:
+        pk_col = _get_sa_pk_column(model)
+        clauses.append(pk_col)
+    return clauses
+
+
+def _build_sa_order_field_clauses(entry: Any, model: type) -> list[Any]:
+    """Extract clauses from a single order entry."""
+    from sqlalchemy import asc, desc
+
+    clauses: list[Any] = []
+    field_val = getattr(entry, "field", None)
+    if field_val is None or field_val is strawberry.UNSET:
+        return clauses
+    entry_fields = field_val.__class__.__dataclass_fields__
+    for col_name in entry_fields:
+        direction = getattr(field_val, col_name)
+        if direction is strawberry.UNSET or direction is None:
+            continue
+        column = getattr(model, col_name, None)
+        if column is None:
+            continue
+        dir_value = direction.value if hasattr(direction, "value") else str(direction)
+        if dir_value.startswith("ASC"):
+            clauses.append(asc(column))
+        else:
+            clauses.append(desc(column))
+    return clauses
 
 
 def _build_sa_order_field(field_input: Any, model: type) -> list[Any]:

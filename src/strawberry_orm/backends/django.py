@@ -13,10 +13,12 @@ from strawberry_orm._async import run_sync
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
+    AggregateMeta,
     BaseBackend,
     extract_element_type,
     input_to_dict,
     invoke_custom_callback,
+    requested_aggregates,
 )
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
@@ -123,6 +125,8 @@ class DjangoBackend(BaseBackend):
         name = kwargs.get("name")
         filters = kwargs.get("filters")
         order = kwargs.get("order")
+        group = kwargs.get("group")
+        aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
             meta = model._meta  # type: ignore[attr-defined]
@@ -167,6 +171,8 @@ class DjangoBackend(BaseBackend):
                 name=name,
                 filters=filters,
                 order=order,
+                group=group,
+                aggregate=aggregate,
             )
 
             annotations = getattr(cls, "__annotations__", {})
@@ -325,6 +331,146 @@ class DjangoBackend(BaseBackend):
         if clauses:
             query = query.order_by(*clauses)
         return query
+
+    # -- Grouping / aggregation -----------------------------------------------
+
+    def apply_aggregation(
+        self, query: Any, info: Any, aggregate_meta: AggregateMeta
+    ) -> Any:
+        from django.db.models import Avg, Count, Max, Min, Sum
+
+        requested = requested_aggregates(info, "aggregates") or {}
+        if not requested:
+            return aggregate_meta.aggregates_type(count=0)
+
+        agg_kwargs: dict[str, Any] = {}
+        if requested.get("count"):
+            agg_kwargs["_count"] = Count("*")
+        _DJANGO_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
+        for func_name, AggCls in _DJANGO_AGG.items():
+            for fname in requested.get(func_name, []):
+                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+
+        if not agg_kwargs:
+            return aggregate_meta.aggregates_type(count=0)
+
+        def _run():
+            result = query.aggregate(**agg_kwargs)
+            row = type("Row", (), result)()
+            return aggregate_meta.build_aggregates(row, requested)
+
+        return run_sync(_run, thread_sensitive=True)
+
+    def apply_grouping(
+        self,
+        query: Any,
+        group_by_input: Any,
+        info: Any,
+        aggregate_meta: AggregateMeta,
+        *,
+        order_input: Any | None = None,
+    ) -> list[Any]:
+        from django.db.models import Avg, Count, Max, Min, Sum
+
+        group_by_list = (
+            group_by_input if isinstance(group_by_input, list) else [group_by_input]
+        )
+        group_fields, group_key_fields = _extract_django_group_fields(group_by_list)
+        aggregate_meta.group_key_fields = group_key_fields
+
+        if not group_fields:
+            return []
+
+        requested = requested_aggregates(info, "groups.aggregates") or {}
+        agg_kwargs: dict[str, Any] = {}
+        if requested.get("count"):
+            agg_kwargs["_count"] = Count("*")
+        _DJANGO_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
+        for func_name, AggCls in _DJANGO_AGG.items():
+            for fname in requested.get(func_name, []):
+                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+
+        def _run():
+            qs = query.values(*group_fields).annotate(**agg_kwargs)
+            if order_input:
+                order_clauses = _extract_django_overlapping_order(
+                    order_input, set(group_key_fields)
+                )
+                if order_clauses:
+                    qs = qs.order_by(*order_clauses)
+            results = list(qs)
+            groups = []
+            for row_dict in results:
+                row = type("Row", (), row_dict)()
+                key = aggregate_meta.build_group_key(row, group_key_fields)
+                aggregates = aggregate_meta.build_aggregates(row, requested)
+                group_obj = type(
+                    "_Group",
+                    (),
+                    {
+                        "key": key,
+                        "aggregates": aggregates,
+                        "edge_indices": [],
+                        "_items_nodes": None,
+                        "_orm_base_query": None,
+                        "_orm_backend": None,
+                        "_orm_model": None,
+                    },
+                )()
+                groups.append(group_obj)
+            return groups
+
+        return run_sync(_run, thread_sensitive=True)
+
+    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
+        key_fields = group_key.__class__.__dataclass_fields__
+        filters: dict[str, Any] = {}
+        for fname in key_fields:
+            val = getattr(group_key, fname, None)
+            if val is not None:
+                filters[fname] = val
+        return query.filter(**filters)
+
+    def batch_group_items(
+        self,
+        query: Any,
+        group_key_fields: list[str],
+        info: Any,
+        model: type,
+        *,
+        per_group_limit: int,
+        order_input: Any | None = None,
+    ) -> dict[tuple, list[Any]]:
+        from collections import defaultdict
+
+        from django.db.models import F, Window
+        from django.db.models.functions import RowNumber
+
+        partition = [F(k) for k in group_key_fields]
+        if order_input:
+            ordering = _build_django_order_from_input(order_input)
+        else:
+            ordering = [F("pk")]
+
+        def _run():
+            qs = query.annotate(
+                _rn=Window(
+                    expression=RowNumber(),
+                    partition_by=partition,
+                    order_by=ordering,
+                )
+            ).filter(_rn__lte=per_group_limit)
+            rows = list(qs)
+            items_by_key: dict[tuple, list[Any]] = defaultdict(list)
+            for row in rows:
+                key = tuple(
+                    str(getattr(row, k)) if getattr(row, k) is not None else None
+                    for k in group_key_fields
+                )
+                items_by_key[key].append(row)
+            return dict(items_by_key)
+
+        return run_sync(_run, thread_sensitive=True)
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -915,4 +1061,92 @@ def _build_django_order_field(field_input: Any, prefix: str = "") -> list[Any]:
             )
         clauses.append(expr)
 
+    return clauses
+
+
+# ---------------------------------------------------------------------------
+# Grouping helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_django_group_fields(
+    group_by_list: list[Any],
+) -> tuple[list[str], list[str]]:
+    """Extract field names for Django GROUP BY from group-by input."""
+
+    fields: list[str] = []
+    key_fields: list[str] = []
+    seen: set[str] = set()
+
+    for entry in group_by_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            val = getattr(field_val, col_name)
+            if val is strawberry.UNSET or val is None:
+                continue
+            if col_name in seen:
+                continue
+            seen.add(col_name)
+            fields.append(col_name)
+            key_fields.append(col_name)
+
+    return fields, key_fields
+
+
+def _extract_django_overlapping_order(
+    order_input: Any, group_field_names: set[str]
+) -> list[str]:
+    """Extract Django order_by strings for group fields overlapping with root order."""
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[str] = []
+
+    for entry in order_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            direction = getattr(field_val, col_name)
+            if direction is strawberry.UNSET or direction is None:
+                continue
+            if col_name not in group_field_names:
+                continue
+            dir_value = (
+                direction.value if hasattr(direction, "value") else str(direction)
+            )
+            if dir_value.startswith("DESC"):
+                clauses.append(f"-{col_name}")
+            else:
+                clauses.append(col_name)
+
+    return clauses
+
+
+def _build_django_order_from_input(order_input: Any) -> list[Any]:
+    """Convert an order input to Django F() ordering expressions."""
+    from django.db.models import F
+
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[Any] = []
+    for entry in order_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            direction = getattr(field_val, col_name)
+            if direction is strawberry.UNSET or direction is None:
+                continue
+            dir_value = (
+                direction.value if hasattr(direction, "value") else str(direction)
+            )
+            if dir_value.startswith("DESC"):
+                clauses.append(F(col_name).desc())
+            else:
+                clauses.append(F(col_name).asc())
+    if not clauses:
+        clauses.append(F("pk"))
     return clauses

@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import inspect
 import re
 import typing
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any, Optional
 
 import strawberry
 
 from strawberry_orm.filters import (
+    _CUSTOM_AGGREGATE_ATTR,
     _CUSTOM_FILTER_ATTR,
+    _CUSTOM_GROUP_ATTR,
     _CUSTOM_ORDER_ATTR,
     TYPE_TO_LOOKUP,
     StringLookup,
@@ -21,7 +26,7 @@ from strawberry_orm.filters import (
 )
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
-from strawberry_orm.types import Ordering
+from strawberry_orm.types import DateGroupByOption, Ordering
 
 FieldMeta = tuple[str, type, bool, type | None]
 
@@ -35,6 +40,129 @@ _SENSITIVE_PATTERNS = re.compile(
 
 _KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
 _KNOWN_ORDER_KEYS = frozenset({"field", "object"})
+
+
+@dataclass
+class AggregateMeta:
+    """Holds the auto-generated aggregate output types and field metadata."""
+
+    model: type
+    aggregates_type: type
+    group_key_type: type
+    sum_type: type | None = None
+    avg_type: type | None = None
+    min_type: type | None = None
+    max_type: type | None = None
+    numeric_fields: list[tuple[str, type]] = dc_field(default_factory=list)
+    comparable_fields: list[tuple[str, type]] = dc_field(default_factory=list)
+    groupable_fields: list[tuple[str, type]] = dc_field(default_factory=list)
+
+    group_key_fields: list[str] = dc_field(default_factory=list)
+
+    custom_fields: list[tuple[str, Callable[..., Any], type]] = dc_field(
+        default_factory=list,
+    )
+    """Each entry is ``(field_name, handler_callable, python_return_type)``."""
+
+    def build_aggregates(self, row: Any, requested: dict[str, Any]) -> Any:
+        """Construct an ``Aggregates`` instance from a SQL result *row*."""
+        kwargs: dict[str, Any] = {}
+        kwargs["count"] = getattr(row, "_count", 0) if requested.get("count") else 0
+
+        for func_name, SubType in [
+            ("sum", self.sum_type),
+            ("avg", self.avg_type),
+            ("min", self.min_type),
+            ("max", self.max_type),
+        ]:
+            col_names = requested.get(func_name, [])
+            if SubType is not None and col_names:
+                sub_kwargs = {}
+                for col in col_names:
+                    sub_kwargs[col] = getattr(row, f"_{func_name}_{col}", None)
+                kwargs[func_name] = SubType(**sub_kwargs)
+
+        for field_name, _handler, _rtype in self.custom_fields:
+            val = getattr(row, f"_custom_{field_name}", None)
+            if val is not None:
+                kwargs[field_name] = val
+
+        return self.aggregates_type(**kwargs)
+
+    def build_group_key(self, row: Any, key_fields: list[str]) -> Any:
+        """Construct a ``GroupKey`` instance from a SQL result *row*."""
+        kwargs: dict[str, Any] = {}
+        for fname in key_fields:
+            val = getattr(row, fname, None)
+            kwargs[fname] = str(val) if val is not None else None
+        return self.group_key_type(**kwargs)
+
+
+def _find_selection(info: Any, field_path: str) -> Any:
+    """Walk ``info.selected_fields`` to find a nested selection by dot-path.
+
+    Strawberry wraps the current field in ``info.selected_fields``, so
+    the first entry is the field being resolved.  We unwrap that
+    automatically when the first path component does not match the
+    top-level field name.
+    """
+    parts = field_path.split(".")
+    selections = info.selected_fields
+
+    if (
+        selections
+        and len(parts) > 0
+        and parts[0] != getattr(selections[0], "name", None)
+    ):
+        inner: list[Any] = []
+        for sel in selections:
+            inner.extend(getattr(sel, "selections", []))
+        if inner:
+            selections = inner
+
+    for part in parts:
+        found = None
+        for sel in selections:
+            if sel.name == part:
+                found = sel
+                break
+        if found is None:
+            return None
+        selections = found.selections if hasattr(found, "selections") else []
+    return found
+
+
+def _selection_requests(info: Any, *path: str) -> bool:
+    """Return ``True`` if the dot-separated *path* is in the selection set."""
+    return _find_selection(info, ".".join(path)) is not None
+
+
+def requested_aggregates(
+    info: Any, field_path: str = "aggregates"
+) -> dict[str, Any] | None:
+    """Parse the selection set to determine which aggregates are needed.
+
+    Returns a dict like::
+
+        {'count': True, 'sum': ['amount'], 'avg': [], 'min': [], 'max': []}
+
+    or ``None`` if the field is not in the selection set at all.
+    """
+    agg_selection = _find_selection(info, field_path)
+    if agg_selection is None:
+        return None
+
+    result: dict[str, Any] = {}
+    for fld in agg_selection.selections:
+        name = fld.name
+        if name == "count":
+            result["count"] = True
+        elif name in ("sum", "avg", "min", "max"):
+            sub_fields = (
+                [sf.name for sf in fld.selections] if hasattr(fld, "selections") else []
+            )
+            result[name] = sub_fields
+    return result
 
 
 def invoke_custom_callback(
@@ -95,6 +223,8 @@ class BaseBackend:
         self._filter_registry: dict[type, type] = {}
         self._projected_filter_cache: dict[tuple[type, Any], type] = {}
         self._order_registry: dict[type, type] = {}
+        self._group_registry: dict[type, type] = {}
+        self._aggregate_type_cache: dict[type, AggregateMeta] = {}
         self._type_querysets: dict[type, Any] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
@@ -691,6 +821,324 @@ class BaseBackend:
         self._order_registry[model] = OrderType
         return OrderType
 
+    # -- Group-by type generation --------------------------------------------
+
+    _NUMERIC_TYPES: tuple[type, ...] = (int, float)
+    _COMPARABLE_TYPES: tuple[type, ...] = (
+        int,
+        float,
+        datetime.date,
+        datetime.time,
+        datetime.datetime,
+    )
+
+    def group(self, model_or_type: type, **kwargs: Any) -> Any:
+        """Generate a ``@oneOf`` group-by input for *model*.
+
+        Boolean fields use ``Boolean`` (set to ``true`` to group by that
+        column); date/datetime fields use ``DateGroupByOption`` so the
+        caller can choose a truncation interval.
+        """
+        model = model_or_type
+        include = kwargs.get("include")
+        exclude = kwargs.get("exclude")
+
+        fields_meta = self._introspect_model(model)
+
+        field_annotations: dict[str, Any] = {}
+        field_defaults: dict[str, Any] = {}
+
+        for fname, ftype, is_relation, _rel in fields_meta:
+            if is_relation:
+                continue
+            if include and fname not in include:
+                continue
+            if exclude and fname in exclude:
+                continue
+            if self._exclude_generated_sensitive_field(fname, include):
+                continue
+            if ftype in (datetime.date, datetime.datetime):
+                field_annotations[fname] = Optional[DateGroupByOption]
+            else:
+                field_annotations[fname] = Optional[bool]
+            field_defaults[fname] = strawberry.UNSET
+
+        field_type_name = f"{model.__name__}GroupByField"
+        field_ns: dict[str, Any] = {
+            "__annotations__": field_annotations,
+            **field_defaults,
+        }
+        field_cls = type(field_type_name, (), field_ns)
+        GroupByFieldType = strawberry.input(field_cls, one_of=True)
+
+        group_type_name = f"{model.__name__}GroupBy"
+        group_ns: dict[str, Any] = {
+            "__annotations__": {"field": Optional[GroupByFieldType]},
+            "field": strawberry.UNSET,
+        }
+        GroupByCls = type(group_type_name, (), group_ns)
+        GroupByType = strawberry.input(GroupByCls, one_of=True)
+        GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
+        GroupByType.__orm_model__ = model  # type: ignore[attr-defined]
+
+        self._group_registry[model] = GroupByType
+        return GroupByType
+
+    def group_type(
+        self,
+        model: type,
+        *,
+        include: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> Callable[[type], type]:
+        """Decorator that builds a ``@oneOf`` group-by input from a user class.
+
+        ``auto`` annotations are expanded to ``Boolean`` or
+        ``DateGroupByOption``.  Methods decorated with ``@group_field``
+        become additional top-level keys on the group-by input.
+        """
+
+        def decorator(cls: type) -> type:
+            return self._build_custom_group_type(
+                cls, model, include=include, exclude=exclude
+            )
+
+        return decorator
+
+    def _build_custom_group_type(
+        self,
+        cls: type,
+        model: type,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+    ) -> type:
+        fields_meta = self._introspect_model(model)
+        col_types = {
+            fname: ftype for fname, ftype, is_rel, _ in fields_meta if not is_rel
+        }
+
+        user_annotations = typing.get_type_hints(cls, include_extras=True)
+
+        field_annotations: dict[str, Any] = {}
+        field_defaults: dict[str, Any] = {}
+        custom_group_annotations: dict[str, Any] = {}
+        custom_group_defaults: dict[str, Any] = {}
+        custom_groups: dict[str, Callable[..., Any]] = {}
+
+        for fname, ann in user_annotations.items():
+            if include and fname not in include:
+                continue
+            if exclude and fname in exclude:
+                continue
+            if ann is strawberry.auto:
+                if fname in col_types:
+                    ftype = col_types[fname]
+                    if ftype in (datetime.date, datetime.datetime):
+                        field_annotations[fname] = Optional[DateGroupByOption]
+                    else:
+                        field_annotations[fname] = Optional[bool]
+                    field_defaults[fname] = strawberry.UNSET
+
+        for attr_name in list(vars(cls)):
+            method = getattr(cls, attr_name, None)
+            if callable(method) and getattr(method, _CUSTOM_GROUP_ATTR, False):
+                custom_group_annotations[attr_name] = Optional[bool]
+                custom_group_defaults[attr_name] = strawberry.UNSET
+                custom_groups[attr_name] = method
+
+        field_type_name = f"{model.__name__}GroupByField"
+        if field_annotations:
+            field_ns: dict[str, Any] = {
+                "__annotations__": field_annotations,
+                **field_defaults,
+            }
+            field_cls = type(field_type_name, (), field_ns)
+            GroupByFieldType = strawberry.input(field_cls, one_of=True)
+        else:
+            GroupByFieldType = None
+
+        group_type_name = f"{model.__name__}GroupBy"
+        group_ns: dict[str, Any] = {"__annotations__": {}}
+        if GroupByFieldType is not None:
+            group_ns["__annotations__"]["field"] = Optional[GroupByFieldType]
+            group_ns["field"] = strawberry.UNSET
+
+        for cname, cann in custom_group_annotations.items():
+            group_ns["__annotations__"][cname] = cann
+            group_ns[cname] = custom_group_defaults[cname]
+
+        GroupByCls = type(group_type_name, (), group_ns)
+        GroupByType = strawberry.input(GroupByCls, one_of=True)
+        GroupByType.__orm_model__ = model  # type: ignore[attr-defined]
+        if GroupByFieldType is not None:
+            GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
+        if custom_groups:
+            GroupByType._custom_groups = custom_groups  # type: ignore[attr-defined]
+
+        self._group_registry[model] = GroupByType
+        return GroupByType
+
+    # -- Aggregate type registration -----------------------------------------
+
+    def aggregate(self, model_or_type: type, **kwargs: Any) -> Any:
+        """Return a marker that stores the aggregate class for *model*.
+
+        With no custom class, aggregation uses all introspected fields.
+        """
+        return None
+
+    def aggregate_type(
+        self,
+        model: type,
+        *,
+        include: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> Callable[[type], type]:
+        """Decorator that registers a user-defined aggregate class.
+
+        ``auto`` annotations select which fields get standard sum/avg/min/max.
+        Methods decorated with ``@aggregate_field`` add custom computed
+        aggregate fields.
+
+        Usage::
+
+            @orm.aggregate_type(Order)
+            class OrderAggregation:
+                amount: auto
+                quantity: auto
+
+                @aggregate_field
+                def total_revenue(self, columns) -> float:
+                    from sqlalchemy import func
+                    return func.sum(columns.amount * columns.quantity)
+        """
+
+        def decorator(cls: type) -> type:
+            cls.__orm_aggregate_model__ = model  # type: ignore[attr-defined]
+            return cls
+
+        return decorator
+
+    # -- Aggregate output type generation ------------------------------------
+
+    def _build_aggregate_types(
+        self, model: type, aggregate_cls: type | None = None
+    ) -> AggregateMeta:
+        """Build the aggregate output types and return an ``AggregateMeta``.
+
+        When *aggregate_cls* is provided (from ``@orm.aggregate_type``),
+        only fields annotated with ``auto`` on that class are included in
+        the standard sub-aggregates (sum/avg/min/max), and methods
+        decorated with ``@aggregate_field`` become additional top-level
+        fields on the aggregates type.
+
+        Cached per ``(model, aggregate_cls)`` so repeated calls return
+        the same types.
+        """
+        import datetime as _dt
+
+        cache_key = (model, aggregate_cls)
+        cached = self._aggregate_type_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        fields_meta = self._introspect_model(model)
+        model_name = model.__name__
+
+        include_fields: set[str] | None = None
+        custom_agg_handlers: list[tuple[str, Callable[..., Any], type]] = []
+
+        if aggregate_cls is not None:
+            user_hints = typing.get_type_hints(aggregate_cls, include_extras=True)
+            include_fields = {k for k, v in user_hints.items() if v is strawberry.auto}
+            for attr_name in list(vars(aggregate_cls)):
+                handler = getattr(aggregate_cls, attr_name, None)
+                if callable(handler) and getattr(
+                    handler, _CUSTOM_AGGREGATE_ATTR, False
+                ):
+                    ret_type = typing.get_type_hints(handler).get("return", float)
+                    custom_agg_handlers.append((attr_name, handler, ret_type))
+
+        numeric_fields: list[tuple[str, type]] = []
+        comparable_fields: list[tuple[str, type]] = []
+        groupable_fields: list[tuple[str, type]] = []
+
+        for fname, ftype, is_relation, _rel in fields_meta:
+            if is_relation:
+                continue
+            if include_fields is not None and fname not in include_fields:
+                groupable_fields.append((fname, ftype))
+                continue
+            if ftype in self._NUMERIC_TYPES:
+                numeric_fields.append((fname, ftype))
+                comparable_fields.append((fname, ftype))
+            elif ftype in (_dt.date, _dt.datetime, _dt.time):
+                comparable_fields.append((fname, ftype))
+            groupable_fields.append((fname, ftype))
+
+        def _make_sub_agg(prefix: str, fields: list[tuple[str, type]]) -> type | None:
+            if not fields:
+                return None
+            ann: dict[str, Any] = {}
+            defs: dict[str, Any] = {}
+            for fname, _ in fields:
+                ann[fname] = Optional[float]
+                defs[fname] = None
+            cls_name = f"{model_name}{prefix}Aggregates"
+            ns = {"__annotations__": ann, **defs}
+            return strawberry.type(type(cls_name, (), ns))
+
+        SumType = _make_sub_agg("Sum", numeric_fields)
+        AvgType = _make_sub_agg("Avg", numeric_fields)
+        MinType = _make_sub_agg("Min", comparable_fields)
+        MaxType = _make_sub_agg("Max", comparable_fields)
+
+        agg_ann: dict[str, Any] = {"count": int}
+        agg_defs: dict[str, Any] = {"count": 0}
+        for label, sub_type in [
+            ("sum", SumType),
+            ("avg", AvgType),
+            ("min", MinType),
+            ("max", MaxType),
+        ]:
+            if sub_type is not None:
+                agg_ann[label] = Optional[sub_type]
+                agg_defs[label] = None
+
+        for field_name, _handler, ret_type in custom_agg_handlers:
+            agg_ann[field_name] = Optional[ret_type]
+            agg_defs[field_name] = None
+
+        agg_cls_name = f"{model_name}Aggregates"
+        agg_ns = {"__annotations__": agg_ann, **agg_defs}
+        AggregatesType = strawberry.type(type(agg_cls_name, (), agg_ns))
+
+        key_ann: dict[str, Any] = {}
+        key_defs: dict[str, Any] = {}
+        for fname, ftype in groupable_fields:
+            key_ann[fname] = Optional[str]
+            key_defs[fname] = None
+        GroupKeyType = strawberry.type(
+            type(f"{model_name}GroupKey", (), {"__annotations__": key_ann, **key_defs})
+        )
+
+        meta = AggregateMeta(
+            model=model,
+            aggregates_type=AggregatesType,
+            group_key_type=GroupKeyType,
+            sum_type=SumType,
+            avg_type=AvgType,
+            min_type=MinType,
+            max_type=MaxType,
+            numeric_fields=numeric_fields,
+            comparable_fields=comparable_fields,
+            groupable_fields=groupable_fields,
+            custom_fields=custom_agg_handlers,
+        )
+        self._aggregate_type_cache[cache_key] = meta
+        return meta
+
     # -- Fields --------------------------------------------------------------
 
     def field(self, **kwargs: Any) -> Any:
@@ -763,6 +1211,8 @@ class BaseBackend:
         name: str | None = None,
         filters: Any = None,
         order: Any = None,
+        group: Any = None,
+        aggregate: Any = None,
     ) -> str:
         """Shared annotation processing for ``type()`` decorators.
 
@@ -802,6 +1252,12 @@ class BaseBackend:
             cls.__orm_filter__ = filters  # type: ignore[attr-defined]
         if order is not None:
             cls.__orm_order__ = order  # type: ignore[attr-defined]
+
+        if group is not None:
+            cls.__orm_group__ = group  # type: ignore[attr-defined]
+
+        if aggregate is not None:
+            cls.__orm_aggregate__ = aggregate  # type: ignore[attr-defined]
 
         type_name = name or cls.__name__
 

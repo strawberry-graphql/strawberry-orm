@@ -15,10 +15,12 @@ from strawberry.extensions import SchemaExtension
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
+    AggregateMeta,
     BaseBackend,
     extract_element_type,
     input_to_dict,
     invoke_custom_callback,
+    requested_aggregates,
 )
 
 _TORTOISE_FIELD_MAP: dict[str, type] = {
@@ -188,6 +190,8 @@ class TortoiseBackend(BaseBackend):
         name = kwargs.get("name")
         filters = kwargs.get("filters")
         order = kwargs.get("order")
+        group = kwargs.get("group")
+        aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
             fields_meta = self._introspect_model(model)
@@ -209,6 +213,8 @@ class TortoiseBackend(BaseBackend):
                 name=name,
                 filters=filters,
                 order=order,
+                group=group,
+                aggregate=aggregate,
             )
 
             annotations = getattr(cls, "__annotations__", {})
@@ -401,6 +407,136 @@ class TortoiseBackend(BaseBackend):
             to_remove = await rel_model.filter(pk__in=to_delete_ids)
             await manager.remove(*to_remove)
             await rel_model.filter(pk__in=to_delete_ids).delete()
+
+    # -- Grouping / aggregation -----------------------------------------------
+
+    async def apply_aggregation(
+        self, query: Any, info: Any, aggregate_meta: AggregateMeta
+    ) -> Any:
+        from tortoise.functions import Avg, Count, Max, Min, Sum
+
+        requested = requested_aggregates(info, "aggregates") or {}
+        if not requested:
+            return aggregate_meta.aggregates_type(count=0)
+
+        agg_kwargs: dict[str, Any] = {}
+        if requested.get("count"):
+            agg_kwargs["_count"] = Count("id")
+        _TORT_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
+        for func_name, AggCls in _TORT_AGG.items():
+            for fname in requested.get(func_name, []):
+                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+
+        if not agg_kwargs:
+            return aggregate_meta.aggregates_type(count=0)
+
+        result = await query.annotate(**agg_kwargs).values(*agg_kwargs.keys())
+        if result:
+            row = type("Row", (), result[0])()
+        else:
+            row = type("Row", (), {k: 0 for k in agg_kwargs})()
+        return aggregate_meta.build_aggregates(row, requested)
+
+    async def apply_grouping(
+        self,
+        query: Any,
+        group_by_input: Any,
+        info: Any,
+        aggregate_meta: AggregateMeta,
+        *,
+        order_input: Any | None = None,
+    ) -> list[Any]:
+        from tortoise.functions import Avg, Count, Max, Min, Sum
+
+        group_by_list = (
+            group_by_input if isinstance(group_by_input, list) else [group_by_input]
+        )
+        group_fields, group_key_fields = _extract_tortoise_group_fields(group_by_list)
+        aggregate_meta.group_key_fields = group_key_fields
+
+        if not group_fields:
+            return []
+
+        requested = requested_aggregates(info, "groups.aggregates") or {}
+        agg_kwargs: dict[str, Any] = {}
+        if requested.get("count"):
+            agg_kwargs["_count"] = Count("id")
+        _TORT_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
+        for func_name, AggCls in _TORT_AGG.items():
+            for fname in requested.get(func_name, []):
+                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+
+        qs = (
+            query.annotate(**agg_kwargs)
+            .group_by(*group_fields)
+            .values(*group_fields, *agg_kwargs.keys())
+        )
+        if order_input:
+            order_clauses = _extract_tortoise_overlapping_order(
+                order_input, set(group_key_fields)
+            )
+            if order_clauses:
+                qs = qs.order_by(*order_clauses)
+
+        rows = await qs
+        groups = []
+        for row_dict in rows:
+            row = type("Row", (), row_dict)()
+            key = aggregate_meta.build_group_key(row, group_key_fields)
+            aggregates = aggregate_meta.build_aggregates(row, requested)
+            group_obj = type(
+                "_Group",
+                (),
+                {
+                    "key": key,
+                    "aggregates": aggregates,
+                    "edge_indices": [],
+                    "_items_nodes": None,
+                    "_orm_base_query": None,
+                    "_orm_backend": None,
+                    "_orm_model": None,
+                },
+            )()
+            groups.append(group_obj)
+        return groups
+
+    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
+        key_fields = group_key.__class__.__dataclass_fields__
+        filters: dict[str, Any] = {}
+        for fname in key_fields:
+            val = getattr(group_key, fname, None)
+            if val is not None:
+                filters[fname] = val
+        return query.filter(**filters)
+
+    async def batch_group_items(
+        self,
+        query: Any,
+        group_key_fields: list[str],
+        info: Any,
+        model: type,
+        *,
+        per_group_limit: int,
+        order_input: Any | None = None,
+    ) -> dict[tuple, list[Any]]:
+        """Per-group fallback since Tortoise has limited window function support."""
+        groups_qs = await query.group_by(*group_key_fields).values(*group_key_fields)
+        items_by_key: dict[tuple, list[Any]] = {}
+
+        for group_dict in groups_qs:
+            key = tuple(
+                str(group_dict[k]) if group_dict[k] is not None else None
+                for k in group_key_fields
+            )
+            scoped = query.filter(**{k: group_dict[k] for k in group_key_fields})
+            if order_input:
+                order_clauses = _build_tortoise_order_from_input(order_input)
+                if order_clauses:
+                    scoped = scoped.order_by(*order_clauses)
+            items = await scoped.limit(per_group_limit)
+            items_by_key[key] = list(items)
+
+        return items_by_key
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -1112,4 +1248,87 @@ def _build_tortoise_order_field(
             )
         )
 
+    return clauses
+
+
+# ---------------------------------------------------------------------------
+# Grouping helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_tortoise_group_fields(
+    group_by_list: list[Any],
+) -> tuple[list[str], list[str]]:
+    """Extract field names for Tortoise GROUP BY from group-by input."""
+    fields: list[str] = []
+    key_fields: list[str] = []
+    seen: set[str] = set()
+
+    for entry in group_by_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            val = getattr(field_val, col_name)
+            if val is strawberry.UNSET or val is None:
+                continue
+            if col_name in seen:
+                continue
+            seen.add(col_name)
+            fields.append(col_name)
+            key_fields.append(col_name)
+
+    return fields, key_fields
+
+
+def _extract_tortoise_overlapping_order(
+    order_input: Any, group_field_names: set[str]
+) -> list[str]:
+    """Extract Tortoise order_by strings for group fields overlapping with root order."""
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[str] = []
+
+    for entry in order_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            direction = getattr(field_val, col_name)
+            if direction is strawberry.UNSET or direction is None:
+                continue
+            if col_name not in group_field_names:
+                continue
+            dir_value = (
+                direction.value if hasattr(direction, "value") else str(direction)
+            )
+            if dir_value.startswith("DESC"):
+                clauses.append(f"-{col_name}")
+            else:
+                clauses.append(col_name)
+
+    return clauses
+
+
+def _build_tortoise_order_from_input(order_input: Any) -> list[str]:
+    """Convert an order input to Tortoise order_by strings."""
+    order_list = order_input if isinstance(order_input, list) else [order_input]
+    clauses: list[str] = []
+    for entry in order_list:
+        field_val = getattr(entry, "field", None)
+        if field_val is None or field_val is strawberry.UNSET:
+            continue
+        entry_fields = field_val.__class__.__dataclass_fields__
+        for col_name in entry_fields:
+            direction = getattr(field_val, col_name)
+            if direction is strawberry.UNSET or direction is None:
+                continue
+            dir_value = (
+                direction.value if hasattr(direction, "value") else str(direction)
+            )
+            if dir_value.startswith("DESC"):
+                clauses.append(f"-{col_name}")
+            else:
+                clauses.append(col_name)
     return clauses

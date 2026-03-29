@@ -18,6 +18,20 @@ class Ordering(enum.Enum):
     DESC_NULLS_LAST = "DESC_NULLS_LAST"
 
 
+@strawberry.enum
+class DateGroupByInterval(enum.Enum):
+    DAY = "DAY"
+    WEEK = "WEEK"
+    MONTH = "MONTH"
+    QUARTER = "QUARTER"
+    YEAR = "YEAR"
+
+
+@strawberry.input
+class DateGroupByOption:
+    interval: DateGroupByInterval
+
+
 @strawberry.type
 class OperationMessage:
     kind: str

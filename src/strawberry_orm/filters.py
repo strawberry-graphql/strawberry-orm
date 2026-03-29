@@ -197,6 +197,8 @@ TYPE_TO_LOOKUP: dict[type, type] = {
 
 _CUSTOM_FILTER_ATTR = "_orm_custom_filter"
 _CUSTOM_ORDER_ATTR = "_orm_custom_order"
+_CUSTOM_GROUP_ATTR = "_orm_custom_group"
+_CUSTOM_AGGREGATE_ATTR = "_orm_custom_aggregate"
 
 
 def filter_field(func):
@@ -238,4 +240,53 @@ def order_field(func):
                 ...
     """
     func._orm_custom_order = True
+    return func
+
+
+def group_field(func):
+    """Mark a method as a custom group-by handler.
+
+    The decorated method must accept ``(self, value: bool, query)`` and
+    return a column expression (or tuple of column expression + label)
+    to use in the GROUP BY clause.  An optional ``info`` parameter will
+    receive the Strawberry ``Info`` when present in the signature.
+
+    Usage inside an ``@orm.group_type(Model)`` class::
+
+        @orm.group_type(Order)
+        class OrderGroupBy:
+            status: auto
+
+            @group_field
+            def by_customer_tier(self, value: bool, query):
+                ...
+    """
+    func._orm_custom_group = True
+    return func
+
+
+def aggregate_field(func):
+    """Mark a method as a custom aggregate handler.
+
+    The decorated method must accept ``(self, columns)`` and return a
+    SQLAlchemy column expression.  ``columns`` is the subquery's column
+    collection (``subq.c``).  An optional ``info`` parameter will receive
+    the Strawberry ``Info`` when present in the signature.
+
+    The method's return-type annotation determines the GraphQL scalar
+    type of the aggregate field (defaults to ``Optional[float]``).
+
+    Usage inside an ``@orm.aggregate_type(Order)`` class::
+
+        @orm.aggregate_type(Order)
+        class OrderAggregation:
+            amount: auto
+            quantity: auto
+
+            @aggregate_field
+            def total_revenue(self, columns) -> float:
+                from sqlalchemy import func
+                return func.sum(columns.amount * columns.quantity)
+    """
+    func._orm_custom_aggregate = True
     return func

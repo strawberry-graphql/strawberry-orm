@@ -18,6 +18,7 @@ EXCLUDED_FILES = {
     "test_queryset_detection.py",
     "test_query_async_session.py",
     "test_internal_sqlalchemy_extra_coverage.py",
+    "test_grouping.py",
 }
 
 EXCLUDED_METHODS = {

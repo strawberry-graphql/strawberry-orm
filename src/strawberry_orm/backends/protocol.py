@@ -47,6 +47,22 @@ class Backend(Protocol):
         """Return a decorator that builds an order input with custom fields."""
         ...
 
+    def group(self, model_or_type: type, **kwargs: Any) -> Any:
+        """Generate a @oneOf group-by input for a model."""
+        ...
+
+    def group_type(self, model: type, **kwargs: Any) -> Any:
+        """Return a decorator that builds a group-by input with custom fields."""
+        ...
+
+    def aggregate(self, model_or_type: type, **kwargs: Any) -> Any:
+        """Return a marker for auto-generated aggregation."""
+        ...
+
+    def aggregate_type(self, model: type, **kwargs: Any) -> Any:
+        """Return a decorator that registers a custom aggregate class."""
+        ...
+
     # -- Fields --------------------------------------------------------------
 
     def field(self, **kwargs: Any) -> Any:
@@ -116,6 +132,58 @@ class Backend(Protocol):
 
         Each entry represents one column; list position determines tie-break
         priority.
+        """
+        ...
+
+    # -- Grouping / aggregation -----------------------------------------------
+
+    def apply_aggregation(
+        self, query: Any, info: Any, aggregate_meta: Any
+    ) -> AwaitableOrValue[Any]:
+        """Run aggregate functions on the full filtered query.
+
+        Only the aggregates requested in the GraphQL selection set are
+        computed (selection-set-driven optimization).
+        """
+        ...
+
+    def apply_grouping(
+        self,
+        query: Any,
+        group_by_input: Any,
+        info: Any,
+        aggregate_meta: Any,
+        *,
+        order_input: Any | None = None,
+    ) -> AwaitableOrValue[list[Any]]:
+        """Run GROUP BY with aggregates and return Group instances.
+
+        If *order_input* contains fields that overlap with *group_by_input*,
+        the groups are sorted by those fields.
+        """
+        ...
+
+    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
+        """Add WHERE clauses to *query* matching the group key values.
+
+        Fallback for unbatched per-group ``items`` resolution.
+        """
+        ...
+
+    def batch_group_items(
+        self,
+        query: Any,
+        group_key_fields: list[str],
+        info: Any,
+        model: type,
+        *,
+        per_group_limit: int,
+        order_input: Any | None = None,
+    ) -> AwaitableOrValue[dict[tuple, list[Any]]]:
+        """Fetch the first *per_group_limit* items for every group in one query.
+
+        Uses ``ROW_NUMBER() OVER (PARTITION BY ...)`` to avoid N+1.
+        Returns a dict mapping group-key tuples to lists of model instances.
         """
         ...
 
