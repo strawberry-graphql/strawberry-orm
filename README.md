@@ -12,6 +12,7 @@ Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.r
 - [Defining Types](#defining-types)
 - [Filters and Ordering](#filters-and-ordering)
 - [Custom Filters and Ordering](#custom-filters-and-ordering)
+- [Grouping and Aggregation](#grouping-and-aggregation)
 - [Mutations](#mutations)
 - [Relay Integration](#relay-integration)
 - [Query Optimization](#query-optimization)
@@ -35,7 +36,7 @@ Requires Python `>=3.12` and `strawberry-graphql>=0.311.0`.
 
 ## Quick Start
 
-A blog API with users, posts, tags, and comments — covering types, relations, queryset scoping, optimizer hints, filters, ordering, object traversal, mutations, ref lists, recursive node mutations, and the query optimizer:
+A blog API with users, posts, tags, and comments — covering types, relations, queryset scoping, optimizer hints, filters, ordering, object traversal, grouping, aggregation, mutations, ref lists, recursive node mutations, and the query optimizer:
 
 ```python
 import strawberry
@@ -47,7 +48,7 @@ orm = StrawberryORM(
     session_getter=lambda info: info.context["session"],
 )
 
-# -- Filters and ordering (register leaf models first) -----------------------
+# -- Filters, ordering, and grouping (register leaf models first) ------------
 
 UserFilter = orm.filter(User)
 UserOrder  = orm.order(User)
@@ -57,6 +58,7 @@ TagOrder   = orm.order(Tag)
 CommentFilter = orm.filter(Comment)
 PostFilter    = orm.filter(Post)      # picks up author/tags/comments relations
 PostOrder     = orm.order(Post)
+PostGroupBy   = orm.group(Post)       # group-by support for aggregation
 
 # -- Types -------------------------------------------------------------------
 
@@ -77,15 +79,18 @@ class CommentType:
     id: auto
     body: auto
 
-@orm.type(Post, filters=PostFilter, order=PostOrder)
+@orm.type(Post, filters=PostFilter, order=PostOrder, group=PostGroupBy)
 class PostType:
     id: auto
     title: auto
     body: auto
     is_published: auto
-    author: UserType
     tags: list[TagType] = orm.field(load=lambda qs: qs.order_by("name"))
     comments: list[CommentType]
+
+    @orm.field
+    def author(self) -> UserType:
+        return self.author
 
     @classmethod
     def get_queryset(cls, qs, info):
@@ -255,7 +260,32 @@ class PostType:
 
 If the nested type carries `filters` and/or `order`, list relations expose those arguments automatically.
 
-### List Fields and Explicit Resolvers
+### `@orm.field` Decorator
+
+Use `@orm.field` (bare, without parentheses) as a decorator on resolver methods. It works for related models, computed fields, and querysets:
+
+```python
+@orm.type(Post)
+class PostType:
+    id: auto
+    title: auto
+
+    # Forward FK — resolves a single related model
+    @orm.field
+    def author(self) -> UserType:
+        return self.author
+
+    # Computed scalar
+    @orm.field
+    def title_upper(self) -> str:
+        return self.title.upper()
+```
+
+When the return type is a `list[T]` where `T` has filters/ordering, the decorator auto-adds `filter` and `order` arguments — just like the assignment form.
+
+`@orm.field()` with parentheses also works identically and accepts keyword arguments (`filters`, `order`, `load`, `only`, etc.).
+
+### List Fields
 
 `orm.field()` builds a list resolver from the model attached to the return type:
 
@@ -265,12 +295,12 @@ class Query:
     users: list[UserType] = orm.field()
 ```
 
-For custom scoping, return a backend query object from a regular Strawberry resolver:
+Use the decorator form for custom scoping:
 
 ```python
 @strawberry.type
 class Query:
-    @strawberry.field
+    @orm.field
     def active_users(self, info: strawberry.types.Info) -> list[UserType]:
         return select(User).where(User.is_active.is_(True))  # SQLAlchemy
         # return User.objects.filter(is_active=True)         # Django
@@ -294,9 +324,9 @@ class PublishedPostType:
 
 Useful for soft-delete filtering, multi-tenant scoping, and authorization-aware model filters.
 
-### Custom Strawberry Fields
+### Custom Fields
 
-Mix generated fields with plain Strawberry fields:
+Mix generated fields with custom resolvers. Use `@orm.field` for resolvers that return ORM data, or `@strawberry.field` for purely computed values:
 
 ```python
 @orm.type(User)
@@ -305,7 +335,7 @@ class UserType:
     name: auto
     email: auto
 
-    @strawberry.field
+    @orm.field
     def display_name(self) -> str:
         return f"{self.name} <{self.email}>"
 ```
@@ -619,7 +649,7 @@ class UserType:
 
 @strawberry.type
 class Query:
-    @orm.field()
+    @orm.field
     def users(self) -> list[UserType]:
         return orm.get_default_queryset(User)
 ```
@@ -688,9 +718,163 @@ class UserOrder:
 
 </details>
 
+### Custom Group-By Types
+
+`orm.group_type(Model)` works like `orm.filter_type()` and `orm.order_type()`. `auto` fields get the standard group-by type (`Boolean` or `DateGroupByOption`). Methods decorated with `@group_field` add custom grouping logic:
+
+```python
+from strawberry_orm import group_field
+
+@orm.group_type(Order)
+class OrderGroupBy:
+    status: auto         # standard Boolean group-by
+    created_at: auto     # DateGroupByOption with interval
+
+    @group_field
+    def by_customer_tier(self, value: bool, query):
+        """Group by a computed customer tier."""
+        from sqlalchemy import case
+        return case(
+            (Order.amount >= 100, "premium"),
+            else_="standard",
+        ).label("customer_tier")
+```
+
 ### Combining with `orm.filter()` / `orm.order()`
 
-`orm.filter()` and `orm.order()` remain available for fully auto-generated types. Use `orm.filter_type()` and `orm.order_type()` only when you need custom logic. The types produced by both APIs are interchangeable in all contexts — `orm.type(Model, filters=..., order=...)`, `orm.field(filters=..., order=...)`, and `orm.connection()`.
+`orm.filter()`, `orm.order()`, and `orm.group()` remain available for fully auto-generated types. Use `orm.filter_type()`, `orm.order_type()`, and `orm.group_type()` only when you need custom logic. The types produced by both APIs are interchangeable in all contexts — `orm.type(Model, filters=..., order=..., group=...)`, `orm.field(filters=..., order=...)`, and `orm.connection()`.
+
+---
+
+## Grouping and Aggregation
+
+Group-by and aggregation are available on Relay connection fields. Register a group-by type for a model and pass it to `orm.type()`:
+
+```python
+from strawberry import relay
+from strawberry_orm import StrawberryORM, auto
+from strawberry_orm.relay import ORMListConnection
+
+orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+
+OrderFilter  = orm.filter(Order)
+OrderOrder   = orm.order(Order)
+OrderGroupBy = orm.group(Order)
+
+@orm.type(Order, filters=OrderFilter, order=OrderOrder, group=OrderGroupBy)
+class OrderNode(relay.Node):
+    id: relay.NodeID[int]
+    status: auto
+    amount: auto
+    quantity: auto
+    created_at: auto
+
+@strawberry.type
+class Query:
+    orders: ORMListConnection[OrderNode] = orm.connection()
+
+schema = strawberry.Schema(
+    query=Query,
+    extensions=[orm.optimizer_extension()],
+)
+```
+
+When `group` is set, the generated connection type automatically includes `aggregates`, `groups`, and an extended `pageInfo` with aggregate data.
+
+### Querying Aggregates
+
+```graphql
+{
+  orders(first: 100) {
+    pageInfo {
+      hasNextPage
+      aggregates {
+        count
+        sum { amount }
+        avg { amount }
+      }
+    }
+    edges {
+      node { status amount }
+    }
+  }
+}
+```
+
+Aggregates are computed over the full filtered result set (before pagination). Page-level aggregates in `pageInfo` cover only the current page.
+
+Auto-generated aggregate types include `count`, `sum`, `avg`, `min`, and `max` — scoped to the numeric and comparable fields on the model.
+
+### Querying Groups
+
+```graphql
+{
+  orders(
+    groupBy: [{ field: { status: true } }]
+    first: 100
+  ) {
+    groups {
+      key { status }
+      aggregates {
+        count
+        sum { amount }
+        avg { amount }
+      }
+      edgeIndices
+      items(first: 5) {
+        edges {
+          node { status amount quantity }
+        }
+      }
+    }
+    edges {
+      node { status amount }
+    }
+  }
+}
+```
+
+Each group includes:
+
+- `key` — the group-by column values
+- `aggregates` — per-group aggregate values (count, sum, avg, min, max)
+- `edgeIndices` — indices into the parent connection's `edges` array
+- `items` — a nested cursor-paginated connection of items in that group
+
+Date/datetime fields support interval-based grouping:
+
+```graphql
+{
+  orders(
+    groupBy: [{ field: { createdAt: { interval: MONTH } } }]
+  ) {
+    groups {
+      key { createdAt }
+      aggregates { count }
+    }
+  }
+}
+```
+
+Supported intervals: `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`.
+
+### Custom Aggregates
+
+Use `@aggregate_field` to define computed aggregate expressions:
+
+```python
+from strawberry_orm import aggregate_field
+
+@orm.aggregate_type(Order)
+class OrderAggregation:
+    amount: auto
+    quantity: auto
+
+    @aggregate_field
+    def total_revenue(self, columns) -> float:
+        from sqlalchemy import func
+        return func.sum(columns.amount * columns.quantity)
+```
 
 ---
 
@@ -1034,7 +1218,7 @@ orm = StrawberryORM(
 
 ## Public Exports
 
-`StrawberryORM`, `auto`, `make_field`, `make_ref_type`, `Ordering`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
+`StrawberryORM`, `auto`, `make_field`, `make_ref_type`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
 
 ## License
 
