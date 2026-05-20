@@ -58,7 +58,7 @@ class SecretNote(Base):
 # ORM setup
 # =========================================================================
 
-orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 UserFilter = orm.filter(SecretUser)
 UserOrder = orm.order(SecretUser)

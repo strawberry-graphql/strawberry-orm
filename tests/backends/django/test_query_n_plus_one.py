@@ -140,7 +140,7 @@ class TestQueryNPlusOnePrevention:
 
 class TestQueryCustomQuerysetNoNPlusOne:
     def test_get_queryset_with_nested_relationships(self, seed, Post, Tag, User):
-        qs_orm = StrawberryORM("django")
+        qs_orm = StrawberryORM.for_django()
 
         @qs_orm.type(Tag)
         class TT:
@@ -179,7 +179,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
         assert len(ctx) <= 6
 
     def test_get_queryset_preserves_optimizer_eager_loads(self, seed, Post, User):
-        qs_orm = StrawberryORM("django")
+        qs_orm = StrawberryORM.for_django()
 
         @qs_orm.type(Post)
         class PT:
@@ -288,7 +288,7 @@ class TestQueryLoadHintNoNPlusOne:
 
 class TestQueryLoadCallable:
     def test_load_callable_filters_nested_relation(self, seed, Post, User):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(Post)
         class PT:
@@ -332,7 +332,7 @@ class TestQueryLoadCallable:
         assert len(ctx) <= 3
 
     def test_load_callable_with_nested_children(self, seed, Post, Tag, User):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(Tag)
         class TT:
@@ -371,7 +371,7 @@ class TestQueryLoadCallable:
         assert len(ctx) <= 5
 
     def test_load_callable_stays_efficient(self, seed, Post, User):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(Post)
         class PT:
@@ -399,7 +399,7 @@ class TestQueryLoadCallable:
 
 class TestQueryNestedGetQueryset:
     def test_get_queryset_filters_nested_relation(self, seed, Post, User):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(Post)
         class PT:
@@ -449,7 +449,7 @@ class TestQueryNestedGetQueryset:
     def test_get_queryset_still_applies_with_nested_filter_argument(
         self, seed, Post, User
     ):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
         PostFilter = orm.filter(Post)
 
         @orm.type(Post, filters=PostFilter)
@@ -499,7 +499,7 @@ class TestQueryNestedGetQueryset:
 
     def test_get_queryset_composes_with_load_callable(self, seed, Post, User):
         """Both type-level get_queryset and field-level load callable should compose."""
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(Post)
         class PT:

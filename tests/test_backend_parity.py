@@ -19,6 +19,7 @@ EXCLUDED_FILES = {
     "test_query_async_session.py",
     "test_internal_sqlalchemy_extra_coverage.py",
     "test_grouping.py",
+    "test_lazy_resolution.py",
 }
 
 EXCLUDED_METHODS = {
@@ -26,6 +27,26 @@ EXCLUDED_METHODS = {
         "test_query_error_handling.py",
         "TestQueryErrorHandling",
         "test_missing_session_raises_runtime_error",
+    ),
+    (
+        "test_query_async_execution.py",
+        "TestAsyncExecution",
+        "test_async_nested_fk_without_custom_resolver",
+    ),
+    (
+        "test_query_async_execution.py",
+        "TestAsyncExecution",
+        "test_async_custom_orm_field_resolver",
+    ),
+    (
+        "test_query_async_execution.py",
+        "TestAsyncExecution",
+        "test_async_relay_connection_filter_and_order",
+    ),
+    (
+        "test_query_relay_connection.py",
+        "TestRelayConnectionFilteringAndOrdering",
+        "test_async_filter_and_order_are_applied_before_pagination",
     ),
 }
 

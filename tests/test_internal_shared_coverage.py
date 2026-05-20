@@ -64,7 +64,7 @@ class TestInternalSharedCoverage:
         )
         assert asyncio.run(await_maybe("value")) == "value"
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.input
         class NameInput:
@@ -76,7 +76,7 @@ class TestInternalSharedCoverage:
 
     @pytest.mark.asyncio
     async def test_auto_field_and_extension_defensive_paths(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         ext = _AutoFilterOrderExtension(orm.backend)
         ext._is_configured = True
@@ -151,7 +151,7 @@ class TestInternalSharedCoverage:
             exclude=["name"],
         )
 
-        ns = MutationNamespace(StrawberryORM("sqlalchemy", dialect="sqlite").backend)
+        ns = MutationNamespace(StrawberryORM.for_sqlalchemy(dialect="sqlite").backend)
         with pytest.raises(ValueError, match="must be a string or list"):
             ns._normalize_enum_options(
                 1, allowed=("PATCH",), field_name="mode", model_name="Model"
@@ -210,7 +210,7 @@ class TestInternalSharedCoverage:
             )
 
     def test_node_input_allows_explicit_root_type_names(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.type
         class UserNode(relay.Node):

@@ -6,7 +6,7 @@ from tests.abstract.query_hint_edge_cases import AbstractTestQueryHintEdgeCasesS
 
 @pytest.fixture
 def make_basic_orm():
-    return lambda: StrawberryORM("django")
+    return lambda: StrawberryORM.for_django()
 
 
 @pytest.fixture

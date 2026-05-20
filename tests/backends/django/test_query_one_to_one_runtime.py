@@ -42,7 +42,7 @@ def profile_model():
 
 class TestQueryOneToOneRuntime:
     def test_root_users_can_select_reverse_one_to_one(self, seed, profile_model):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(profile_model)
         class ProfileType:
@@ -80,7 +80,7 @@ class TestQueryOneToOneRuntime:
     def test_prefetched_reverse_relations_can_select_nested_one_to_one(
         self, seed, profile_model
     ):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(profile_model)
         class ProfileType:
@@ -129,7 +129,7 @@ class TestQueryOneToOneRuntime:
         }
 
     def test_reverse_one_to_one_respects_custom_queryset(self, seed, profile_model):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(profile_model)
         class ProfileType:

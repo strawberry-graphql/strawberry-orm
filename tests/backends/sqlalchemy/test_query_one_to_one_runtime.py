@@ -89,7 +89,7 @@ def runtime_session():
 
 class TestQueryOneToOneRuntime:
     def test_root_users_can_select_reverse_one_to_one(self, runtime_session):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Profile)
         class ProfileType:
@@ -123,7 +123,7 @@ class TestQueryOneToOneRuntime:
     def test_prefetched_reverse_relations_can_select_nested_one_to_one(
         self, runtime_session
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Profile)
         class ProfileType:
@@ -166,7 +166,7 @@ class TestQueryOneToOneRuntime:
         }
 
     def test_reverse_one_to_one_respects_custom_queryset(self, runtime_session):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Profile)
         class ProfileType:

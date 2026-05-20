@@ -73,7 +73,7 @@ async def seed(tortoise_db):
 class TestQueryNPlusOnePrevention:
     @pytest.mark.asyncio
     async def test_three_level_deep_nesting(self, seed, Comment, Post, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Comment)
         class CT:
@@ -141,7 +141,7 @@ class TestQueryNPlusOnePrevention:
     async def test_sibling_relationships_stay_bounded(
         self, seed, Comment, Post, Tag, User
     ):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:
@@ -182,7 +182,7 @@ class TestQueryNPlusOnePrevention:
     @pytest.mark.asyncio
     async def test_without_optimizer_causes_more_queries(self, seed, Post, User):
         """Without the optimizer, accessing nested relations triggers extra queries."""
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -210,7 +210,7 @@ class TestQueryNPlusOnePrevention:
 class TestQueryCustomQuerysetNoNPlusOne:
     @pytest.mark.asyncio
     async def test_get_queryset_with_nested_relationships(self, seed, Post, Tag, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:
@@ -248,7 +248,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
 
     @pytest.mark.asyncio
     async def test_get_queryset_preserves_optimizer_eager_loads(self, seed, Post, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -280,7 +280,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
 class TestQueryLoadHintNoNPlusOne:
     @pytest.mark.asyncio
     async def test_load_hint_adds_eager_load_efficiently(self, seed, Post, Tag, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:
@@ -316,7 +316,7 @@ class TestQueryLoadHintNoNPlusOne:
     async def test_multiple_load_hints_stay_efficient(
         self, seed, Comment, Post, Tag, User
     ):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:
@@ -358,7 +358,7 @@ class TestQueryLoadHintNoNPlusOne:
 class TestQueryLoadCallable:
     @pytest.mark.asyncio
     async def test_load_callable_filters_nested_relation(self, seed, Post, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -405,7 +405,7 @@ class TestQueryLoadCallable:
 
     @pytest.mark.asyncio
     async def test_load_callable_with_nested_children(self, seed, Post, Tag, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:
@@ -443,7 +443,7 @@ class TestQueryLoadCallable:
 
     @pytest.mark.asyncio
     async def test_load_callable_stays_efficient(self, seed, Post, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -471,7 +471,7 @@ class TestQueryLoadCallable:
 class TestQueryNestedGetQueryset:
     @pytest.mark.asyncio
     async def test_get_queryset_filters_nested_relation(self, seed, Post, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -511,7 +511,7 @@ class TestQueryNestedGetQueryset:
     async def test_get_queryset_still_applies_with_nested_filter_argument(
         self, seed, Post, User
     ):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
         PostFilter = orm.filter(Post)
 
         @orm.type(Post, filters=PostFilter)
@@ -562,7 +562,7 @@ class TestQueryNestedGetQueryset:
     @pytest.mark.asyncio
     async def test_get_queryset_composes_with_load_callable(self, seed, Post, User):
         """Both type-level get_queryset and field-level load callable should compose."""
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PT:
@@ -599,7 +599,7 @@ class TestQueryNestedGetQueryset:
     async def test_custom_m2m_prefetch_does_not_leak_between_parents(
         self, seed, Post, Tag
     ):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
         class TT:

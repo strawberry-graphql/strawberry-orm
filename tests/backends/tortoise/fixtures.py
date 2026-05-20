@@ -22,7 +22,7 @@ from tests.backends.tortoise.models import (
     User as TortUser,
 )
 
-_main_orm = StrawberryORM("tortoise")
+_main_orm = StrawberryORM.for_tortoise()
 
 UserFilter = _main_orm.filter(TortUser)
 UserOrder = _main_orm.order(TortUser)
@@ -167,7 +167,7 @@ main_schema = strawberry.Schema(
 
 
 def _build_node_mutation_schema():
-    node_orm = StrawberryORM("tortoise")
+    node_orm = StrawberryORM.for_tortoise()
     node_project = {
         "post": {
             "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
@@ -296,7 +296,7 @@ def _build_node_mutation_schema():
 # Self-is-model schema
 # =========================================================================
 
-_self_orm = StrawberryORM("tortoise")
+_self_orm = StrawberryORM.for_tortoise()
 
 
 @_self_orm.type(TortPost)
@@ -351,7 +351,7 @@ self_model_schema = strawberry.Schema(
 # Get-queryset schema
 # =========================================================================
 
-_qs_orm = StrawberryORM("tortoise")
+_qs_orm = StrawberryORM.for_tortoise()
 
 
 @_qs_orm.type(TortPost)
@@ -392,7 +392,7 @@ get_queryset_schema = strawberry.Schema(
 # Multiple-types schema
 # =========================================================================
 
-_multi_orm = StrawberryORM("tortoise")
+_multi_orm = StrawberryORM.for_tortoise()
 
 
 @_multi_orm.type(TortUser)
@@ -441,7 +441,7 @@ async def tortoise_db():
 
 @pytest.fixture
 def orm():
-    return StrawberryORM("tortoise")
+    return StrawberryORM.for_tortoise(lazy_resolution="off")
 
 
 # -- Model class fixtures ----------------------------------------------------

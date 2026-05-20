@@ -42,8 +42,7 @@ A blog API with users, posts, tags, and comments — covering types, relations, 
 import strawberry
 from strawberry_orm import StrawberryORM, auto
 
-orm = StrawberryORM(
-    "sqlalchemy",
+orm = StrawberryORM.for_sqlalchemy(
     dialect="postgresql",
     session_getter=lambda info: info.context["session"],
 )
@@ -185,9 +184,9 @@ mutation {
 
 | Backend | Constructor | Notes |
 | --- | --- | --- |
-| Django | `StrawberryORM("django")` | Uses Django querysets directly. |
-| SQLAlchemy | `StrawberryORM("sqlalchemy", dialect="...", session_getter=...)` | Requires a `Session` or `AsyncSession` at resolve time. |
-| Tortoise | `StrawberryORM("tortoise")` | Async ORM; use async Strawberry execution. |
+| Django | `StrawberryORM.for_django(...)` | Uses Django querysets directly. |
+| SQLAlchemy | `StrawberryORM.for_sqlalchemy(dialect="...", session_getter=...)` | Requires a `Session` or `AsyncSession` at resolve time. |
+| Tortoise | `StrawberryORM.for_tortoise(...)` | Async ORM; use async Strawberry execution. |
 
 - **Django** — sync and async schema execution both work. Custom async resolvers that touch the ORM directly still need `sync_to_async(...)`.
 - **SQLAlchemy** — the session is resolved from `session_getter`, `info.context["session"]`, `info.context.session`, or `info.context.get_session()`. Both sync and async sessions are supported.
@@ -203,10 +202,17 @@ Shared options:
 | `default_query_limit` | `None` | Default limit for auto-generated list queries. |
 | `exclude_sensitive_fields` | `True` | Excludes sensitive-looking fields from generated input/filter/order types. |
 | `warn_sensitive` | `True` | Warns when sensitive-looking fields are exposed on output types. |
+| `lazy_resolution` | `"warn"` | `"off"`, `"warn"`, or `"error"` when a GraphQL relation field has no explicit resolver (recommend `optimizer_extension()`). |
 | `max_filter_depth` | `10` | Caps recursive filter nesting. |
 | `max_filter_branches` | `50` | Caps `all` / `any` / `oneOf` branch count. |
 | `max_in_list_size` | `500` | Caps `inList` / `notInList` size. |
 | `enable_regex_filters` | `False` | Enables `regex` and `iRegex` string lookups. |
+
+Django-only:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `django_async_safe` | `True` | Offloads sync ORM resolvers with `sync_to_async(thread_sensitive=True)` under async GraphQL. |
 
 SQLAlchemy-only:
 
@@ -524,7 +530,7 @@ Registration order matters: define related orders *before* the parent (e.g. `orm
 ```python
 from strawberry_orm import StrawberryORM, filter_field, auto
 
-orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+orm = StrawberryORM.for_sqlalchemy(dialect="postgresql", session_getter=...)
 
 @orm.filter_type(User)
 class UserFilter:
@@ -566,7 +572,7 @@ The generated GraphQL input places custom fields as top-level keys alongside `fi
 ```graphql
 input UserFilter @oneOf {
   field: UserField           # auto-generated scalar lookups
-  object: UserObject         # auto-generated relation lookups (if any)
+  object: UserFilterObject   # auto-generated relation lookups (if any)
   search: String             # custom
   hasPosts: Boolean          # custom
   all: [UserFilter!]
@@ -755,7 +761,7 @@ from strawberry import relay
 from strawberry_orm import StrawberryORM, auto
 from strawberry_orm.relay import ORMListConnection
 
-orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+orm = StrawberryORM.for_sqlalchemy(dialect="postgresql", session_getter=...)
 
 OrderFilter  = orm.filter(Order)
 OrderOrder   = orm.order(Order)
@@ -1026,7 +1032,7 @@ Extend `relay.Node` instead of a plain Strawberry type. Use `relay.NodeID` for t
 from strawberry import relay
 from strawberry_orm import StrawberryORM, auto
 
-orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=...)
+orm = StrawberryORM.for_sqlalchemy(dialect="postgresql", session_getter=...)
 
 UserFilter = orm.filter(User)
 UserOrder  = orm.order(User)
@@ -1155,13 +1161,26 @@ class UserType:
 
 ## Async Usage
 
-`strawberry-orm` supports both sync and async execution. The same schema code works everywhere -- the only difference is how you call ORM APIs in resolvers:
+`strawberry-orm` supports both sync and async execution (`schema.execute` / `schema.execute_sync`, Django `AsyncGraphQLView`, etc.).
 
 | Backend | Pattern |
 | --- | --- |
-| Django | Sync by default. Wrap direct ORM calls with `sync_to_async(...)` in async resolvers. |
+| Django | `django_async_safe=True` (default) wraps generated and `@orm.type` resolvers with `sync_to_async` when the event loop is running. Mount `extensions=[orm.optimizer_extension()]` for eager loads. |
 | SQLAlchemy | Pass a sync `Session` or `AsyncSession` via `session_getter`. Both work transparently. |
 | Tortoise | Async-first. Use `async def` resolvers and `await` ORM calls. |
+
+```python
+orm = StrawberryORM.for_django()  # django_async_safe=True, lazy_resolution="warn"
+
+schema = strawberry.Schema(
+    query=Query,
+    extensions=[orm.optimizer_extension()],
+)
+```
+
+Custom sync resolvers passed to `orm.field(my_resolver)` are async-safe automatically. They do **not** receive `_AutoFilterOrderExtension` (that extension is only for auto list/connection fields with `filter`/`order`).
+
+Optional runtime FK checks: `extensions=[orm.lazy_resolution_extension()]`.
 
 ```python
 # Tortoise example
@@ -1170,15 +1189,21 @@ class Query:
     @strawberry.field
     async def users(self) -> list[UserType]:
         return await User.all()
-
-@strawberry.type
-class Mutation:
-    @strawberry.mutation
-    async def create_post(self, input: CreatePostInput) -> PostType:
-        return await Post.create(title=input.title, body=input.body)
 ```
 
 `apply_ref_list` is sync for Django/sync-SQLAlchemy and awaitable for Tortoise/async-SQLAlchemy.
+
+### Migrating from a custom Django async integration layer
+
+If you previously monkey-patched `StrawberryORM` for `AsyncGraphQLView`, you can remove that module and rely on:
+
+| Old workaround | Built-in replacement |
+| --- | --- |
+| `_patch_orm_filter_extension_for_async` | `_AutoFilterOrderExtension` async/sync paths |
+| `@orm.type` + `_ensure_async_resolver` | `django_async_safe` + `@orm.type` post-processing |
+| Custom `orm.field` without filter extension | `orm.field(callable)` (no `_AutoFilterOrderExtension`) |
+| `_materialize_django_result` | `materialize_query` / extension materialization |
+| Manual `is_type_of` | Automatic on `@orm.type(Model)` |
 
 ---
 
@@ -1203,8 +1228,7 @@ class Mutation:
 A production-oriented configuration:
 
 ```python
-orm = StrawberryORM(
-    "sqlalchemy",
+orm = StrawberryORM.for_sqlalchemy(
     dialect="postgresql",
     session_getter=lambda info: info.context["session"],
     default_query_limit=100,

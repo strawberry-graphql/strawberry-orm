@@ -33,7 +33,7 @@ from tests.backends.sqlalchemy.models import (
 # Main schema
 # =========================================================================
 
-_main_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_main_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 UserFilter = _main_orm.filter(SAUser)
 UserOrder = _main_orm.order(SAUser)
@@ -203,7 +203,7 @@ main_schema = strawberry.Schema(
 # Node mutation schema
 # =========================================================================
 
-_node_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_node_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 _node_project = {
     "post": {
         "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
@@ -349,7 +349,7 @@ node_mutation_schema = strawberry.Schema(
 # Self-is-model schema
 # =========================================================================
 
-_self_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_self_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 
 @_self_orm.type(SAPost)
@@ -404,7 +404,7 @@ self_model_schema = strawberry.Schema(
 # Get-queryset schema
 # =========================================================================
 
-_qs_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_qs_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 
 @_qs_orm.type(SAPost)
@@ -445,7 +445,7 @@ get_queryset_schema = strawberry.Schema(
 # Multiple-types schema
 # =========================================================================
 
-_multi_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+_multi_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 
 @_multi_orm.type(SAUser)
@@ -487,7 +487,7 @@ multi_type_schema = strawberry.Schema(
 
 @pytest.fixture
 def orm():
-    return StrawberryORM("sqlalchemy", dialect="sqlite")
+    return StrawberryORM.for_sqlalchemy(dialect="sqlite", lazy_resolution="off")
 
 
 # -- Model class fixtures ----------------------------------------------------

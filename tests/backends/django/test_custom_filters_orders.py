@@ -11,7 +11,7 @@ from tests.backends.django.models import User as DjUser
 
 class TestCustomFilterType:
     def _build_schema(self):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.filter_type(DjUser)
         class UserFilter:
@@ -96,7 +96,7 @@ class TestCustomFilterType:
 
 class TestCustomOrderType:
     def _build_schema(self):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
         UserFilter = orm.filter(DjUser)
 
         @orm.order_type(DjUser)
@@ -176,7 +176,7 @@ class TestCustomOrderType:
 
 class TestFilterFieldValueAnnotationValidation:
     def test_missing_value_annotation_raises(self):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         with pytest.raises(TypeError, match="'value' parameter"):
 

@@ -85,7 +85,7 @@ class AuditPost(Base):
 # Module-level ORM types (avoids PEP 563 / Strawberry resolution issues)
 # =========================================================================
 
-_orm_vuln_a = StrawberryORM("sqlalchemy", dialect="sqlite")
+_orm_vuln_a = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 _filt_vuln_a = _orm_vuln_a.filter(AuditUser)
 
 
@@ -276,7 +276,7 @@ class TestVulnB_DjangoRefListAuthorizationBypass:
 
     def test_sa_backend_calls_authorize(self, seeded):
         """Baseline: SA backend DOES call the authorize callback."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         log = []
 
         def authorizer(action, model, obj_id, info):
@@ -517,7 +517,7 @@ class TestVulnM_DjangoFilterFieldTraversal:
     """Django Q objects allow __ traversal — filter field names are trusted."""
 
     def test_filter_field_names_come_from_model_introspection(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(AuditUser)
         field_type = filt._field_type
         field_names = set(field_type.__dataclass_fields__.keys())
@@ -573,7 +573,7 @@ class TestVulnO_RefIdTypeCoercion:
 
     def test_non_numeric_id_on_integer_pk(self, seeded):
         """Non-numeric string ID should fail gracefully, not crash."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         group_ref = orm.ref(AuditGroup)
         update_type = group_ref.__dataclass_fields__["update"].type
         actual_type = (
@@ -668,7 +668,7 @@ class TestAdvisory2_SensitiveFieldWarnings:
         """orm.type() with password_hash included should emit a warning."""
         import warnings as _warnings
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
@@ -689,7 +689,7 @@ class TestAdvisory2_SensitiveFieldWarnings:
         """Explicitly excluding a sensitive field should not emit a warning."""
         import warnings as _warnings
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
@@ -713,7 +713,7 @@ class TestAdvisory2_SensitiveFieldWarnings:
         """orm.type() with api_key included should emit a warning."""
         import warnings as _warnings
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
@@ -733,7 +733,7 @@ class TestAdvisory2_SensitiveFieldWarnings:
         """warn_sensitive=False should suppress all sensitive field warnings."""
         import warnings as _warnings
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", warn_sensitive=False)
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_sensitive=False)
 
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
@@ -761,9 +761,7 @@ class TestAdvisory3_DefaultQueryLimit:
 
     def test_sa_default_queryset_has_limit(self, engine, seeded):
         """SQLAlchemy get_default_queryset should produce a LIMIT clause."""
-        orm = StrawberryORM(
-            "sqlalchemy",
-            dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
             default_query_limit=100,
         )
         stmt = orm.get_default_queryset(AuditUser)
@@ -772,16 +770,14 @@ class TestAdvisory3_DefaultQueryLimit:
 
     def test_sa_default_queryset_no_limit_when_unset(self, engine, seeded):
         """Without default_query_limit, no LIMIT should be applied."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         stmt = orm.get_default_queryset(AuditUser)
         sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
         assert "LIMIT" not in sql.upper(), f"Expected no LIMIT in SQL. Got: {sql}"
 
     def test_sa_default_limit_actual_row_count(self, engine, seeded):
         """LIMIT should actually restrict the returned rows."""
-        orm = StrawberryORM(
-            "sqlalchemy",
-            dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
             default_query_limit=2,
         )
         stmt = orm.get_default_queryset(AuditUser)
@@ -800,7 +796,7 @@ class TestAdvisory4_RefListPatchMode:
 
     def test_sa_patch_semantics_preserves_existing(self, engine, seeded):
         """Patch semantics should add new refs without removing existing ones."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         user = seeded.get(AuditUser, 1)
         group1 = seeded.get(AuditGroup, 1)
         user.groups.append(group1)
@@ -849,9 +845,7 @@ class TestAdvisory5_StringLookupNoRegex:
 
     def test_filter_uses_no_regex_by_default(self):
         """With enable_regex_filters=False, filter() should use StringLookupNoRegex."""
-        orm = StrawberryORM(
-            "sqlalchemy",
-            dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
             enable_regex_filters=False,
         )
         filt = orm.filter(AuditUser)
@@ -871,9 +865,7 @@ class TestAdvisory5_StringLookupNoRegex:
 
     def test_filter_uses_regex_when_enabled(self):
         """With enable_regex_filters=True, filter() should use StringLookup."""
-        orm = StrawberryORM(
-            "sqlalchemy",
-            dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
             enable_regex_filters=True,
         )
         filt = orm.filter(AuditUser)

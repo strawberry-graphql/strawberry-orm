@@ -14,7 +14,7 @@ Usage::
         def can_update(self, instance, data, info):
             return instance.author_id == info.context["user"].id
 
-    orm = StrawberryORM("sqlalchemy", ..., repos={Post: PostRepo})
+    orm = StrawberryORM.for_sqlalchemy(..., repos={Post: PostRepo})
 """
 
 from __future__ import annotations

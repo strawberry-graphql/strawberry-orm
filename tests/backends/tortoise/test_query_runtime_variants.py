@@ -11,7 +11,7 @@ from strawberry_orm.types import auto
 
 class TestQueryRuntimeVariants:
     def _build_schema(self, User, Post):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
         PostFilter = orm.filter(Post)

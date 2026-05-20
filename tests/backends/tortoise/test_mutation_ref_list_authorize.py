@@ -17,7 +17,7 @@ def schema_execute_async():
 @pytest.fixture
 def build_ref_list_authorize_schema():
     def _build(Post, Tag, *, authorizer):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @strawberry.input
         class CreateTagInput:

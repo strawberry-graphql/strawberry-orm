@@ -17,7 +17,7 @@ def schema_execute(sa_session):
 @pytest.fixture
 def build_ref_list_authorize_schema():
     def _build(Post, Tag, *, authorizer):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.input
         class CreateTagInput:

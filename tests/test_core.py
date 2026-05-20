@@ -8,14 +8,26 @@ from strawberry_orm import StrawberryORM
 
 
 class TestBackendInstantiation:
-    def test_sqlalchemy_backend(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+    def test_for_sqlalchemy_backend(self):
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         assert orm._backend_name == "sqlalchemy"
 
-    def test_tortoise_backend(self):
-        orm = StrawberryORM("tortoise")
+    def test_for_tortoise_backend(self):
+        orm = StrawberryORM.for_tortoise()
         assert orm._backend_name == "tortoise"
+
+    def test_for_django_backend(self):
+        orm = StrawberryORM.for_django(lazy_resolution="off")
+        assert orm._backend_name == "django"
+
+    def test_direct_instantiation_raises(self):
+        with pytest.raises(TypeError, match="for_django"):
+            StrawberryORM()
+
+    def test_positional_backend_argument_raises(self):
+        with pytest.raises(TypeError):
+            StrawberryORM("django")  # type: ignore[misc]
 
     def test_unknown_backend_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
-            StrawberryORM("nosql")  # type: ignore[arg-type]
+            StrawberryORM._construct("nosql")  # type: ignore[arg-type]

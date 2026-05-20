@@ -17,7 +17,7 @@ def schema_execute():
 @pytest.fixture
 def build_ref_list_authorize_schema():
     def _build(Post, Tag, *, authorizer):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @strawberry.input
         class CreateTagInput:

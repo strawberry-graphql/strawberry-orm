@@ -6,7 +6,7 @@ from tests.abstract.query_hint_edge_cases import AbstractTestQueryHintEdgeCasesA
 
 @pytest.fixture
 def make_basic_orm():
-    return lambda: StrawberryORM("tortoise")
+    return lambda: StrawberryORM.for_tortoise()
 
 
 @pytest.fixture

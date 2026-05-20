@@ -6,7 +6,7 @@ from tests.abstract.query_hint_edge_cases import AbstractTestQueryHintEdgeCasesS
 
 @pytest.fixture
 def make_basic_orm():
-    return lambda: StrawberryORM("sqlalchemy", dialect="sqlite")
+    return lambda: StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 
 @pytest.fixture

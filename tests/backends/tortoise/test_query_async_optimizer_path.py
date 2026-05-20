@@ -10,7 +10,7 @@ from strawberry_orm.types import auto
 class TestAsyncOptimizerPath:
     @pytest.mark.asyncio
     async def test_async_resolver_returning_query_object_is_optimized(self, seed, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(User)
         class UserType:

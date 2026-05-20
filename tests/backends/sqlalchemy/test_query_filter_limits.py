@@ -8,7 +8,7 @@ from strawberry_orm.types import auto
 
 class TestQueryFilterLimits:
     def _build_schema(self, User, **orm_kwargs):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", **orm_kwargs)
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", **orm_kwargs)
         UserFilter = orm.filter(User)
 
         @orm.type(User, filters=UserFilter)

@@ -137,7 +137,7 @@ class TestAsyncSessionExecution:
 class TestAsyncSessionMutations:
     @pytest.mark.asyncio
     async def test_apply_ref_list_can_be_awaited_with_async_session(self, async_seed):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SATag)
         class TagType:
@@ -186,7 +186,7 @@ class TestAsyncSessionMutations:
     async def test_apply_ref_list_async_supports_create_update_and_delete(
         self, async_seed
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.input
         class CreateTagInput:
@@ -281,7 +281,7 @@ class TestAsyncSessionMutations:
 
     @pytest.mark.asyncio
     async def test_apply_ref_list_async_supports_delete_and_create(self, async_seed):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.input
         class CreateTagInput:

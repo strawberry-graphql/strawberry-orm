@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 
+import pytest
 import strawberry
 from strawberry import relay
 
@@ -12,7 +13,7 @@ from strawberry_orm.types import auto
 
 class TestRelayConnectionFilteringAndOrdering:
     def _build_schema(self, User):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
 
@@ -150,3 +151,40 @@ class TestRelayConnectionFilteringAndOrdering:
                 {"name": "Alice", "email": "alice@example.com"},
             ]
         }
+
+    @pytest.mark.asyncio
+    async def test_async_filter_and_order_are_applied_before_pagination(
+        self, seed, User
+    ):
+        schema = self._build_schema(User)
+        query = """
+            query UsersConnection($after: String) {
+                usersConnection(
+                    filter: { field: { email: { contains: "example.com" } } }
+                    order: [{ field: { name: DESC } }]
+                    first: 1
+                    after: $after
+                ) {
+                    edges {
+                        cursor
+                        node { name email }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                }
+            }
+        """
+        first_page = await schema.execute(query)
+        assert first_page.errors is None
+        assert first_page.data["usersConnection"]["edges"][0]["node"]["name"] == "Bob"
+
+        second_page = await schema.execute(
+            query,
+            variable_values={
+                "after": first_page.data["usersConnection"]["pageInfo"]["endCursor"]
+            },
+        )
+        assert second_page.errors is None
+        assert second_page.data["usersConnection"]["edges"][0]["node"]["name"] == "Alice"

@@ -11,7 +11,7 @@ from tests.backends.tortoise.models import User as TortUser
 
 class TestCustomFilterType:
     def _build_schema(self):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.filter_type(TortUser)
         class UserFilter:
@@ -95,7 +95,7 @@ class TestCustomFilterType:
 
 class TestCustomOrderType:
     def _build_schema(self):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
         UserFilter = orm.filter(TortUser)
 
         @orm.order_type(TortUser)
@@ -167,7 +167,7 @@ class TestCustomOrderType:
 
 class TestFilterFieldValueAnnotationValidation:
     def test_missing_value_annotation_raises(self):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         with pytest.raises(TypeError, match="'value' parameter"):
 

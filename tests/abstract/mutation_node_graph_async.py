@@ -560,7 +560,7 @@ class AbstractTestNodeGraphMutationsAsync:
         assert "Field 'posts' is not defined by type" in str(result.errors[0])
 
     def test_invalid_projection_key_raises(self, Post, seed):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
         class PostNode(relay.Node):

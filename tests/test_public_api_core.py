@@ -37,7 +37,7 @@ def sa_session():
 
 class TestPublicApiCore:
     def test_make_field_applies_permission_classes(self, sa_session):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -57,7 +57,7 @@ class TestPublicApiCore:
         assert "denied" in str(result.errors[0]).lower()
 
     def test_make_field_without_permissions_registers_hints(self, sa_session):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -87,7 +87,7 @@ class TestPublicApiCore:
         }
 
     def test_wrapper_methods_delegate_to_backend(self, sa_session):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         TagRef = orm.ref(SAUser, delete=True)
         assert "update" in TagRef.__dataclass_fields__
@@ -126,7 +126,7 @@ class TestPublicApiCore:
         assert result.data == {"ping": "pong"}
 
     def test_invalid_filter_type_errors_during_auto_field_setup(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @strawberry.input
         class BadFilter:
@@ -139,7 +139,7 @@ class TestPublicApiCore:
                 users: list[str] = orm.field(filters=BadFilter)
 
     def test_backend_default_mutation_field_factories_return_fields(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         base_backend = BaseBackend()
 
         @strawberry.input
@@ -166,7 +166,7 @@ class TestBareOrmFieldDecorator:
 
     def test_resolves_single_related_model(self, sa_session):
         """Forward FK: ``self.author`` returns a single related ORM instance."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class AuthorType:
@@ -203,7 +203,7 @@ class TestBareOrmFieldDecorator:
 
     def test_resolves_list_of_related_models(self, sa_session):
         """Reverse FK: ``self.posts`` returns a list of related ORM instances."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAPost)
         class PostType:
@@ -237,7 +237,7 @@ class TestBareOrmFieldDecorator:
 
     def test_resolves_computed_scalar(self, sa_session):
         """Bare ``@orm.field`` works for computed scalar values."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -268,7 +268,7 @@ class TestBareOrmFieldDecorator:
 
     def test_resolver_receives_info(self, sa_session):
         """Bare ``@orm.field`` passes ``info`` to resolvers that accept it."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -293,7 +293,7 @@ class TestBareOrmFieldDecorator:
 
     def test_resolves_queryset_on_root_query(self, sa_session):
         """Bare ``@orm.field`` on a root query method returning a queryset."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -317,7 +317,7 @@ class TestBareOrmFieldDecorator:
 
     def test_parenthesized_form_still_works(self, sa_session):
         """``@orm.field()`` with parentheses continues to work unchanged."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class UserType:
@@ -341,7 +341,7 @@ class TestBareOrmFieldDecorator:
 
     def test_nested_related_model_chain(self, sa_session):
         """Nested ``@orm.field`` resolvers: post -> author, comment -> post -> author."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(SAUser)
         class AuthorType:

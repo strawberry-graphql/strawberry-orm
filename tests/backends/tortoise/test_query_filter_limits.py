@@ -9,7 +9,7 @@ from strawberry_orm.types import auto
 
 class TestQueryFilterLimits:
     def _build_schema(self, User, **orm_kwargs):
-        orm = StrawberryORM("tortoise", **orm_kwargs)
+        orm = StrawberryORM.for_tortoise( **orm_kwargs)
         UserFilter = orm.filter(User)
 
         @orm.type(User, filters=UserFilter)

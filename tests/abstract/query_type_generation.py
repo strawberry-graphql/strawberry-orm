@@ -213,3 +213,36 @@ class AbstractTestQueryCustomName:
         UserInput = orm.input(User, name="PersonInput")
         definition = UserInput.__strawberry_definition__
         assert definition.name == "PersonInput"
+
+    def test_filter_object_type_name(self, orm, User, Post):
+        orm.filter(User)
+        PostFilter = orm.filter(Post)
+        assert hasattr(PostFilter, "_object_type")
+        definition = PostFilter._object_type.__strawberry_definition__
+        assert definition.name == "PostFilterObject"
+
+    def test_type_name_model_object_does_not_collide_with_filter(self, orm, User, Post):
+        UserFilter = orm.filter(User)
+        PostFilter = orm.filter(Post)
+
+        @orm.type(User, name="UserObject", filters=UserFilter)
+        class UserObjectType:
+            id: auto
+            name: auto
+
+        @orm.type(Post, name="PostObject", filters=PostFilter)
+        class PostObjectType:
+            id: auto
+            title: auto
+            author: UserObjectType
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self) -> list[PostObjectType]:
+                return []
+
+        schema = strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
+        assert UserObjectType.__strawberry_definition__.name == "UserObject"
+        assert PostObjectType.__strawberry_definition__.name == "PostObject"
+        assert PostFilter._object_type.__strawberry_definition__.name == "PostFilterObject"

@@ -166,6 +166,7 @@ class SQLAlchemyBackend(BaseBackend):
                     ),
                 )
 
+            self._check_lazy_relation_fields(cls, model, cls.__annotations__)
             return self._finalize_type(cls, model, type_name, name)
 
         return decorator

@@ -146,7 +146,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=DenyAllPolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyAllPolicy())
         info = _make_info(session)
 
         @strawberry.input
@@ -163,7 +163,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=DenyUpdatePolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyUpdatePolicy())
         info = _make_info(session)
 
         @strawberry.input
@@ -181,7 +181,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=DenyDeletePolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyDeletePolicy())
         info = _make_info(session)
 
         @strawberry.input
@@ -198,7 +198,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=DenyUnlinkPolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyUnlinkPolicy())
         info = _make_info(session)
 
         @strawberry.input
@@ -215,7 +215,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=ScopingPolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=ScopingPolicy())
         info = _make_info(session, allowed_ids=[999])
 
         @strawberry.input
@@ -234,7 +234,7 @@ class TestRefListPolicy:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=DenyAllPolicy())
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyAllPolicy())
         info = _make_info(session)
 
         @strawberry.input
@@ -262,7 +262,7 @@ class TestRefListPolicy:
 
 class TestNodeMutationPolicy:
     def _build_schema(self, policy):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", policy=policy)
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=policy)
 
         @orm.type(SAUser)
         class UserNode(relay.Node):

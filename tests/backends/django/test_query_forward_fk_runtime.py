@@ -8,7 +8,7 @@ from strawberry_orm.types import auto
 
 class TestQueryForwardFKRuntime:
     def _build_schema(self, User, Post, *, author_get_queryset=None):
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
 
         @orm.type(User)
         class AuthorType:

@@ -50,7 +50,7 @@ class Order(GroupBase):
 # ORM setup
 # ---------------------------------------------------------------------------
 
-orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 OrderFilter = orm.filter(Order)
 OrderOrder = orm.order(Order)
@@ -674,7 +674,7 @@ class TestNormalPaginationUnchanged:
 class TestBackwardCompatibility:
     def test_connection_without_group_has_no_aggregates(self):
         """A type without group= should not get aggregates/groups."""
-        plain_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        plain_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         PlainFilter = plain_orm.filter(Order)
 
         @plain_orm.type(Order, filters=PlainFilter)
@@ -927,7 +927,7 @@ class TestGroupItemsPagination:
 # Custom aggregation tests
 # ===========================================================================
 
-custom_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+custom_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 CustomOrderFilter = custom_orm.filter(Order)
 CustomOrderOrder = custom_orm.order(Order)

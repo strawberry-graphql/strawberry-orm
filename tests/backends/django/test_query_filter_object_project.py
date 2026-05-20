@@ -26,7 +26,7 @@ class TestFilterProjectTypeGeneration(AbstractTestFilterProjectTypeGeneration):
     pass
 
 
-_orm = StrawberryORM("django")
+_orm = StrawberryORM.for_django()
 _orm.filter(DjUser)
 _orm.filter(DjTag)
 _orm.filter(DjComment)

@@ -126,7 +126,7 @@ class TestCheckPolicy:
 class TestRefListPolicy:
     async def test_create_denied_by_policy(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=DenyAllPolicy())
+        orm = StrawberryORM.for_tortoise( policy=DenyAllPolicy())
 
         @strawberry.input
         class TortCreateTag:
@@ -142,7 +142,7 @@ class TestRefListPolicy:
 
     async def test_update_denied_by_policy(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=DenyUpdatePolicy())
+        orm = StrawberryORM.for_tortoise( policy=DenyUpdatePolicy())
 
         @strawberry.input
         class TortUpdateTag:
@@ -159,7 +159,7 @@ class TestRefListPolicy:
 
     async def test_delete_denied_by_policy(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=DenyDeletePolicy())
+        orm = StrawberryORM.for_tortoise( policy=DenyDeletePolicy())
 
         @strawberry.input
         class TortDeleteRef:
@@ -175,7 +175,7 @@ class TestRefListPolicy:
 
     async def test_unlink_denied_by_policy(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=DenyUnlinkPolicy())
+        orm = StrawberryORM.for_tortoise( policy=DenyUnlinkPolicy())
 
         @strawberry.input
         class TortUnlinkRef:
@@ -191,7 +191,7 @@ class TestRefListPolicy:
 
     async def test_scope_query_hides_objects(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=ScopingPolicy())
+        orm = StrawberryORM.for_tortoise( policy=ScopingPolicy())
 
         @strawberry.input
         class TortUpdateTag2:
@@ -210,7 +210,7 @@ class TestRefListPolicy:
 
     async def test_authorize_callback_takes_precedence(self, tortoise_db):
         data = await _seed()
-        orm = StrawberryORM("tortoise", policy=DenyAllPolicy())
+        orm = StrawberryORM.for_tortoise( policy=DenyAllPolicy())
 
         @strawberry.input
         class TortCreateTag2:
@@ -240,7 +240,7 @@ class TestRefListPolicy:
 # Module-level node schema (types must be at module scope for resolution)
 # ---------------------------------------------------------------------------
 
-_policy_node_orm = StrawberryORM("tortoise")
+_policy_node_orm = StrawberryORM.for_tortoise()
 
 
 @_policy_node_orm.type(TortUser)

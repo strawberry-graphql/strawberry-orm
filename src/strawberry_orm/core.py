@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typing as _typing
 from collections.abc import Callable
-from functools import wraps
+from functools import partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
 from typing import Any, Literal, Optional
@@ -21,7 +21,14 @@ from strawberry.extensions.field_extension import (
 from strawberry.types.arguments import StrawberryArgument
 from strawberry.types.cast import cast as strawberry_cast
 
-from strawberry_orm._async import AwaitableOrValue, await_maybe
+from strawberry_orm._async import (
+    AwaitableOrValue,
+    await_maybe,
+    in_async_context,
+    materialize_result,
+    run_orm_work,
+    run_orm_work_blocking,
+)
 from strawberry_orm.backends.protocol import Backend
 from strawberry_orm.mutations import MutationNamespace
 from strawberry_orm.types import FieldDefinition
@@ -176,6 +183,9 @@ def _make_query_resolver(
 
         resolver.__annotations__ = {"info": info_type}
 
+    wrap = getattr(backend, "wrap_async_safe", None)
+    if wrap is not None:
+        resolver = wrap(resolver, materialize=False)
     return resolver
 
 
@@ -296,6 +306,32 @@ class _AutoFilterOrderExtension(FieldExtension):
             ctx._orm_group_by = group_by  # type: ignore[attr-defined]
             ctx._orm_order = order  # type: ignore[attr-defined]
 
+    def _run_filter_work(
+        self,
+        result: Any,
+        info: Any,
+        *,
+        filter: Any = None,
+        order: Any = None,
+        group_by: Any = None,
+    ) -> Any:
+        if self._model is not None and self._backend.is_query_object(result):
+            if filter is not None:
+                result = self._backend.apply_filters(result, filter, self._model)
+
+            self._stash_context(info, result, group_by=group_by, order=order)
+
+            if order is not None:
+                result = self._backend.apply_ordering(result, order, self._model)
+            result = materialize_result(
+                self._backend,
+                result,
+                info,
+                sync=True,
+            )
+
+        return result
+
     def _apply(
         self,
         result: Any,
@@ -306,6 +342,16 @@ class _AutoFilterOrderExtension(FieldExtension):
         group_by: Any = None,
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
+            if in_async_context():
+                return run_orm_work_blocking(
+                    self._run_filter_work,
+                    result,
+                    info,
+                    filter=filter,
+                    order=order,
+                    group_by=group_by,
+                )
+
             if filter is not None:
                 result = self._backend.apply_filters(result, filter, self._model)
 
@@ -356,6 +402,46 @@ class _AutoFilterOrderExtension(FieldExtension):
         result = next_(source, info, **self._resolver_kwargs(kwargs))
         if isawaitable(result):
             result = await await_maybe(result)
+
+        forwarded = self._resolver_kwargs(kwargs)
+        if self._model is not None and self._backend.is_query_object(result):
+            materialize = self._backend.materialize_query
+            if iscoroutinefunction(materialize):
+                if kwargs.get("filter") is not None:
+                    result = self._backend.apply_filters(
+                        result,
+                        kwargs["filter"],
+                        self._model,
+                    )
+                self._stash_context(
+                    info,
+                    result,
+                    group_by=kwargs.get("group_by"),
+                    order=kwargs.get("order"),
+                )
+                if kwargs.get("order") is not None:
+                    result = self._backend.apply_ordering(
+                        result,
+                        kwargs["order"],
+                        self._model,
+                    )
+                result = await materialize(result, info)
+                return self._cast_result(result)
+
+            result = await await_maybe(
+                run_orm_work(
+                    partial(
+                        self._run_filter_work,
+                        result,
+                        info,
+                        filter=kwargs.get("filter"),
+                        order=kwargs.get("order"),
+                        group_by=kwargs.get("group_by"),
+                    ),
+                    thread_sensitive=True,
+                )
+            )
+            return self._cast_result(result)
 
         result = self._apply(
             result,
@@ -664,12 +750,22 @@ class StrawberryORM:
 
     Usage::
 
-        orm = StrawberryORM("django")
-        orm = StrawberryORM("sqlalchemy", dialect="postgresql", session_getter=get_session)
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_django()
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="postgresql",
+            session_getter=get_session,
+        )
+        orm = StrawberryORM.for_tortoise()
+
     """
 
-    def __init__(self, backend: BackendName, **kwargs: Any) -> None:
+    def __init__(self) -> None:
+        raise TypeError(
+            "Use StrawberryORM.for_django(), StrawberryORM.for_sqlalchemy(), "
+            "or StrawberryORM.for_tortoise() to create an instance."
+        )
+
+    def _configure(self, backend: BackendName, **kwargs: Any) -> None:
         from strawberry_orm.repo import AbstractRepo
 
         self._backend_name = backend
@@ -684,6 +780,38 @@ class StrawberryORM:
             self._backend._repos = _policy_to_repos(policy)  # type: ignore[attr-defined]
 
         self.mutations = MutationNamespace(self._backend)
+
+    @classmethod
+    def _construct(cls, backend: BackendName, **kwargs: Any) -> StrawberryORM:
+        orm = object.__new__(cls)
+        orm._configure(backend, **kwargs)
+        return orm
+
+    @classmethod
+    def for_django(cls, **kwargs: Any) -> StrawberryORM:
+        """Create an ORM configured for Django."""
+        return cls._construct("django", **kwargs)
+
+    @classmethod
+    def for_sqlalchemy(
+        cls,
+        *,
+        dialect: str = "postgresql",
+        session_getter: Callable[..., Any] | None = None,
+        **kwargs: Any,
+    ) -> StrawberryORM:
+        """Create an ORM configured for SQLAlchemy."""
+        return cls._construct(
+            "sqlalchemy",
+            dialect=dialect,
+            session_getter=session_getter,
+            **kwargs,
+        )
+
+    @classmethod
+    def for_tortoise(cls, **kwargs: Any) -> StrawberryORM:
+        """Create an ORM configured for Tortoise ORM."""
+        return cls._construct("tortoise", **kwargs)
 
     @property
     def backend(self) -> Backend:
@@ -740,12 +868,9 @@ class StrawberryORM:
         deprecation_reason: str | None = None,
     ) -> Any:
         if fn is not None:
-            return strawberry.field(
-                resolver=fn,
-                extensions=[
-                    _AutoFilterOrderExtension(self._backend),
-                ],
-            )
+            wrap = getattr(self._backend, "wrap_async_safe", None)
+            resolver = wrap(fn) if wrap is not None else fn
+            return strawberry.field(resolver=resolver)
 
         if filters is not None or order is not None:
             return _AutoField(
@@ -841,6 +966,14 @@ class StrawberryORM:
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)
+
+    def lazy_resolution_extension(self, **kwargs: Any) -> type[SchemaExtension]:
+        from strawberry_orm.lazy_resolution import LazyResolutionExtension
+
+        mode = kwargs.pop("mode", None) or getattr(
+            self._backend, "_lazy_resolution", "warn"
+        )
+        return LazyResolutionExtension.configure(self._backend, mode=mode, **kwargs)
 
 
 def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:

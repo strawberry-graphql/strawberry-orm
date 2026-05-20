@@ -8,7 +8,7 @@ from strawberry_orm.types import auto
 
 class TestQueryFilterLimits:
     def _build_schema(self, User, **orm_kwargs):
-        orm = StrawberryORM("django", **orm_kwargs)
+        orm = StrawberryORM.for_django( **orm_kwargs)
         UserFilter = orm.filter(User)
 
         @orm.type(User, filters=UserFilter)

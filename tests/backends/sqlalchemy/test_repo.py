@@ -225,8 +225,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyAllTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyAllTagRepo}
         )
         info = _make_info(session)
 
@@ -244,8 +243,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyUpdateTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyUpdateTagRepo}
         )
         info = _make_info(session)
 
@@ -264,8 +262,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyDeleteTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyDeleteTagRepo}
         )
         info = _make_info(session)
 
@@ -284,8 +281,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyUnlinkTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyUnlinkTagRepo}
         )
         info = _make_info(session)
 
@@ -304,8 +300,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: ScopingTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: ScopingTagRepo}
         )
         info = _make_info(session, allowed_ids=[999])
 
@@ -325,8 +320,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyAllTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyAllTagRepo}
         )
         info = _make_info(session)
 
@@ -352,8 +346,7 @@ class TestRefListRepo:
         session = _make_session()
         _seed(session)
 
-        orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", repos={SATag: DenyAllTagRepo}
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos={SATag: DenyAllTagRepo}
         )
 
         repo = orm.backend.get_repo(SAUser)
@@ -364,7 +357,7 @@ class TestRefListRepo:
         session = _make_session()
         data = _seed(session)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         info = _make_info(session)
 
         @strawberry.input
@@ -386,7 +379,7 @@ class TestRefListRepo:
 
 class TestLifecycleHooks:
     def _build_schema(self, repos):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", repos=repos)
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos=repos)
 
         @orm.type(SAUser)
         class LCUserNode(relay.Node):
@@ -473,7 +466,7 @@ class TestLifecycleHooks:
 
 class TestNodeMutationRepo:
     def _build_schema(self, repos):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite", repos=repos)
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos=repos)
 
         @orm.type(SAUser)
         class UserNode(relay.Node):

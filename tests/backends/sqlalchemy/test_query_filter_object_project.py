@@ -28,7 +28,7 @@ class TestFilterProjectTypeGeneration(AbstractTestFilterProjectTypeGeneration):
 
 
 def _build_projected_schema():
-    orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
     orm.filter(SAUser)
     orm.filter(SATag)
     orm.filter(SAComment)

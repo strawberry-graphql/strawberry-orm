@@ -10,7 +10,7 @@ from strawberry_orm.types import Ordering, auto
 
 class TestCustomFilterType:
     def _build_schema(self, User, Post):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.filter_type(User)
         class UserFilter:
@@ -114,7 +114,7 @@ class TestCustomFilterType:
 
 class TestCustomOrderType:
     def _build_schema(self, User, Post):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         UserFilter = orm.filter(User)
 
         @orm.order_type(User)
@@ -193,7 +193,7 @@ class TestCustomOrderType:
 
 class TestFilterFieldValueAnnotationValidation:
     def test_missing_value_annotation_raises(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         from tests.backends.sqlalchemy.models import User
 
         with pytest.raises(TypeError, match="'value' parameter"):

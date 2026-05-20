@@ -148,7 +148,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
     def test_get_queryset_with_nested_relationships(
         self, sa_session, seed, query_counter, Post, Tag, User
     ):
-        qs_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        qs_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @qs_orm.type(Tag)
         class TT:
@@ -189,7 +189,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
     def test_get_queryset_preserves_optimizer_eager_loads(
         self, sa_session, seed, query_counter, Post, User
     ):
-        qs_orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        qs_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @qs_orm.type(Post)
         class PT:
@@ -304,7 +304,7 @@ class TestQueryLoadCallable:
     def test_load_callable_filters_nested_relation(
         self, sa_session, seed, query_counter, Post, User
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Post)
         class PT:
@@ -354,7 +354,7 @@ class TestQueryLoadCallable:
     def test_load_callable_with_nested_children(
         self, sa_session, seed, query_counter, Post, Tag, User
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Tag)
         class TT:
@@ -397,7 +397,7 @@ class TestQueryLoadCallable:
     def test_load_callable_stays_efficient(
         self, sa_session, seed, query_counter, Post, User
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Post)
         class PT:
@@ -431,7 +431,7 @@ class TestQueryNestedGetQueryset:
     def test_get_queryset_filters_nested_relation(
         self, sa_session, seed, query_counter, Post, User
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Post)
         class PT:
@@ -483,7 +483,7 @@ class TestQueryNestedGetQueryset:
     def test_get_queryset_still_applies_with_nested_filter_argument(
         self, sa_session, seed, Post, User
     ):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         PostFilter = orm.filter(Post)
 
         @orm.type(Post, filters=PostFilter)
@@ -536,7 +536,7 @@ class TestQueryNestedGetQueryset:
         self, sa_session, seed, query_counter, Post, User
     ):
         """Both type-level get_queryset and field-level load callable should compose."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Post)
         class PT:

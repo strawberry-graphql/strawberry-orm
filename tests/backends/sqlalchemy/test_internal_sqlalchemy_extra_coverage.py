@@ -50,7 +50,7 @@ class MissingOrder:
 
 class TestInternalSqlalchemyExtraCoverage:
     def test_boolean_impl_and_missing_relation_type_paths(self):
-        backend = StrawberryORM("sqlalchemy", dialect="sqlite").backend
+        backend = StrawberryORM.for_sqlalchemy(dialect="sqlite").backend
         fields = _introspect_sa_model(FlagModel)
         assert ("enabled", bool, False, None) in fields
 

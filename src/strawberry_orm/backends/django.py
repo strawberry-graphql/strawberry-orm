@@ -9,7 +9,9 @@ from typing import Any, Optional
 import strawberry
 from strawberry.extensions import SchemaExtension
 
-from strawberry_orm._async import run_sync
+from inspect import iscoroutinefunction
+
+from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
@@ -72,10 +74,16 @@ class DjangoBackend(BaseBackend):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self._django_async_safe: bool = kwargs.get("django_async_safe", True)
         self._max_filter_depth = max_filter_depth
         self._max_filter_branches = max_filter_branches
         self._enable_regex_filters = enable_regex_filters
         self._max_in_list_size = max_in_list_size
+
+    def wrap_async_safe(self, resolver: Any, *, materialize: bool = True) -> Any:
+        if not self._django_async_safe:
+            return resolver
+        return async_safe_resolver(resolver, materialize=materialize)
 
     def _introspect_model(
         self, model: type
@@ -129,6 +137,14 @@ class DjangoBackend(BaseBackend):
         aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
+            if "is_type_of" not in cls.__dict__:
+
+                @classmethod
+                def is_type_of(inner_cls: type, obj: object, info: Any) -> bool:
+                    return isinstance(obj, model)
+
+                cls.is_type_of = is_type_of  # type: ignore[method-assign]
+
             meta = model._meta  # type: ignore[attr-defined]
 
             col_types: dict[str, type] = {}
@@ -182,8 +198,8 @@ class DjangoBackend(BaseBackend):
                 if field_name in vars(cls):
                     continue
                 kind = rel_info["kind"]
+                ann = annotations[field_name]
                 if kind == "many":
-                    ann = annotations[field_name]
                     el_type = extract_element_type(ann)
                     f_type = (
                         getattr(el_type, "__orm_filter__", None) if el_type else None
@@ -209,16 +225,38 @@ class DjangoBackend(BaseBackend):
 
                         def _make_resolver(fname: str, return_ann: Any) -> Any:
                             def resolver(self: Any) -> Any:
-                                qs = getattr(self, fname).all()
-                                return run_sync(list, qs, thread_sensitive=True)
+                                return list(getattr(self, fname).all())
 
                             resolver.__name__ = fname
                             resolver.__annotations__ = {"return": return_ann}
+                            if self._django_async_safe:
+                                resolver = async_safe_resolver(resolver)
                             return strawberry.field(resolver=resolver)
 
                         setattr(cls, field_name, _make_resolver(field_name, ann))
+                elif kind in ("fk", "one"):
 
-            return self._finalize_type(cls, model, type_name, name)
+                    def _make_fk_resolver(fname: str, return_ann: Any) -> Any:
+                        def resolver(self: Any) -> Any:
+                            return getattr(self, fname)
+
+                        resolver.__name__ = fname
+                        resolver.__annotations__ = {"return": return_ann}
+                        if self._django_async_safe:
+                            resolver = async_safe_resolver(
+                                resolver,
+                                materialize=False,
+                            )
+                        return strawberry.field(resolver=resolver)
+
+                    setattr(cls, field_name, _make_fk_resolver(field_name, ann))
+
+            annotations = getattr(cls, "__annotations__", {})
+            self._check_lazy_relation_fields(cls, model, annotations)
+            graphql_type = self._finalize_type(cls, model, type_name, name)
+            if self._django_async_safe:
+                graphql_type = self._post_process_strawberry_fields(graphql_type)
+            return graphql_type
 
         return decorator
 
@@ -486,7 +524,51 @@ class DjangoBackend(BaseBackend):
         return isinstance(value, QuerySet)
 
     def materialize_query(self, query: Any, info: Any) -> Any:
+        from strawberry_orm._async import in_async_context
+
+        if not in_async_context():
+            return list(query)
         return run_sync(list, query, thread_sensitive=True)
+
+    def _post_process_strawberry_fields(self, graphql_type: type) -> type:
+        if not self._django_async_safe:
+            return graphql_type
+
+        from strawberry.types.field import UNRESOLVED
+        from strawberry.types.fields.resolver import StrawberryResolver
+
+        for field in graphql_type.__strawberry_definition__.fields:
+            resolver = field.base_resolver
+            if resolver is not None:
+                wrapped = resolver.wrapped_func
+                if wrapped is not None and not iscoroutinefunction(wrapped):
+                    resolver.wrapped_func = async_safe_resolver(wrapped)
+                continue
+
+            python_name = field.python_name
+            if not python_name:
+                continue
+
+            captured_field = field
+            captured_name = python_name
+
+            def _make_resolve_basic(
+                bound_field: Any = captured_field,
+                bound_name: str = captured_name,
+            ) -> Any:
+                def _resolve_basic(root: Any) -> Any:
+                    value = bound_field.default_resolver(root, bound_name)
+                    return materialize_result(self, value, None, sync=False)
+
+                return async_safe_resolver(_resolve_basic, materialize=False)
+
+            field_type = field.type
+            field.base_resolver = StrawberryResolver(
+                _make_resolve_basic(),
+                type_override=field_type if field_type is not UNRESOLVED else None,
+            )
+
+        return graphql_type
 
     # -- Optimizer -----------------------------------------------------------
 
@@ -727,18 +809,26 @@ def _make_dj_rel_resolver(
 ) -> Any:
     """Create a Strawberry field for a Django many-relation with filter/order."""
 
-    def _evaluate(qs: Any) -> Any:
-        return run_sync(list, qs, thread_sensitive=True)
+    def _resolve(
+        self: Any,
+        filter: Any = None,
+        order: Any = None,
+    ) -> list[Any]:
+        qs = getattr(self, fname).all()
+        if filter is not None:
+            qs = backend.apply_filters(qs, filter, rel_model)
+        if order is not None:
+            qs = backend.apply_ordering(qs, order, rel_model)
+        return list(qs)
 
     if filter_type and order_type:
 
-        def resolver(self: Any, filter: Any = None, order: Any = None) -> Any:
-            qs = getattr(self, fname).all()
-            if filter is not None:
-                qs = backend.apply_filters(qs, filter, rel_model)
-            if order is not None:
-                qs = backend.apply_ordering(qs, order, rel_model)
-            return _evaluate(qs)
+        def resolver(
+            self: Any,
+            filter: Any = None,
+            order: Any = None,
+        ) -> list[Any]:
+            return _resolve(self, filter=filter, order=order)
 
         resolver.__annotations__ = {
             "filter": Optional[filter_type],
@@ -746,23 +836,19 @@ def _make_dj_rel_resolver(
         }
     elif filter_type:
 
-        def resolver(self: Any, filter: Any = None) -> Any:
-            qs = getattr(self, fname).all()
-            if filter is not None:
-                qs = backend.apply_filters(qs, filter, rel_model)
-            return _evaluate(qs)
+        def resolver(self: Any, filter: Any = None) -> list[Any]:
+            return _resolve(self, filter=filter, order=None)
 
         resolver.__annotations__ = {"filter": Optional[filter_type]}
     else:
 
-        def resolver(self: Any, order: Any = None) -> Any:
-            qs = getattr(self, fname).all()
-            if order is not None:
-                qs = backend.apply_ordering(qs, order, rel_model)
-            return _evaluate(qs)
+        def resolver(self: Any, order: Any = None) -> list[Any]:
+            return _resolve(self, filter=None, order=order)
 
         resolver.__annotations__ = {"order": Optional[list[order_type]]}
 
+    if getattr(backend, "_django_async_safe", False):
+        resolver = async_safe_resolver(resolver)
     return strawberry.field(resolver=resolver)
 
 

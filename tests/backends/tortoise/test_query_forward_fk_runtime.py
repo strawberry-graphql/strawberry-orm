@@ -9,7 +9,7 @@ from strawberry_orm.types import auto
 
 class TestQueryForwardFKRuntime:
     def _build_schema(self, User, Post, *, author_get_queryset=None):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
 
         @orm.type(User)
         class AuthorType:

@@ -12,7 +12,7 @@ from strawberry_orm.types import auto
 
 class TestRelayConnectionFilteringAndOrdering:
     def _build_schema(self, User):
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
 

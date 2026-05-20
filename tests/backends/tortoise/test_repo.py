@@ -198,7 +198,7 @@ class TestRefListRepo:
     async def test_create_denied_by_repo(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyAllTagRepo})
         info = _make_info()
 
         @strawberry.input
@@ -214,7 +214,7 @@ class TestRefListRepo:
     async def test_update_denied_by_repo(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyUpdateTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyUpdateTagRepo})
         info = _make_info()
 
         @strawberry.input
@@ -231,7 +231,7 @@ class TestRefListRepo:
     async def test_delete_denied_by_repo(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyDeleteTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyDeleteTagRepo})
         info = _make_info()
 
         ref_type = orm.ref(TortTag, delete=True)
@@ -248,7 +248,7 @@ class TestRefListRepo:
     async def test_unlink_denied_by_repo(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyUnlinkTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyUnlinkTagRepo})
         info = _make_info()
 
         ref_type = orm.ref(TortTag, unlink=True)
@@ -265,7 +265,7 @@ class TestRefListRepo:
     async def test_scope_query_hides_objects(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: ScopingTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: ScopingTagRepo})
         info = _make_info(allowed_ids=[999])
 
         @strawberry.input
@@ -283,7 +283,7 @@ class TestRefListRepo:
     async def test_authorize_callback_takes_precedence(self, tortoise_db):
         data = await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyAllTagRepo})
         info = _make_info()
 
         @strawberry.input
@@ -308,7 +308,7 @@ class TestRefListRepo:
         """A repo for TortTag should not affect TortUser operations."""
         await _seed()
 
-        orm = StrawberryORM("tortoise", repos={TortTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_tortoise( repos={TortTag: DenyAllTagRepo})
 
         repo = orm.backend.get_repo(TortUser)
         assert repo is None, "No repo registered for TortUser"
@@ -317,7 +317,7 @@ class TestRefListRepo:
         """Without repos, all operations should succeed."""
         data = await _seed()
 
-        orm = StrawberryORM("tortoise")
+        orm = StrawberryORM.for_tortoise()
         info = _make_info()
 
         @strawberry.input
@@ -339,7 +339,7 @@ class TestRefListRepo:
 # ---------------------------------------------------------------------------
 
 
-_lifecycle_orm = StrawberryORM("tortoise")
+_lifecycle_orm = StrawberryORM.for_tortoise()
 
 
 @_lifecycle_orm.type(TortUser)
@@ -442,7 +442,7 @@ class TestLifecycleHooks:
 # ---------------------------------------------------------------------------
 
 
-_repo_node_orm = StrawberryORM("tortoise")
+_repo_node_orm = StrawberryORM.for_tortoise()
 
 
 @_repo_node_orm.type(TortUser)

@@ -27,7 +27,7 @@ class TestFilterProjectTypeGeneration(AbstractTestFilterProjectTypeGeneration):
     pass
 
 
-_orm = StrawberryORM("tortoise")
+_orm = StrawberryORM.for_tortoise()
 _orm.filter(TortUser)
 _orm.filter(TortTag)
 _orm.filter(TortComment)

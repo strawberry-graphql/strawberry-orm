@@ -282,6 +282,7 @@ class TortoiseBackend(BaseBackend):
                     self_backend = self
                     setattr(cls, field_name, _make_resolver(field_name, rel_model, ann))
 
+            self._check_lazy_relation_fields(cls, model, annotations)
             return self._finalize_type(cls, model, type_name, name)
 
         return decorator

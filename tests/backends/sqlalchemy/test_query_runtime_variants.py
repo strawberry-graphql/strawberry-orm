@@ -10,7 +10,7 @@ from strawberry_orm.types import auto
 
 class TestQueryRuntimeVariants:
     def _build_schema(self, User, Post):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
         PostFilter = orm.filter(Post)

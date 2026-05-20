@@ -193,7 +193,7 @@ class TestRepoModelExtraction:
 class TestRefListRepo:
     def test_create_denied_by_repo(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyAllTagRepo})
         info = SimpleNamespace(context={})
 
         @strawberry.input
@@ -208,7 +208,7 @@ class TestRefListRepo:
 
     def test_update_denied_by_repo(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyUpdateTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyUpdateTagRepo})
         info = SimpleNamespace(context={})
 
         @strawberry.input
@@ -224,7 +224,7 @@ class TestRefListRepo:
 
     def test_delete_denied_by_repo(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyDeleteTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyDeleteTagRepo})
         info = SimpleNamespace(context={})
 
         ref_type = orm.ref(DjTag, delete=True)
@@ -240,7 +240,7 @@ class TestRefListRepo:
 
     def test_unlink_denied_by_repo(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyUnlinkTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyUnlinkTagRepo})
         info = SimpleNamespace(context={})
 
         ref_type = orm.ref(DjTag, unlink=True)
@@ -256,7 +256,7 @@ class TestRefListRepo:
 
     def test_scope_query_hides_objects(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: ScopingTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: ScopingTagRepo})
         info = SimpleNamespace(context={"allowed_ids": [999]})
 
         @strawberry.input
@@ -273,7 +273,7 @@ class TestRefListRepo:
 
     def test_authorize_callback_takes_precedence(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyAllTagRepo})
         info = SimpleNamespace(context={})
 
         @strawberry.input
@@ -295,7 +295,7 @@ class TestRefListRepo:
     def test_per_model_isolation(self, setup_tables):
         """A repo for DjTag should not affect DjUser operations."""
         _seed()
-        orm = StrawberryORM("django", repos={DjTag: DenyAllTagRepo})
+        orm = StrawberryORM.for_django( repos={DjTag: DenyAllTagRepo})
 
         repo = orm.backend.get_repo(DjUser)
         assert repo is None, "No repo registered for DjUser"
@@ -303,7 +303,7 @@ class TestRefListRepo:
     def test_no_repos_allows_all(self, setup_tables):
         """Without repos, all operations should succeed."""
         data = _seed()
-        orm = StrawberryORM("django")
+        orm = StrawberryORM.for_django()
         info = SimpleNamespace(context={})
 
         @strawberry.input
@@ -319,11 +319,11 @@ class TestRefListRepo:
 
 # ---------------------------------------------------------------------------
 # Module-level node schema (single ORM instance — registering the same Django
-# models on multiple StrawberryORM("django") instances breaks `auto` / Node resolution)
+# models on multiple StrawberryORM.for_django() instances breaks `auto` / Node resolution)
 # ---------------------------------------------------------------------------
 
 
-_repo_node_orm = StrawberryORM("django")
+_repo_node_orm = StrawberryORM.for_django()
 
 
 @_repo_node_orm.type(DjUser)

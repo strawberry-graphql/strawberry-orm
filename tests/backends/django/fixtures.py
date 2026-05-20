@@ -32,7 +32,7 @@ from tests.backends.django.models import (
 # Main schema
 # =========================================================================
 
-_main_orm = StrawberryORM("django")
+_main_orm = StrawberryORM.for_django(lazy_resolution="off")
 
 UserFilter = _main_orm.filter(DjUser)
 UserOrder = _main_orm.order(DjUser)
@@ -185,7 +185,7 @@ main_schema = strawberry.Schema(
 # Node mutation schema
 # =========================================================================
 
-_node_orm = StrawberryORM("django")
+_node_orm = StrawberryORM.for_django(lazy_resolution="off")
 _node_project = {
     "post": {
         "author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
@@ -316,7 +316,7 @@ node_mutation_schema = strawberry.Schema(
 # Self-is-model schema
 # =========================================================================
 
-_self_orm = StrawberryORM("django")
+_self_orm = StrawberryORM.for_django(lazy_resolution="off")
 
 
 @_self_orm.type(DjPost)
@@ -371,7 +371,7 @@ self_model_schema = strawberry.Schema(
 # Get-queryset schema
 # =========================================================================
 
-_qs_orm = StrawberryORM("django")
+_qs_orm = StrawberryORM.for_django(lazy_resolution="off")
 
 
 @_qs_orm.type(DjPost)
@@ -412,7 +412,7 @@ get_queryset_schema = strawberry.Schema(
 # Multiple-types schema
 # =========================================================================
 
-_multi_orm = StrawberryORM("django")
+_multi_orm = StrawberryORM.for_django(lazy_resolution="off")
 
 
 @_multi_orm.type(DjUser)
@@ -454,7 +454,7 @@ multi_type_schema = strawberry.Schema(
 
 @pytest.fixture
 def orm():
-    return StrawberryORM("django")
+    return StrawberryORM.for_django(lazy_resolution="off")
 
 
 # -- Model class fixtures ----------------------------------------------------

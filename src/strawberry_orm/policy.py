@@ -34,7 +34,7 @@ class MutationPolicy:
             def scope_query(self, model, query, info):
                 return query.filter(tenant_id=info.context["tenant_id"])
 
-        orm = StrawberryORM("sqlalchemy", ..., policy=MyPolicy())
+        orm = StrawberryORM.for_sqlalchemy(..., policy=MyPolicy())
     """
 
     def can_create(self, model: type, data: dict[str, Any], info: Any) -> bool:

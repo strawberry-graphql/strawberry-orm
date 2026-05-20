@@ -12,7 +12,7 @@ from strawberry_orm.types import auto
 
 class TestRelayConnectionFilteringAndOrdering:
     def _build_schema(self, User):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
 

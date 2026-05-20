@@ -11,7 +11,10 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+LazyResolutionMode = Literal["off", "warn", "error"]
+_LAZY_RESOLUTION_MODES: frozenset[str] = frozenset({"off", "warn", "error"})
 
 import strawberry
 
@@ -230,6 +233,13 @@ class BaseBackend:
         self._exclude_sensitive_fields: bool = kwargs.get(
             "exclude_sensitive_fields", True
         )
+        lazy_resolution = kwargs.get("lazy_resolution", "warn")
+        if lazy_resolution not in _LAZY_RESOLUTION_MODES:
+            raise ValueError(
+                "lazy_resolution must be one of 'off', 'warn', or 'error'; "
+                f"got {lazy_resolution!r}"
+            )
+        self._lazy_resolution: LazyResolutionMode = lazy_resolution
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
 
     def get_repo(self, model: type) -> Any | None:
@@ -406,7 +416,7 @@ class BaseBackend:
         FilterCls.one_of = strawberry.UNSET
 
         if object_annotations:
-            obj_type_name = f"{model.__name__}Object{suffix}"
+            obj_type_name = f"{model.__name__}FilterObject{suffix}"
             obj_ns: dict[str, Any] = {
                 "__annotations__": object_annotations,
                 **object_defaults,
@@ -663,7 +673,7 @@ class BaseBackend:
             filter_ns["field"] = strawberry.UNSET
 
         if object_annotations:
-            obj_type_name = f"{model.__name__}Object"
+            obj_type_name = f"{model.__name__}FilterObject"
             obj_ns: dict[str, Any] = {
                 "__annotations__": object_annotations,
                 **object_defaults,
@@ -1199,6 +1209,58 @@ class BaseBackend:
             if m is model:
                 return type_name
         return None
+
+    def _relation_type_from_annotation(self, ann: Any) -> Any | None:
+        import typing as _typing
+        from types import UnionType
+
+        el = extract_element_type(ann)
+        if el is not None:
+            candidate = el
+        else:
+            origin = _typing.get_origin(ann)
+            if origin in (_typing.Union, UnionType):
+                args = [a for a in _typing.get_args(ann) if a is not type(None)]
+                candidate = args[0] if len(args) == 1 else None
+            else:
+                candidate = ann
+        if candidate is None or not isinstance(candidate, type):
+            return None
+        if getattr(candidate, "__orm_model__", None) is not None:
+            return candidate
+        return None
+
+    def _check_lazy_relation_fields(
+        self,
+        cls: type,
+        model: type,
+        annotations: dict[str, Any],
+    ) -> None:
+        if self._lazy_resolution == "off":
+            return
+
+        from strawberry_orm.types import FieldDefinition
+
+        for field_name, ann in annotations.items():
+            if self._relation_type_from_annotation(ann) is None:
+                continue
+            if field_name in vars(cls):
+                val = vars(cls)[field_name]
+                if isinstance(val, FieldDefinition):
+                    if val.disable_optimization:
+                        continue
+                elif callable(val):
+                    continue
+            message = (
+                f"Field '{field_name}' on {model.__name__} resolves a related ORM "
+                f"type lazily. Add an explicit resolver, use "
+                f"orm.field(load=[...], disable_optimization=True) to silence, and "
+                f"mount extensions=[orm.optimizer_extension()] on the schema for "
+                f"eager loading."
+            )
+            if self._lazy_resolution == "error":
+                raise ValueError(message)
+            warnings.warn(message, stacklevel=4)
 
     def _process_type_annotations(
         self,

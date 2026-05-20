@@ -142,7 +142,7 @@ class TestFix1_LikeWildcardEscaping:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account)
 
         @orm.type(Account, filters=filt)
@@ -220,7 +220,7 @@ class TestFix2_InputExcludesPrimaryKeys:
     """input() should exclude primary-key columns by default."""
 
     def test_input_excludes_pk_by_default(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         InputType = orm.input(Account)
         field_names = set(InputType.__dataclass_fields__.keys())
         assert "id" not in field_names, (
@@ -229,7 +229,7 @@ class TestFix2_InputExcludesPrimaryKeys:
 
     def test_input_can_include_pk_via_opt_out(self):
         """Users should be able to opt-in to PK inclusion via exclude_pk=False."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         try:
             InputType = orm.input(Account, exclude_pk=False)
         except TypeError:
@@ -257,7 +257,7 @@ class TestFix3_FutureAnnotationsCompat:
 
     def test_type_decorator_with_string_annotations(self):
         """Simulate PEP 563 by using string annotations directly."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         # Manually create a class with string annotations
         # (equivalent to `from __future__ import annotations`)
@@ -283,7 +283,7 @@ class TestFix3_FutureAnnotationsCompat:
 
     def test_schema_creation_with_string_annotations(self):
         """Full round-trip: type with string annotations -> schema -> query."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         ns = {
             "__annotations__": {
@@ -332,7 +332,7 @@ class TestFix4_LikeEscapeInSQL:
 
         event.listen(engine, "before_cursor_execute", _before)
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account)
 
         @orm.type(Account, filters=filt)
@@ -379,7 +379,7 @@ class TestFix5_FilterDepthLimit:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        self.orm = StrawberryORM("sqlalchemy", dialect="sqlite", max_filter_depth=5)
+        self.orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", max_filter_depth=5)
         filt = self.orm.filter(Account)
 
         @self.orm.type(Account, filters=filt)
@@ -456,8 +456,7 @@ class TestFix6_RegexValidation:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        self.orm = StrawberryORM(
-            "sqlalchemy", dialect="sqlite", enable_regex_filters=False
+        self.orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", enable_regex_filters=False
         )
         filt = self.orm.filter(Account)
 
@@ -530,7 +529,7 @@ class TestFix7_PermissionClassesApplied:
             description="secret",
         )
 
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Account)
         class AT:
@@ -591,7 +590,7 @@ class TestFix8_RefListAuthorizationHook:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        self.orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        self.orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
     def test_authorize_callback_invoked(self):
         """The authorize callback should be called for each ref."""
@@ -693,7 +692,7 @@ class TestFix8B_RefExplicitUnlinkAndDelete:
         return ref_type(delete=actual_type(id=str(ref_id)))
 
     def test_unlink_removes_from_relation_without_hard_delete(self, seeded):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         account = seeded.get(Account, 1)
         role = seeded.get(Role, 1)
         account.groups.append(role)
@@ -714,7 +713,7 @@ class TestFix8B_RefExplicitUnlinkAndDelete:
         assert list(account.groups) == []
 
     def test_delete_hard_deletes_the_row(self, seeded):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         account = seeded.get(Account, 1)
         role = seeded.get(Role, 1)
         account.groups.append(role)
@@ -754,7 +753,7 @@ class TestFix9_ErrorSanitization:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account)
 
         @orm.type(Account, filters=filt)
@@ -813,7 +812,7 @@ class TestFix10_FilterExclude:
     input so they cannot be used for data exfiltration."""
 
     def test_sensitive_fields_excluded_by_default(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         filt = orm.filter(Account)
         field_names = set(filt._field_type.__dataclass_fields__.keys())
@@ -834,7 +833,7 @@ class TestFix10_FilterExclude:
         assert "is_admin" not in input_names
 
     def test_sensitive_fields_can_be_explicitly_included(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         filt = orm.filter(Account, include=["password_hash"])
         field_names = set(filt._field_type.__dataclass_fields__.keys())
@@ -845,7 +844,7 @@ class TestFix10_FilterExclude:
         assert "password_hash" in input_names
 
     def test_excluded_field_not_in_filter(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account, exclude=["password_hash", "api_key"])
         field_type = filt._field_type
 
@@ -857,7 +856,7 @@ class TestFix10_FilterExclude:
 
     def test_excluded_field_not_filterable_at_runtime(self, seeded):
         """Trying to filter on an excluded field should fail or be ignored."""
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account, exclude=["password_hash"])
 
         @orm.type(Account, filters=filt)
@@ -881,7 +880,7 @@ class TestFix10_FilterExclude:
         assert result.errors is not None
 
     def test_input_exclude_removes_fields(self):
-        orm = StrawberryORM("sqlalchemy", dialect="sqlite")
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         inp = orm.input(Account, exclude=["password_hash", "api_key", "is_admin"])
         field_names = set(inp.__dataclass_fields__.keys())
         assert "password_hash" not in field_names
