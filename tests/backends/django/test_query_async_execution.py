@@ -126,7 +126,7 @@ class TestAsyncExecution:
 
         from strawberry_orm.relay import ORMListConnection
 
-        orm = StrawberryORM.for_django( lazy_resolution="off")
+        orm = StrawberryORM.for_django(lazy_resolution="off")
         UserFilter = orm.filter(User)
         UserOrder = orm.order(User)
 

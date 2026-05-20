@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 import strawberry
 from strawberry.extensions import SchemaExtension
@@ -100,7 +100,7 @@ class SQLAlchemyBackend(BaseBackend):
                     impl_name = type(col.type.impl).__name__.upper()
                     py_type = _SA_TYPE_MAP.get(impl_name, py_type)
                 if col.nullable:
-                    py_type = Optional[py_type]
+                    py_type = py_type | None
                 col_types[col.key] = py_type
 
             rel_names = {rel.key for rel in mapper.relationships}
@@ -189,12 +189,15 @@ class SQLAlchemyBackend(BaseBackend):
                 continue
             if exclude and fname in exclude:
                 continue
-            if self._exclude_sensitive_fields and not (include and fname in include):
-                if _SENSITIVE_PATTERNS.search(fname):
-                    continue
+            if (
+                self._exclude_sensitive_fields
+                and not (include and fname in include)
+                and _SENSITIVE_PATTERNS.search(fname)
+            ):
+                continue
             if is_relation:
                 continue
-            annotations[fname] = Optional[ftype]
+            annotations[fname] = ftype | None
             defaults[fname] = strawberry.UNSET
 
         type_name = name or f"{model.__name__}Input"
@@ -278,7 +281,6 @@ class SQLAlchemyBackend(BaseBackend):
         if not requested and not aggregate_meta.custom_fields:
             return aggregate_meta.aggregates_type(count=0)
 
-        model = aggregate_meta.model
         subq = query.subquery()
         agg_cols: list[Any] = []
 
@@ -968,8 +970,8 @@ def _make_sa_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
-            "order": Optional[list[order_type]],
+            "filter": filter_type | None,
+            "order": list[order_type] | None,
         }
     elif filter_type:
 
@@ -982,7 +984,7 @@ def _make_sa_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
+            "filter": filter_type | None,
         }
     else:
 
@@ -995,7 +997,7 @@ def _make_sa_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "order": Optional[list[order_type]],
+            "order": list[order_type] | None,
         }
 
     return strawberry.field(resolver=resolver)

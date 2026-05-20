@@ -31,7 +31,9 @@ class LazyResolutionExtension(SchemaExtension):
             {"_backend": backend, "_mode": mode},
         )
 
-    def resolve(self, _next: Any, root: Any, info: Any, *args: Any, **kwargs: Any) -> Any:
+    def resolve(
+        self, _next: Any, root: Any, info: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         self._check_django_fk_access(root, info)
         return _next(root, info, *args, **kwargs)
 
@@ -54,7 +56,9 @@ class LazyResolutionExtension(SchemaExtension):
         if backend.__class__.__name__ != "DjangoBackend":
             return
 
-        field_name = getattr(info, "python_name", None) or getattr(info, "field_name", None)
+        field_name = getattr(info, "python_name", None) or getattr(
+            info, "field_name", None
+        )
         if not field_name:
             return
         field_name = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", field_name).lower()

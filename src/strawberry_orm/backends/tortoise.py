@@ -7,7 +7,7 @@ import importlib
 import re
 from collections import defaultdict
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 import strawberry
 from strawberry.extensions import SchemaExtension
@@ -158,9 +158,7 @@ class TortoiseBackend(BaseBackend):
                 related_model = _resolve_related_model(field_obj)
                 result.append((name, Any, True, related_model))
                 seen.add(name)
-                fk_type: type = (
-                    Optional[int] if getattr(field_obj, "null", False) else int
-                )
+                fk_type: type = int | None if getattr(field_obj, "null", False) else int
                 result.append((f"{name}_id", fk_type, False, None))
                 seen.add(f"{name}_id")
                 continue
@@ -250,6 +248,7 @@ class TortoiseBackend(BaseBackend):
                         fname: str,
                         related_model: type,
                         return_ann: Any,
+                        backend: Any,
                     ) -> Any:
                         async def resolver(self: Any, info: Any) -> Any:
                             rel_value = getattr(self, fname)
@@ -260,7 +259,7 @@ class TortoiseBackend(BaseBackend):
                                     pk__in=[item.id for item in list(rel_value)]
                                 )
                             )
-                            qs = self_backend._apply_nested_queryset(  # type: ignore[name-defined]
+                            qs = backend._apply_nested_queryset(
                                 qs,
                                 type(self),
                                 fname,
@@ -279,8 +278,11 @@ class TortoiseBackend(BaseBackend):
                         }
                         return strawberry.field(resolver=resolver)
 
-                    self_backend = self
-                    setattr(cls, field_name, _make_resolver(field_name, rel_model, ann))
+                    setattr(
+                        cls,
+                        field_name,
+                        _make_resolver(field_name, rel_model, ann, self),
+                    )
 
             self._check_lazy_relation_fields(cls, model, annotations)
             return self._finalize_type(cls, model, type_name, name)
@@ -723,14 +725,18 @@ class TortoiseBackend(BaseBackend):
                 type_name = self._type_name_for_model(current_model)
                 if type_name and store:
                     hints = store.get(type_name, field_name)
-                    if hints and not hints.disable_optimization:
-                        if hints.load and not callable(hints.load):
-                            for rel_name in hints.load:
-                                if rel_name in meta.fields_map:
-                                    rel_path = (
-                                        f"{prefix}__{rel_name}" if prefix else rel_name
-                                    )
-                                    prefetch_paths.append(rel_path)
+                    if (
+                        hints
+                        and not hints.disable_optimization
+                        and hints.load
+                        and not callable(hints.load)
+                    ):
+                        for rel_name in hints.load:
+                            if rel_name in meta.fields_map:
+                                rel_path = (
+                                    f"{prefix}__{rel_name}" if prefix else rel_name
+                                )
+                                prefetch_paths.append(rel_path)
 
         for field_node in info.field_nodes:
             _walk_selections(field_node.selection_set, model)
@@ -844,9 +850,11 @@ def _get_reverse_fk_field(
     """Find the FK column on related_model that points back to parent_model."""
     meta = related_model._meta  # type: ignore[attr-defined]
     for name, field_obj in meta.fields_map.items():
-        if type(field_obj).__name__ == "ForeignKeyFieldInstance":
-            if field_obj.related_model is parent_model:
-                return getattr(field_obj, "source_field", f"{name}_id")
+        if (
+            type(field_obj).__name__ == "ForeignKeyFieldInstance"
+            and field_obj.related_model is parent_model
+        ):
+            return getattr(field_obj, "source_field", f"{name}_id")
     return f"{field_name}_id"
 
 
@@ -858,7 +866,6 @@ def _make_tortoise_rel_resolver(
     order_type: Any,
 ) -> Any:
     """Create a Strawberry field for a Tortoise relation with filter/order."""
-    from typing import Optional
 
     info_type = strawberry.types.Info
 
@@ -888,8 +895,8 @@ def _make_tortoise_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
-            "order": Optional[list[order_type]],
+            "filter": filter_type | None,
+            "order": list[order_type] | None,
         }
     elif filter_type:
 
@@ -904,7 +911,7 @@ def _make_tortoise_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
+            "filter": filter_type | None,
         }
     else:
 
@@ -919,7 +926,7 @@ def _make_tortoise_rel_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "order": Optional[list[order_type]],
+            "order": list[order_type] | None,
         }
 
     return strawberry.field(resolver=resolver)

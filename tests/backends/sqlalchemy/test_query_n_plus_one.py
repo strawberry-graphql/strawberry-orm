@@ -315,9 +315,7 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(
-                load=lambda stmt: stmt.where(Post.is_published == True)
-            )  # noqa: E712
+            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
 
         @strawberry.type
         class Q:
@@ -371,9 +369,7 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(
-                load=lambda stmt: stmt.where(Post.is_published == True)
-            )  # noqa: E712
+            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
 
         @strawberry.type
         class Q:
@@ -408,9 +404,7 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(
-                load=lambda stmt: stmt.where(Post.is_published == True)
-            )  # noqa: E712
+            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
 
         @strawberry.type
         class Q:

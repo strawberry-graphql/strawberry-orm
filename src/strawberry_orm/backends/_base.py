@@ -11,10 +11,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Literal, Optional
-
-LazyResolutionMode = Literal["off", "warn", "error"]
-_LAZY_RESOLUTION_MODES: frozenset[str] = frozenset({"off", "warn", "error"})
+from typing import Any, Literal
 
 import strawberry
 
@@ -30,6 +27,9 @@ from strawberry_orm.filters import (
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
 from strawberry_orm.types import DateGroupByOption, Ordering
+
+LazyResolutionMode = Literal["off", "warn", "error"]
+_LAZY_RESOLUTION_MODES: frozenset[str] = frozenset({"off", "warn", "error"})
 
 FieldMeta = tuple[str, type, bool, type | None]
 
@@ -297,7 +297,7 @@ class BaseBackend:
                 continue
             if is_relation:
                 continue
-            annotations[fname] = Optional[ftype]
+            annotations[fname] = ftype | None
             defaults[fname] = strawberry.UNSET
 
         type_name = name or f"{model.__name__}Input"
@@ -371,7 +371,7 @@ class BaseBackend:
                 else:
                     rel_filter = self._filter_registry.get(rel_model)
                 if rel_filter is not None:
-                    object_annotations[fname] = Optional[rel_filter]
+                    object_annotations[fname] = rel_filter | None
                     object_defaults[fname] = strawberry.UNSET
                     relation_models[fname] = rel_model
                 continue
@@ -379,7 +379,7 @@ class BaseBackend:
             if lookup_type is not None:
                 if lookup_type is StringLookup and not enable_regex:
                     lookup_type = StringLookupNoRegex
-                field_annotations[fname] = Optional[lookup_type]
+                field_annotations[fname] = lookup_type | None
                 field_defaults[fname] = strawberry.UNSET
 
         # Reuse the existing FieldType when creating a projected variant.
@@ -401,15 +401,15 @@ class BaseBackend:
 
         filter_type_name = f"{model.__name__}Filter{suffix}"
         filter_ns: dict[str, Any] = {
-            "__annotations__": {"field": Optional[FieldType]},
+            "__annotations__": {"field": FieldType | None},
             "field": strawberry.UNSET,
         }
         FilterCls = type(filter_type_name, (), filter_ns)
 
-        FilterCls.__annotations__["all"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["any"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["not_"] = Optional[FilterCls]
-        FilterCls.__annotations__["one_of"] = Optional[list[FilterCls]]
+        FilterCls.__annotations__["all"] = list[FilterCls] | None
+        FilterCls.__annotations__["any"] = list[FilterCls] | None
+        FilterCls.__annotations__["not_"] = FilterCls | None
+        FilterCls.__annotations__["one_of"] = list[FilterCls] | None
         FilterCls.all = strawberry.UNSET
         FilterCls.any = strawberry.UNSET
         FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
@@ -423,7 +423,7 @@ class BaseBackend:
             }
             obj_cls = type(obj_type_name, (), obj_ns)
             ObjectType = strawberry.input(obj_cls, one_of=True)
-            FilterCls.__annotations__["object"] = Optional[ObjectType]
+            FilterCls.__annotations__["object"] = ObjectType | None
             FilterCls.object = strawberry.UNSET
 
         FilterType = strawberry.input(FilterCls, one_of=True)
@@ -511,11 +511,11 @@ class BaseBackend:
                 if rel_model is not None:
                     rel_order = self._order_registry.get(rel_model)
                     if rel_order is not None:
-                        object_annotations[fname] = Optional[rel_order]
+                        object_annotations[fname] = rel_order | None
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
                 continue
-            field_annotations[fname] = Optional[Ordering]
+            field_annotations[fname] = Ordering | None
             field_defaults[fname] = strawberry.UNSET
 
         field_type_name = f"{model.__name__}OrderField"
@@ -528,7 +528,7 @@ class BaseBackend:
 
         order_type_name = f"{model.__name__}Order"
         order_ns: dict[str, Any] = {
-            "__annotations__": {"field": Optional[OrderFieldType]},
+            "__annotations__": {"field": OrderFieldType | None},
             "field": strawberry.UNSET,
         }
         OrderCls = type(order_type_name, (), order_ns)
@@ -541,7 +541,7 @@ class BaseBackend:
             }
             obj_cls = type(obj_type_name, (), obj_ns)
             OrderObjectType = strawberry.input(obj_cls, one_of=True)
-            OrderCls.__annotations__["object"] = Optional[OrderObjectType]
+            OrderCls.__annotations__["object"] = OrderObjectType | None
             OrderCls.object = strawberry.UNSET
 
         OrderType = strawberry.input(OrderCls, one_of=True)
@@ -622,13 +622,13 @@ class BaseBackend:
                     if lookup_type is not None:
                         if lookup_type is StringLookup and not enable_regex:
                             lookup_type = StringLookupNoRegex
-                        field_annotations[fname] = Optional[lookup_type]
+                        field_annotations[fname] = lookup_type | None
                         field_defaults[fname] = strawberry.UNSET
                 elif fname in rel_info:
                     rel_model = rel_info[fname]
                     rel_filter = self._filter_registry.get(rel_model)
                     if rel_filter is not None:
-                        object_annotations[fname] = Optional[rel_filter]
+                        object_annotations[fname] = rel_filter | None
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
 
@@ -651,7 +651,7 @@ class BaseBackend:
                         f"'value' parameter with a type annotation."
                     )
                 value_type = value_param.annotation
-                custom_filter_annotations[attr_name] = Optional[value_type]
+                custom_filter_annotations[attr_name] = value_type | None
                 custom_filter_defaults[attr_name] = strawberry.UNSET
                 custom_filters[attr_name] = method
 
@@ -669,7 +669,7 @@ class BaseBackend:
         filter_type_name = f"{model.__name__}Filter"
         filter_ns: dict[str, Any] = {"__annotations__": {}}
         if FieldType is not None:
-            filter_ns["__annotations__"]["field"] = Optional[FieldType]
+            filter_ns["__annotations__"]["field"] = FieldType | None
             filter_ns["field"] = strawberry.UNSET
 
         if object_annotations:
@@ -680,7 +680,7 @@ class BaseBackend:
             }
             obj_cls = type(obj_type_name, (), obj_ns)
             ObjectType = strawberry.input(obj_cls, one_of=True)
-            filter_ns["__annotations__"]["object"] = Optional[ObjectType]
+            filter_ns["__annotations__"]["object"] = ObjectType | None
             filter_ns["object"] = strawberry.UNSET
 
         for cname, cann in custom_filter_annotations.items():
@@ -689,10 +689,10 @@ class BaseBackend:
 
         FilterCls = type(filter_type_name, (), filter_ns)
 
-        FilterCls.__annotations__["all"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["any"] = Optional[list[FilterCls]]
-        FilterCls.__annotations__["not_"] = Optional[FilterCls]
-        FilterCls.__annotations__["one_of"] = Optional[list[FilterCls]]
+        FilterCls.__annotations__["all"] = list[FilterCls] | None
+        FilterCls.__annotations__["any"] = list[FilterCls] | None
+        FilterCls.__annotations__["not_"] = FilterCls | None
+        FilterCls.__annotations__["one_of"] = list[FilterCls] | None
         FilterCls.all = strawberry.UNSET
         FilterCls.any = strawberry.UNSET
         FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
@@ -720,7 +720,7 @@ class BaseBackend:
     ) -> Callable[[type], type]:
         """Decorator that builds a ``@oneOf`` order input from a user class.
 
-        ``auto`` annotations are expanded to ``Optional[Ordering]``.
+        ``auto`` annotations are expanded to ``Ordering | None``.
         Methods decorated with ``@order_field`` become additional top-level
         keys on the order input alongside ``field`` and ``object``.
         """
@@ -768,20 +768,20 @@ class BaseBackend:
                 continue
             if ann is strawberry.auto:
                 if fname in col_types:
-                    field_annotations[fname] = Optional[Ordering]
+                    field_annotations[fname] = Ordering | None
                     field_defaults[fname] = strawberry.UNSET
                 elif fname in rel_info:
                     rel_model = rel_info[fname]
                     rel_order = self._order_registry.get(rel_model)
                     if rel_order is not None:
-                        object_annotations[fname] = Optional[rel_order]
+                        object_annotations[fname] = rel_order | None
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
 
         for attr_name in list(vars(cls)):
             method = getattr(cls, attr_name, None)
             if callable(method) and getattr(method, _CUSTOM_ORDER_ATTR, False):
-                custom_order_annotations[attr_name] = Optional[Ordering]
+                custom_order_annotations[attr_name] = Ordering | None
                 custom_order_defaults[attr_name] = strawberry.UNSET
                 custom_orders[attr_name] = method
 
@@ -799,7 +799,7 @@ class BaseBackend:
         order_type_name = f"{model.__name__}Order"
         order_ns: dict[str, Any] = {"__annotations__": {}}
         if OrderFieldType is not None:
-            order_ns["__annotations__"]["field"] = Optional[OrderFieldType]
+            order_ns["__annotations__"]["field"] = OrderFieldType | None
             order_ns["field"] = strawberry.UNSET
 
         if object_annotations:
@@ -810,7 +810,7 @@ class BaseBackend:
             }
             obj_cls = type(obj_type_name, (), obj_ns)
             OrderObjectType = strawberry.input(obj_cls, one_of=True)
-            order_ns["__annotations__"]["object"] = Optional[OrderObjectType]
+            order_ns["__annotations__"]["object"] = OrderObjectType | None
             order_ns["object"] = strawberry.UNSET
 
         for cname, cann in custom_order_annotations.items():
@@ -868,9 +868,9 @@ class BaseBackend:
             if self._exclude_generated_sensitive_field(fname, include):
                 continue
             if ftype in (datetime.date, datetime.datetime):
-                field_annotations[fname] = Optional[DateGroupByOption]
+                field_annotations[fname] = DateGroupByOption | None
             else:
-                field_annotations[fname] = Optional[bool]
+                field_annotations[fname] = bool | None
             field_defaults[fname] = strawberry.UNSET
 
         field_type_name = f"{model.__name__}GroupByField"
@@ -883,7 +883,7 @@ class BaseBackend:
 
         group_type_name = f"{model.__name__}GroupBy"
         group_ns: dict[str, Any] = {
-            "__annotations__": {"field": Optional[GroupByFieldType]},
+            "__annotations__": {"field": GroupByFieldType | None},
             "field": strawberry.UNSET,
         }
         GroupByCls = type(group_type_name, (), group_ns)
@@ -941,19 +941,18 @@ class BaseBackend:
                 continue
             if exclude and fname in exclude:
                 continue
-            if ann is strawberry.auto:
-                if fname in col_types:
-                    ftype = col_types[fname]
-                    if ftype in (datetime.date, datetime.datetime):
-                        field_annotations[fname] = Optional[DateGroupByOption]
-                    else:
-                        field_annotations[fname] = Optional[bool]
-                    field_defaults[fname] = strawberry.UNSET
+            if ann is strawberry.auto and fname in col_types:
+                ftype = col_types[fname]
+                if ftype in (datetime.date, datetime.datetime):
+                    field_annotations[fname] = DateGroupByOption | None
+                else:
+                    field_annotations[fname] = bool | None
+                field_defaults[fname] = strawberry.UNSET
 
         for attr_name in list(vars(cls)):
             method = getattr(cls, attr_name, None)
             if callable(method) and getattr(method, _CUSTOM_GROUP_ATTR, False):
-                custom_group_annotations[attr_name] = Optional[bool]
+                custom_group_annotations[attr_name] = bool | None
                 custom_group_defaults[attr_name] = strawberry.UNSET
                 custom_groups[attr_name] = method
 
@@ -971,7 +970,7 @@ class BaseBackend:
         group_type_name = f"{model.__name__}GroupBy"
         group_ns: dict[str, Any] = {"__annotations__": {}}
         if GroupByFieldType is not None:
-            group_ns["__annotations__"]["field"] = Optional[GroupByFieldType]
+            group_ns["__annotations__"]["field"] = GroupByFieldType | None
             group_ns["field"] = strawberry.UNSET
 
         for cname, cann in custom_group_annotations.items():
@@ -1093,7 +1092,7 @@ class BaseBackend:
             ann: dict[str, Any] = {}
             defs: dict[str, Any] = {}
             for fname, _ in fields:
-                ann[fname] = Optional[float]
+                ann[fname] = float | None
                 defs[fname] = None
             cls_name = f"{model_name}{prefix}Aggregates"
             ns = {"__annotations__": ann, **defs}
@@ -1113,11 +1112,11 @@ class BaseBackend:
             ("max", MaxType),
         ]:
             if sub_type is not None:
-                agg_ann[label] = Optional[sub_type]
+                agg_ann[label] = sub_type | None
                 agg_defs[label] = None
 
         for field_name, _handler, ret_type in custom_agg_handlers:
-            agg_ann[field_name] = Optional[ret_type]
+            agg_ann[field_name] = ret_type | None
             agg_defs[field_name] = None
 
         agg_cls_name = f"{model_name}Aggregates"
@@ -1126,8 +1125,8 @@ class BaseBackend:
 
         key_ann: dict[str, Any] = {}
         key_defs: dict[str, Any] = {}
-        for fname, ftype in groupable_fields:
-            key_ann[fname] = Optional[str]
+        for fname, _ftype in groupable_fields:
+            key_ann[fname] = str | None
             key_defs[fname] = None
         GroupKeyType = strawberry.type(
             type(f"{model_name}GroupKey", (), {"__annotations__": key_ann, **key_defs})
@@ -1293,9 +1292,8 @@ class BaseBackend:
                 del annotations[field_name]
                 continue
             ann = annotations[field_name]
-            if ann is strawberry.auto:
-                if field_name in col_types:
-                    annotations[field_name] = col_types[field_name]
+            if ann is strawberry.auto and field_name in col_types:
+                annotations[field_name] = col_types[field_name]
 
         cls.__annotations__ = annotations
         cls.__orm_model__ = model  # type: ignore[attr-defined]

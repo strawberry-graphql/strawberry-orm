@@ -17,8 +17,8 @@ from strawberry_orm.filters import (
     group_field,
     order_field,
 )
-from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.lazy_resolution import LazyResolutionExtension
+from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import FieldHints, OptimizerExtension, OptimizerStore
 from strawberry_orm.policy import MutationPolicy
 from strawberry_orm.repo import AbstractRepo

@@ -242,7 +242,9 @@ class AbstractTestQueryCustomName:
             def posts(self) -> list[PostObjectType]:
                 return []
 
-        schema = strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
+        strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
         assert UserObjectType.__strawberry_definition__.name == "UserObject"
         assert PostObjectType.__strawberry_definition__.name == "PostObject"
-        assert PostFilter._object_type.__strawberry_definition__.name == "PostFilterObject"
+        assert (
+            PostFilter._object_type.__strawberry_definition__.name == "PostFilterObject"
+        )

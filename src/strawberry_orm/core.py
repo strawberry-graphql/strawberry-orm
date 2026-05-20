@@ -7,7 +7,7 @@ from collections.abc import Callable
 from functools import partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import strawberry
 from strawberry import relay
@@ -130,10 +130,10 @@ def _make_query_resolver(
 
         annotations: dict[str, Any] = {"info": info_type}
         if filter_type:
-            annotations["filter"] = Optional[filter_type]
+            annotations["filter"] = filter_type | None
         if order_type:
-            annotations["order"] = Optional[list[order_type]]
-        annotations["group_by"] = Optional[list[group_type]]
+            annotations["order"] = list[order_type] | None
+        annotations["group_by"] = list[group_type] | None
         resolver.__annotations__ = annotations
     elif filter_type and order_type:
 
@@ -149,8 +149,8 @@ def _make_query_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
-            "order": Optional[list[order_type]],
+            "filter": filter_type | None,
+            "order": list[order_type] | None,
         }
     elif filter_type:
 
@@ -162,7 +162,7 @@ def _make_query_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "filter": Optional[filter_type],
+            "filter": filter_type | None,
         }
     elif order_type:
 
@@ -174,7 +174,7 @@ def _make_query_resolver(
 
         resolver.__annotations__ = {
             "info": info_type,
-            "order": Optional[list[order_type]],
+            "order": list[order_type] | None,
         }
     else:
 
@@ -249,7 +249,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                 StrawberryArgument(
                     python_name="filter",
                     graphql_name=None,
-                    type_annotation=StrawberryAnnotation(Optional[self._filters]),
+                    type_annotation=StrawberryAnnotation(self._filters | None),
                     default=None,
                 )
             )
@@ -259,7 +259,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                 StrawberryArgument(
                     python_name="order",
                     graphql_name=None,
-                    type_annotation=StrawberryAnnotation(Optional[list[self._order]]),
+                    type_annotation=StrawberryAnnotation(list[self._order] | None),
                     default=None,
                 )
             )
@@ -269,7 +269,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                 StrawberryArgument(
                     python_name="group_by",
                     graphql_name="groupBy",
-                    type_annotation=StrawberryAnnotation(Optional[list[self._group]]),
+                    type_annotation=StrawberryAnnotation(list[self._group] | None),
                     default=None,
                 )
             )
@@ -403,7 +403,7 @@ class _AutoFilterOrderExtension(FieldExtension):
         if isawaitable(result):
             result = await await_maybe(result)
 
-        forwarded = self._resolver_kwargs(kwargs)
+        self._resolver_kwargs(kwargs)
         if self._model is not None and self._backend.is_query_object(result):
             materialize = self._backend.materialize_query
             if iscoroutinefunction(materialize):
@@ -632,11 +632,11 @@ def _build_grouped_connection(
 
     page_info_ns: dict[str, Any] = {
         "__annotations__": {
-            "start_cursor": Optional[str],
-            "end_cursor": Optional[str],
+            "start_cursor": str | None,
+            "end_cursor": str | None,
             "has_previous_page": bool,
             "has_next_page": bool,
-            "aggregates": Optional[AggregatesType],
+            "aggregates": AggregatesType | None,
         },
         "aggregates": None,
     }
@@ -712,8 +712,8 @@ def _build_grouped_connection(
     conn_ns: dict[str, Any] = {
         "__annotations__": {
             "page_info": ExtPageInfo,
-            "aggregates": Optional[AggregatesType],
-            "groups": Optional[list[GroupType]],
+            "aggregates": AggregatesType | None,
+            "groups": list[GroupType] | None,
         },
         "aggregates": None,
         "groups": None,

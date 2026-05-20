@@ -761,7 +761,8 @@ class TestAdvisory3_DefaultQueryLimit:
 
     def test_sa_default_queryset_has_limit(self, engine, seeded):
         """SQLAlchemy get_default_queryset should produce a LIMIT clause."""
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
             default_query_limit=100,
         )
         stmt = orm.get_default_queryset(AuditUser)
@@ -777,7 +778,8 @@ class TestAdvisory3_DefaultQueryLimit:
 
     def test_sa_default_limit_actual_row_count(self, engine, seeded):
         """LIMIT should actually restrict the returned rows."""
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
             default_query_limit=2,
         )
         stmt = orm.get_default_queryset(AuditUser)
@@ -845,7 +847,8 @@ class TestAdvisory5_StringLookupNoRegex:
 
     def test_filter_uses_no_regex_by_default(self):
         """With enable_regex_filters=False, filter() should use StringLookupNoRegex."""
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
             enable_regex_filters=False,
         )
         filt = orm.filter(AuditUser)
@@ -865,7 +868,8 @@ class TestAdvisory5_StringLookupNoRegex:
 
     def test_filter_uses_regex_when_enabled(self):
         """With enable_regex_filters=True, filter() should use StringLookup."""
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite",
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
             enable_regex_filters=True,
         )
         filt = orm.filter(AuditUser)

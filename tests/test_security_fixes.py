@@ -307,7 +307,7 @@ class TestFix3_FutureAnnotationsCompat:
                 return select(Account)
 
         try:
-            schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+            strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
         except Exception as e:
             pytest.fail(f"Schema creation crashed with PEP 563 types: {e}")
 
@@ -456,7 +456,8 @@ class TestFix6_RegexValidation:
     @pytest.fixture(autouse=True)
     def _setup(self, seeded):
         self.session = seeded
-        self.orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", enable_regex_filters=False
+        self.orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite", enable_regex_filters=False
         )
         filt = self.orm.filter(Account)
 

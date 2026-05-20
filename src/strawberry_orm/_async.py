@@ -23,7 +23,7 @@ def in_async_context() -> bool:
     return True
 
 
-def run_sync(
+def run_sync[T](
     func: Callable[..., T],
     *args: Any,
     thread_sensitive: bool = False,
@@ -61,7 +61,7 @@ def materialize_result(
     return backend.materialize_query(value, info)
 
 
-def run_orm_work(
+def run_orm_work[T](
     func: Callable[..., T],
     *args: Any,
     thread_sensitive: bool = True,
@@ -71,7 +71,7 @@ def run_orm_work(
     return run_sync(func, *args, thread_sensitive=thread_sensitive, **kwargs)
 
 
-def run_orm_work_blocking(
+def run_orm_work_blocking[T](
     func: Callable[..., T],
     *args: Any,
     **kwargs: Any,
@@ -89,7 +89,7 @@ def run_orm_work_blocking(
         return pool.submit(call).result()
 
 
-async def await_maybe(value: AwaitableOrValue[T]) -> T:
+async def await_maybe[T](value: AwaitableOrValue[T]) -> T:
     """Await *value* when needed, otherwise return it unchanged."""
     if isawaitable(value):
         return await value

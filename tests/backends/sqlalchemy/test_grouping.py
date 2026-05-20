@@ -706,7 +706,7 @@ class TestEdgeCases:
         GroupBase.metadata.create_all(empty_engine)
         empty_session = sessionmaker(bind=empty_engine)()
 
-        result = schema.execute_sync(
+        schema.execute_sync(
             """
             query {
                 orders(first: 10) {

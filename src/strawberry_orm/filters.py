@@ -274,7 +274,7 @@ def aggregate_field(func):
     the Strawberry ``Info`` when present in the signature.
 
     The method's return-type annotation determines the GraphQL scalar
-    type of the aggregate field (defaults to ``Optional[float]``).
+    type of the aggregate field (defaults to ``float | None``).
 
     Usage inside an ``@orm.aggregate_type(Order)`` class::
 

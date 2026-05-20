@@ -187,4 +187,6 @@ class TestRelayConnectionFilteringAndOrdering:
             },
         )
         assert second_page.errors is None
-        assert second_page.data["usersConnection"]["edges"][0]["node"]["name"] == "Alice"
+        assert (
+            second_page.data["usersConnection"]["edges"][0]["node"]["name"] == "Alice"
+        )

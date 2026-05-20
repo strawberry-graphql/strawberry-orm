@@ -2,7 +2,6 @@
 
 import asyncio
 from types import SimpleNamespace
-from typing import Optional
 
 import pytest
 import strawberry
@@ -44,7 +43,7 @@ class DummyAutoField:
 
 class TestInternalSharedCoverage:
     def test_core_helper_functions_cover_none_and_wrapper_methods(self):
-        assert _unwrap_optional_annotation(Optional[int]) is int
+        assert _unwrap_optional_annotation(int | None) is int
         assert _unwrap_optional_annotation(int | str | None) == int | str | None
         assert _extract_connection_node(int) is None
         assert _resolve_orm_metadata(int) == (None, None, None, None, None)

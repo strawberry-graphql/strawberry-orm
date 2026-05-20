@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from enum import Enum
 from typing import Any
 
@@ -65,10 +66,8 @@ def _seed_django() -> None:
 
     with connection.schema_editor() as editor:
         for model in (DjUser, DjTag, DjPost, DjComment):
-            try:
+            with contextlib.suppress(Exception):
                 editor.create_model(model)
-            except Exception:
-                pass
 
     alice = DjUser.objects.create(id=1, name="Alice", email="alice@example.com")
     bob = DjUser.objects.create(id=2, name="Bob", email="bob@example.com")

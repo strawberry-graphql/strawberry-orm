@@ -46,7 +46,7 @@ async def seed(tortoise_db):
         is_published=True,
         author=alice,
     )
-    p3 = await Post.create(
+    await Post.create(
         id=3,
         title="Draft Post",
         body="Not published yet",

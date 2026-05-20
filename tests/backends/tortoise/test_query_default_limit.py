@@ -7,7 +7,7 @@ from tests.abstract.query_default_limit import AbstractTestQueryDefaultLimitAsyn
 @pytest.fixture
 def make_default_limit_orm():
     def _make(**kwargs):
-        return StrawberryORM.for_tortoise( **kwargs)
+        return StrawberryORM.for_tortoise(**kwargs)
 
     return _make
 

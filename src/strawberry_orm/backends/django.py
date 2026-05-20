@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from inspect import iscoroutinefunction
+from typing import Any
 
 import strawberry
 from strawberry.extensions import SchemaExtension
-
-from inspect import iscoroutinefunction
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
 from strawberry_orm.optimizer import OptimizerExtension
@@ -172,7 +171,7 @@ class DjangoBackend(BaseBackend):
                     if attname and attname != field_obj.name:
                         fk_type: type = int
                         if getattr(field_obj, "null", False):
-                            fk_type = Optional[int]
+                            fk_type = int | None
                         col_types[attname] = fk_type
                     continue
                 py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
@@ -747,26 +746,30 @@ class DjangoBackend(BaseBackend):
                     type_name = self._type_name_for_model(current_model)
                     if type_name and store:
                         hints = store.get(type_name, field_name)
-                        if hints and not hints.disable_optimization:
-                            if hints.load and not callable(hints.load):
-                                for rel_name in hints.load:
-                                    try:
-                                        rel_field = meta.get_field(rel_name)
-                                    except Exception:
-                                        continue
-                                    rel_class = type(rel_field).__name__
-                                    rel_path = (
-                                        f"{prefix}__{rel_name}" if prefix else rel_name
-                                    )
-                                    is_fk = rel_class in (
-                                        "ForeignKey",
-                                        "OneToOneField",
-                                        "OneToOneRel",
-                                    )
-                                    if is_fk and not in_prefetch:
-                                        select_related.append(rel_path)
-                                    else:
-                                        prefetch_related.append(rel_path)
+                        if (
+                            hints
+                            and not hints.disable_optimization
+                            and hints.load
+                            and not callable(hints.load)
+                        ):
+                            for rel_name in hints.load:
+                                try:
+                                    rel_field = meta.get_field(rel_name)
+                                except Exception:
+                                    continue
+                                rel_class = type(rel_field).__name__
+                                rel_path = (
+                                    f"{prefix}__{rel_name}" if prefix else rel_name
+                                )
+                                is_fk = rel_class in (
+                                    "ForeignKey",
+                                    "OneToOneField",
+                                    "OneToOneRel",
+                                )
+                                if is_fk and not in_prefetch:
+                                    select_related.append(rel_path)
+                                else:
+                                    prefetch_related.append(rel_path)
 
             for field_node in info.field_nodes:
                 _walk_selections(field_node.selection_set, model)
@@ -831,21 +834,21 @@ def _make_dj_rel_resolver(
             return _resolve(self, filter=filter, order=order)
 
         resolver.__annotations__ = {
-            "filter": Optional[filter_type],
-            "order": Optional[list[order_type]],
+            "filter": filter_type | None,
+            "order": list[order_type] | None,
         }
     elif filter_type:
 
         def resolver(self: Any, filter: Any = None) -> list[Any]:
             return _resolve(self, filter=filter, order=None)
 
-        resolver.__annotations__ = {"filter": Optional[filter_type]}
+        resolver.__annotations__ = {"filter": filter_type | None}
     else:
 
         def resolver(self: Any, order: Any = None) -> list[Any]:
             return _resolve(self, filter=None, order=order)
 
-        resolver.__annotations__ = {"order": Optional[list[order_type]]}
+        resolver.__annotations__ = {"order": list[order_type] | None}
 
     if getattr(backend, "_django_async_safe", False):
         resolver = async_safe_resolver(resolver)
@@ -960,7 +963,7 @@ def _build_django_filter(
                 )
             combined = Q()
             has_clause = False
-            for i, f in enumerate(val):
+            for _i, f in enumerate(val):
                 sub_clause, query = _build_django_filter(
                     f, **{**recurse_kw, "query": query}
                 )
@@ -978,7 +981,7 @@ def _build_django_filter(
                 )
             combined = Q()
             has_clause = False
-            for i, f in enumerate(val):
+            for _i, f in enumerate(val):
                 sub_clause, query = _build_django_filter(
                     f, **{**recurse_kw, "query": query}
                 )

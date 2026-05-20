@@ -7,7 +7,7 @@ from tests.abstract.query_default_limit import AbstractTestQueryDefaultLimitSync
 @pytest.fixture
 def make_default_limit_orm():
     def _make(**kwargs):
-        return StrawberryORM.for_django( **kwargs)
+        return StrawberryORM.for_django(**kwargs)
 
     return _make
 

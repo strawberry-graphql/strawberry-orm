@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.9.0"
+version = "0.9.1"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -73,6 +73,9 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["strawberry_orm"]
+
+[tool.ruff.lint.per-file-ignores]
+"cli.py" = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

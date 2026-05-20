@@ -547,9 +547,9 @@ class TestErrorInformationLeakage:
         )
         # If there's an error, check if it leaks table/column names
         if result.errors:
-            error_msg = str(result.errors[0])
+            str(result.errors[0])
             # This test documents that errors may contain internal details
-            assert "sec_user" in error_msg or "username" in error_msg or True
+            assert True
 
 
 # =========================================================================

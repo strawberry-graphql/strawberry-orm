@@ -114,7 +114,7 @@ class TestCheckPolicy:
 class TestRefListPolicy:
     def test_create_denied_by_policy(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=DenyAllPolicy())
+        orm = StrawberryORM.for_django(policy=DenyAllPolicy())
 
         @strawberry.input
         class CreateTag:
@@ -130,7 +130,7 @@ class TestRefListPolicy:
 
     def test_update_denied_by_policy(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=DenyUpdatePolicy())
+        orm = StrawberryORM.for_django(policy=DenyUpdatePolicy())
 
         @strawberry.input
         class UpdateTag:
@@ -147,7 +147,7 @@ class TestRefListPolicy:
 
     def test_delete_denied_by_policy(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=DenyDeletePolicy())
+        orm = StrawberryORM.for_django(policy=DenyDeletePolicy())
 
         @strawberry.input
         class DeleteRef:
@@ -163,7 +163,7 @@ class TestRefListPolicy:
 
     def test_unlink_denied_by_policy(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=DenyUnlinkPolicy())
+        orm = StrawberryORM.for_django(policy=DenyUnlinkPolicy())
 
         @strawberry.input
         class UnlinkRef:
@@ -179,7 +179,7 @@ class TestRefListPolicy:
 
     def test_scope_query_hides_objects(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=ScopingPolicy())
+        orm = StrawberryORM.for_django(policy=ScopingPolicy())
 
         @strawberry.input
         class UpdateTag:
@@ -198,7 +198,7 @@ class TestRefListPolicy:
 
     def test_authorize_callback_takes_precedence(self, setup_tables):
         data = _seed()
-        orm = StrawberryORM.for_django( policy=DenyAllPolicy())
+        orm = StrawberryORM.for_django(policy=DenyAllPolicy())
 
         @strawberry.input
         class CreateTag:
