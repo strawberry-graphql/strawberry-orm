@@ -90,3 +90,27 @@ class Comment(Base):
         remote_side=[id], back_populates="replies"
     )
     replies: Mapped[list[Comment]] = relationship(back_populates="parent")
+
+
+class Publisher(Base):
+    """Related model with a non-``id`` primary key."""
+
+    __tablename__ = "publisher"
+
+    publisher_code: Mapped[str] = mapped_column(String(20), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+
+
+class Book(Base):
+    __tablename__ = "book"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    publisher_code: Mapped[str] = mapped_column(ForeignKey("publisher.publisher_code"))
+    prequel_id: Mapped[int | None] = mapped_column(ForeignKey("book.id"), nullable=True)
+
+    publisher: Mapped[Publisher] = relationship()
+    prequel: Mapped[Book | None] = relationship(
+        remote_side=[id], back_populates="sequels"
+    )
+    sequels: Mapped[list[Book]] = relationship(back_populates="prequel")

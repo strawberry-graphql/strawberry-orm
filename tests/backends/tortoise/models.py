@@ -57,3 +57,25 @@ class Comment(Model):
 
     class Meta:
         table = "comment"
+
+
+class Publisher(Model):
+    """Related model with a non-``id`` primary key."""
+
+    publisher_code = fields.CharField(max_length=20, pk=True)
+    name = fields.CharField(max_length=100)
+
+    class Meta:
+        table = "publisher"
+
+
+class Book(Model):
+    id = fields.IntField(primary_key=True)
+    title = fields.CharField(max_length=200)
+    publisher = fields.ForeignKeyField("models.Publisher", related_name="books")
+    prequel = fields.ForeignKeyField("models.Book", related_name="sequels", null=True)
+
+    sequels: fields.ReverseRelation[Book]
+
+    class Meta:
+        table = "book"

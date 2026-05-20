@@ -16,6 +16,9 @@ from tests.backends.tortoise.models import (
     Post as TortPost,
 )
 from tests.backends.tortoise.models import (
+    Publisher as TortPublisher,
+)
+from tests.backends.tortoise.models import (
     Tag as TortTag,
 )
 from tests.backends.tortoise.models import (
@@ -465,6 +468,11 @@ def Tag():
 @pytest.fixture
 def Comment():
     return TortComment
+
+
+@pytest.fixture
+def Publisher():
+    return TortPublisher
 
 
 @pytest_asyncio.fixture

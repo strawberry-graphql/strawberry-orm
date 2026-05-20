@@ -76,6 +76,12 @@ class SQLAlchemyBackend(BaseBackend):
         column and relationship on an SQLAlchemy mapped class."""
         return _introspect_sa_model(model)
 
+    def _get_pk_names(self, model: type) -> set[str]:
+        from sqlalchemy import inspect as sa_inspect
+
+        mapper = sa_inspect(model)
+        return {col.key for col in mapper.primary_key}
+
     # -- Type generation -----------------------------------------------------
 
     def type(self, model: type, **kwargs: Any) -> Any:
@@ -1126,7 +1132,11 @@ def _build_sa_filter(
         if val is strawberry.UNSET or val is None:
             continue
 
-        if key == "field":
+        if key == "is_null":
+            from strawberry_orm.backends._base import _FILTER_RELATION_PRESENCE_ERROR
+
+            raise ValueError(_FILTER_RELATION_PRESENCE_ERROR)
+        elif key == "field":
             clause = _build_sa_field_clause(
                 val,
                 model,
@@ -1141,9 +1151,24 @@ def _build_sa_filter(
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
                 relationship_prop = getattr(model, rel_name)
+                is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
+                if is_null_val is not strawberry.UNSET and is_null_val is not None:
+                    if relationship_prop.property.uselist:
+                        raise ValueError(
+                            f"is_null is not supported for many-relation "
+                            f"'{rel_name}'. Use a custom @filter_field for M2M "
+                            "presence."
+                        )
+                    local_col = list(relationship_prop.property.local_columns)[0]
+                    clause = (
+                        local_col.is_(None) if is_null_val else local_col.isnot(None)
+                    )
+                    return clause, query
                 rel_model = relationship_prop.property.mapper.class_
                 inner, query = _build_sa_filter(
-                    nested_filter, rel_model, **{**recurse_kw, "query": query}
+                    nested_filter,
+                    rel_model,
+                    **{**recurse_kw, "query": query},
                 )
                 if inner is not None:
                     if relationship_prop.property.uselist:

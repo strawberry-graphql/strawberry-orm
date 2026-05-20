@@ -158,7 +158,14 @@ class TortoiseBackend(BaseBackend):
                 related_model = _resolve_related_model(field_obj)
                 result.append((name, Any, True, related_model))
                 seen.add(name)
-                fk_type: type = int | None if getattr(field_obj, "null", False) else int
+                fk_type: type = int
+                if related_model is not None:
+                    pk_attr = related_model._meta.pk_attr  # type: ignore[attr-defined]
+                    pk_field = related_model._meta.fields_map.get(pk_attr)  # type: ignore[attr-defined]
+                    if pk_field is not None and type(pk_field).__name__ == "CharField":
+                        fk_type = str
+                if getattr(field_obj, "null", False):
+                    fk_type = fk_type | None  # type: ignore[assignment]
                 result.append((f"{name}_id", fk_type, False, None))
                 seen.add(f"{name}_id")
                 continue
@@ -179,6 +186,10 @@ class TortoiseBackend(BaseBackend):
             seen.add(name)
 
         return result
+
+    def _get_pk_names(self, model: type) -> set[str]:
+        meta = model._meta  # type: ignore[attr-defined]
+        return {meta.pk_attr}
 
     # -- Type generation -----------------------------------------------------
 
@@ -990,7 +1001,18 @@ def _build_tortoise_filter(
         if val is strawberry.UNSET or val is None:
             continue
 
-        if key == "field":
+        if key == "is_null":
+            if not _prefix:
+                from strawberry_orm.backends._base import (
+                    _FILTER_RELATION_PRESENCE_ERROR,
+                )
+
+                raise ValueError(_FILTER_RELATION_PRESENCE_ERROR)
+            from tortoise.expressions import Q
+
+            rel_name = _prefix.removesuffix("__")
+            return Q(**{f"{rel_name}_id__isnull": val}), query
+        elif key == "field":
             clause = _build_tortoise_field_clause(
                 val,
                 prefix=_prefix,

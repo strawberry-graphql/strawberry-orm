@@ -113,16 +113,30 @@ class DjangoBackend(BaseBackend):
                     field.related_model if hasattr(field, "related_model") else None
                 )
                 result.append((field.name, Any, True, related_model))
-                # Also expose the _id column as a concrete integer field
                 attname = getattr(field, "attname", None)
                 if attname and attname != field.name:
-                    result.append((attname, int, False, None))
+                    fk_type: type = int
+                    if related_model is not None:
+                        pk_field = related_model._meta.pk
+                        if pk_field is not None:
+                            fk_type = _DJANGO_FIELD_MAP.get(
+                                type(pk_field).__name__, str
+                            )
+                    if getattr(field, "null", False):
+                        fk_type = fk_type | None  # type: ignore[assignment]
+                    result.append((attname, fk_type, False, None))
                 continue
 
             py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
             result.append((field.name, py_type, False, None))
 
         return result
+
+    def _get_pk_names(self, model: type) -> set[str]:
+        meta = model._meta  # type: ignore[attr-defined]
+        if meta.pk is None:
+            return set()
+        return {meta.pk.name}
 
     # -- Type generation -----------------------------------------------------
 
@@ -916,7 +930,15 @@ def _build_django_filter(
         if val is strawberry.UNSET or val is None:
             continue
 
-        if key == "field":
+        if key == "is_null":
+            if not _prefix:
+                from strawberry_orm.backends._base import (
+                    _FILTER_RELATION_PRESENCE_ERROR,
+                )
+
+                raise ValueError(_FILTER_RELATION_PRESENCE_ERROR)
+            return Q(**{f"{_prefix}isnull": val}), query
+        elif key == "field":
             clause = _build_django_field_clause(
                 val,
                 prefix=_prefix,

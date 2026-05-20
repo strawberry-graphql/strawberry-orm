@@ -82,6 +82,7 @@ TORT_EXCLUDED_FILES = {
     "test_backend.py",
     "test_ref_type.py",
     "test_internal_tortoise_extra_coverage.py",
+    "test_query_filter_relation_presence.py",
 }
 
 

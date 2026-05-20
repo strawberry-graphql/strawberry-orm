@@ -45,3 +45,32 @@ class Comment(models.Model):
     class Meta:
         app_label = "testapp"
         db_table = "comment"
+
+
+class Publisher(models.Model):
+    """Related model with a non-``id`` primary key."""
+
+    publisher_code = models.CharField(max_length=20, primary_key=True)
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        db_table = "publisher"
+
+
+class Book(models.Model):
+    title = models.CharField(max_length=200)
+    publisher = models.ForeignKey(
+        Publisher, on_delete=models.CASCADE, related_name="books"
+    )
+    prequel = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        related_name="sequels",
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        app_label = "testapp"
+        db_table = "book"

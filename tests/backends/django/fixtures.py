@@ -22,6 +22,9 @@ from tests.backends.django.models import (
     Post as DjPost,
 )
 from tests.backends.django.models import (
+    Publisher as DjPublisher,
+)
+from tests.backends.django.models import (
     Tag as DjTag,
 )
 from tests.backends.django.models import (
@@ -478,6 +481,11 @@ def Tag():
 @pytest.fixture
 def Comment():
     return DjComment
+
+
+@pytest.fixture
+def Publisher():
+    return DjPublisher
 
 
 # -- DB setup fixtures -------------------------------------------------------

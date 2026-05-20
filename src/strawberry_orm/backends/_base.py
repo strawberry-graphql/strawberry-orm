@@ -33,12 +33,23 @@ _LAZY_RESOLUTION_MODES: frozenset[str] = frozenset({"off", "warn", "error"})
 
 FieldMeta = tuple[str, type, bool, type | None]
 
+_FILTER_RELATION_PRESENCE_ERROR = (
+    "Filter is_null is only valid under object.<relation> for FK presence on the "
+    "parent row. Use field.<fk_id>.isNull for the FK column, or nest under object."
+)
+
 _SENSITIVE_PATTERNS = re.compile(
     r"(password|passwd|secret|token|api_key|apikey|hash|ssn|"
     r"credit_card|creditcard|private_key|privatekey|admin|staff|"
     r"superuser|permission|role)",
     re.IGNORECASE,
 )
+
+
+def _annotate_filter_relation_presence(FilterCls: type) -> None:
+    """Add ``is_null`` for FK presence when the filter is used under ``object``."""
+    FilterCls.__annotations__["is_null"] = bool | None
+    FilterCls.is_null = strawberry.UNSET
 
 
 _KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
@@ -352,6 +363,7 @@ class BaseBackend:
         object_annotations: dict[str, Any] = {}
         object_defaults: dict[str, Any] = {}
         relation_models: dict[str, type] = {}
+        pending_self_relations: list[str] = []
 
         for fname, ftype, is_relation, rel_model in fields_meta:
             if include and fname not in include:
@@ -372,6 +384,10 @@ class BaseBackend:
                     rel_filter = self._filter_registry.get(rel_model)
                 if rel_filter is not None:
                     object_annotations[fname] = rel_filter | None
+                    object_defaults[fname] = strawberry.UNSET
+                    relation_models[fname] = rel_model
+                elif rel_model == model:
+                    pending_self_relations.append(fname)
                     object_defaults[fname] = strawberry.UNSET
                     relation_models[fname] = rel_model
                 continue
@@ -414,6 +430,7 @@ class BaseBackend:
         FilterCls.any = strawberry.UNSET
         FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
         FilterCls.one_of = strawberry.UNSET
+        _annotate_filter_relation_presence(FilterCls)
 
         if object_annotations:
             obj_type_name = f"{model.__name__}FilterObject{suffix}"
@@ -432,6 +449,16 @@ class BaseBackend:
         if object_annotations:
             FilterType._object_type = ObjectType  # type: ignore[attr-defined]
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
+
+        if pending_self_relations:
+            if project is None:
+                self._filter_registry[model] = FilterType
+            return self.filter(
+                model,
+                include=include,
+                exclude=exclude,
+                project=project,
+            )
 
         if project is None:
             self._filter_registry[model] = FilterType
@@ -604,6 +631,7 @@ class BaseBackend:
         object_annotations: dict[str, Any] = {}
         object_defaults: dict[str, Any] = {}
         relation_models: dict[str, type] = {}
+        pending_self_relations: list[str] = []
         custom_filter_annotations: dict[str, Any] = {}
         custom_filter_defaults: dict[str, Any] = {}
         custom_filters: dict[str, Callable[..., Any]] = {}
@@ -629,6 +657,10 @@ class BaseBackend:
                     rel_filter = self._filter_registry.get(rel_model)
                     if rel_filter is not None:
                         object_annotations[fname] = rel_filter | None
+                        object_defaults[fname] = strawberry.UNSET
+                        relation_models[fname] = rel_model
+                    elif rel_model == model:
+                        pending_self_relations.append(fname)
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
 
@@ -672,17 +704,6 @@ class BaseBackend:
             filter_ns["__annotations__"]["field"] = FieldType | None
             filter_ns["field"] = strawberry.UNSET
 
-        if object_annotations:
-            obj_type_name = f"{model.__name__}FilterObject"
-            obj_ns: dict[str, Any] = {
-                "__annotations__": object_annotations,
-                **object_defaults,
-            }
-            obj_cls = type(obj_type_name, (), obj_ns)
-            ObjectType = strawberry.input(obj_cls, one_of=True)
-            filter_ns["__annotations__"]["object"] = ObjectType | None
-            filter_ns["object"] = strawberry.UNSET
-
         for cname, cann in custom_filter_annotations.items():
             filter_ns["__annotations__"][cname] = cann
             filter_ns[cname] = custom_filter_defaults[cname]
@@ -697,6 +718,29 @@ class BaseBackend:
         FilterCls.any = strawberry.UNSET
         FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
         FilterCls.one_of = strawberry.UNSET
+        _annotate_filter_relation_presence(FilterCls)
+
+        ObjectType = None
+        if object_annotations:
+            obj_type_name = f"{model.__name__}FilterObject"
+            obj_ns: dict[str, Any] = {
+                "__annotations__": object_annotations,
+                **object_defaults,
+            }
+            obj_cls = type(obj_type_name, (), obj_ns)
+            ObjectType = strawberry.input(obj_cls, one_of=True)
+            filter_ns["__annotations__"]["object"] = ObjectType | None
+            filter_ns["object"] = strawberry.UNSET
+            FilterCls = type(filter_type_name, (), filter_ns)
+            FilterCls.__annotations__["all"] = list[FilterCls] | None
+            FilterCls.__annotations__["any"] = list[FilterCls] | None
+            FilterCls.__annotations__["not_"] = FilterCls | None
+            FilterCls.__annotations__["one_of"] = list[FilterCls] | None
+            FilterCls.all = strawberry.UNSET
+            FilterCls.any = strawberry.UNSET
+            FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
+            FilterCls.one_of = strawberry.UNSET
+            _annotate_filter_relation_presence(FilterCls)
 
         FilterType = strawberry.input(FilterCls, one_of=True)
         FilterType.__orm_model__ = model  # type: ignore[attr-defined]
@@ -707,6 +751,12 @@ class BaseBackend:
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
         if custom_filters:
             FilterType._custom_filters = custom_filters  # type: ignore[attr-defined]
+
+        if pending_self_relations:
+            self._filter_registry[model] = FilterType
+            return self._build_custom_filter_type(
+                cls, model, include=include, exclude=exclude
+            )
 
         self._filter_registry[model] = FilterType
         return FilterType

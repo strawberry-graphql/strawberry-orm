@@ -23,6 +23,9 @@ from tests.backends.sqlalchemy.models import (
     Post as SAPost,
 )
 from tests.backends.sqlalchemy.models import (
+    Publisher as SAPublisher,
+)
+from tests.backends.sqlalchemy.models import (
     Tag as SATag,
 )
 from tests.backends.sqlalchemy.models import (
@@ -511,6 +514,11 @@ def Tag():
 @pytest.fixture
 def Comment():
     return SAComment
+
+
+@pytest.fixture
+def Publisher():
+    return SAPublisher
 
 
 # -- Session / DB fixtures ---------------------------------------------------

@@ -102,6 +102,13 @@ class AbstractTestQueryInputGeneration:
         assert "posts" not in field_names
         assert "comments" not in field_names
 
+    def test_input_excludes_non_id_primary_key(self, orm, Publisher):
+        PublisherInput = orm.input(Publisher)
+        definition = PublisherInput.__strawberry_definition__
+        field_names = {f.name for f in definition.fields}
+        assert "publisher_code" not in field_names
+        assert "name" in field_names
+
     def test_input_includes_scalar_columns(self, orm, User):
         UserInput = orm.input(User)
         definition = UserInput.__strawberry_definition__
