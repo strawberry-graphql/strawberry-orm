@@ -53,6 +53,16 @@ EXCLUDED_METHODS = {
         "TestRelayConnectionFilteringAndOrdering",
         "test_async_filter_and_order_are_applied_before_pagination",
     ),
+    (
+        "test_query_filter_reference_lookup.py",
+        "TestQueryFilterReferenceLookup",
+        "test_object_author_id_filter_avoids_join",
+    ),
+    (
+        "test_query_filter_reference_lookup.py",
+        "TestQueryFilterReferenceLookup",
+        "test_object_author_name_filter_may_join",
+    ),
 }
 
 
@@ -88,6 +98,8 @@ TORT_EXCLUDED_FILES = {
     "test_ref_type.py",
     "test_internal_tortoise_extra_coverage.py",
     "test_query_filter_relation_presence.py",
+    "test_query_filter_reference_lookup.py",
+    "test_query_filter_reference_lookup_custom_pk.py",
 }
 
 

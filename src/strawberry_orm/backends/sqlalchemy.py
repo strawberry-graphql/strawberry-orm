@@ -19,6 +19,10 @@ from strawberry_orm.backends._base import (
     invoke_custom_callback,
     requested_aggregates,
 )
+from strawberry_orm.backends.filter_pk_shortcut import (
+    build_reference_object_filter_clause,
+)
+from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 from strawberry_orm.types import DateGroupByInterval
 
@@ -1065,7 +1069,17 @@ def _introspect_sa_model(
             impl_name = type(col.type.impl).__name__.upper()
             py_type = _SA_TYPE_MAP.get(impl_name, py_type)
 
-        result.append((col.key, py_type, False, None))
+        fk_target = None
+        if col.foreign_keys:
+            fk = next(iter(col.foreign_keys))
+            target_table = fk.column.table if fk.column is not None else None
+            if target_table is not None:
+                for rel_mapper in mapper.registry.mappers:
+                    if rel_mapper.local_table is target_table:
+                        fk_target = rel_mapper.class_
+                        break
+
+        result.append((col.key, py_type, False, fk_target))
 
     for rel in mapper.relationships:
         target_model = rel.mapper.class_
@@ -1165,6 +1179,19 @@ def _build_sa_filter(
                     )
                     return clause, query
                 rel_model = relationship_prop.property.mapper.class_
+                if not relationship_prop.property.uselist:
+                    local_col = list(relationship_prop.property.local_columns)[0]
+                    fk_clause = build_reference_object_filter_clause(
+                        nested_filter,
+                        build_field_clause=_build_sa_reference_field_clause,
+                        custom_filter_keys=frozenset(custom_filters.keys()),
+                        max_branches=max_branches,
+                        local_col=local_col,
+                        enable_regex=enable_regex,
+                        max_in_list_size=max_in_list_size,
+                    )
+                    if fk_clause is not None:
+                        return fk_clause, query
                 inner, query = _build_sa_filter(
                     nested_filter,
                     rel_model,
@@ -1272,6 +1299,99 @@ def _escape_like(val: str) -> str:
     return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _coerce_reference_value(val: Any) -> Any:
+    if isinstance(val, list):
+        return [_coerce_reference_value(item) for item in val]
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return val
+    text = str(val)
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _build_reference_lookup_clauses(
+    column: Any,
+    lookup: Any,
+    *,
+    max_in_list_size: int = 500,
+) -> list[Any]:
+    if not is_reference_lookup(lookup):
+        raise TypeError("Expected ReferenceLookup for FK / reference filtering.")
+
+    clauses = []
+    fields = lookup.__class__.__dataclass_fields__
+
+    for op_name in fields:
+        val = getattr(lookup, op_name)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        val = _coerce_reference_value(val)
+
+        if op_name == "is_null":
+            clauses.append(column.is_(None) if val else column.isnot(None))
+        elif op_name in ("in_list", "not_in_list"):
+            if len(val) > max_in_list_size:
+                raise ValueError(
+                    f"in_list/not_in_list has {len(val)} items; "
+                    f"maximum is {max_in_list_size}"
+                )
+            if op_name == "in_list":
+                clauses.append(column.in_(val))
+            else:
+                clauses.append(column.notin_(val))
+        elif op_name == "neq":
+            clauses.append(column != val)
+        elif op_name == "exact":
+            clauses.append(column == val)
+
+    return clauses
+
+
+def _build_sa_reference_field_clause(
+    field_input: Any,
+    *,
+    local_col: Any,
+    enable_regex: bool = True,
+    max_in_list_size: int = 500,
+) -> Any:
+    from sqlalchemy import and_
+
+    clauses: list[Any] = []
+    fields = field_input.__class__.__dataclass_fields__
+
+    for col_name in fields:
+        lookup = getattr(field_input, col_name)
+        if lookup is strawberry.UNSET or lookup is None:
+            continue
+        if is_reference_lookup(lookup):
+            clauses.extend(
+                _build_reference_lookup_clauses(
+                    local_col,
+                    lookup,
+                    max_in_list_size=max_in_list_size,
+                )
+            )
+        elif is_fk_shortcut_lookup(lookup):
+            clauses.extend(
+                _build_lookup_clauses(
+                    local_col,
+                    lookup,
+                    enable_regex=enable_regex,
+                    max_in_list_size=max_in_list_size,
+                )
+            )
+        else:
+            raise TypeError(
+                f"Expected ReferenceLookup or FK-mappable IntComparisonLookup "
+                f"for reference field '{col_name}'."
+            )
+
+    return and_(*clauses) if clauses else None
+
+
 def _build_lookup_clauses(
     column: Any,
     lookup: Any,
@@ -1280,6 +1400,13 @@ def _build_lookup_clauses(
     max_in_list_size: int = 500,
 ) -> list[Any]:
     """Translate a single lookup object (e.g. StringLookup) into clauses."""
+    if is_reference_lookup(lookup):
+        return _build_reference_lookup_clauses(
+            column,
+            lookup,
+            max_in_list_size=max_in_list_size,
+        )
+
     clauses = []
     fields = lookup.__class__.__dataclass_fields__
 

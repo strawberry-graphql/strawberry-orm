@@ -17,7 +17,7 @@ class AbstractTestQueryFilterMultiField:
         data = execute("""
             { posts(filter: {
                 all: [
-                    { field: { authorId: { exact: 1 } } },
+                    { object: { author: { field: { id: { exact: 1 } } } } },
                     { field: { isPublished: { exact: true } } },
                     { field: { title: { contains: "World" } } }
                 ]
@@ -72,10 +72,10 @@ class AbstractTestQueryFilterDeeplyNested:
                         {
                             all: [
                                 { field: { isPublished: { exact: true } } },
-                                { field: { authorId: { exact: 1 } } }
+                                { object: { author: { field: { id: { exact: 1 } } } } }
                             ]
                         },
-                        { field: { authorId: { exact: 3 } } }
+                        { object: { author: { field: { id: { exact: 3 } } } } }
                     ]
                 }
             }) { title } }
@@ -143,7 +143,7 @@ class AbstractTestQueryFilterComplexScenarios:
             { posts(filter: {
                 all: [
                     { field: { isPublished: { exact: true } } },
-                    { not: { field: { authorId: { exact: 1 } } } }
+                    { not: { object: { author: { field: { id: { exact: 1 } } } } } }
                 ]
             }) { title } }
         """)
@@ -155,11 +155,11 @@ class AbstractTestQueryFilterComplexScenarios:
                 oneOf: [
                     {
                         all: [
-                            { field: { authorId: { exact: 1 } } },
+                            { object: { author: { field: { id: { exact: 1 } } } } },
                             { field: { title: { contains: "World" } } }
                         ]
                     },
-                    { field: { authorId: { exact: 3 } } }
+                    { object: { author: { field: { id: { exact: 3 } } } } }
                 ]
             }) { title } }
         """)

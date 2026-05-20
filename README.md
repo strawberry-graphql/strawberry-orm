@@ -399,7 +399,7 @@ Filters are recursive `@oneOf` trees supporting `field`, `all`, `any`, `not`, an
 
 # AND
 { posts(filter: { all: [
-    { field: { authorId: { exact: 1 } } }
+    { object: { author: { field: { id: { exact: 1 } } } } }
     { field: { isPublished: { exact: true } } }
 ] }) { title } }
 

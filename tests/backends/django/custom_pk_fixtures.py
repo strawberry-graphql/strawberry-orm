@@ -64,6 +64,11 @@ def Publisher():
 
 
 @pytest.fixture
+def Book():
+    return DjBook
+
+
+@pytest.fixture
 def custom_pk_seed(setup_tables):
     _ensure_publisher_book_tables()
     _flush_publisher_book_tables()

@@ -21,6 +21,7 @@ from strawberry_orm.filters import (
     _CUSTOM_GROUP_ATTR,
     _CUSTOM_ORDER_ATTR,
     TYPE_TO_LOOKUP,
+    ReferenceLookup,
     StringLookup,
     StringLookupNoRegex,
 )
@@ -325,6 +326,32 @@ class BaseBackend:
                 pk_candidates.add(fname)
         return {"id"} if "id" in pk_candidates else set()
 
+    @staticmethod
+    def _is_forward_fk_attname_field(
+        is_relation: bool,
+        related_model: type | None,
+    ) -> bool:
+        """True for FK column attnames (e.g. ``author_id``), not relation keys."""
+        return not is_relation and related_model is not None
+
+    def _resolve_filter_lookup_type(
+        self,
+        fname: str,
+        ftype: type,
+        *,
+        pk_names: set[str],
+        enable_regex: bool = False,
+    ) -> type | None:
+        """Pick a lookup input type for a scalar filter field."""
+        if fname in pk_names and ftype is not int:
+            return ReferenceLookup
+        lookup_type = self._filter_overrides.get(ftype) or TYPE_TO_LOOKUP.get(ftype)
+        if lookup_type is None:
+            return None
+        if lookup_type is StringLookup and not enable_regex:
+            return StringLookupNoRegex
+        return lookup_type
+
     def partial(self, model: type, **kwargs: Any) -> Any:
         kwargs.setdefault("name", f"{model.__name__}PartialInput")
         return self.input(model, **kwargs)
@@ -364,6 +391,7 @@ class BaseBackend:
         object_defaults: dict[str, Any] = {}
         relation_models: dict[str, type] = {}
         pending_self_relations: list[str] = []
+        pk_names = self._get_pk_names(model)
 
         for fname, ftype, is_relation, rel_model in fields_meta:
             if include and fname not in include:
@@ -391,10 +419,15 @@ class BaseBackend:
                     object_defaults[fname] = strawberry.UNSET
                     relation_models[fname] = rel_model
                 continue
-            lookup_type = self._filter_overrides.get(ftype) or TYPE_TO_LOOKUP.get(ftype)
+            if self._is_forward_fk_attname_field(is_relation, rel_model):
+                continue
+            lookup_type = self._resolve_filter_lookup_type(
+                fname,
+                ftype,
+                pk_names=pk_names,
+                enable_regex=enable_regex,
+            )
             if lookup_type is not None:
-                if lookup_type is StringLookup and not enable_regex:
-                    lookup_type = StringLookupNoRegex
                 field_annotations[fname] = lookup_type | None
                 field_defaults[fname] = strawberry.UNSET
 
@@ -623,6 +656,12 @@ class BaseBackend:
             for fname, _, is_rel, rel in fields_meta
             if is_rel and rel is not None
         }
+        pk_names = self._get_pk_names(model)
+        fk_attnames = {
+            fname
+            for fname, _, is_rel, rel in fields_meta
+            if self._is_forward_fk_attname_field(is_rel, rel)
+        }
 
         user_annotations = typing.get_type_hints(cls, include_extras=True)
 
@@ -643,13 +682,16 @@ class BaseBackend:
                 continue
             if ann is strawberry.auto:
                 if fname in col_types:
+                    if fname in fk_attnames:
+                        continue
                     ftype = col_types[fname]
-                    lookup_type = self._filter_overrides.get(
-                        ftype
-                    ) or TYPE_TO_LOOKUP.get(ftype)
+                    lookup_type = self._resolve_filter_lookup_type(
+                        fname,
+                        ftype,
+                        pk_names=pk_names,
+                        enable_regex=enable_regex,
+                    )
                     if lookup_type is not None:
-                        if lookup_type is StringLookup and not enable_regex:
-                            lookup_type = StringLookupNoRegex
                         field_annotations[fname] = lookup_type | None
                         field_defaults[fname] = strawberry.UNSET
                 elif fname in rel_info:

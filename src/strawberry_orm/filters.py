@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal
+from typing import Any
 
 import strawberry
 
@@ -65,6 +66,69 @@ class IDLookup:
     is_null: bool | None = strawberry.UNSET
     in_list: list[strawberry.ID] | None = strawberry.UNSET
     not_in_list: list[strawberry.ID] | None = strawberry.UNSET
+
+
+@strawberry.input
+class ReferenceLookup:
+    """Filter by primary-key values (no join when used via ``object.<relation>``).
+
+    Exposed on a model's own PK fields (e.g. ``id``, ``publisher_code``).
+    Filtering a parent by a related PK uses ``object.<relation>.field.<pk>``,
+    which applies the parent's forward FK column without joining.
+    """
+
+    exact: strawberry.ID | None = strawberry.UNSET
+    neq: strawberry.ID | None = strawberry.UNSET
+    is_null: bool | None = strawberry.UNSET
+    in_list: list[strawberry.ID] | None = strawberry.UNSET
+    not_in_list: list[strawberry.ID] | None = strawberry.UNSET
+
+
+def is_reference_lookup(lookup: Any) -> bool:
+    """Return True when *lookup* is a :class:`ReferenceLookup` input instance."""
+    return isinstance(lookup, ReferenceLookup)
+
+
+_FK_SHORTCUT_INT_OPS = frozenset({"exact", "neq", "is_null", "in_list", "not_in_list"})
+
+
+def is_fk_shortcut_lookup(lookup: Any) -> bool:
+    """Return True when *lookup* can target a parent FK column without joining."""
+    if is_reference_lookup(lookup):
+        return True
+    if not isinstance(lookup, IntComparisonLookup):
+        return False
+    has_op = False
+    for op_name in lookup.__class__.__dataclass_fields__:
+        val = getattr(lookup, op_name)
+        if val is strawberry.UNSET or val is None:
+            continue
+        has_op = True
+        if op_name not in _FK_SHORTCUT_INT_OPS:
+            return False
+    return has_op
+
+
+def _unwrap_optional_lookup_type(lookup_type: Any) -> Any:
+    of_type = getattr(lookup_type, "of_type", None)
+    if of_type is not None:
+        return _unwrap_optional_lookup_type(of_type)
+    annotation = getattr(lookup_type, "annotation", None)
+    if annotation is not None:
+        return annotation
+    return lookup_type
+
+
+def is_reference_lookup_type(lookup_type: Any) -> bool:
+    """Return True when *lookup_type* is :class:`ReferenceLookup` (or optional)."""
+    inner = _unwrap_optional_lookup_type(lookup_type)
+    if inner is ReferenceLookup:
+        return True
+    origin = getattr(inner, "__origin__", None)
+    args = getattr(inner, "__args__", ())
+    if origin is ReferenceLookup:
+        return True
+    return any(arg is ReferenceLookup for arg in args if arg is not type(None))
 
 
 # ---------------------------------------------------------------------------

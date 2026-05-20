@@ -12,6 +12,10 @@ from typing import Any
 import strawberry
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm.backends.filter_pk_shortcut import (
+    build_reference_object_filter_clause,
+)
+from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
@@ -166,7 +170,7 @@ class TortoiseBackend(BaseBackend):
                         fk_type = str
                 if getattr(field_obj, "null", False):
                     fk_type = fk_type | None  # type: ignore[assignment]
-                result.append((f"{name}_id", fk_type, False, None))
+                result.append((f"{name}_id", fk_type, False, related_model))
                 seen.add(f"{name}_id")
                 continue
 
@@ -985,6 +989,7 @@ def _build_tortoise_filter(
 
     fields = filter_input.__class__.__dataclass_fields__
     custom_filters = getattr(type(filter_input), "_custom_filters", {})
+    custom_filter_keys = frozenset(custom_filters.keys())
     recurse_kw = dict(
         query=query,
         info=info,
@@ -1026,6 +1031,19 @@ def _build_tortoise_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
+                fk_col = f"{rel_name}_id"
+                fk_prefix = f"{_prefix}{fk_col}"
+                fk_clause = build_reference_object_filter_clause(
+                    nested_filter,
+                    build_field_clause=_build_tortoise_reference_field_clause,
+                    custom_filter_keys=custom_filter_keys,
+                    max_branches=max_branches,
+                    fk_prefix=fk_prefix,
+                    enable_regex=enable_regex,
+                    max_in_list_size=max_in_list_size,
+                )
+                if fk_clause is not None:
+                    return fk_clause, query
                 return _build_tortoise_filter(
                     nested_filter,
                     query=query,
@@ -1107,6 +1125,97 @@ def _build_tortoise_filter(
     return None, query
 
 
+def _coerce_reference_value(val: Any) -> Any:
+    if isinstance(val, list):
+        return [_coerce_reference_value(item) for item in val]
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return val
+    text = str(val)
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _build_tortoise_reference_lookup(
+    col_name: str,
+    lookup: Any,
+    *,
+    max_in_list_size: int = 500,
+) -> Any:
+    from tortoise.queryset import Q
+
+    if not is_reference_lookup(lookup):
+        raise TypeError("Expected ReferenceLookup for FK / reference filtering.")
+
+    q = Q()
+    fields = lookup.__class__.__dataclass_fields__
+
+    for op_name in fields:
+        val = getattr(lookup, op_name)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        val = _coerce_reference_value(val)
+
+        if op_name == "is_null":
+            q = q & Q(**{f"{col_name}__isnull": val})
+        elif op_name in ("in_list", "not_in_list"):
+            if len(val) > max_in_list_size:
+                raise ValueError(
+                    f"in_list/not_in_list has {len(val)} items; "
+                    f"maximum is {max_in_list_size}"
+                )
+            if op_name == "in_list":
+                q = q & Q(**{f"{col_name}__in": val})
+            else:
+                q = q & ~Q(**{f"{col_name}__in": val})
+        elif op_name == "neq":
+            q = q & ~Q(**{f"{col_name}": val})
+        elif op_name == "exact":
+            q = q & Q(**{f"{col_name}": val})
+
+    return q
+
+
+def _build_tortoise_reference_field_clause(
+    field_input: Any,
+    *,
+    fk_prefix: str,
+    enable_regex: bool = False,
+    max_in_list_size: int = 500,
+) -> Any:
+    from tortoise.queryset import Q
+
+    q = Q()
+    fields = field_input.__class__.__dataclass_fields__
+
+    for col_name in fields:
+        lookup = getattr(field_input, col_name)
+        if lookup is strawberry.UNSET or lookup is None:
+            continue
+        if is_reference_lookup(lookup):
+            q = q & _build_tortoise_reference_lookup(
+                fk_prefix,
+                lookup,
+                max_in_list_size=max_in_list_size,
+            )
+        elif is_fk_shortcut_lookup(lookup):
+            q = q & _build_tortoise_lookup(
+                fk_prefix,
+                lookup,
+                enable_regex=enable_regex,
+                max_in_list_size=max_in_list_size,
+            )
+        else:
+            raise TypeError(
+                f"Expected ReferenceLookup or FK-mappable IntComparisonLookup "
+                f"for reference field '{col_name}'."
+            )
+
+    return q
+
+
 def _build_tortoise_field_clause(
     field_input: Any,
     *,
@@ -1143,6 +1252,13 @@ def _build_tortoise_lookup(
     max_in_list_size: int = 500,
 ) -> Any:
     """Translate a single lookup object into Tortoise Q conditions."""
+    if is_reference_lookup(lookup):
+        return _build_tortoise_reference_lookup(
+            col_name,
+            lookup,
+            max_in_list_size=max_in_list_size,
+        )
+
     from tortoise.queryset import Q
 
     q = Q()

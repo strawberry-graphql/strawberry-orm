@@ -38,11 +38,11 @@ class AbstractTestQueryFilterBooleanOperators:
                 any: [
                     {
                         all: [
-                            { field: { authorId: { exact: 1 } } },
+                            { object: { author: { field: { id: { exact: 1 } } } } },
                             { field: { isPublished: { exact: true } } }
                         ]
                     },
-                    { field: { authorId: { exact: 3 } } }
+                    { object: { author: { field: { id: { exact: 3 } } } } }
                 ]
             }) { title } }
         """)

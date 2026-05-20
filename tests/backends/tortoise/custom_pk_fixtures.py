@@ -66,6 +66,11 @@ def Publisher():
     return TortPublisher
 
 
+@pytest.fixture
+def Book():
+    return TortBook
+
+
 @pytest_asyncio.fixture
 async def custom_pk_seed(custom_pk_db):
     await TortBook.all().delete()

@@ -52,6 +52,11 @@ def Publisher():
 
 
 @pytest.fixture
+def Book():
+    return SABook
+
+
+@pytest.fixture
 def custom_pk_seed(sa_session):
     engine = sa_session.get_bind()
     SABase.metadata.create_all(engine, tables=[SAPublisher.__table__, SABook.__table__])

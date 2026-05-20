@@ -11,6 +11,10 @@ import strawberry
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
+from strawberry_orm.backends.filter_pk_shortcut import (
+    build_reference_object_filter_clause,
+)
+from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
@@ -124,7 +128,7 @@ class DjangoBackend(BaseBackend):
                             )
                     if getattr(field, "null", False):
                         fk_type = fk_type | None  # type: ignore[assignment]
-                    result.append((attname, fk_type, False, None))
+                    result.append((attname, fk_type, False, related_model))
                 continue
 
             py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
@@ -364,6 +368,7 @@ class DjangoBackend(BaseBackend):
         q_obj, query = _build_django_filter(
             filter_input,
             query=query,
+            model=model,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -894,10 +899,35 @@ _LOOKUP_TO_DJANGO: dict[str, str] = {
 }
 
 
+def _django_forward_fk_attname(model: type, rel_name: str) -> str | None:
+    from django.db.models.fields.related import ForeignKey, OneToOneField
+
+    try:
+        field = model._meta.get_field(rel_name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if isinstance(field, (ForeignKey, OneToOneField)):
+        return field.attname
+    return None
+
+
+def _django_related_model(model: type, rel_name: str) -> type | None:
+    from django.db.models.fields.related import ForeignKey, OneToOneField
+
+    try:
+        field = model._meta.get_field(rel_name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if isinstance(field, (ForeignKey, OneToOneField)):
+        return field.remote_field.model
+    return None
+
+
 def _build_django_filter(
     filter_input: Any,
     *,
     query: Any = None,
+    model: type | None = None,
     info: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
@@ -917,8 +947,10 @@ def _build_django_filter(
 
     fields = filter_input.__class__.__dataclass_fields__
     custom_filters = getattr(type(filter_input), "_custom_filters", {})
+    custom_filter_keys = frozenset(custom_filters.keys())
     recurse_kw = dict(
         query=query,
+        model=model,
         info=info,
         max_depth=max_depth,
         max_branches=max_branches,
@@ -955,9 +987,30 @@ def _build_django_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
+                rel_model = (
+                    _django_related_model(model, rel_name)
+                    if model is not None
+                    else None
+                )
+                if model is not None:
+                    fk_attname = _django_forward_fk_attname(model, rel_name)
+                    if fk_attname is not None:
+                        fk_prefix = f"{_prefix}{fk_attname}"
+                        fk_clause = build_reference_object_filter_clause(
+                            nested_filter,
+                            build_field_clause=_build_django_reference_field_clause,
+                            custom_filter_keys=custom_filter_keys,
+                            max_branches=max_branches,
+                            fk_prefix=fk_prefix,
+                            enable_regex=enable_regex,
+                            max_in_list_size=max_in_list_size,
+                        )
+                        if fk_clause is not None:
+                            return fk_clause, query
                 return _build_django_filter(
                     nested_filter,
                     query=query,
+                    model=rel_model,
                     info=info,
                     max_depth=max_depth,
                     max_branches=max_branches,
@@ -1027,6 +1080,97 @@ def _build_django_filter(
     return None, query
 
 
+def _coerce_reference_value(val: Any) -> Any:
+    if isinstance(val, list):
+        return [_coerce_reference_value(item) for item in val]
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return val
+    text = str(val)
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _build_django_reference_lookup(
+    col_name: str,
+    lookup: Any,
+    *,
+    max_in_list_size: int = 500,
+) -> Any:
+    from django.db.models import Q
+
+    if not is_reference_lookup(lookup):
+        raise TypeError("Expected ReferenceLookup for FK / reference filtering.")
+
+    q = Q()
+    fields = lookup.__class__.__dataclass_fields__
+
+    for op_name in fields:
+        val = getattr(lookup, op_name)
+        if val is strawberry.UNSET or val is None:
+            continue
+
+        val = _coerce_reference_value(val)
+
+        if op_name == "is_null":
+            q &= Q(**{f"{col_name}__isnull": val})
+        elif op_name in ("in_list", "not_in_list"):
+            if len(val) > max_in_list_size:
+                raise ValueError(
+                    f"in_list/not_in_list has {len(val)} items; "
+                    f"maximum is {max_in_list_size}"
+                )
+            if op_name == "in_list":
+                q &= Q(**{f"{col_name}__in": val})
+            else:
+                q &= ~Q(**{f"{col_name}__in": val})
+        elif op_name == "neq":
+            q &= ~Q(**{f"{col_name}__exact": val})
+        elif op_name == "exact":
+            q &= Q(**{f"{col_name}__exact": val})
+
+    return q
+
+
+def _build_django_reference_field_clause(
+    field_input: Any,
+    *,
+    fk_prefix: str,
+    enable_regex: bool = False,
+    max_in_list_size: int = 500,
+) -> Any:
+    from django.db.models import Q
+
+    q = Q()
+    fields = field_input.__class__.__dataclass_fields__
+
+    for col_name in fields:
+        lookup = getattr(field_input, col_name)
+        if lookup is strawberry.UNSET or lookup is None:
+            continue
+        if is_reference_lookup(lookup):
+            q &= _build_django_reference_lookup(
+                fk_prefix,
+                lookup,
+                max_in_list_size=max_in_list_size,
+            )
+        elif is_fk_shortcut_lookup(lookup):
+            q &= _build_django_lookup(
+                fk_prefix,
+                lookup,
+                enable_regex=enable_regex,
+                max_in_list_size=max_in_list_size,
+            )
+        else:
+            raise TypeError(
+                f"Expected ReferenceLookup or FK-mappable IntComparisonLookup "
+                f"for reference field '{col_name}'."
+            )
+
+    return q
+
+
 def _build_django_field_clause(
     field_input: Any,
     *,
@@ -1062,6 +1206,13 @@ def _build_django_lookup(
     enable_regex: bool = False,
     max_in_list_size: int = 500,
 ) -> Any:
+    if is_reference_lookup(lookup):
+        return _build_django_reference_lookup(
+            col_name,
+            lookup,
+            max_in_list_size=max_in_list_size,
+        )
+
     from django.db.models import Q
 
     q = Q()
