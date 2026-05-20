@@ -551,6 +551,9 @@ class DjangoBackend(BaseBackend):
         from strawberry.types.fields.resolver import StrawberryResolver
 
         for field in graphql_type.__strawberry_definition__.fields:
+            if getattr(field, "_orm_connection", False):
+                continue
+
             resolver = field.base_resolver
             if resolver is not None:
                 wrapped = resolver.wrapped_func

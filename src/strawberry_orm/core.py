@@ -24,6 +24,7 @@ from strawberry.types.cast import cast as strawberry_cast
 from strawberry_orm._async import (
     AwaitableOrValue,
     await_maybe,
+    await_maybe_blocking,
     in_async_context,
     materialize_result,
     run_orm_work,
@@ -389,7 +390,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             group_by=kwargs.get("group_by"),
         )
         if isawaitable(result):
-            return self._resolve_awaitable_result(result)
+            result = await_maybe_blocking(result)
         return self._cast_result(result)
 
     async def resolve_async(
@@ -590,12 +591,13 @@ class _AutoConnection:
             max_results=self._kwargs.get("max_results"),
         )
         field._orm_auto_field = True  # type: ignore[attr-defined]
+        field._orm_connection = True  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
         extensions = list(self._kwargs.get("extensions") or [])
         extensions.append(_AutoFilterOrderExtension(self._backend))
-        return relay.connection(
+        field = relay.connection(
             self._graphql_type,
             resolver=resolver,
             name=self._kwargs.get("name"),
@@ -604,6 +606,8 @@ class _AutoConnection:
             extensions=extensions,
             max_results=self._kwargs.get("max_results"),
         )
+        field._orm_connection = True  # type: ignore[attr-defined]
+        return field
 
 
 def _build_grouped_connection(

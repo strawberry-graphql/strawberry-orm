@@ -113,7 +113,7 @@ class TestInternalSharedCoverage:
             None,
             None,
         )
-        assert await resolved == ["value"]
+        assert resolved == ["value"]
 
     def test_base_backend_and_mutation_namespace_validation_errors(self):
         base = BaseBackend()

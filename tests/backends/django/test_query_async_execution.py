@@ -165,3 +165,57 @@ class TestAsyncExecution:
             {"node": {"name": "Bob"}},
             {"node": {"name": "Alice"}},
         ]
+
+    @pytest.mark.asyncio
+    async def test_async_nested_orm_connection_on_orm_type(self, seed):
+        """Sync ``@orm.connection`` on ``@orm.type`` under async GraphQL execution."""
+        from strawberry import relay
+
+        from strawberry_orm.relay import ORMListConnection
+        from tests.backends.django.models import Comment as DjComment
+        from tests.backends.django.models import Post as DjPost
+
+        orm = StrawberryORM.for_django(lazy_resolution="off")
+        CommentFilter = orm.filter(DjComment)
+        CommentOrder = orm.order(DjComment)
+        PostFilter = orm.filter(DjPost)
+        PostOrder = orm.order(DjPost)
+
+        @orm.type(DjComment, filters=CommentFilter, order=CommentOrder)
+        class CommentNode(relay.Node):
+            id: relay.NodeID[int]
+            body: auto
+
+        @orm.type(DjPost, filters=PostFilter, order=PostOrder)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+            @orm.connection(ORMListConnection[CommentNode])
+            def comments(self, info: strawberry.types.Info) -> list[CommentNode]:
+                return DjComment.objects.filter(post_id=self.id).order_by("id")  # type: ignore[attr-defined]
+
+        @strawberry.type
+        class Query:
+            @orm.field
+            def posts(self) -> list[PostNode]:
+                return list(DjPost.objects.order_by("id"))  # type: ignore[return-value]
+
+        schema = strawberry.Schema(
+            query=Query,
+            extensions=[orm.optimizer_extension()],
+        )
+        result = await schema.execute(
+            """
+            {
+                posts {
+                    comments(first: 10) {
+                        edges { node { body } }
+                    }
+                }
+            }
+            """
+        )
+        assert result.errors is None
+        first_post_edges = result.data["posts"][0]["comments"]["edges"]
+        assert len(first_post_edges) >= 1

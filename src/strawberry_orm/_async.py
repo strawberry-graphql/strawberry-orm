@@ -96,6 +96,24 @@ async def await_maybe[T](value: AwaitableOrValue[T]) -> T:
     return value
 
 
+def await_maybe_blocking[T](value: AwaitableOrValue[T]) -> T:
+    """Resolve *value* to a concrete result for sync ``FieldExtension.resolve``.
+
+    When the event loop is already running, awaitables are finished in a worker
+    thread with a fresh loop so parent sync extensions (e.g. Relay connections)
+    never receive an unawaited coroutine.
+    """
+    if not isawaitable(value):
+        return value
+
+    def finish() -> T:
+        return asyncio.run(await_maybe(value))
+
+    if not in_async_context():
+        return finish()
+    return run_orm_work_blocking(finish)
+
+
 def async_safe_resolver(
     func: Callable[..., Any],
     *,

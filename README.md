@@ -1178,7 +1178,9 @@ schema = strawberry.Schema(
 )
 ```
 
-Custom sync resolvers passed to `orm.field(my_resolver)` are async-safe automatically. They do **not** receive `_AutoFilterOrderExtension` (that extension is only for auto list/connection fields with `filter`/`order`).
+Custom sync resolvers passed to `orm.field(my_resolver)` are async-safe automatically. Automatic `filter` and `order` arguments are wired on generated list and connection fields; pass filters/order explicitly on bare `orm.field(my_resolver)` resolvers if you need them.
+
+Sync `@orm.connection` resolvers on `@orm.type` work under async execution, including when the method name matches a Django reverse relation (e.g. `def comments(self, info)` returning a queryset).
 
 Optional runtime FK checks: `extensions=[orm.lazy_resolution_extension()]`.
 

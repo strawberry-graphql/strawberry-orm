@@ -44,6 +44,11 @@ EXCLUDED_METHODS = {
         "test_async_relay_connection_filter_and_order",
     ),
     (
+        "test_query_async_execution.py",
+        "TestAsyncExecution",
+        "test_async_nested_orm_connection_on_orm_type",
+    ),
+    (
         "test_query_relay_connection.py",
         "TestRelayConnectionFilteringAndOrdering",
         "test_async_filter_and_order_are_applied_before_pagination",
