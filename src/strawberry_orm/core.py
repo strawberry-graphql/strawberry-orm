@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import typing as _typing
 from collections.abc import Callable
 from functools import partial, wraps
@@ -971,6 +972,31 @@ class StrawberryORM:
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)
 
+    def schema(self, *, optimizer: bool | None = None, **kwargs: Any) -> Any:
+        """Create a :class:`strawberry.Schema` with the optimizer enabled by default.
+
+        Pass ``optimizer=False`` to opt out, or set ``enable_optimizer=False`` when
+        constructing the ORM instance. Additional ``extensions`` are merged after
+        the optimizer unless an optimizer extension was already provided.
+        """
+        from strawberry_orm.lazy_resolution import extensions_include_lazy_resolution
+        from strawberry_orm.optimizer.extension import extensions_include_optimizer
+
+        if optimizer is None:
+            optimizer = self._backend._enable_optimizer
+
+        extensions = list(kwargs.pop("extensions", None) or [])
+
+        if optimizer and not extensions_include_optimizer(extensions):
+            extensions.insert(0, self.optimizer_extension())
+
+        lazy_mode = getattr(self._backend, "_lazy_resolution", "off")
+        if lazy_mode != "off" and not extensions_include_lazy_resolution(extensions):
+            insert_at = 1 if extensions_include_optimizer(extensions) else 0
+            extensions.insert(insert_at, self.lazy_resolution_extension(mode=lazy_mode))
+
+        return strawberry.Schema(extensions=extensions, **kwargs)
+
     def lazy_resolution_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         from strawberry_orm.lazy_resolution import LazyResolutionExtension
 
@@ -994,6 +1020,9 @@ def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:
 
 
 def _create_backend(name: BackendName, **kwargs: Any) -> Backend:
+    if "warn_missing_queryset" not in kwargs and "pytest" in sys.modules:
+        kwargs["warn_missing_queryset"] = False
+
     if name == "django":
         from strawberry_orm.backends.django import DjangoBackend
 

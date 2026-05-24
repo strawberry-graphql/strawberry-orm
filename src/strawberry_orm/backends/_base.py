@@ -242,6 +242,7 @@ class BaseBackend:
         self._aggregate_type_cache: dict[type, AggregateMeta] = {}
         self._type_querysets: dict[type, Any] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
+        self._warn_missing_queryset: bool = kwargs.get("warn_missing_queryset", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
             "exclude_sensitive_fields", True
         )
@@ -253,6 +254,7 @@ class BaseBackend:
             )
         self._lazy_resolution: LazyResolutionMode = lazy_resolution
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
+        self._enable_optimizer: bool = kwargs.get("enable_optimizer", True)
 
     def get_repo(self, model: type) -> Any | None:
         """Return an instantiated repo for *model*, or ``None``."""
@@ -1346,12 +1348,25 @@ class BaseBackend:
                 f"Field '{field_name}' on {model.__name__} resolves a related ORM "
                 f"type lazily. Add an explicit resolver, use "
                 f"orm.field(load=[...], disable_optimization=True) to silence, and "
-                f"mount extensions=[orm.optimizer_extension()] on the schema for "
+                f"use orm.schema(...) (optimizer enabled by default) for "
                 f"eager loading."
             )
             if self._lazy_resolution == "error":
                 raise ValueError(message)
             warnings.warn(message, stacklevel=4)
+
+    def _check_missing_queryset(self, cls: type, model: type, type_name: str) -> None:
+        if not self._warn_missing_queryset:
+            return
+        if model in self._type_querysets:
+            return
+        warnings.warn(
+            f"GraphQL type '{type_name}' (model {model.__name__}) has no "
+            f"get_queryset classmethod. Row-level scoping is not applied when "
+            f"this model's rows load — define get_queryset on the @orm.type "
+            f"class or set warn_missing_queryset=False on the ORM.",
+            stacklevel=4,
+        )
 
     def _process_type_annotations(
         self,
@@ -1417,6 +1432,8 @@ class BaseBackend:
             vars(cls).get("get_queryset"), classmethod
         ):
             self._type_querysets[model] = cls.get_queryset
+
+        self._check_missing_queryset(cls, model, type_name)
 
         for attr_name in list(vars(cls)):
             val = getattr(cls, attr_name, None)

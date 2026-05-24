@@ -55,6 +55,57 @@ class AbstractTestQueryTypeGeneration:
         ext = orm.optimizer_extension()
         assert isinstance(ext, type)
 
+    def test_schema_enables_optimizer_by_default(self, orm, User):
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field()
+
+        schema = orm.schema(query=Query)
+        extension_names = [ext.__name__ for ext in schema.extensions]
+        assert any(name.startswith("OptimizerExtension_") for name in extension_names)
+
+    def test_schema_can_disable_optimizer(self, orm, User):
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field()
+
+        schema = orm.schema(query=Query, optimizer=False)
+        extension_names = [ext.__name__ for ext in schema.extensions]
+        assert not any(
+            name.startswith("OptimizerExtension_") for name in extension_names
+        )
+
+    def test_schema_does_not_duplicate_optimizer_extension(self, orm, User):
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field()
+
+        schema = orm.schema(
+            query=Query,
+            extensions=[orm.optimizer_extension()],
+        )
+        optimizer_count = sum(
+            1
+            for ext in schema.extensions
+            if ext.__name__.startswith("OptimizerExtension_")
+        )
+        assert optimizer_count == 1
+
     def test_ref_update_only(self, orm, Tag):
         TagRef = orm.ref(Tag)
         definition = TagRef.__strawberry_definition__
@@ -249,7 +300,7 @@ class AbstractTestQueryCustomName:
             def posts(self) -> list[PostObjectType]:
                 return []
 
-        strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
+        orm.schema(query=Query)
         assert UserObjectType.__strawberry_definition__.name == "UserObject"
         assert PostObjectType.__strawberry_definition__.name == "PostObject"
         assert (

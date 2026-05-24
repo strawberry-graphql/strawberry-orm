@@ -116,11 +116,11 @@ class TestInternalSharedCoverage:
         assert resolved == ["value"]
 
     def test_base_backend_and_mutation_namespace_validation_errors(self):
-        base = BaseBackend()
+        base = BaseBackend(warn_missing_queryset=False)
         with pytest.raises(NotImplementedError):
             base._introspect_model(object)
 
-        backend = DummyBackend()
+        backend = DummyBackend(warn_missing_queryset=False)
         input_type = backend.input(object)
         assert "password_hash" not in input_type.__dataclass_fields__
         assert backend.field(load=["name"]).__class__.__name__ == "FieldDefinition"

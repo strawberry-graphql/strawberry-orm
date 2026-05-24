@@ -177,10 +177,9 @@ class _MainMutation:
         return post  # type: ignore[return-value]
 
 
-main_schema = strawberry.Schema(
+main_schema = _main_orm.schema(
     query=_MainQuery,
     mutation=_MainMutation,
-    extensions=[_main_orm.optimizer_extension()],
 )
 
 
@@ -308,10 +307,9 @@ class _NodeMutation:
         return _selected_root_key(input)
 
 
-node_mutation_schema = strawberry.Schema(
+node_mutation_schema = _node_orm.schema(
     query=_NodeQuery,
     mutation=_NodeMutation,
-    extensions=[_node_orm.optimizer_extension()],
 )
 
 
@@ -364,9 +362,8 @@ class _SelfModelQuery:
         return DjPost.objects.all()  # type: ignore[return-value]
 
 
-self_model_schema = strawberry.Schema(
+self_model_schema = _self_orm.schema(
     query=_SelfModelQuery,
-    extensions=[_self_orm.optimizer_extension()],
 )
 
 
@@ -405,9 +402,8 @@ class _GetQuerysetQuery:
         return DjUser.objects.all()  # type: ignore[return-value]
 
 
-get_queryset_schema = strawberry.Schema(
+get_queryset_schema = _qs_orm.schema(
     query=_GetQuerysetQuery,
-    extensions=[_qs_orm.optimizer_extension()],
 )
 
 
@@ -442,9 +438,8 @@ class _MultiTypeQuery:
         return DjUser.objects.all()  # type: ignore[return-value]
 
 
-multi_type_schema = strawberry.Schema(
+multi_type_schema = _multi_orm.schema(
     query=_MultiTypeQuery,
-    extensions=[_multi_orm.optimizer_extension()],
 )
 
 

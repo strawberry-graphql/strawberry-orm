@@ -14,6 +14,16 @@ if TYPE_CHECKING:
     from strawberry_orm.optimizer.store import OptimizerStore
 
 
+def extensions_include_optimizer(extensions: list[Any]) -> bool:
+    """Return True if *extensions* already contains an optimizer extension."""
+    for ext in extensions:
+        if isinstance(ext, type) and issubclass(ext, OptimizerExtension):
+            return True
+        if getattr(ext, "__name__", "").startswith("OptimizerExtension_"):
+            return True
+    return False
+
+
 class OptimizerExtension(SchemaExtension):
     """A Strawberry schema extension that reads the GraphQL query tree
     and tells the active backend to apply eager-loading / column-selection

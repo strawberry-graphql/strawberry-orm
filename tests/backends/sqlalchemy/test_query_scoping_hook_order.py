@@ -1,0 +1,159 @@
+"""Scoping hook call-order tests for SQLAlchemy."""
+
+import builtins
+
+import pytest
+import strawberry
+
+from strawberry_orm.types import auto
+from tests.abstract.query_scoping_hook_order import (
+    SCOPE_PREFIX,
+    _posts_load_exclude_guide,
+    _published_posts_queryset,
+    assert_get_queryset_before_load,
+    scope_messages,
+)
+
+
+@pytest.fixture
+def schema_execute(sa_session):
+    def _execute(schema, query: str):
+        return schema.execute_sync(
+            query,
+            context_value={"session": sa_session},
+        )
+
+    return _execute
+
+
+def _install_print_tracker(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    def tracking_print(*args, **kwargs) -> None:
+        if args:
+            message = str(args[0])
+            if message.startswith(SCOPE_PREFIX):
+                calls.append(message)
+
+    monkeypatch.setattr(builtins, "print", tracking_print)
+    return calls
+
+
+def _build_schema_get_queryset_only(orm, Post, User, *, optimizer: bool = True):
+    backend_name = orm._backend_name
+
+    @orm.type(Post)
+    class PostType:
+        id: auto
+        title: auto
+
+        @classmethod
+        def get_queryset(cls, qs, info):
+            print(f"{SCOPE_PREFIX}PostType.get_queryset", flush=True)
+            return _published_posts_queryset(Post, backend_name, qs)
+
+    @orm.type(User)
+    class UserType:
+        id: auto
+        name: auto
+        posts: list[PostType]
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def users(self, info: strawberry.types.Info) -> list[UserType]:
+            stmt = orm.get_default_queryset(User)
+            if backend_name == "sqlalchemy" and not optimizer:
+                return info.context["session"].scalars(stmt).all()
+            return stmt
+
+    return orm.schema(query=Query, optimizer=optimizer)
+
+
+def _build_schema_get_queryset_and_load(orm, Post, User):
+    backend_name = orm._backend_name
+
+    @orm.type(Post)
+    class PostType:
+        id: auto
+        title: auto
+
+        @classmethod
+        def get_queryset(cls, qs, info):
+            print(f"{SCOPE_PREFIX}PostType.get_queryset", flush=True)
+            return _published_posts_queryset(Post, backend_name, qs)
+
+    def posts_load(qs):
+        print(f"{SCOPE_PREFIX}UserType.posts.load", flush=True)
+        return _posts_load_exclude_guide(Post, backend_name, qs)
+
+    @orm.type(User)
+    class UserType:
+        id: auto
+        name: auto
+        posts: list[PostType] = orm.field(load=posts_load)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def users(self, info: strawberry.types.Info) -> list[UserType]:
+            return orm.get_default_queryset(User)
+
+    return orm.schema(query=Query)
+
+
+class TestScopingHookOrder:
+    USERS_POSTS_QUERY = "{ users { name posts { title } } }"
+
+    def test_get_queryset_runs_during_optimizer_prefetch(
+        self,
+        monkeypatch,
+        orm,
+        seed,
+        schema_execute,
+        Post,
+        User,
+    ):
+        calls = _install_print_tracker(monkeypatch)
+        schema = _build_schema_get_queryset_only(orm, Post, User)
+        result = schema_execute(schema, self.USERS_POSTS_QUERY)
+        assert result.errors is None
+        messages = scope_messages(calls)
+        assert messages.count(f"{SCOPE_PREFIX}PostType.get_queryset") >= 1
+        assert f"{SCOPE_PREFIX}UserType.posts.load" not in messages
+
+    def test_get_queryset_runs_before_load_callable(
+        self,
+        monkeypatch,
+        orm,
+        seed,
+        schema_execute,
+        Post,
+        User,
+    ):
+        calls = _install_print_tracker(monkeypatch)
+        schema = _build_schema_get_queryset_and_load(orm, Post, User)
+        result = schema_execute(schema, self.USERS_POSTS_QUERY)
+        assert result.errors is None
+        messages = scope_messages(calls)
+        assert_get_queryset_before_load(messages)
+
+    def test_without_optimizer_skips_scoping_hooks(
+        self,
+        monkeypatch,
+        orm,
+        seed,
+        schema_execute,
+        Post,
+        User,
+    ):
+        calls = _install_print_tracker(monkeypatch)
+        schema = _build_schema_get_queryset_only(
+            orm,
+            Post,
+            User,
+            optimizer=False,
+        )
+        result = schema_execute(schema, self.USERS_POSTS_QUERY)
+        assert result.errors is None
+        assert scope_messages(calls) == []

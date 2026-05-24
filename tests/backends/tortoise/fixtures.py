@@ -162,10 +162,9 @@ class _MainMutation:
         return post  # type: ignore[return-value]
 
 
-main_schema = strawberry.Schema(
+main_schema = _main_orm.schema(
     query=_MainQuery,
     mutation=_MainMutation,
-    extensions=[_main_orm.optimizer_extension()],
 )
 
 
@@ -288,10 +287,9 @@ def _build_node_mutation_schema():
         async def inspect_update_node_input(self, input: UpdateNodeInput) -> str:
             return _selected_root_key(input)
 
-    return strawberry.Schema(
+    return node_orm.schema(
         query=NodeQuery,
         mutation=NodeMutation,
-        extensions=[node_orm.optimizer_extension()],
     )
 
 
@@ -344,9 +342,8 @@ class _SelfModelQuery:
         return await TortPost.all().order_by("id")  # type: ignore[return-value]
 
 
-self_model_schema = strawberry.Schema(
+self_model_schema = _self_orm.schema(
     query=_SelfModelQuery,
-    extensions=[_self_orm.optimizer_extension()],
 )
 
 
@@ -385,9 +382,8 @@ class _GetQuerysetQuery:
         return TortUser.all()  # type: ignore[return-value]
 
 
-get_queryset_schema = strawberry.Schema(
+get_queryset_schema = _qs_orm.schema(
     query=_GetQuerysetQuery,
-    extensions=[_qs_orm.optimizer_extension()],
 )
 
 
@@ -422,9 +418,8 @@ class _MultiTypeQuery:
         return TortUser.all()  # type: ignore[return-value]
 
 
-multi_type_schema = strawberry.Schema(
+multi_type_schema = _multi_orm.schema(
     query=_MultiTypeQuery,
-    extensions=[_multi_orm.optimizer_extension()],
 )
 
 

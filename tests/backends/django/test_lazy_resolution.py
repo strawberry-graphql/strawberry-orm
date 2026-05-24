@@ -138,7 +138,7 @@ class TestLazyResolutionRuntime:
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
 
-        with pytest.warns(UserWarning, match="Lazy resolution of 'author'"):
+        with pytest.warns(UserWarning, match="query path: query \\{ posts \\{ author"):
             result = schema.execute_sync("{ posts { author { name } } }")
 
         assert result.errors is None
@@ -153,7 +153,10 @@ class TestLazyResolutionRuntime:
 
         result = schema.execute_sync("{ posts { author { name } } }")
         assert result.errors is not None
-        assert "Lazy resolution of 'author'" in str(result.errors[0].message)
+        assert "query path: query { posts { author { name } } }" in str(
+            result.errors[0].message
+        )
+        assert "select_related('author')" in str(result.errors[0].message)
 
     def test_runtime_no_warning_when_optimizer_prefetches(self, seed):
         orm = StrawberryORM.for_django(lazy_resolution="off")
@@ -190,6 +193,6 @@ class TestLazyResolutionRuntime:
             w
             for w in caught
             if issubclass(w.category, UserWarning)
-            and "Lazy resolution" in str(w.message)
+            and "Unoptimized relation loads detected" in str(w.message)
         ]
         assert lazy_warnings == []
