@@ -145,6 +145,12 @@ class TestInternalBackendCoverage:
         assert _get_reverse_fk_field(Comment, Post, "post") == "post_id"
 
     @pytest.mark.asyncio
+    async def test_count_query(self, tortoise_db, seed, User):
+        backend = TortoiseBackend()
+        qs = backend.get_default_queryset(User)
+        assert await backend.count_query(qs, info=None) >= 3
+
+    @pytest.mark.asyncio
     async def test_query_object_helpers_handle_fallback_values(self):
         backend = TortoiseBackend()
         plain = NoModelQuery([Item(None), Item(1)])

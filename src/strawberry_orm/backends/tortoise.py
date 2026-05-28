@@ -617,6 +617,9 @@ class TortoiseBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    async def count_query(self, query: Any, info: Any) -> int:
+        return await query.count()
+
     async def materialize_query(self, query: Any, info: Any) -> list[Any]:
         return _apply_python_ordering(
             list(await query),

@@ -541,6 +541,9 @@ class DjangoBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    def count_query(self, query: Any, info: Any) -> int:
+        return query.count()
+
     def materialize_query(self, query: Any, info: Any) -> Any:
         from strawberry_orm._async import in_async_context
 

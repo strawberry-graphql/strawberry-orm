@@ -92,14 +92,18 @@ from strawberry_orm.policy import _policy_to_repos
 from strawberry_orm.relay.connection import (
     ORMConnectionExtension,
     ORMListConnection,
+    _await_nodes_if_needed,
     _compute_page_aggregates,
+    _connection_total_count,
     _decode_cursor_offset,
     _extract_items_after,
     _extract_items_first,
     _extract_items_order,
     _get_items_arg,
     _node_matches_group_key,
+    _should_await_nodes,
     _use_orm_connection_extension,
+    connection_type_for_node,
 )
 from strawberry_orm.types import DateGroupByOption, Ordering, auto
 from tests.backends.sqlalchemy.models import Base as SABase
@@ -665,10 +669,234 @@ class TestConnectionCoverage:
             "resolve_connection",
             side_effect=pending_connection,
         ):
-            result = ORMListConnection.resolve_connection([], info=SimpleNamespace())
+            info = SimpleNamespace(selected_fields=[])
+            result = ORMListConnection.resolve_connection([], info=info)
             assert asyncio.iscoroutine(result)
             resolved = await result
             assert hasattr(resolved, "edges")
+
+    @pytest.mark.asyncio
+    async def test_resolve_connection_sync_finish_when_total_count_not_selected(self):
+        async def pending_connection(*_args, **_kwargs):
+            return SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        info = SimpleNamespace(selected_fields=[])
+        with (
+            patch.object(
+                ORMListConnection.__mro__[2],
+                "resolve_connection",
+                side_effect=pending_connection,
+            ),
+            patch(
+                "strawberry_orm.relay.connection.optimize_query_nodes",
+                side_effect=lambda nodes, _info: nodes,
+            ),
+        ):
+            resolved = await ORMListConnection.resolve_connection([], info=info)
+        assert hasattr(resolved, "edges")
+
+    @pytest.mark.asyncio
+    async def test_finish_connection_awaitable_post_process(self):
+        connection = SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        async def total():
+            return 4
+
+        async def post_process(*_args, **_kwargs):
+            return connection
+
+        with patch.object(
+            ORMListConnection,
+            "_post_process_connection",
+            side_effect=post_process,
+        ):
+            resolved = await ORMListConnection._finish_connection(
+                connection,
+                total(),
+                info=SimpleNamespace(),
+            )
+        assert resolved.total_count == 4
+
+    @pytest.mark.asyncio
+    async def test_resolve_connection_awaitable_finish(self):
+        async def pending_connection(*_args, **_kwargs):
+            return SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        async def count_coro():
+            return 3
+
+        info = SimpleNamespace(
+            selected_fields=[
+                SimpleNamespace(
+                    name="usersConnection",
+                    selections=[
+                        SimpleNamespace(name="totalCount", selections=[]),
+                    ],
+                )
+            ]
+        )
+
+        with (
+            patch.object(
+                ORMListConnection.__mro__[2],
+                "resolve_connection",
+                side_effect=pending_connection,
+            ),
+            patch(
+                "strawberry_orm.relay.connection._connection_total_count",
+                return_value=count_coro(),
+            ),
+            patch(
+                "strawberry_orm.relay.connection.optimize_query_nodes",
+                side_effect=lambda nodes, _info: nodes,
+            ),
+        ):
+            resolved = await ORMListConnection.resolve_connection([], info=info)
+        assert resolved.total_count == 3
+
+    @pytest.mark.asyncio
+    async def test_resolve_connection_attaches_total_count(self):
+        async def count_coro():
+            return 99
+
+        info = SimpleNamespace(
+            selected_fields=[
+                SimpleNamespace(
+                    name="usersConnection",
+                    selections=[
+                        SimpleNamespace(name="totalCount", selections=[]),
+                    ],
+                )
+            ]
+        )
+
+        def sync_connection(*_args, **_kwargs):
+            return SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        with (
+            patch.object(
+                ORMListConnection.__mro__[2],
+                "resolve_connection",
+                side_effect=sync_connection,
+            ),
+            patch(
+                "strawberry_orm.relay.connection._connection_total_count",
+                return_value=count_coro(),
+            ),
+            patch(
+                "strawberry_orm.relay.connection.optimize_query_nodes",
+                side_effect=lambda nodes, _info: nodes,
+            ),
+        ):
+            resolved = await ORMListConnection.resolve_connection([], info=info)
+        assert resolved.total_count == 99
+
+    @pytest.mark.asyncio
+    async def test_finish_connection_awaitable_total_count(self):
+        connection = SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        async def total():
+            return 7
+
+        resolved = await ORMListConnection._finish_connection(
+            connection,
+            total(),
+            info=SimpleNamespace(),
+        )
+        assert resolved.total_count == 7
+
+    def test_should_await_nodes_false_for_plain_iterables(self):
+        assert _should_await_nodes([1, 2, 3], SimpleNamespace()) is False
+
+    def test_should_not_await_orm_query_objects(self):
+        class AwaitableQuery:
+            def __await__(self):
+                async def _fail():
+                    raise AssertionError("query must not be awaited")
+
+                return _fail().__await__()
+
+        backend = SimpleNamespace(is_query_object=lambda value: isinstance(value, AwaitableQuery))
+        info = SimpleNamespace(context={"_orm_backend": backend})
+        query = AwaitableQuery()
+        assert _should_await_nodes(query, info) is False
+
+    @pytest.mark.asyncio
+    async def test_await_nodes_if_needed_skips_query_objects(self):
+        class AwaitableQuery:
+            def __await__(self):
+                async def _fail():
+                    raise AssertionError("query must not be awaited")
+
+                return _fail().__await__()
+
+        backend = SimpleNamespace(is_query_object=lambda value: isinstance(value, AwaitableQuery))
+        info = SimpleNamespace(context={"_orm_backend": backend})
+        query = AwaitableQuery()
+        assert await _await_nodes_if_needed(query, info) is query
+
+    @pytest.mark.asyncio
+    async def test_connection_total_count_branches(self):
+        backend = SimpleNamespace(
+            is_query_object=lambda _value: True,
+            count_query=lambda _query, _info: 42,
+        )
+        info = SimpleNamespace(context={"_orm_backend": backend})
+        assert _connection_total_count(object(), info) == 42
+
+        async def pending_nodes():
+            return [1, 2, 3]
+
+        assert (
+            await _connection_total_count(
+                pending_nodes(), SimpleNamespace(context={})
+            )
+            == 3
+        )
+
+        class NoLen:
+            def __iter__(self):
+                return iter([1, 2])
+
+        assert _connection_total_count(NoLen(), SimpleNamespace(context={})) == 2
+
+    def test_connection_type_for_node_sets_node_type(self):
+        from strawberry import relay
+
+        @strawberry.type
+        class SampleNode(relay.Node):
+            id: relay.NodeID[int]
+
+        conn_type = connection_type_for_node(SampleNode)
+        assert conn_type._node_type is SampleNode
+
+    @pytest.mark.asyncio
+    async def test_orm_connection_extension_resolve_async_keeps_query_objects(self):
+        class AwaitableQuery:
+            def __await__(self):
+                async def _fail():
+                    raise AssertionError("query must not be awaited")
+
+                return _fail().__await__()
+
+        backend = SimpleNamespace(
+            is_query_object=lambda value: isinstance(value, AwaitableQuery)
+        )
+        info = SimpleNamespace(context={"_orm_backend": backend})
+        ext = ORMConnectionExtension()
+        ext.connection_type = SimpleNamespace(
+            resolve_connection=lambda *_args, **_kwargs: "paginated"
+        )
+
+        async def next_(_source, _info, **_kwargs):
+            return AwaitableQuery()
+
+        with patch(
+            "strawberry_orm.relay.connection.optimize_query_nodes",
+            side_effect=lambda nodes, _info: nodes,
+        ):
+            result = await ext.resolve_async(next_, None, info)
+        assert result == "paginated"
 
     def test_get_items_arg_dict_and_list_forms(self):
         groups_sel = SimpleNamespace(
@@ -851,6 +1079,25 @@ class TestCoreCoverage:
 
         result = await ext.resolve_async(next_, None, SimpleNamespace(context={}))
         assert isinstance(result, list)
+
+    def test_auto_filter_order_sync_resolve_keeps_awaitable_query_objects(self):
+        class AwaitableQuery:
+            def __await__(self):
+                async def _fail():
+                    raise AssertionError("query must not be awaited in sync resolve")
+
+                return _fail().__await__()
+
+        backend = SimpleNamespace(
+            is_query_object=lambda value: isinstance(value, AwaitableQuery)
+        )
+        ext = _AutoFilterOrderExtension(backend)
+        ext._model = object
+        ext._is_configured = True
+        query = AwaitableQuery()
+        with patch.object(ext, "_apply", return_value=query):
+            result = ext.resolve(lambda *_args, **_kwargs: [], None, SimpleNamespace())
+        assert result is query
 
     def test_build_grouped_connection_without_node(self, Post):
         backend = SQLAlchemyBackend(dialect="sqlite")

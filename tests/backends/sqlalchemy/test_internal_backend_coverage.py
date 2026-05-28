@@ -417,6 +417,12 @@ class TestInternalBackendCoverage:
         users = backend.apply_optimizer_hints(backend._store, query, info)
         assert len(users) >= 1
 
+    def test_count_query(self, sa_session, seed, User):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        info = SimpleNamespace(context={"session": sa_session})
+        query = backend.get_default_queryset(User)
+        assert backend.count_query(query, info) >= 3
+
     def test_apply_optimizer_hints_chained_nested_relationships(
         self, sa_session, seed, User, Post
     ):

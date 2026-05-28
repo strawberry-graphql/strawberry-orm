@@ -424,6 +424,10 @@ class TestInternalBackendCoverage:
         qs = Post.objects.all()
         assert len(backend.materialize_query(qs, info=None)) == 4
 
+    def test_count_query(self, seed, Post):
+        backend = DjangoBackend()
+        assert backend.count_query(Post.objects.all(), info=None) == 4
+
     @pytest.mark.asyncio
     async def test_materialize_query_async_path(self, seed, Post):
         backend = DjangoBackend()

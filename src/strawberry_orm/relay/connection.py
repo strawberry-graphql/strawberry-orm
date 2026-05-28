@@ -6,7 +6,8 @@ import inspect
 from collections.abc import Iterable
 from typing import Any, TypeVar, cast
 
-from strawberry import relay
+import strawberry
+from strawberry import field, relay
 from strawberry.extensions.field_extension import (
     AsyncExtensionResolver,
     SyncExtensionResolver,
@@ -23,6 +24,59 @@ from strawberry_orm.backends._base import (
 from strawberry_orm.optimizer.extension import optimize_query_nodes
 
 NodeType = TypeVar("NodeType", bound=relay.Node)
+
+
+def _should_await_nodes(nodes: Any, info: Info) -> bool:
+    """Return whether *nodes* should be awaited before pagination.
+
+    ORM query objects (e.g. Tortoise ``QuerySet``) are awaitable but must not be
+    awaited here; pagination and ``count()`` handle them in the active context.
+    """
+    if not inspect.isawaitable(nodes):
+        return False
+    if inspect.iscoroutine(nodes):
+        return True
+    backend = _orm_backend_from_info(info)
+    return backend is None or not backend.is_query_object(nodes)
+
+
+async def _await_nodes_if_needed(nodes: Any, info: Info) -> Any:
+    if _should_await_nodes(nodes, info):
+        return await nodes
+    return nodes
+
+
+def _orm_backend_from_info(info: Any) -> Any | None:
+    """Return the active ORM backend from resolver context or schema extensions."""
+    ctx = info.context
+    if isinstance(ctx, dict):
+        backend = ctx.get("_orm_backend")
+    else:
+        backend = getattr(ctx, "_orm_backend", None)
+    if backend is not None:
+        return backend
+    from strawberry_orm.optimizer.extension import get_configured_optimizer
+
+    backend, _store = get_configured_optimizer(info)
+    return backend
+
+
+def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
+    """Count connection nodes before Relay pagination is applied."""
+    backend = _orm_backend_from_info(info)
+    if backend is not None and backend.is_query_object(nodes):
+        return backend.count_query(nodes, info)
+    if inspect.isawaitable(nodes):
+
+        async def _count_awaitable() -> int:
+            resolved = await nodes
+            return len(resolved)
+
+        return _count_awaitable()
+    try:
+        return len(nodes)
+    except TypeError:
+        return len(list(nodes))
 
 
 class ORMConnectionExtension(ConnectionExtension):
@@ -63,7 +117,7 @@ class ORMConnectionExtension(ConnectionExtension):
         if inspect.isawaitable(nodes):
 
             async def _await_optimized() -> Any:
-                optimized = await nodes
+                optimized = await _await_nodes_if_needed(nodes, info)
                 connection = self._paginate_nodes(
                     optimized,
                     info,
@@ -110,7 +164,7 @@ class ORMConnectionExtension(ConnectionExtension):
         if inspect.isawaitable(nodes):
 
             async def _await_nodes() -> Any:
-                resolved_nodes = await nodes
+                resolved_nodes = await _await_nodes_if_needed(nodes, info)
                 connection = self._resolve_nodes(
                     resolved_nodes,
                     info,
@@ -146,9 +200,7 @@ class ORMConnectionExtension(ConnectionExtension):
         last: int | None = None,
         **kwargs: Any,
     ) -> Any:
-        nodes = next_(source, info, **kwargs)
-        if inspect.isawaitable(nodes):
-            nodes = await nodes
+        nodes = await _await_nodes_if_needed(next_(source, info, **kwargs), info)
         connection = self._resolve_nodes(
             nodes,
             info,
@@ -238,7 +290,38 @@ def _compute_page_aggregates(edges: list[Any], meta: Any) -> Any:
     return meta.aggregates_type(**kwargs)
 
 
-class ORMListConnection(ListConnection[NodeType]):
+@strawberry.type(description="A connection to a list of items.")
+class ORMConnection(ListConnection[NodeType]):
+    """Relay connection with ``totalCount`` for the full filtered result set."""
+
+    total_count: int | None = field(
+        default=None,
+        description=(
+            "Total number of items in this connection before pagination is applied."
+        ),
+    )
+
+
+def connection_type_for_node(node_type: type) -> Any:
+    """Return a concrete Strawberry connection type for *node_type* with ``totalCount``."""
+    import types as _types_mod
+
+    type_name = f"{node_type.__name__}Connection"
+
+    def _exec_body(ns: dict[str, Any]) -> None:
+        ns["__annotations__"] = {"total_count": int | None}
+        ns["total_count"] = None
+
+    new_cls = _types_mod.new_class(
+        type_name,
+        (ORMListConnection[node_type],),  # type: ignore[misc]
+        exec_body=_exec_body,
+    )
+    new_cls._node_type = node_type  # type: ignore[attr-defined]
+    return strawberry.type(new_cls, name=type_name)
+
+
+class ORMListConnection(ORMConnection[NodeType]):
     """A ListConnection that works with any ORM backend.
 
     When the generated connection subclass has ``_orm_aggregate_meta`` set,
@@ -255,17 +338,61 @@ class ORMListConnection(ListConnection[NodeType]):
         **kwargs,
     ) -> AwaitableOrValue:
         nodes = optimize_query_nodes(nodes, info)
+        want_total = _selection_requests(info, "totalCount")
+        total_count: AwaitableOrValue[int | None] = (
+            _connection_total_count(nodes, info) if want_total else None
+        )
+
         connection = super().resolve_connection(nodes, info=info, **kwargs)
 
-        # Handle async case
-        if not isinstance(connection, cls.__mro__[0]) and not isinstance(
-            connection, ORMListConnection
-        ):
-            # It's likely an awaitable - return as-is for now
-            # Async post-processing is handled by the caller
-            return connection
+        if inspect.isawaitable(connection):
 
-        return cls._post_process_connection(connection, info=info, **kwargs)
+            async def _await_connection() -> Any:
+                resolved = await connection
+                finished = cls._finish_connection(
+                    resolved,
+                    total_count,
+                    info=info,
+                    **kwargs,
+                )
+                if inspect.isawaitable(finished):
+                    return await finished
+                return finished
+
+            return _await_connection()
+
+        return cls._finish_connection(connection, total_count, info=info, **kwargs)
+
+    @classmethod
+    def _attach_total_count(cls, connection: Any, total_count: int | None) -> Any:
+        if total_count is not None:
+            connection.total_count = total_count
+        return connection
+
+    @classmethod
+    def _finish_connection(
+        cls,
+        connection: Any,
+        total_count: AwaitableOrValue[int | None],
+        *,
+        info: Any,
+        **kwargs: Any,
+    ) -> AwaitableOrValue[Any]:
+        if inspect.isawaitable(total_count):
+
+            async def _await_total() -> Any:
+                count = await total_count
+                processed = cls._post_process_connection(
+                    connection, info=info, **kwargs
+                )
+                if inspect.isawaitable(processed):
+                    processed = await processed
+                return cls._attach_total_count(processed, count)
+
+            return _await_total()
+
+        processed = cls._post_process_connection(connection, info=info, **kwargs)
+        return cls._attach_total_count(processed, total_count)
 
     @classmethod
     def _post_process_connection(cls, connection, *, info, **kwargs):
@@ -414,7 +541,9 @@ __all__ = [
     "Edge",
     "ListConnection",
     "NodeType",
+    "ORMConnection",
     "ORMConnectionExtension",
     "ORMListConnection",
+    "connection_type_for_node",
     "PageInfo",
 ]

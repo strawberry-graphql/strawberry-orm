@@ -398,7 +398,9 @@ class _AutoFilterOrderExtension(FieldExtension):
             order=kwargs.get("order"),
             group_by=kwargs.get("group_by"),
         )
-        if isawaitable(result):
+        if isawaitable(result) and not (
+            self._model is not None and self._backend.is_query_object(result)
+        ):
             result = await_maybe_blocking(result)
         return self._cast_result(result)
 
@@ -568,6 +570,10 @@ class _AutoConnection:
                 order_type,
                 aggregate_type=aggregate_type,
             )
+        elif node_type is not None:
+            from strawberry_orm.relay.connection import connection_type_for_node
+
+            graphql_type = connection_type_for_node(node_type)
 
         base_resolver = _make_query_resolver(
             self._backend, model, filter_type, order_type, group_type
@@ -608,10 +614,31 @@ class _AutoConnection:
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
+        graphql_type = self._graphql_type
+        node_type = (
+            _extract_connection_node(graphql_type) if graphql_type is not None else None
+        )
+        model, filter_type, order_type, group_type, _aggregate_type = (
+            _resolve_orm_metadata(graphql_type)
+            if graphql_type is not None
+            else (None,) * 5
+        )
+        if node_type is not None:
+            from strawberry_orm.relay.connection import connection_type_for_node
+
+            graphql_type = connection_type_for_node(node_type)
+
         extensions = list(self._kwargs.get("extensions") or [])
-        extensions.append(_AutoFilterOrderExtension(self._backend))
+        extensions.append(
+            _AutoFilterOrderExtension(
+                self._backend,
+                filters=filter_type,
+                order=order_type,
+                group=group_type,
+            )
+        )
         field = relay.connection(
-            self._graphql_type,
+            graphql_type,
             resolver=resolver,
             name=self._kwargs.get("name"),
             description=self._kwargs.get("description"),
@@ -732,9 +759,11 @@ def _build_grouped_connection(
     conn_ns: dict[str, Any] = {
         "__annotations__": {
             "page_info": ExtPageInfo,
+            "total_count": int | None,
             "aggregates": AggregatesType | None,
             "groups": list[GroupType] | None,
         },
+        "total_count": None,
         "aggregates": None,
         "groups": None,
         "_orm_aggregate_meta": meta,

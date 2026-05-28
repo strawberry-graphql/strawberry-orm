@@ -497,6 +497,13 @@ class SQLAlchemyBackend(BaseBackend):
 
         return isinstance(value, Select)
 
+    def count_query(self, query: Any, info: Any) -> int:
+        from sqlalchemy import func, select
+
+        subq = query.subquery()
+        stmt = select(func.count()).select_from(subq)
+        return self._get_session(info).execute(stmt).scalar_one()
+
     def materialize_query(self, query: Any, info: Any) -> Any:
         return self._execute_stmt(query, info)
 
