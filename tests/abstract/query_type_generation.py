@@ -1,8 +1,13 @@
 """Abstract type generation tests: orm.type/filter/order/input/partial/ref."""
 
 import strawberry
+from strawberry.extensions import SchemaExtension
 
 from strawberry_orm.types import auto
+
+
+class _StubExtension(SchemaExtension):
+    pass
 
 
 class AbstractTestQueryTypeGeneration:
@@ -105,6 +110,46 @@ class AbstractTestQueryTypeGeneration:
             if ext.__name__.startswith("OptimizerExtension_")
         )
         assert optimizer_count == 1
+
+    def test_schema_inserts_lazy_resolution_after_custom_optimizer(
+        self, orm, User, monkeypatch
+    ):
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field()
+
+        monkeypatch.setattr(orm._backend, "_lazy_resolution", "warn")
+        schema = orm.schema(
+            query=Query,
+            extensions=[
+                _StubExtension,
+                orm.optimizer_extension(),
+                _StubExtension,
+            ],
+        )
+        extension_names = [ext.__name__ for ext in schema.extensions]
+        optimizer_index = next(
+            i
+            for i, name in enumerate(extension_names)
+            if name.startswith("OptimizerExtension_")
+        )
+        lazy_index = next(
+            i
+            for i, name in enumerate(extension_names)
+            if name.startswith("LazyResolutionExtension_")
+        )
+        assert lazy_index == optimizer_index + 1
+        assert extension_names == [
+            "_StubExtension",
+            extension_names[optimizer_index],
+            extension_names[lazy_index],
+            "_StubExtension",
+        ]
 
     def test_ref_update_only(self, orm, Tag):
         TagRef = orm.ref(Tag)

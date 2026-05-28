@@ -502,7 +502,7 @@ wheels = [
 
 [[package]]
 name = "strawberry-orm"
-version = "0.11.0"
+version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "strawberry-graphql" },
@@ -529,7 +529,11 @@ tortoise = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "greenlet" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
     { name = "pytest-cov" },
+    { name = "pytest-django" },
     { name = "starlette" },
     { name = "typer" },
     { name = "uvicorn" },
@@ -552,7 +556,11 @@ provides-extras = ["django", "sqlalchemy", "tortoise", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "greenlet", specifier = ">=3.3.2" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "pytest-django", specifier = ">=4.8" },
     { name = "starlette", specifier = ">=0.52.1" },
     { name = "typer", specifier = ">=0.24.1" },
     { name = "uvicorn", specifier = ">=0.41.0" },

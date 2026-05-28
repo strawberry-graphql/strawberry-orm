@@ -980,7 +980,10 @@ class StrawberryORM:
         the optimizer unless an optimizer extension was already provided.
         """
         from strawberry_orm.lazy_resolution import extensions_include_lazy_resolution
-        from strawberry_orm.optimizer.extension import extensions_include_optimizer
+        from strawberry_orm.optimizer.extension import (
+            extensions_include_optimizer,
+            extensions_optimizer_index,
+        )
 
         if optimizer is None:
             optimizer = self._backend._enable_optimizer
@@ -992,7 +995,8 @@ class StrawberryORM:
 
         lazy_mode = getattr(self._backend, "_lazy_resolution", "off")
         if lazy_mode != "off" and not extensions_include_lazy_resolution(extensions):
-            insert_at = 1 if extensions_include_optimizer(extensions) else 0
+            optimizer_index = extensions_optimizer_index(extensions)
+            insert_at = (optimizer_index + 1) if optimizer_index is not None else 0
             extensions.insert(insert_at, self.lazy_resolution_extension(mode=lazy_mode))
 
         return strawberry.Schema(extensions=extensions, **kwargs)

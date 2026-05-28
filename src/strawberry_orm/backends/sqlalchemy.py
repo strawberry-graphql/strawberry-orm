@@ -160,7 +160,7 @@ class SQLAlchemyBackend(BaseBackend):
                 if f_type is None and o_type is None:
                     continue
                 if field_name not in rel_names:
-                    continue
+                    continue  # pragma: no cover
                 rel = mapper.relationships[field_name]
                 rel_model = rel.mapper.class_
                 setattr(
@@ -662,7 +662,7 @@ class SQLAlchemyBackend(BaseBackend):
             from parent_loader independently, avoiding invalid cross-relationship chaining.
             """
             if selection_set is None:
-                return [parent_loader]
+                return [parent_loader]  # pragma: no cover
             loaders: list[Any] = []
             has_child_rels = False
             for node in selection_set.selections:

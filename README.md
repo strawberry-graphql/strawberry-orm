@@ -1,5 +1,8 @@
 # strawberry-orm
 
+[![Tests](https://github.com/strawberry-graphql/strawberry-orm/actions/workflows/tests.yml/badge.svg)](https://github.com/strawberry-graphql/strawberry-orm/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/strawberry-graphql/strawberry-orm/graph/badge.svg)](https://codecov.io/gh/strawberry-graphql/strawberry-orm)
+
 Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.rocks/) on top of Django ORM, SQLAlchemy, and Tortoise ORM.
 
 > **Warning** — `strawberry-orm` is still in **alpha**. Expect breaking changes and incomplete APIs while the package stabilizes.
@@ -416,6 +419,100 @@ class UserType:
 | `compute={...}` | Computed-column hints for the optimizer store. |
 | `disable_optimization=True` | Skip optimization for that field. |
 | `description="..."` | Forward a field description to Strawberry. |
+
+#### Tangible example: root queryset vs `load=`
+
+Clients often use a **custom root resolver** that already returns a filtered queryset. That scopes **User** rows for that field only. Nested `posts` still load in a **separate optimizer step** — there is no resolver on `UserType.posts` that returns `Post.objects…`, so you cannot “fix drafts” by returning a queryset higher in the tree.
+
+**Schema (Django):**
+
+```python
+from typing import Annotated
+
+import strawberry
+
+from strawberry_orm import StrawberryORM
+from strawberry_orm.types import auto
+
+orm = StrawberryORM.for_django()
+
+from myapp.models import Post, User  # Django models
+
+
+@orm.type(Post)
+class PostType:
+    id: auto
+    title: auto
+    is_published: auto
+
+
+@orm.type(User)
+class UserType:
+    id: auto
+    name: auto
+    # No custom resolver — optimizer prefetches posts when the query asks for them.
+    posts: list[PostType] = orm.field(
+        load=lambda qs: qs.filter(is_published=True)  # scope this edge only
+    )
+
+
+@strawberry.type
+class Query:
+    @orm.field
+    def active_users(self, info) -> list[UserType]:
+        # ✓ Scopes which *users* are returned from this field
+        return User.objects.filter(is_active=True)
+```
+
+**What goes wrong without `load=` (or `PostType.get_queryset`):**
+
+```graphql
+query {
+  activeUsers {
+    name
+    posts {
+      title
+      isPublished
+    }
+  }
+}
+```
+
+| Row | User | Post title | is_published |
+| --- | --- | --- | --- |
+| 1 | Alice (active) | Hello world | true |
+| 2 | Alice (active) | Secret draft | false |
+| 3 | Bob (inactive) | — | — |
+
+`active_users` excludes Bob, but Alice’s draft still appears under `posts` — the root queryset never filtered **Post** rows.
+
+**What each mechanism does here:**
+
+| Mechanism | Runs when | Effect in this example |
+| --- | --- | --- |
+| `active_users` returns `User.objects.filter(is_active=True)` | Root field resolve | Hides inactive users |
+| Optimizer walks `posts { title isPublished }` | Before SQL on users | Adds `prefetch_related` for `posts` |
+| `load=lambda qs: qs.filter(is_published=True)` on `UserType.posts` | Building that prefetch | Drops draft posts under each user |
+| `PostType.get_queryset` (alternative) | Same prefetch step | Same publish filter for **all** Post loads |
+
+You do **not** need `load=["posts"]` when the client already selects `posts { … }` — the optimizer follows the selection set (including `... on SomeType` inline fragments and named fragment spreads). Use `load=[...]` when you want extra joins beyond what the query selected, or `load=callable` / `get_queryset` when nested rows must be filtered.
+
+**Union inline fragments** — common in production APIs:
+
+```graphql
+query {
+  activeUsers {
+    posts {
+      ... on PostType {
+        title
+        isPublished
+      }
+    }
+  }
+}
+```
+
+With `orm.schema()`, the optimizer walks fields inside each inline branch so `posts` and nested relations are still prefetched (no `AttributeError` on fragment nodes).
 
 Field permissions via `make_field(permission_classes=[...])` — see [Defining Types](#defining-types).
 

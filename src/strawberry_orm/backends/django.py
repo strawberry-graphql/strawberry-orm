@@ -599,6 +599,8 @@ class DjangoBackend(BaseBackend):
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         import re
 
+        from strawberry_orm.optimizer.selections import iter_field_nodes
+
         def optimize() -> Any:
             try:
                 model = query.model
@@ -612,6 +614,7 @@ class DjangoBackend(BaseBackend):
 
             select_related: list[str] = []
             prefetch_related: list[Any] = []
+            fragments = getattr(info, "fragments", None)
 
             def _to_snake(name: str) -> str:
                 return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
@@ -651,7 +654,7 @@ class DjangoBackend(BaseBackend):
                 if selection_set is None:
                     return
                 meta = current_model._meta  # type: ignore[attr-defined]
-                for node in selection_set.selections:
+                for node in iter_field_nodes(selection_set, fragments):
                     field_name = _to_snake(node.name.value)
                     full_path = f"{prefix}__{field_name}" if prefix else field_name
                     try:
@@ -802,7 +805,9 @@ class DjangoBackend(BaseBackend):
             if type_name_root and store:
                 for field_node in info.field_nodes:
                     if field_node.selection_set:
-                        for sel in field_node.selection_set.selections:
+                        for sel in iter_field_nodes(
+                            field_node.selection_set, fragments
+                        ):
                             fname = _to_snake(sel.name.value)
                             hints = store.get(type_name_root, fname)
                             if hints and hints.only:

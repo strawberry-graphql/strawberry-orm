@@ -18,9 +18,11 @@ EXCLUDED_FILES = {
     "test_queryset_detection.py",
     "test_query_async_session.py",
     "test_internal_sqlalchemy_extra_coverage.py",
+    "test_internal_backend_coverage.py",
     "test_grouping.py",
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
+    "test_optimizer_inline_fragments.py",  # Django-only until SA/Tortoise port iter_field_nodes
 }
 
 EXCLUDED_METHODS = {

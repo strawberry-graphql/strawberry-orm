@@ -14,14 +14,19 @@ if TYPE_CHECKING:
     from strawberry_orm.optimizer.store import OptimizerStore
 
 
+def extensions_optimizer_index(extensions: list[Any]) -> int | None:
+    """Return the index of the optimizer extension in *extensions*, or None."""
+    for index, ext in enumerate(extensions):
+        if isinstance(ext, type) and issubclass(ext, OptimizerExtension):
+            return index
+        if getattr(ext, "__name__", "").startswith("OptimizerExtension_"):
+            return index
+    return None
+
+
 def extensions_include_optimizer(extensions: list[Any]) -> bool:
     """Return True if *extensions* already contains an optimizer extension."""
-    for ext in extensions:
-        if isinstance(ext, type) and issubclass(ext, OptimizerExtension):
-            return True
-        if getattr(ext, "__name__", "").startswith("OptimizerExtension_"):
-            return True
-    return False
+    return extensions_optimizer_index(extensions) is not None
 
 
 class OptimizerExtension(SchemaExtension):
@@ -31,7 +36,8 @@ class OptimizerExtension(SchemaExtension):
 
     The extension intercepts resolver return values. When a resolver returns
     a raw query object (SA ``Select``, Django ``QuerySet``), the optimizer
-    walks ``info.selected_fields``, adds eager-loads, and executes the query
+    walks the GraphQL selection set (including inline fragments and spreads),
+    adds eager-loads, and executes the query
     so that downstream resolvers receive model instances instead.
     """
 

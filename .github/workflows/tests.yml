@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Python 3.12)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: >-
+          uv sync --group dev
+          --extra django --extra sqlalchemy --extra tortoise
+
+      - name: Run tests with coverage
+        run: uv run pytest
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        if: always()
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

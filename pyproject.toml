@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.11.0"
+version = "0.12.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -47,7 +47,11 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "greenlet>=3.3.2",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "pytest-cov>=7.0.0",
+    "pytest-django>=4.8",
     "starlette>=0.52.1",
     "typer>=0.24.1",
     "uvicorn>=0.41.0",
@@ -80,6 +84,27 @@ known-first-party = ["strawberry_orm"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = [
+    "--cov=strawberry_orm",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "--cov-fail-under=100",
+]
 markers = [
     "asyncio: mark test as async",
+    "django_db: mark test as requiring django database access",
+]
+
+[tool.coverage.run]
+source = ["strawberry_orm"]
+omit = [
+    "*/backends/protocol.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
 ]
