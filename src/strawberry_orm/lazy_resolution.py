@@ -258,7 +258,8 @@ def _tortoise_relation_prefetched(instance: Any, field_name: str) -> bool | None
         return None
 
     field = fields_map[field_name]
-    if getattr(field, "related_model", None) is None:
+    related_model = getattr(field, "related_model", None)
+    if related_model is None:
         return None
 
     fetched = getattr(instance, "_fetched", None)
@@ -267,7 +268,24 @@ def _tortoise_relation_prefetched(instance: Any, field_name: str) -> bool | None
     if isinstance(fetched, dict) and field_name in fetched:
         return True
 
-    return field_name in instance.__dict__
+    field_cls = type(field).__name__
+
+    try:
+        rel_value = getattr(instance, field_name)
+    except Exception:
+        return False
+
+    if isinstance(rel_value, list) and field_cls in (
+        "BackwardFKRelation",
+        "BackwardOneToOneRelation",
+        "ManyToManyFieldInstance",
+    ):
+        return True
+
+    if getattr(rel_value, "_fetched", False):
+        return True
+
+    return isinstance(rel_value, related_model)
 
 
 def relation_is_prefetched(

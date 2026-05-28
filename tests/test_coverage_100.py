@@ -181,10 +181,13 @@ class TestAsyncRemaining:
         def resolver() -> FakeQS:
             return FakeQS([1])
 
-        with patch(
-            "strawberry_orm._async.asyncio.get_running_loop",
-            side_effect=RuntimeError,
-        ), patch.dict("sys.modules", {"django.db.models": None}):
+        with (
+            patch(
+                "strawberry_orm._async.asyncio.get_running_loop",
+                side_effect=RuntimeError,
+            ),
+            patch.dict("sys.modules", {"django.db.models": None}),
+        ):
             wrapped = async_safe_resolver(resolver)
             assert wrapped() == [1]
 
@@ -430,6 +433,15 @@ class TestLazyResolutionRemaining:
         tortoise_attr._fetched = set()
         tortoise_attr.author = object()
         assert _tortoise_relation_prefetched(tortoise_attr, "author") is True
+
+        class BackwardFKRelation:
+            related_model = object
+
+        tortoise_list = SimpleNamespace(
+            _meta=SimpleNamespace(fields_map={"posts": BackwardFKRelation()}),
+            posts=[object()],
+        )
+        assert _tortoise_relation_prefetched(tortoise_list, "posts") is True
 
         assert relation_is_prefetched(DummyCovBackend(), object(), "x") is None
 

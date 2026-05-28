@@ -487,6 +487,8 @@ class TestInternalBackendCoverage:
     def test_optimizer_nested_loader_without_selection_set(
         self, sa_session, seed, User, Post
     ):
+        from graphql.language.ast import FieldNode, NameNode, SelectionSetNode
+
         backend = SQLAlchemyBackend(dialect="sqlite")
         backend._type_registry["UserType"] = User
         backend._store.hints = {
@@ -498,21 +500,141 @@ class TestInternalBackendCoverage:
                 )
             }
         }
-        posts_sel = SimpleNamespace(
-            name=SimpleNamespace(value="posts"),
+        posts_field = FieldNode(
+            alias=None,
+            name=NameNode(value="posts"),
+            arguments=(),
+            directives=(),
             selection_set=None,
         )
-        field_node = SimpleNamespace(
-            selection_set=SimpleNamespace(selections=[posts_sel])
+        field_node = FieldNode(
+            alias=None,
+            name=NameNode(value="users"),
+            arguments=(),
+            directives=(),
+            selection_set=SelectionSetNode(selections=[posts_field]),
         )
         info = SimpleNamespace(
             field_nodes=[field_node],
+            fragments={},
             context={"session": sa_session},
         )
         result = backend.apply_optimizer_hints(
             backend._store, backend.get_default_queryset(User), info
         )
         assert len(result) >= 1
+
+    def test_apply_optimizer_hints_walks_graphql_inline_fragments(
+        self, sa_session, seed, User, Post
+    ):
+        from graphql import parse
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        doc = parse("{ users { posts { ... on PostType { title tags { name } } } } }")
+        users_field = doc.definitions[0].selection_set.selections[0]
+        info = SimpleNamespace(
+            field_nodes=[users_field],
+            fragments={},
+            context={"session": sa_session},
+        )
+        users = backend.apply_optimizer_hints(None, select(User), info)
+        assert len(users) >= 1
+
+    def test_apply_optimizer_hints_chained_loader_with_criteria(
+        self, sa_session, seed, User, Post
+    ):
+        from graphql.language.ast import FieldNode, NameNode, SelectionSetNode
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        backend._type_registry["UserType"] = User
+
+        class PostQueryType:
+            @classmethod
+            def get_queryset(cls, stmt, info):
+                return stmt.where(Post.is_published.is_(True))
+
+        class UserQueryType:
+            @classmethod
+            def get_queryset(cls, stmt, info):
+                return stmt.where(User.name != "")
+
+        backend._type_querysets[Post] = PostQueryType.get_queryset
+        backend._type_querysets[User] = UserQueryType.get_queryset
+        author_field = FieldNode(
+            alias=None,
+            name=NameNode(value="author"),
+            arguments=(),
+            directives=(),
+            selection_set=None,
+        )
+        posts_field = FieldNode(
+            alias=None,
+            name=NameNode(value="posts"),
+            arguments=(),
+            directives=(),
+            selection_set=SelectionSetNode(selections=[author_field]),
+        )
+        users_field = FieldNode(
+            alias=None,
+            name=NameNode(value="users"),
+            arguments=(),
+            directives=(),
+            selection_set=SelectionSetNode(selections=[posts_field]),
+        )
+        info = SimpleNamespace(
+            field_nodes=[users_field],
+            fragments={},
+            context={"session": sa_session},
+        )
+        users = backend.apply_optimizer_hints(
+            None, backend.get_default_queryset(User), info
+        )
+        assert len(users) >= 1
+
+    def test_apply_optimizer_hints_selectinload_with_criteria(
+        self, sa_session, seed, User, Post, Tag
+    ):
+        from graphql.language.ast import FieldNode, NameNode, SelectionSetNode
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        backend._type_registry["UserType"] = User
+
+        class TagQueryType:
+            @classmethod
+            def get_queryset(cls, stmt, info):
+                return stmt.where(Tag.name != "")
+
+        backend._type_querysets[Tag] = TagQueryType.get_queryset
+        tags_field = FieldNode(
+            alias=None,
+            name=NameNode(value="tags"),
+            arguments=(),
+            directives=(),
+            selection_set=None,
+        )
+        posts_field = FieldNode(
+            alias=None,
+            name=NameNode(value="posts"),
+            arguments=(),
+            directives=(),
+            selection_set=SelectionSetNode(selections=[tags_field]),
+        )
+        users_field = FieldNode(
+            alias=None,
+            name=NameNode(value="users"),
+            arguments=(),
+            directives=(),
+            selection_set=SelectionSetNode(selections=[posts_field]),
+        )
+        info = SimpleNamespace(
+            field_nodes=[users_field],
+            fragments={},
+            context={"session": sa_session},
+        )
+        users = backend.apply_optimizer_hints(
+            None, backend.get_default_queryset(User), info
+        )
+        assert len(users) >= 1
 
     def test_build_sa_field_clause_skips_missing_column(self, Post):
         @strawberry.input

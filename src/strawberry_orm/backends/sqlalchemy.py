@@ -98,6 +98,14 @@ class SQLAlchemyBackend(BaseBackend):
         aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
+            if "is_type_of" not in cls.__dict__:
+
+                @classmethod
+                def is_type_of(inner_cls: type, obj: object, info: Any) -> bool:
+                    return isinstance(obj, model)
+
+                cls.is_type_of = is_type_of  # type: ignore[method-assign]
+
             from sqlalchemy import inspect as sa_inspect
 
             mapper = sa_inspect(model)
@@ -522,6 +530,13 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy.orm import joinedload, load_only, selectinload
 
+        from strawberry_orm.optimizer.selections import (
+            fragments_from_info,
+            iter_field_nodes,
+        )
+
+        fragments = fragments_from_info(info)
+
         try:
             entity = query.column_descriptions[0]["entity"]
         except (AttributeError, IndexError, KeyError):
@@ -605,7 +620,7 @@ class SQLAlchemyBackend(BaseBackend):
         def _apply_loads(stmt: Any, selection_set: Any, current_mapper: Any) -> Any:
             if selection_set is None:
                 return stmt
-            for node in selection_set.selections:
+            for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
 
                 if field_name in current_mapper.relationships:
@@ -665,7 +680,7 @@ class SQLAlchemyBackend(BaseBackend):
                 return [parent_loader]  # pragma: no cover
             loaders: list[Any] = []
             has_child_rels = False
-            for node in selection_set.selections:
+            for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
                 if field_name in child_mapper.relationships:
                     has_child_rels = True

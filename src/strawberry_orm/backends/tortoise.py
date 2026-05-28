@@ -71,6 +71,46 @@ def _query_orderings(
     return _QUERY_ORDERINGS.get(id(query))
 
 
+def _coalesce_tortoise_prefetch_paths(model: type, paths: list[str]) -> list[Any]:
+    """Merge nested prefetch strings into ``Prefetch`` objects for reverse relations.
+
+    Tortoise does not always apply nested prefetches such as ``posts__tags`` on
+    reverse FK relations; building an explicit ``Prefetch('posts', Post...tags)``
+    queryset matches what ``fetch_related`` does for direct models.
+    """
+    from tortoise.query_utils import Prefetch
+
+    nested: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for path in paths:
+        if "__" in path:
+            root, sub = path.split("__", 1)
+            nested.setdefault(root, []).append(sub)
+        else:
+            roots.append(path)
+
+    result: list[Any] = []
+    used_roots: set[str] = set()
+    meta = model._meta  # type: ignore[attr-defined]
+    for root, subs in nested.items():
+        field = meta.fields_map.get(root)
+        related_model = (
+            getattr(field, "related_model", None) if field is not None else None
+        )
+        if related_model is None:
+            continue
+        qs = related_model.all()
+        if subs:
+            qs = qs.prefetch_related(*subs)
+        result.append(Prefetch(root, qs))
+        used_roots.add(root)
+
+    for root in roots:
+        if root not in used_roots and root in meta.fields_map:
+            result.append(root)
+    return result
+
+
 class _CustomRel:
     """Holds metadata for a relationship that uses a custom queryset."""
 
@@ -207,6 +247,14 @@ class TortoiseBackend(BaseBackend):
         aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
+            if "is_type_of" not in cls.__dict__:
+
+                @classmethod
+                def is_type_of(inner_cls: type, obj: object, info: Any) -> bool:
+                    return isinstance(obj, model)
+
+                cls.is_type_of = is_type_of  # type: ignore[method-assign]
+
             fields_meta = self._introspect_model(model)
             col_types: dict[str, type] = {}
             rel_fields: dict[str, dict[str, Any]] = {}
@@ -607,7 +655,13 @@ class TortoiseBackend(BaseBackend):
         query: Any,
         info: Any,
     ) -> Any:
+        from strawberry_orm.optimizer.selections import (
+            fragments_from_info,
+            iter_field_nodes,
+        )
+
         orderings = _query_orderings(query)
+        fragments = fragments_from_info(info)
 
         try:
             model = query.model
@@ -667,7 +721,7 @@ class TortoiseBackend(BaseBackend):
             if selection_set is None:
                 return  # pragma: no cover
             meta = current_model._meta  # type: ignore[attr-defined]
-            for node in selection_set.selections:
+            for node in iter_field_nodes(selection_set, fragments):
                 field_name = _to_snake(node.name.value)
                 full_path = f"{prefix}__{field_name}" if prefix else field_name
 
@@ -763,14 +817,16 @@ class TortoiseBackend(BaseBackend):
         if type_name_root and store:
             for field_node in info.field_nodes:
                 if field_node.selection_set:
-                    for sel in field_node.selection_set.selections:
+                    for sel in iter_field_nodes(field_node.selection_set, fragments):
                         fname = _to_snake(sel.name.value)
                         hints = store.get(type_name_root, fname)
                         if hints and hints.only:
                             only_fields.extend(hints.only)
 
         if prefetch_paths:
-            query = query.prefetch_related(*prefetch_paths)
+            query = query.prefetch_related(
+                *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
+            )
         if only_fields:
             query = query.only(*only_fields)
         if orderings:

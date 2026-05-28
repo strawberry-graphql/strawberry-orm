@@ -29,6 +29,40 @@ def extensions_include_optimizer(extensions: list[Any]) -> bool:
     return extensions_optimizer_index(extensions) is not None
 
 
+def _extensions_from_info(info: Any) -> list[Any]:
+    schema = getattr(info, "schema", None)
+    if schema is None:
+        return []
+    strawberry_schema = getattr(schema, "_strawberry_schema", schema)
+    return list(getattr(strawberry_schema, "extensions", None) or [])
+
+
+def schema_includes_optimizer(info: Any) -> bool:
+    """Return True when the executing schema has an optimizer extension."""
+    return extensions_include_optimizer(_extensions_from_info(info))
+
+
+def get_configured_optimizer(info: Any) -> tuple[Backend | None, OptimizerStore | None]:
+    """Return the backend and store bound to the schema's optimizer extension."""
+    extensions = _extensions_from_info(info)
+    index = extensions_optimizer_index(extensions)
+    if index is None:
+        return None, None
+    extension = extensions[index]
+    return (
+        getattr(extension, "_backend", None),
+        getattr(extension, "_store", None),
+    )
+
+
+def optimize_query_nodes(nodes: Any, info: Any) -> Any:
+    """Apply optimizer hints to *nodes* when it is still a backend query object."""
+    backend, store = get_configured_optimizer(info)
+    if backend is None or store is None or not backend.is_query_object(nodes):
+        return nodes
+    return backend.apply_optimizer_hints(store, nodes, info)
+
+
 class OptimizerExtension(SchemaExtension):
     """A Strawberry schema extension that reads the GraphQL query tree
     and tells the active backend to apply eager-loading / column-selection

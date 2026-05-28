@@ -22,7 +22,6 @@ EXCLUDED_FILES = {
     "test_grouping.py",
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
-    "test_optimizer_inline_fragments.py",  # Django-only until SA/Tortoise port iter_field_nodes
 }
 
 EXCLUDED_METHODS = {

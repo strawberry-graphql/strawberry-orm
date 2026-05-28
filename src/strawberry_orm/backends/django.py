@@ -599,7 +599,10 @@ class DjangoBackend(BaseBackend):
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         import re
 
-        from strawberry_orm.optimizer.selections import iter_field_nodes
+        from strawberry_orm.optimizer.selections import (
+            fragments_from_info,
+            iter_field_nodes,
+        )
 
         def optimize() -> Any:
             try:
@@ -614,7 +617,7 @@ class DjangoBackend(BaseBackend):
 
             select_related: list[str] = []
             prefetch_related: list[Any] = []
-            fragments = getattr(info, "fragments", None)
+            fragments = fragments_from_info(info)
 
             def _to_snake(name: str) -> str:
                 return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()

@@ -2,17 +2,174 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+import inspect
+from collections.abc import Iterable
+from typing import Any, TypeVar, cast
 
 from strawberry import relay
+from strawberry.extensions.field_extension import (
+    AsyncExtensionResolver,
+    SyncExtensionResolver,
+)
 from strawberry.relay import Connection, Edge, ListConnection, PageInfo
+from strawberry.relay.fields import ConnectionExtension
+from strawberry.relay.types import Node
+from strawberry.types import Info
 
 from strawberry_orm._async import AwaitableOrValue
 from strawberry_orm.backends._base import (
     _selection_requests,
 )
+from strawberry_orm.optimizer.extension import optimize_query_nodes
 
 NodeType = TypeVar("NodeType", bound=relay.Node)
+
+
+class ORMConnectionExtension(ConnectionExtension):
+    """Connection field extension that applies optimizer hints before pagination."""
+
+    def _paginate_nodes(
+        self,
+        nodes: Any,
+        info: Info,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        first: int | None = None,
+        last: int | None = None,
+    ) -> Any:
+        assert self.connection_type is not None
+        return self.connection_type.resolve_connection(
+            cast("Iterable[Node]", nodes),
+            info=info,
+            before=before,
+            after=after,
+            first=first,
+            last=last,
+            max_results=self.max_results,
+        )
+
+    def _resolve_nodes(
+        self,
+        nodes: Any,
+        info: Info,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        first: int | None = None,
+        last: int | None = None,
+    ) -> Any:
+        nodes = optimize_query_nodes(nodes, info)
+        if inspect.isawaitable(nodes):
+
+            async def _await_optimized() -> Any:
+                optimized = await nodes
+                connection = self._paginate_nodes(
+                    optimized,
+                    info,
+                    before=before,
+                    after=after,
+                    first=first,
+                    last=last,
+                )
+                if inspect.isawaitable(connection):
+                    connection = await connection
+                return connection
+
+            return _await_optimized()
+
+        connection = self._paginate_nodes(
+            nodes,
+            info,
+            before=before,
+            after=after,
+            first=first,
+            last=last,
+        )
+        if inspect.isawaitable(connection):
+
+            async def _await_connection() -> Any:
+                return await connection
+
+            return _await_connection()
+        return connection
+
+    def resolve(
+        self,
+        next_: SyncExtensionResolver,
+        source: Any,
+        info: Info,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        first: int | None = None,
+        last: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        nodes = next_(source, info, **kwargs)
+        if inspect.isawaitable(nodes):
+
+            async def _await_nodes() -> Any:
+                resolved_nodes = await nodes
+                connection = self._resolve_nodes(
+                    resolved_nodes,
+                    info,
+                    before=before,
+                    after=after,
+                    first=first,
+                    last=last,
+                )
+                if inspect.isawaitable(connection):
+                    connection = await connection
+                return connection
+
+            return _await_nodes()
+
+        return self._resolve_nodes(
+            nodes,
+            info,
+            before=before,
+            after=after,
+            first=first,
+            last=last,
+        )
+
+    async def resolve_async(
+        self,
+        next_: AsyncExtensionResolver,
+        source: Any,
+        info: Info,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        first: int | None = None,
+        last: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        nodes = next_(source, info, **kwargs)
+        if inspect.isawaitable(nodes):
+            nodes = await nodes
+        connection = self._resolve_nodes(
+            nodes,
+            info,
+            before=before,
+            after=after,
+            first=first,
+            last=last,
+        )
+        if inspect.isawaitable(connection):
+            connection = await connection
+        return connection
+
+
+def _use_orm_connection_extension(field: Any) -> None:
+    """Replace Strawberry's ``ConnectionExtension`` with ``ORMConnectionExtension``."""
+    field.extensions = [
+        ORMConnectionExtension(max_results=ext.max_results)
+        if isinstance(ext, ConnectionExtension)
+        else ext
+        for ext in field.extensions
+    ]
 
 
 def _node_matches_group_key(node: Any, key: Any, key_fields: list[str]) -> bool:
@@ -97,6 +254,7 @@ class ORMListConnection(ListConnection[NodeType]):
         info,
         **kwargs,
     ) -> AwaitableOrValue:
+        nodes = optimize_query_nodes(nodes, info)
         connection = super().resolve_connection(nodes, info=info, **kwargs)
 
         # Handle async case
@@ -256,6 +414,7 @@ __all__ = [
     "Edge",
     "ListConnection",
     "NodeType",
+    "ORMConnectionExtension",
     "ORMListConnection",
     "PageInfo",
 ]

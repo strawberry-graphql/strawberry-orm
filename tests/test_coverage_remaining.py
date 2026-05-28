@@ -90,6 +90,7 @@ from strawberry_orm.optimizer.extension import (
 )
 from strawberry_orm.policy import _policy_to_repos
 from strawberry_orm.relay.connection import (
+    ORMConnectionExtension,
     ORMListConnection,
     _compute_page_aggregates,
     _decode_cursor_offset,
@@ -98,6 +99,7 @@ from strawberry_orm.relay.connection import (
     _extract_items_order,
     _get_items_arg,
     _node_matches_group_key,
+    _use_orm_connection_extension,
 )
 from strawberry_orm.types import DateGroupByOption, Ordering, auto
 from tests.backends.sqlalchemy.models import Base as SABase
@@ -704,6 +706,72 @@ class TestConnectionCoverage:
         )
         assert _get_items_arg(info2, "order") == "ASC"
 
+    @pytest.mark.asyncio
+    async def test_orm_connection_extension_async_resolve_branches(self):
+        ext = ORMConnectionExtension(max_results=10)
+
+        async def async_connection(*_args, **_kwargs):
+            return SimpleNamespace(edges=[], page_info=SimpleNamespace())
+
+        ext.connection_type = SimpleNamespace(resolve_connection=async_connection)
+        info = SimpleNamespace()
+
+        async def pending_nodes():
+            return [1, 2]
+
+        with patch(
+            "strawberry_orm.relay.connection.optimize_query_nodes",
+            side_effect=lambda nodes, _info: pending_nodes(),
+        ):
+            coro = ext._resolve_nodes([], info)
+            assert asyncio.iscoroutine(coro)
+            resolved = await coro
+            assert hasattr(resolved, "edges")
+
+        with patch.object(ext, "_paginate_nodes", return_value=async_connection()):
+            coro = ext._resolve_nodes([1], info)
+            assert asyncio.iscoroutine(coro)
+            assert hasattr(await coro, "edges")
+
+        async def pending_from_next(source, info, **kwargs):
+            return pending_nodes()
+
+        with patch.object(ext, "_paginate_nodes", return_value=async_connection()):
+            sync_result = ext.resolve(pending_from_next, None, info)
+            assert asyncio.iscoroutine(sync_result)
+            assert hasattr(await sync_result, "edges")
+
+    @pytest.mark.asyncio
+    async def test_orm_connection_extension_resolve_async(self):
+        ext = ORMConnectionExtension(max_results=None)
+
+        async def async_connection(*_args, **_kwargs):
+            return "connection"
+
+        ext.connection_type = SimpleNamespace(resolve_connection=async_connection)
+        info = SimpleNamespace()
+
+        async def next_(source, info, **kwargs):
+            return [1]
+
+        with patch(
+            "strawberry_orm.relay.connection.optimize_query_nodes",
+            side_effect=lambda nodes, _info: nodes,
+        ):
+            result = await ext.resolve_async(next_, None, info)
+            assert result == "connection"
+
+    def test_use_orm_connection_extension_replaces_connection_extension(self):
+        from strawberry.relay.fields import ConnectionExtension
+
+        field = SimpleNamespace(
+            extensions=[ConnectionExtension(max_results=5), object()],
+        )
+        _use_orm_connection_extension(field)
+        assert isinstance(field.extensions[0], ORMConnectionExtension)
+        assert field.extensions[0].max_results == 5
+        assert field.extensions[1] is not None
+
 
 # ---------------------------------------------------------------------------
 # _async.py
@@ -1137,12 +1205,15 @@ class TestMiscCoverage:
             unlink=strawberry.UNSET,
             delete=DeleteRef(id=strawberry.ID("2")),
         )
-        with patch(
-            "strawberry_orm.mutations._async_load_instance",
-            AsyncMock(return_value=child),
-        ), patch(
-            "strawberry_orm.mutations._async_delete_instance", AsyncMock()
-        ) as delete_mock:
+        with (
+            patch(
+                "strawberry_orm.mutations._async_load_instance",
+                AsyncMock(return_value=child),
+            ),
+            patch(
+                "strawberry_orm.mutations._async_delete_instance", AsyncMock()
+            ) as delete_mock,
+        ):
             await ns._apply_reverse_many_async(post, spec, [delete_ref], info)
             delete_mock.assert_awaited()
         sa_session.delete(child)
@@ -2023,12 +2094,15 @@ class TestPushTo98:
         def fake_resolver() -> FakeQuerySet:
             return FakeQuerySet([1, 2])
 
-        with patch(
-            "strawberry_orm._async.asyncio.get_running_loop",
-            side_effect=RuntimeError,
-        ), patch.dict(
-            "sys.modules",
-            {"django.db.models": SimpleNamespace(QuerySet=FakeQuerySet)},
+        with (
+            patch(
+                "strawberry_orm._async.asyncio.get_running_loop",
+                side_effect=RuntimeError,
+            ),
+            patch.dict(
+                "sys.modules",
+                {"django.db.models": SimpleNamespace(QuerySet=FakeQuerySet)},
+            ),
         ):
             wrapped = async_safe_resolver(fake_resolver)
             result = wrapped()
@@ -2640,6 +2714,66 @@ class TestLastCoverageLines:
         )
         assert _django_relation_prefetched(fk_post_no_cache, "author") is True
         assert _tortoise_relation_prefetched(object(), "tags") is None
+
+        class ManyToManyFieldInstance:
+            related_model = object
+
+        class BackwardFKRelation:
+            related_model = object
+
+        list_posts = SimpleNamespace(
+            _meta=SimpleNamespace(
+                fields_map={"posts": BackwardFKRelation()},
+            ),
+            posts=[object()],
+        )
+        assert _tortoise_relation_prefetched(list_posts, "posts") is True
+
+        class RaisingTags:
+            _meta = SimpleNamespace(
+                fields_map={"tags": ManyToManyFieldInstance()},
+            )
+
+            @property
+            def tags(self):
+                raise RuntimeError("access denied")
+
+        assert _tortoise_relation_prefetched(RaisingTags(), "tags") is False
+
+    def test_coalesce_tortoise_prefetch_paths_skips_unknown_nested_roots(self):
+        from tortoise.query_utils import Prefetch
+
+        from strawberry_orm.backends.tortoise import _coalesce_tortoise_prefetch_paths
+
+        class _PostModel:
+            _meta = SimpleNamespace(basequery=object())
+
+        class _PostQuerySet:
+            model = _PostModel
+            query = object()
+
+            def prefetch_related(self, *_args: str):
+                return self
+
+        class _BackwardFK:
+            related_model = _PostModel
+
+        _PostModel.all = classmethod(lambda cls: _PostQuerySet())  # type: ignore[method-assign]
+
+        class _FakeUser:
+            _meta = SimpleNamespace(
+                fields_map={"posts": _BackwardFK(), "name": object()}
+            )
+
+        assert (
+            _coalesce_tortoise_prefetch_paths(_FakeUser, ["not_a_relation__nested"])
+            == []
+        )
+        coalesced = _coalesce_tortoise_prefetch_paths(
+            _FakeUser, ["posts__tags", "posts"]
+        )
+        assert len(coalesced) == 1
+        assert isinstance(coalesced[0], Prefetch)
 
     def test_sqlalchemy_final_helper_branches(self, sa_session, seed, Post):
         from strawberry_orm.backends.sqlalchemy import (

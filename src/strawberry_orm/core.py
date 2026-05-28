@@ -285,6 +285,12 @@ class _AutoFilterOrderExtension(FieldExtension):
         forwarded.pop("group_by", None)
         return forwarded
 
+    def _defer_query_materialization(self, info: Any) -> bool:
+        """Leave query objects for OptimizerExtension when the schema has one."""
+        from strawberry_orm.optimizer.extension import schema_includes_optimizer
+
+        return schema_includes_optimizer(info)
+
     def _stash_context(
         self,
         info: Any,
@@ -325,12 +331,13 @@ class _AutoFilterOrderExtension(FieldExtension):
 
             if order is not None:
                 result = self._backend.apply_ordering(result, order, self._model)
-            result = materialize_result(
-                self._backend,
-                result,
-                info,
-                sync=True,
-            )
+            if not self._defer_query_materialization(info):
+                result = materialize_result(
+                    self._backend,
+                    result,
+                    info,
+                    sync=True,
+                )
 
         return result
 
@@ -361,7 +368,8 @@ class _AutoFilterOrderExtension(FieldExtension):
 
             if order is not None:
                 result = self._backend.apply_ordering(result, order, self._model)
-            result = self._backend.materialize_query(result, info)
+            if not self._defer_query_materialization(info):
+                result = self._backend.materialize_query(result, info)
 
         return result
 
@@ -427,7 +435,8 @@ class _AutoFilterOrderExtension(FieldExtension):
                         kwargs["order"],
                         self._model,
                     )
-                result = await materialize(result, info)
+                if not self._defer_query_materialization(info):
+                    result = await materialize(result, info)
                 return self._cast_result(result)
 
             result = await await_maybe(
@@ -591,6 +600,9 @@ class _AutoConnection:
             extensions=extensions,
             max_results=self._kwargs.get("max_results"),
         )
+        from strawberry_orm.relay.connection import _use_orm_connection_extension
+
+        _use_orm_connection_extension(field)
         field._orm_auto_field = True  # type: ignore[attr-defined]
         field._orm_connection = True  # type: ignore[attr-defined]
         setattr(owner, name, field)
@@ -607,6 +619,9 @@ class _AutoConnection:
             extensions=extensions,
             max_results=self._kwargs.get("max_results"),
         )
+        from strawberry_orm.relay.connection import _use_orm_connection_extension
+
+        _use_orm_connection_extension(field)
         field._orm_connection = True  # type: ignore[attr-defined]
         return field
 
