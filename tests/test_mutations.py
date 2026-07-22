@@ -96,6 +96,31 @@ class TestMakeRefType:
         field_names = [f.name for f in definition.fields]
         assert set(field_names) == {"create", "update", "unlink", "delete"}
 
+    def test_with_upsert(self):
+        @strawberry.input
+        class UpsertTagInput:
+            where: str
+            create: str | None = None
+
+        class FakeModel:
+            __name__ = "Tag"
+
+        RefType = make_ref_type(
+            FakeModel, update=False, upsert=UpsertTagInput, unlink=True
+        )
+        definition = RefType.__strawberry_definition__
+        field_names = [f.name for f in definition.fields]
+        assert set(field_names) == {"upsert", "unlink"}
+
+    def test_update_false_omits_update(self):
+        class FakeModel:
+            __name__ = "Tag"
+
+        RefType = make_ref_type(FakeModel, update=False, unlink=True)
+        definition = RefType.__strawberry_definition__
+        field_names = [f.name for f in definition.fields]
+        assert field_names == ["unlink"]
+
     def test_custom_name(self):
         class FakeModel:
             __name__ = "Tag"

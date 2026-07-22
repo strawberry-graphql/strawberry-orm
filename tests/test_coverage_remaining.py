@@ -78,11 +78,14 @@ from strawberry_orm.mutations import (
     _PROJECT_LEAF,
     _PROJECT_UNBOUNDED,
     MutationNamespace,
+    OpFields,
+    RelationPolicy,
     RelationRemovalPolicy,
     RelationSpec,
     _primary_key_value,
     _sync_get_many_related,
     _sync_save_instance,
+    make_ref_type,
 )
 from strawberry_orm.optimizer.extension import (
     OptimizerExtension,
@@ -381,13 +384,14 @@ class TestMutationsCoverage:
             )
 
         @strawberry.input
-        class UpdateUser:
-            id: strawberry.ID
-            name: str | None = strawberry.UNSET
+        class CreateUser:
+            name: str
+            email: str
 
         AuthorRelationInput.__relation_policy__ = {
             "default_on_replace": "DISCONNECT",
             "on_replace_options": ("DISCONNECT", "DELETE"),
+            "allowed_ops": frozenset({"create", "update"}),
         }
         disposable = SAUser(id=50, name="Disposable", email="disposable@example.com")
         sa_session.add(disposable)
@@ -396,12 +400,12 @@ class TestMutationsCoverage:
         sa_session.flush()
 
         wrapper = AuthorRelationInput(
-            update=UpdateUser(id=strawberry.ID("2")),
+            create=CreateUser(name="Replacement", email="replacement@example.com"),
             on_replace=RelationRemovalPolicy.DELETE,
         )
         ns._apply_single_sync(comment, spec, wrapper, info)
         sa_session.flush()
-        assert comment.author_id == 2
+        assert comment.author.email == "replacement@example.com"
         assert sa_session.get(SAUser, disposable.id) is None
 
     @pytest.mark.asyncio
@@ -430,21 +434,22 @@ class TestMutationsCoverage:
             )
 
         @strawberry.input
-        class UpdateUser:
-            id: strawberry.ID
-            name: str | None = strawberry.UNSET
+        class CreateUser:
+            name: str
+            email: str
 
         AuthorRelationInput.__relation_policy__ = {
             "default_on_replace": "DISCONNECT",
             "on_replace_options": ("DISCONNECT", "DELETE"),
+            "allowed_ops": frozenset({"create", "update"}),
         }
         wrapper = AuthorRelationInput(
-            update=UpdateUser(id=strawberry.ID("2")),
+            create=CreateUser(name="AsyncRep", email="async-rep@example.com"),
             on_replace=RelationRemovalPolicy.DELETE,
         )
 
         with (
-            patch.object(ns, "_update_async", AsyncMock(return_value=related)),
+            patch.object(ns, "_create_async", AsyncMock(return_value=related)),
             patch(
                 "strawberry_orm.mutations._async_save_instance", AsyncMock()
             ) as save_mock,
@@ -816,7 +821,9 @@ class TestConnectionCoverage:
 
                 return _fail().__await__()
 
-        backend = SimpleNamespace(is_query_object=lambda value: isinstance(value, AwaitableQuery))
+        backend = SimpleNamespace(
+            is_query_object=lambda value: isinstance(value, AwaitableQuery)
+        )
         info = SimpleNamespace(context={"_orm_backend": backend})
         query = AwaitableQuery()
         assert _should_await_nodes(query, info) is False
@@ -830,7 +837,9 @@ class TestConnectionCoverage:
 
                 return _fail().__await__()
 
-        backend = SimpleNamespace(is_query_object=lambda value: isinstance(value, AwaitableQuery))
+        backend = SimpleNamespace(
+            is_query_object=lambda value: isinstance(value, AwaitableQuery)
+        )
         info = SimpleNamespace(context={"_orm_backend": backend})
         query = AwaitableQuery()
         assert await _await_nodes_if_needed(query, info) is query
@@ -848,9 +857,7 @@ class TestConnectionCoverage:
             return [1, 2, 3]
 
         assert (
-            await _connection_total_count(
-                pending_nodes(), SimpleNamespace(context={})
-            )
+            await _connection_total_count(pending_nodes(), SimpleNamespace(context={}))
             == 3
         )
 
@@ -2508,7 +2515,12 @@ class TestPushTo98:
             backend, "_introspect_model", side_effect=introspect_with_secret
         ):
             ns._populate_model_input(
-                cls, SAUser, operation="create", project=_PROJECT_UNBOUNDED
+                cls,
+                SAUser,
+                operation="create",
+                project=_PROJECT_UNBOUNDED,
+                op_fields=OpFields(),
+                include_id=False,
             )
         assert "password_hash" not in cls.__annotations__
         assert "name" in cls.__annotations__
@@ -2534,15 +2546,17 @@ class TestPushTo98:
             )
 
         @strawberry.input
-        class UpdateUser:
-            id: strawberry.ID
+        class CreateUser:
+            name: str
+            email: str
 
         AuthorRelationInput.__relation_policy__ = {
             "default_on_replace": "DISCONNECT",
             "on_replace_options": ("DISCONNECT", "DELETE"),
+            "allowed_ops": frozenset({"create", "update"}),
         }
         wrapper = AuthorRelationInput(
-            update=UpdateUser(id=strawberry.ID("2")),
+            create=CreateUser(name="NoRepoRep", email="norepo-rep@example.com"),
             on_replace=RelationRemovalPolicy.DELETE,
         )
         ns._apply_single_sync(comment, spec, wrapper, info)
@@ -2678,15 +2692,17 @@ class TestPushTo98:
             )
 
         @strawberry.input
-        class UpdateUser:
-            id: strawberry.ID
+        class CreateUser:
+            name: str
+            email: str
 
         AuthorRelationInput.__relation_policy__ = {
             "default_on_replace": "DISCONNECT",
             "on_replace_options": ("DISCONNECT", "DELETE"),
+            "allowed_ops": frozenset({"create", "update"}),
         }
         wrapper = AuthorRelationInput(
-            update=UpdateUser(id=strawberry.ID("2")),
+            create=CreateUser(name="GoneRep", email="gone-rep@example.com"),
             on_replace=RelationRemovalPolicy.DELETE,
         )
         with patch.object(UserRepo, "_delete", autospec=True) as delete_mock:
@@ -2731,15 +2747,17 @@ class TestPushTo98:
             )
 
         @strawberry.input
-        class UpdateUser:
-            id: strawberry.ID
+        class CreateUser:
+            name: str
+            email: str
 
         AuthorRelationInput.__relation_policy__ = {
             "default_on_replace": "DISCONNECT",
             "on_replace_options": ("DISCONNECT", "DELETE"),
+            "allowed_ops": frozenset({"create", "update"}),
         }
         wrapper = AuthorRelationInput(
-            update=UpdateUser(id=strawberry.ID("2")),
+            create=CreateUser(name="AsyncGoneRep", email="async-gone-rep@example.com"),
             on_replace=RelationRemovalPolicy.DELETE,
         )
         with (
@@ -3114,3 +3132,636 @@ class TestLastCoverageLines:
         assert "optimizer eager-loads" in _django_relation_hint(
             post, "generic_link", "Post"
         )
+
+
+class TestMutationMetaOpsCoverage:
+    """Cover remaining mutation upsert / _meta branches for 100% coverage."""
+
+    def test_make_ref_type_requires_at_least_one_op(self):
+        class FakeModel:
+            __name__ = "Empty"
+
+        with pytest.raises(ValueError, match="at least one operation"):
+            make_ref_type(FakeModel, update=False)
+
+    def test_normalize_op_fields_rejects_non_string_entries(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        with pytest.raises(ValueError, match="list of field name strings"):
+            ns._normalize_op_fields([1, "name"], model=SAUser, field_name="create")
+
+    def test_normalize_where_rejects_non_string_container(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        with pytest.raises(ValueError, match="must be a string or"):
+            ns._normalize_where_fields({"email": True}, model=SAUser)
+
+    def test_normalize_where_rejects_non_string_list_entries(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        with pytest.raises(ValueError, match="list of field name strings"):
+            ns._normalize_where_fields(["email", 2], model=SAUser)
+
+    def test_op_fields_for_unsupported_operation(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        with pytest.raises(ValueError, match="Unsupported operation"):
+            ns._op_fields_for(_PROJECT_UNBOUNDED, "delete")
+
+    def test_where_input_requires_upsert_where(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        with pytest.raises(ValueError, match="has no upsert.where"):
+            ns._where_input(SAUser, _PROJECT_UNBOUNDED)
+
+    def test_where_and_upsert_input_cache_hits(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        project = ns._normalize_model_project(
+            SAUser, {"_meta": {"upsert": {"where": ["email"]}}}
+        )
+        first_where = ns._where_input(SAUser, project)
+        second_where = ns._where_input(SAUser, project)
+        assert first_where is second_where
+        first_upsert = ns._upsert_input(SAUser, project)
+        second_upsert = ns._upsert_input(SAUser, project)
+        assert first_upsert is second_upsert
+
+    def test_singular_and_list_require_enabled_ops(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        empty = RelationPolicy(explicit_ops=True)
+        child = {"_meta": empty, "relations": {}}
+        author = ns._relation_specs(SAPost)["author"]
+        tags = ns._relation_specs(SAPost)["tags"]
+        with pytest.raises(ValueError, match="requires at least one of create"):
+            ns._single_relation_input(SAPost, author, child)
+        with pytest.raises(ValueError, match="requires at least one operation"):
+            ns._list_relation_ref_type(SAPost, tags, child)
+
+    def test_execute_relation_op_unsupported(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        with pytest.raises(ValueError, match="Unsupported relation operation"):
+            ns._execute_relation_op_sync(
+                SAUser, "link", object(), info, project=_PROJECT_UNBOUNDED
+            )
+
+    @pytest.mark.asyncio
+    async def test_execute_relation_op_async_unsupported(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        with pytest.raises(ValueError, match="Unsupported relation operation"):
+            await ns._execute_relation_op_async(
+                SAUser, "link", object(), info, project=_PROJECT_UNBOUNDED
+            )
+
+    def test_find_by_where_sync_unsupported_and_tortoise(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "TortoiseBackend"
+            with pytest.raises(ValueError, match="requires async where lookup"):
+                ns._find_by_where_sync(SAUser, {"email": "a@b.com"}, info)
+            type(backend).__name__ = "OtherBackend"
+            with pytest.raises(ValueError, match="Unsupported backend for upsert"):
+                ns._find_by_where_sync(SAUser, {"email": "a@b.com"}, info)
+        finally:
+            type(backend).__name__ = original
+
+    @pytest.mark.asyncio
+    async def test_find_by_where_async_sqlalchemy_and_unsupported(
+        self, sa_session, seed
+    ):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        matches = await ns._find_by_where_async(
+            SAUser, {"email": "alice@example.com"}, info
+        )
+        assert len(matches) == 1
+        matches_pk = await ns._find_by_where_async(SAUser, {"id": "1"}, info)
+        assert len(matches_pk) == 1
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "OtherBackend"
+            with pytest.raises(ValueError, match="Unsupported backend for upsert"):
+                await ns._find_by_where_async(SAUser, {"email": "a@b.com"}, info)
+        finally:
+            type(backend).__name__ = original
+
+    @pytest.mark.asyncio
+    async def test_find_by_where_async_django_delegates(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "DjangoBackend"
+            with patch.object(
+                ns, "_find_by_where_sync", return_value=["ok"]
+            ) as sync_find:
+                result = await ns._find_by_where_async(SAUser, {"email": "x"}, info)
+                assert result == ["ok"]
+                sync_find.assert_called_once()
+        finally:
+            type(backend).__name__ = original
+
+    def test_find_by_where_sync_django_path(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+
+        class FakeQS:
+            def __init__(self):
+                self.filters = []
+
+            def filter(self, **kwargs):
+                self.filters.append(kwargs)
+                return self
+
+            def __iter__(self):
+                return iter(["row"])
+
+        fake_qs = FakeQS()
+
+        class FakeManager:
+            def all(self):
+                return fake_qs
+
+        FakeModel = type("FakeModel", (), {"objects": FakeManager()})
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "DjangoBackend"
+            rows = ns._find_by_where_sync(FakeModel, {"id": "9", "email": "e"}, info)
+        finally:
+            type(backend).__name__ = original
+        assert rows == ["row"]
+        assert {"pk": "9"} in fake_qs.filters
+        assert {"email": "e"} in fake_qs.filters
+
+    def test_upsert_sync_strips_id_from_create_merge(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        project = ns._normalize_model_project(
+            SAUser,
+            {"_meta": {"upsert": {"where": ["id"]}, "create": ["name", "email"]}},
+        )
+        upsert_type = ns._upsert_input(SAUser, project)
+        where_type = ns._where_input(SAUser, project)
+        create_type = ns._create_input(SAUser, project)
+        payload = upsert_type(
+            where=where_type(id=strawberry.ID("999")),
+            create=create_type(name="FromIdMiss", email="from-id-miss@example.com"),
+        )
+        created = ns._upsert_sync(SAUser, payload, info, project=project)
+        assert created.email == "from-id-miss@example.com"
+        assert created.name == "FromIdMiss"
+
+    @pytest.mark.asyncio
+    async def test_upsert_async_hit_and_miss(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        project = ns._normalize_model_project(
+            SAUser,
+            {
+                "_meta": {
+                    "create": ["email", "name"],
+                    "update": ["name"],
+                    "upsert": {"where": ["email"]},
+                }
+            },
+        )
+        upsert_type = ns._upsert_input(SAUser, project)
+        where_type = ns._where_input(SAUser, project)
+        create_type = ns._create_input(SAUser, project)
+        update_type = ns._update_input(SAUser, project, include_id=False)
+
+        with patch.object(ns, "_create_async", new=AsyncMock(return_value="created")):
+            created = await ns._upsert_async(
+                SAUser,
+                upsert_type(
+                    where=where_type(email="async-upsert@example.com"),
+                    create=create_type(
+                        email="async-upsert@example.com", name="Async Upsert"
+                    ),
+                ),
+                info,
+                project=project,
+            )
+            assert created == "created"
+
+        existing = sa_session.get(SAUser, 1)
+        with (
+            patch.object(
+                ns, "_find_by_where_async", new=AsyncMock(return_value=[existing])
+            ),
+            patch.object(ns, "_update_async", new=AsyncMock(return_value="updated")),
+        ):
+            updated = await ns._upsert_async(
+                SAUser,
+                upsert_type(
+                    where=where_type(email="alice@example.com"),
+                    update=update_type(name="Async Upserted"),
+                ),
+                info,
+                project=project,
+            )
+            assert updated == "updated"
+
+        with (
+            patch.object(
+                ns, "_find_by_where_async", new=AsyncMock(return_value=[1, 2])
+            ),
+            pytest.raises(ValueError, match="matched 2 rows"),
+        ):
+            await ns._upsert_async(
+                SAUser,
+                upsert_type(where=where_type(email="alice@example.com")),
+                info,
+                project=project,
+            )
+
+    @pytest.mark.asyncio
+    async def test_apply_m2m_async_upsert_and_other_refs(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 3)
+        spec = ns._relation_specs(SAPost)["tags"]
+        project = ns._normalize_model_project(
+            SATag, {"_meta": {"upsert": {"where": ["name"]}}}
+        )
+        upsert_type = ns._upsert_input(SATag, project)
+        where_type = ns._where_input(SATag, project)
+        fake_tag = SATag(id=80, name="async-m2m-tag")
+
+        @strawberry.input
+        class TagRef:
+            upsert: Any | None = strawberry.UNSET
+            create: Any | None = strawberry.UNSET
+
+        TagRef.__child_project__ = project
+        refs = [
+            TagRef(
+                upsert=upsert_type(
+                    where=where_type(name="async-m2m-tag"),
+                    create=ns._create_input(SATag, project)(name="async-m2m-tag"),
+                )
+            ),
+            TagRef(create=ns._create_input(SATag, project)(name="other-ref-create")),
+        ]
+        with (
+            patch.object(ns, "_upsert_async", new=AsyncMock(return_value=fake_tag)),
+            patch.object(backend, "apply_ref_list", new=AsyncMock()) as apply_mock,
+        ):
+            await ns._apply_m2m_async(post, spec, refs, info)
+            apply_mock.assert_awaited()
+        assert fake_tag in list(post.tags)
+
+    def test_apply_m2m_sync_sets_child_project_from_ref(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 4)
+        spec = ns._relation_specs(SAPost)["tags"]
+        project = ns._normalize_model_project(
+            SATag, {"_meta": {"upsert": {"where": ["name"]}}}
+        )
+        upsert_type = ns._upsert_input(SATag, project)
+        where_type = ns._where_input(SATag, project)
+
+        @strawberry.input
+        class TagRef:
+            upsert: Any | None = strawberry.UNSET
+
+        TagRef.__child_project__ = project
+        # Force the empty-refs child_project path then set from ref
+        refs = [
+            TagRef(
+                upsert=upsert_type(
+                    where=where_type(name="sync-m2m-tag"),
+                    create=ns._create_input(SATag, project)(name="sync-m2m-tag"),
+                )
+            )
+        ]
+        ns._apply_m2m_sync(post, spec, refs, info)
+        assert any(t.name == "sync-m2m-tag" for t in post.tags)
+
+    def test_reverse_many_upsert_sync(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 1)
+        spec = ns._relation_specs(SAPost)["comments"]
+        project = {
+            "_meta": RelationPolicy(upsert_where=("body",), explicit_ops=True),
+            "relations": {},
+        }
+
+        @strawberry.input
+        class CommentRef:
+            upsert: Any | None = strawberry.UNSET
+
+        CommentRef.__child_project__ = project
+        with patch.object(ns, "_upsert_sync", return_value=object()) as upsert:
+            ns._apply_reverse_many_sync(post, spec, [CommentRef(upsert=object())], info)
+            upsert.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reverse_many_upsert_async(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 2)
+        spec = ns._relation_specs(SAPost)["comments"]
+        project = {
+            "_meta": RelationPolicy(upsert_where=("body",), explicit_ops=True),
+            "relations": {},
+        }
+
+        @strawberry.input
+        class CommentRef:
+            upsert: Any | None = strawberry.UNSET
+
+        CommentRef.__child_project__ = project
+        with patch.object(
+            ns, "_upsert_async", new=AsyncMock(return_value=object())
+        ) as upsert:
+            await ns._apply_reverse_many_async(
+                post, spec, [CommentRef(upsert=object())], info
+            )
+            upsert.assert_awaited_once()
+
+    def test_eligible_scalar_skips_fk_and_sensitive(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        base = backend._introspect_model
+
+        def introspect(model):
+            rows = list(base(model))
+            rows.append(("author_id", int, False, None))
+            rows.append(("password_hash", str, False, None))
+            return rows
+
+        with patch.object(backend, "_introspect_model", side_effect=introspect):
+            names = ns._eligible_scalar_names(SAPost)
+        assert "author_id" not in names
+        assert "password_hash" not in names
+
+    def test_list_delete_enabled_in_explicit_ops(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        project = ns._normalize_model_project(
+            SATag, {"_meta": {"delete": True, "create": True}}
+        )
+        enabled = ns._enabled_ops(project["_meta"], kind="many")
+        assert enabled == {"create", "delete"}
+
+    @pytest.mark.asyncio
+    async def test_find_by_where_async_with_repo_scope(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+
+        class UserRepo(AbstractRepo[SAUser]):
+            def scope_query(self, qs, info):
+                return qs
+
+        backend._repos = {SAUser: UserRepo}
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        rows = await ns._find_by_where_async(SAUser, {"id": "1"}, info)
+        assert len(rows) == 1
+        rows = await ns._find_by_where_async(
+            SAUser, {"email": "alice@example.com"}, info
+        )
+        assert len(rows) == 1
+
+    def test_execute_relation_op_async_upsert_branch(self, sa_session):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+
+        async def _run():
+            with patch.object(
+                ns, "_upsert_async", new=AsyncMock(return_value="up")
+            ) as upsert:
+                result = await ns._execute_relation_op_async(
+                    SAUser,
+                    "upsert",
+                    object(),
+                    info,
+                    project=_PROJECT_UNBOUNDED,
+                )
+                assert result == "up"
+                upsert.assert_awaited_once()
+
+        asyncio.run(_run())
+
+    def test_find_by_where_sync_with_repo_scope(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+
+        class UserRepo(AbstractRepo[SAUser]):
+            def scope_query(self, qs, info):
+                return qs
+
+        backend._repos = {SAUser: UserRepo}
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        rows = ns._find_by_where_sync(SAUser, {"email": "alice@example.com"}, info)
+        assert len(rows) == 1
+
+        # Django path with repo.scope_query
+        class FakeQS:
+            def filter(self, **kwargs):
+                return self
+
+            def __iter__(self):
+                return iter(["scoped"])
+
+        class FakeManager:
+            def all(self):
+                return FakeQS()
+
+        FakeModel = type("FakeModel", (), {"objects": FakeManager()})
+
+        class FakeRepo(AbstractRepo):
+            def scope_query(self, qs, info):
+                return qs
+
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "DjangoBackend"
+            backend._repos = {FakeModel: FakeRepo}
+            ns2 = MutationNamespace(backend)
+            assert ns2._find_by_where_sync(FakeModel, {"id": "1"}, info) == ["scoped"]
+        finally:
+            type(backend).__name__ = original
+            backend._repos = {SAUser: UserRepo}
+
+    @pytest.mark.asyncio
+    async def test_find_by_where_async_tortoise_and_async_session(
+        self, sa_session, seed
+    ):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+
+        class FakeQS:
+            def __init__(self):
+                self._filters = {}
+
+            def filter(self, **kwargs):
+                self._filters.update(kwargs)
+                return self
+
+            def __await__(self):
+                async def _inner():
+                    return ["tortoise-row"]
+
+                return _inner().__await__()
+
+        class FakeModel:
+            @staticmethod
+            def all():
+                return FakeQS()
+
+        class FakeRepo(AbstractRepo):
+            def scope_query(self, qs, info):
+                return qs
+
+        original = type(backend).__name__
+        try:
+            type(backend).__name__ = "TortoiseBackend"
+            backend._repos = {FakeModel: FakeRepo}
+            ns2 = MutationNamespace(backend)
+            rows = await ns2._find_by_where_async(
+                FakeModel, {"id": "3", "name": "x"}, info
+            )
+            assert rows == ["tortoise-row"]
+        finally:
+            type(backend).__name__ = original
+            backend._repos = {}
+
+        # AsyncSession branch
+        class FakeAsyncSession:
+            async def execute(self, stmt):
+                class Result:
+                    def scalars(self_inner):
+                        class Scalars:
+                            def all(self_inner2):
+                                return ["async-session-row"]
+
+                        return Scalars()
+
+                return Result()
+
+        info_async = SimpleNamespace(context={"session": FakeAsyncSession()})
+        with patch.object(backend, "_get_session", return_value=FakeAsyncSession()):
+            import builtins
+
+            real_isinstance = builtins.isinstance
+
+            def _isinstance(obj, typ):
+                if getattr(typ, "__name__", "") == "AsyncSession":
+                    return True
+                return real_isinstance(obj, typ)
+
+            with patch("builtins.isinstance", _isinstance):
+                rows = await ns._find_by_where_async(SAUser, {"id": "1"}, info_async)
+                assert rows == ["async-session-row"]
+
+    @pytest.mark.asyncio
+    async def test_upsert_async_strips_id_on_create_merge(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        project = ns._normalize_model_project(
+            SAUser,
+            {"_meta": {"upsert": {"where": ["id"]}, "create": ["name", "email"]}},
+        )
+        upsert_type = ns._upsert_input(SAUser, project)
+        where_type = ns._where_input(SAUser, project)
+        create_type = ns._create_input(SAUser, project)
+        with patch.object(
+            ns, "_create_async", new=AsyncMock(return_value="created")
+        ) as create:
+            result = await ns._upsert_async(
+                SAUser,
+                upsert_type(
+                    where=where_type(id=strawberry.ID("999")),
+                    create=create_type(name="N", email="e@example.com"),
+                ),
+                info,
+                project=project,
+            )
+            assert result == "created"
+            create.assert_awaited_once()
+            # merged create payload should not keep GraphQL id as a column
+            payload = create.await_args.args[1]
+            assert (
+                not hasattr(payload, "id")
+                or getattr(payload, "id", strawberry.UNSET) is strawberry.UNSET
+            )
+
+    def test_m2m_upsert_child_project_fallback_sync(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 4)
+        spec = ns._relation_specs(SAPost)["tags"]
+        project = ns._normalize_model_project(
+            SATag, {"_meta": {"upsert": {"where": ["name"]}}}
+        )
+        fake_tag = SATag(id=81, name="fallback-sync")
+
+        @strawberry.input
+        class PlainRef:
+            create: Any | None = strawberry.UNSET
+
+        @strawberry.input
+        class UpsertRef:
+            upsert: Any | None = strawberry.UNSET
+
+        UpsertRef.__child_project__ = project
+        refs = [PlainRef(), UpsertRef(upsert=object())]
+        with (
+            patch.object(ns, "_upsert_sync", return_value=fake_tag),
+            patch.object(backend, "apply_ref_list"),
+        ):
+            ns._apply_m2m_sync(post, spec, refs, info)
+        assert fake_tag in list(post.tags)
+
+    @pytest.mark.asyncio
+    async def test_m2m_upsert_child_project_fallback_async(self, sa_session, seed):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        ns = MutationNamespace(backend)
+        info = SimpleNamespace(context={"session": sa_session})
+        post = sa_session.get(SAPost, 3)
+        spec = ns._relation_specs(SAPost)["tags"]
+        project = ns._normalize_model_project(
+            SATag, {"_meta": {"upsert": {"where": ["name"]}}}
+        )
+        fake_tag = SATag(id=82, name="fallback-async")
+
+        @strawberry.input
+        class PlainRef:
+            create: Any | None = strawberry.UNSET
+
+        @strawberry.input
+        class UpsertRef:
+            upsert: Any | None = strawberry.UNSET
+
+        UpsertRef.__child_project__ = project
+        refs = [PlainRef(), UpsertRef(upsert=object())]
+        with (
+            patch.object(ns, "_upsert_async", new=AsyncMock(return_value=fake_tag)),
+            patch.object(backend, "apply_ref_list", new=AsyncMock()),
+        ):
+            await ns._apply_m2m_async(post, spec, refs, info)
+        assert fake_tag in list(post.tags)

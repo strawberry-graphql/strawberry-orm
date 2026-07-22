@@ -1389,9 +1389,48 @@ Rules:
 
 `_meta` supports:
 
-- `onReplace` — `"DISCONNECT"` or `"DELETE"`, or an array of both to expose a choice. Controls what happens to the previous object when replacing a singular (FK) relation. Default: `DISCONNECT`.
+- `onReplace` — `"DISCONNECT"` or `"DELETE"`, or an array of both to expose a choice. Controls what happens to the previous object when replacing a singular (FK) relation via `create` or `upsert`. Default: `DISCONNECT`. Only exposed when `create` or `upsert` is enabled.
+- `create` — `True` (all scalars) or a list of scalar field names. Enables the nested `create` branch and defines its writable scalars.
+- `update` — `True` or a list of scalar field names. Enables the nested `update` branch (always includes required `id`).
+- `upsert` — `{"where": ["email"]}` (string or list). Enables nested `upsert` with Prisma-like `{ where, create, update }`. Create/update payload types reuse the `create` / `update` allowlists when those keys are present; otherwise both sides default to all scalars. Never nest field lists under `upsert`.
+- `unlink` / `delete` — `True` on list (to-many) relations only.
 
-Values can be a single string (fixes behavior, omits the GraphQL field) or an array of strings (exposes a choice to the caller).
+When none of `create` / `update` / `upsert` / `unlink` / `delete` are present, behavior matches today (singular: create+update; list: create+update+unlink+delete; all scalars). If any of those keys is present, only the listed ops are generated.
+
+Relations always follow the projection tree (not re-listed in `_meta`). Values for `onReplace` can be a single string (fixes behavior, omits the GraphQL field) or an array of strings (exposes a choice to the caller).
+
+Example with per-op fields and upsert:
+
+```python
+project = {
+    "post": {
+        "author": {
+            "_meta": {
+                "onReplace": ["DISCONNECT", "DELETE"],
+                "create": ["email", "name"],
+                "update": ["name"],
+                "upsert": {"where": ["email"]},
+            },
+        },
+        "tags": {
+            "_meta": {
+                "upsert": {"where": ["name"]},
+                "unlink": True,
+            },
+        },
+    },
+}
+```
+
+```graphql
+author: {
+  upsert: {
+    where: { email: "ada@example.com" }
+    create: { email: "ada@example.com", name: "Ada" }
+    update: { name: "Ada Lovelace" }
+  }
+}
+```
 
 </details>
 

@@ -190,8 +190,11 @@ class TestInternalSharedCoverage:
             create: int | None = None
             update: int | None = None
 
-        SingleWrapper.__relation_policy__ = {"default_on_replace": "DISCONNECT"}
-        with pytest.raises(ValueError, match="exactly one of create or update"):
+        SingleWrapper.__relation_policy__ = {
+            "default_on_replace": "DISCONNECT",
+            "allowed_ops": frozenset({"create", "update"}),
+        }
+        with pytest.raises(ValueError, match="exactly one of create, update"):
             ns._resolve_single_wrapper(SingleWrapper(create=1, update=2))
 
         assert ns._child_project(_PROJECT_UNBOUNDED, "anything") == _PROJECT_UNBOUNDED

@@ -22,6 +22,7 @@ EXCLUDED_FILES = {
     "test_grouping.py",
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
+    "test_mutation_meta_ops.py",
 }
 
 EXCLUDED_METHODS = {
@@ -103,6 +104,7 @@ TORT_EXCLUDED_FILES = {
     "test_query_filter_reference_lookup.py",
     "test_query_filter_reference_lookup_custom_pk.py",
     "test_lazy_query_logging.py",
+    "test_mutation_meta_ops.py",
 }
 
 

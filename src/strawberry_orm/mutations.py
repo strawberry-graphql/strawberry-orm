@@ -17,18 +17,20 @@ def make_ref_type(
     model: type,
     *,
     create: type | None = None,
-    update: type | None = None,
+    update: type | None | Literal[False] = None,
+    upsert: type | None = None,
     unlink: bool = False,
     delete: bool = False,
     name: str | None = None,
 ) -> type:
     """Generate a ``@oneOf`` input type for managing a related list.
 
-    The returned Strawberry input has up to four ``@oneOf`` variants:
-    - ``update`` (always): link an existing object by ID, optionally updating
+    The returned Strawberry input has up to five ``@oneOf`` variants:
+    - ``update`` (default): link an existing object by ID, optionally updating
       its fields.  When no *update* type is provided a minimal ``{id: ID}``
-      link-only type is generated automatically.
+      link-only type is generated automatically.  Pass ``update=False`` to omit.
     - ``create`` (opt-in): create a new object inline.
+    - ``upsert`` (opt-in): create-or-update by configured ``where`` fields.
     - ``unlink`` (opt-in): remove an existing object from the relation.
     - ``delete`` (opt-in): hard-delete an existing object.
     """
@@ -40,10 +42,15 @@ def make_ref_type(
         annotations["create"] = create | None
         defaults["create"] = strawberry.UNSET
 
-    if update is None:
-        update = _make_id_only_input(f"{type_name}LinkInput")
-    annotations["update"] = update | None
-    defaults["update"] = strawberry.UNSET
+    if update is not False:
+        if update is None:
+            update = _make_id_only_input(f"{type_name}LinkInput")
+        annotations["update"] = update | None
+        defaults["update"] = strawberry.UNSET
+
+    if upsert is not None:
+        annotations["upsert"] = upsert | None
+        defaults["upsert"] = strawberry.UNSET
 
     if unlink:
         unlink_type = _make_id_only_input(f"{type_name}UnlinkInput")
@@ -54,6 +61,9 @@ def make_ref_type(
         delete_type = _make_id_only_input(f"{type_name}DeleteInput")
         annotations["delete"] = delete_type | None
         defaults["delete"] = strawberry.UNSET
+
+    if not annotations:
+        raise ValueError(f"Ref type {type_name} requires at least one operation")
 
     ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
     cls = type(type_name, (), ns)
@@ -108,8 +118,24 @@ class RelationSpec:
 
 
 @dataclass(frozen=True)
+class OpFields:
+    """Scalar allowlist for a write op. ``fields is None`` means all eligible scalars."""
+
+    fields: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
 class RelationPolicy:
     on_replace_options: tuple[str, ...] | None = None
+    create: OpFields | None = None
+    update: OpFields | None = None
+    upsert_where: tuple[str, ...] | None = None
+    unlink: bool = False
+    delete: bool = False
+    explicit_ops: bool = False
+
+
+_OP_META_KEYS = frozenset({"create", "update", "upsert", "unlink", "delete"})
 
 
 class MutationNamespace:
@@ -119,7 +145,9 @@ class MutationNamespace:
         self._backend = backend
         self._relation_cache: dict[type, dict[str, RelationSpec]] = {}
         self._create_inputs: dict[tuple[type, Any], type] = {}
-        self._update_inputs: dict[tuple[type, Any], type] = {}
+        self._update_inputs: dict[tuple[type, Any, bool], type] = {}
+        self._upsert_inputs: dict[tuple[type, Any], type] = {}
+        self._where_inputs: dict[tuple[type, Any], type] = {}
         self._single_ops: dict[tuple[type, str, Any], type] = {}
         self._list_ops: dict[tuple[type, str, Any], type] = {}
         self._root_create_inputs: dict[tuple[tuple[type, Any], ...], type] = {}
@@ -315,24 +343,7 @@ class MutationNamespace:
         if meta is not None and not isinstance(meta, dict):
             raise ValueError(f"_meta for model {model.__name__} must be a dict")
 
-        policy = RelationPolicy()
-        if meta:
-            allowed_meta_keys = {"onReplace"}
-            unknown_meta_keys = sorted(set(meta) - allowed_meta_keys)
-            if unknown_meta_keys:
-                raise ValueError(
-                    f"Unknown _meta key(s) for model {model.__name__}: "
-                    f"{', '.join(unknown_meta_keys)}"
-                )
-            if "onReplace" in meta:
-                policy = RelationPolicy(
-                    on_replace_options=self._normalize_enum_options(
-                        meta["onReplace"],
-                        allowed=("DISCONNECT", "DELETE"),
-                        field_name="onReplace",
-                        model_name=model.__name__,
-                    ),
-                )
+        policy = self._normalize_relation_policy(model, meta or {})
 
         normalized_relations: dict[str, Any] = {}
         for relation_name, nested_project in project.items():
@@ -348,6 +359,208 @@ class MutationNamespace:
                 nested_project,
             )
         return {"_meta": policy, "relations": normalized_relations}
+
+    def _normalize_relation_policy(
+        self, model: type, meta: dict[str, Any]
+    ) -> RelationPolicy:
+        allowed_meta_keys = {"onReplace", *_OP_META_KEYS}
+        unknown_meta_keys = sorted(set(meta) - allowed_meta_keys)
+        if unknown_meta_keys:
+            raise ValueError(
+                f"Unknown _meta key(s) for model {model.__name__}: "
+                f"{', '.join(unknown_meta_keys)}"
+            )
+
+        explicit_ops = bool(set(meta) & _OP_META_KEYS)
+        on_replace_options: tuple[str, ...] | None = None
+        if "onReplace" in meta:
+            on_replace_options = self._normalize_enum_options(
+                meta["onReplace"],
+                allowed=("DISCONNECT", "DELETE"),
+                field_name="onReplace",
+                model_name=model.__name__,
+            )
+
+        create = (
+            self._normalize_op_fields(meta["create"], model=model, field_name="create")
+            if "create" in meta
+            else None
+        )
+        update = (
+            self._normalize_op_fields(meta["update"], model=model, field_name="update")
+            if "update" in meta
+            else None
+        )
+
+        upsert_where: tuple[str, ...] | None = None
+        if "upsert" in meta:
+            upsert_cfg = meta["upsert"]
+            if not isinstance(upsert_cfg, dict):
+                raise ValueError(
+                    f"_meta.upsert for {model.__name__} must be a dict with 'where'"
+                )
+            unknown_upsert = sorted(set(upsert_cfg) - {"where"})
+            if unknown_upsert:
+                raise ValueError(
+                    f"Unknown _meta.upsert key(s) for {model.__name__}: "
+                    f"{', '.join(unknown_upsert)}"
+                )
+            if "where" not in upsert_cfg:
+                raise ValueError(
+                    f"_meta.upsert for {model.__name__} requires a non-empty 'where'"
+                )
+            upsert_where = self._normalize_where_fields(
+                upsert_cfg["where"], model=model
+            )
+
+        unlink = self._normalize_bool_op(meta, "unlink", model.__name__)
+        delete = self._normalize_bool_op(meta, "delete", model.__name__)
+
+        return RelationPolicy(
+            on_replace_options=on_replace_options,
+            create=create,
+            update=update,
+            upsert_where=upsert_where,
+            unlink=unlink,
+            delete=delete,
+            explicit_ops=explicit_ops,
+        )
+
+    def _normalize_bool_op(
+        self, meta: dict[str, Any], field_name: str, model_name: str
+    ) -> bool:
+        if field_name not in meta:
+            return False
+        if meta[field_name] is not True:
+            raise ValueError(
+                f"_meta.{field_name} for {model_name} must be True when present"
+            )
+        return True
+
+    def _normalize_op_fields(
+        self, value: Any, *, model: type, field_name: str
+    ) -> OpFields:
+        if value is True:
+            return OpFields(fields=None)
+        if isinstance(value, list):
+            names = tuple(value)
+            if not all(isinstance(name, str) for name in names):
+                raise ValueError(
+                    f"_meta.{field_name} for {model.__name__} must be True or a "
+                    f"list of field name strings"
+                )
+            eligible = self._eligible_scalar_names(model)
+            unknown = sorted(set(names) - eligible)
+            if unknown:
+                raise ValueError(
+                    f"Unknown field(s) in _meta.{field_name} for {model.__name__}: "
+                    f"{', '.join(unknown)}"
+                )
+            return OpFields(fields=names)
+        raise ValueError(
+            f"_meta.{field_name} for {model.__name__} must be True or a list of "
+            f"field name strings"
+        )
+
+    def _normalize_where_fields(self, value: Any, *, model: type) -> tuple[str, ...]:
+        if isinstance(value, str):
+            names = (value,)
+        elif isinstance(value, list):
+            names = tuple(value)
+        else:
+            raise ValueError(
+                f"_meta.upsert.where for {model.__name__} must be a string or "
+                f"list of strings"
+            )
+        if not names:
+            raise ValueError(f"_meta.upsert.where for {model.__name__} cannot be empty")
+        if not all(isinstance(name, str) for name in names):
+            raise ValueError(
+                f"_meta.upsert.where for {model.__name__} must be a string or "
+                f"list of field name strings"
+            )
+        eligible = self._eligible_scalar_names(model) | {"id"}
+        unknown = sorted(set(names) - eligible)
+        if unknown:
+            raise ValueError(
+                f"Unknown field(s) in _meta.upsert.where for {model.__name__}: "
+                f"{', '.join(unknown)}"
+            )
+        deduped: list[str] = []
+        for name in names:
+            if name not in deduped:
+                deduped.append(name)
+        return tuple(deduped)
+
+    def _eligible_scalar_names(self, model: type) -> set[str]:
+        relation_specs = self._relation_specs(model)
+        excluded_scalar_fields = {
+            spec.fk_column
+            for spec in relation_specs.values()
+            if spec.fk_column is not None and spec.relation_mode == "forward_fk"
+        }
+        pk_names = self._backend._get_pk_names(model)
+        names: set[str] = set()
+        for (
+            field_name,
+            _field_type,
+            is_relation,
+            _related,
+        ) in self._backend._introspect_model(model):
+            if is_relation:
+                continue
+            if field_name in excluded_scalar_fields:
+                continue
+            if field_name in pk_names:
+                continue
+            if self._backend._exclude_generated_sensitive_field(field_name, None):
+                continue
+            names.add(field_name)
+        return names
+
+    def _policy_from_project(self, project: Any) -> RelationPolicy:
+        if project in (_PROJECT_UNBOUNDED, _PROJECT_SHALLOW, _PROJECT_LEAF):
+            return RelationPolicy()
+        return project["_meta"]
+
+    def _op_fields_for(self, project: Any, operation: str) -> OpFields:
+        policy = self._policy_from_project(project)
+        if operation == "create":
+            if policy.create is not None:
+                return policy.create
+            return OpFields(fields=None)
+        if operation == "update":
+            if policy.update is not None:
+                return policy.update
+            return OpFields(fields=None)
+        raise ValueError(f"Unsupported operation for field allowlist: {operation}")
+
+    def _enabled_ops(
+        self, policy: RelationPolicy, *, kind: Literal["single", "many"]
+    ) -> set[str]:
+        if not policy.explicit_ops:
+            enabled = {"create", "update"}
+            if kind == "many":
+                enabled.update({"unlink", "delete"})
+            return enabled
+
+        enabled: set[str] = set()
+        if policy.create is not None:
+            enabled.add("create")
+        if policy.update is not None:
+            enabled.add("update")
+        if policy.upsert_where is not None:
+            enabled.add("upsert")
+        if kind == "many":
+            if policy.unlink:
+                enabled.add("unlink")
+            if policy.delete:
+                enabled.add("delete")
+        elif policy.unlink or policy.delete:
+            raise ValueError(
+                "unlink/delete are only valid on list (to-many) relation _meta"
+            )
+        return enabled
 
     def _project_signature(self, project: Any) -> Any:
         if project in (_PROJECT_UNBOUNDED, _PROJECT_SHALLOW, _PROJECT_LEAF):
@@ -448,26 +661,98 @@ class MutationNamespace:
             {},
         )
         self._create_inputs[cache_key] = cls
-        self._populate_model_input(cls, model, operation="create", project=project)
+        self._populate_model_input(
+            cls,
+            model,
+            operation="create",
+            project=project,
+            op_fields=self._op_fields_for(project, "create"),
+            include_id=False,
+        )
         result = strawberry.input(cls)
         self._create_inputs[cache_key] = result
         return result
 
-    def _update_input(self, model: type, project: Any) -> type:
+    def _update_input(
+        self, model: type, project: Any, *, include_id: bool = True
+    ) -> type:
         signature = self._project_signature(project)
-        cache_key = (model, signature)
+        cache_key = (model, signature, include_id)
         if cache_key in self._update_inputs:
             return self._update_inputs[cache_key]
 
+        suffix = "" if include_id else "Patch"
         cls = type(
-            f"Update{model.__name__}NodeInput{self._project_suffix(project)}",
+            f"Update{suffix}{model.__name__}NodeInput{self._project_suffix(project)}",
             (),
             {},
         )
         self._update_inputs[cache_key] = cls
-        self._populate_model_input(cls, model, operation="update", project=project)
+        self._populate_model_input(
+            cls,
+            model,
+            operation="update",
+            project=project,
+            op_fields=self._op_fields_for(project, "update"),
+            include_id=include_id,
+        )
         result = strawberry.input(cls)
         self._update_inputs[cache_key] = result
+        return result
+
+    def _where_input(self, model: type, project: Any) -> type:
+        policy = self._policy_from_project(project)
+        if policy.upsert_where is None:
+            raise ValueError(f"Model {model.__name__} project has no upsert.where")
+        signature = self._project_signature(project)
+        cache_key = (model, signature)
+        if cache_key in self._where_inputs:
+            return self._where_inputs[cache_key]
+
+        annotations: dict[str, Any] = {}
+        type_by_name = {
+            field_name: field_type
+            for field_name, field_type, is_relation, _related in self._backend._introspect_model(
+                model
+            )
+            if not is_relation
+        }
+        for field_name in policy.upsert_where:
+            if field_name == "id":
+                annotations["id"] = strawberry.ID
+            else:
+                annotations[field_name] = type_by_name[field_name]
+
+        cls = type(
+            f"Where{model.__name__}NodeInput{self._project_suffix(project)}",
+            (),
+            {"__annotations__": annotations},
+        )
+        result = strawberry.input(cls)
+        self._where_inputs[cache_key] = result
+        return result
+
+    def _upsert_input(self, model: type, project: Any) -> type:
+        signature = self._project_signature(project)
+        cache_key = (model, signature)
+        if cache_key in self._upsert_inputs:
+            return self._upsert_inputs[cache_key]
+
+        cls = type(
+            f"Upsert{model.__name__}NodeInput{self._project_suffix(project)}",
+            (),
+            {},
+        )
+        self._upsert_inputs[cache_key] = cls
+        cls.__annotations__ = {
+            "where": self._where_input(model, project),
+            "create": self._create_input(model, project) | None,
+            "update": self._update_input(model, project, include_id=False) | None,
+        }
+        cls.create = strawberry.UNSET
+        cls.update = strawberry.UNSET
+        result = strawberry.input(cls)
+        self._upsert_inputs[cache_key] = result
         return result
 
     def _populate_model_input(
@@ -477,6 +762,8 @@ class MutationNamespace:
         *,
         operation: str,
         project: Any,
+        op_fields: OpFields,
+        include_id: bool,
     ) -> None:
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
@@ -487,6 +774,7 @@ class MutationNamespace:
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
         }
         pk_names = self._backend._get_pk_names(model)
+        allowed_scalars = None if op_fields.fields is None else set(op_fields.fields)
 
         for (
             field_name,
@@ -500,14 +788,14 @@ class MutationNamespace:
                 continue
             if self._backend._exclude_generated_sensitive_field(field_name, None):
                 continue
-            if operation == "create" and field_name in pk_names:
+            if field_name in pk_names:
                 continue
-            if operation == "update" and field_name in pk_names:
+            if allowed_scalars is not None and field_name not in allowed_scalars:
                 continue
             annotations[field_name] = field_type | None
             defaults[field_name] = strawberry.UNSET
 
-        if operation == "update":
+        if include_id:
             annotations["id"] = strawberry.ID
 
         if project != _PROJECT_LEAF:
@@ -544,34 +832,61 @@ class MutationNamespace:
             {},
         )
         self._single_ops[cache_key] = cls
-        policy = (
-            RelationPolicy()
-            if child_project in (_PROJECT_UNBOUNDED, _PROJECT_SHALLOW, _PROJECT_LEAF)
-            else child_project["_meta"]
-        )
-        cls.__annotations__ = {
-            "create": self._create_input(spec.related_model, child_project) | None,
-            "update": self._update_input(spec.related_model, child_project) | None,
-        }
-        cls.create = strawberry.UNSET
-        cls.update = strawberry.UNSET
-        default_on_replace = (
-            policy.on_replace_options
-            if policy.on_replace_options is not None
-            else ("DISCONNECT", "DELETE")
-        )
-        cls.__relation_policy__ = {  # type: ignore[attr-defined]
-            "on_replace_options": default_on_replace,
-            "default_on_replace": self._default_option(
-                default_on_replace, "DISCONNECT"
-            ),
-        }
-        if len(default_on_replace) > 1:
-            cls.__annotations__["on_replace"] = RelationRemovalPolicy | None
-            cls.on_replace = strawberry.field(
-                default=strawberry.UNSET,
-                name="onReplace",
+        policy = self._policy_from_project(child_project)
+        enabled = self._enabled_ops(policy, kind="single")
+        if not enabled:
+            raise ValueError(
+                f"Singular relation '{spec.name}' on {owner_model.__name__} "
+                f"requires at least one of create, update, upsert"
             )
+
+        annotations: dict[str, Any] = {}
+        if "create" in enabled:
+            annotations["create"] = (
+                self._create_input(spec.related_model, child_project) | None
+            )
+            cls.create = strawberry.UNSET
+        if "update" in enabled:
+            annotations["update"] = (
+                self._update_input(spec.related_model, child_project) | None
+            )
+            cls.update = strawberry.UNSET
+        if "upsert" in enabled:
+            annotations["upsert"] = (
+                self._upsert_input(spec.related_model, child_project) | None
+            )
+            cls.upsert = strawberry.UNSET
+
+        cls.__annotations__ = annotations
+
+        can_repoint = "create" in enabled or "upsert" in enabled
+        if can_repoint:
+            default_on_replace = (
+                policy.on_replace_options
+                if policy.on_replace_options is not None
+                else ("DISCONNECT", "DELETE")
+            )
+            cls.__relation_policy__ = {  # type: ignore[attr-defined]
+                "on_replace_options": default_on_replace,
+                "default_on_replace": self._default_option(
+                    default_on_replace, "DISCONNECT"
+                ),
+                "allowed_ops": frozenset(enabled),
+            }
+            if len(default_on_replace) > 1:
+                cls.__annotations__["on_replace"] = RelationRemovalPolicy | None
+                cls.on_replace = strawberry.field(
+                    default=strawberry.UNSET,
+                    name="onReplace",
+                )
+        else:
+            cls.__relation_policy__ = {  # type: ignore[attr-defined]
+                "on_replace_options": ("DISCONNECT",),
+                "default_on_replace": "DISCONNECT",
+                "allowed_ops": frozenset(enabled),
+            }
+        cls.__child_project__ = child_project  # type: ignore[attr-defined]
+
         result = strawberry.input(cls)
         self._single_ops[cache_key] = result
         return result
@@ -586,17 +901,44 @@ class MutationNamespace:
         if cache_key in self._list_ops:
             return self._list_ops[cache_key]
 
+        policy = self._policy_from_project(child_project)
+        enabled = self._enabled_ops(policy, kind="many")
+        if not enabled:
+            raise ValueError(
+                f"List relation '{spec.name}' on {owner_model.__name__} "
+                f"requires at least one operation"
+            )
+
+        create_type = (
+            self._create_input(spec.related_model, child_project)
+            if "create" in enabled
+            else None
+        )
+        if "update" in enabled:
+            update_type: type | None | Literal[False] = self._update_input(
+                spec.related_model, child_project
+            )
+        else:
+            update_type = False
+        upsert_type = (
+            self._upsert_input(spec.related_model, child_project)
+            if "upsert" in enabled
+            else None
+        )
+
         ref_type = make_ref_type(
             spec.related_model,
-            create=self._create_input(spec.related_model, child_project),
-            update=self._update_input(spec.related_model, child_project),
-            unlink=True,
-            delete=True,
+            create=create_type,
+            update=update_type,
+            upsert=upsert_type,
+            unlink="unlink" in enabled,
+            delete="delete" in enabled,
             name=(
                 f"{owner_model.__name__}{spec.name.title()}Ref"
                 f"{self._project_suffix(child_project)}"
             ),
         )
+        ref_type.__child_project__ = child_project  # type: ignore[attr-defined]
         self._list_ops[cache_key] = ref_type
         return ref_type
 
@@ -657,17 +999,243 @@ class MutationNamespace:
             on_replace_value = policy["default_on_replace"]
         else:
             on_replace_value = on_replace.value
+        allowed_ops = policy.get("allowed_ops", frozenset({"create", "update"}))
         selected = [
-            (name, value)
-            for name, value in values.items()
-            if name in {"create", "update"}
+            (name, value) for name, value in values.items() if name in allowed_ops
         ]
         if len(selected) != 1:
-            raise ValueError(
-                "Single relation inputs require exactly one of create or update"
-            )
+            op_list = ", ".join(sorted(allowed_ops))
+            raise ValueError(f"Single relation inputs require exactly one of {op_list}")
         operation, payload = selected[0]
         return operation, payload, on_replace_value
+
+    def _build_input_instance(self, input_type: type, values: dict[str, Any]) -> Any:
+        kwargs: dict[str, Any] = {}
+        for field_name in input_type.__dataclass_fields__:
+            kwargs[field_name] = values.get(field_name, strawberry.UNSET)
+        return input_type(**kwargs)
+
+    def _execute_relation_op_sync(
+        self,
+        model: type,
+        operation: str,
+        payload: Any,
+        info: Any,
+        *,
+        project: Any,
+        parent_link: tuple[str, Any] | None = None,
+    ) -> Any:
+        if operation == "create":
+            return self._create_sync(model, payload, info, parent_link=parent_link)
+        if operation == "update":
+            return self._update_sync(model, payload, info, parent_link=parent_link)
+        if operation == "upsert":
+            return self._upsert_sync(
+                model, payload, info, project=project, parent_link=parent_link
+            )
+        raise ValueError(f"Unsupported relation operation: {operation}")
+
+    async def _execute_relation_op_async(
+        self,
+        model: type,
+        operation: str,
+        payload: Any,
+        info: Any,
+        *,
+        project: Any,
+        parent_link: tuple[str, Any] | None = None,
+    ) -> Any:
+        if operation == "create":
+            return await self._create_async(
+                model, payload, info, parent_link=parent_link
+            )
+        if operation == "update":
+            return await self._update_async(
+                model, payload, info, parent_link=parent_link
+            )
+        if operation == "upsert":
+            return await self._upsert_async(
+                model, payload, info, project=project, parent_link=parent_link
+            )
+        raise ValueError(f"Unsupported relation operation: {operation}")
+
+    def _find_by_where_sync(
+        self, model: type, where: dict[str, Any], info: Any
+    ) -> list[Any]:
+        repo = self._backend.get_repo(model)
+        filters = dict(where)
+        if "id" in filters:
+            filters["pk"] = filters.pop("id")
+
+        backend_name = self._backend.__class__.__name__
+        if backend_name == "DjangoBackend":
+            qs = model.objects.all()
+            if repo is not None:
+                qs = repo.scope_query(qs, info)
+            if "pk" in filters:
+                qs = qs.filter(pk=filters.pop("pk"))
+            return list(qs.filter(**filters))
+
+        if backend_name == "SQLAlchemyBackend":
+            from sqlalchemy import select
+
+            session = self._backend._get_session(info)
+            stmt = select(model)
+            if repo is not None:
+                stmt = repo.scope_query(stmt, info)
+            if "pk" in filters:
+                pk_value = filters.pop("pk")
+                pk_names = list(self._backend._get_pk_names(model))
+                pk_col = getattr(model, pk_names[0])
+                stmt = stmt.where(pk_col == pk_value)
+            for key, value in filters.items():
+                stmt = stmt.where(getattr(model, key) == value)
+            result = session.execute(stmt)
+            return list(result.scalars().all())
+
+        if backend_name == "TortoiseBackend":
+            # Tortoise mutations use the async path.
+            raise ValueError("TortoiseBackend requires async where lookup")
+
+        raise ValueError(f"Unsupported backend for upsert: {backend_name}")
+
+    async def _find_by_where_async(
+        self, model: type, where: dict[str, Any], info: Any
+    ) -> list[Any]:
+        repo = self._backend.get_repo(model)
+        filters = dict(where)
+        if "id" in filters:
+            filters["pk"] = filters.pop("id")
+
+        backend_name = self._backend.__class__.__name__
+        if backend_name == "TortoiseBackend":
+            qs = model.all()
+            if repo is not None:
+                qs = repo.scope_query(qs, info)
+            if "pk" in filters:
+                qs = qs.filter(pk=filters.pop("pk"))
+            return list(await qs.filter(**filters))
+
+        if backend_name == "SQLAlchemyBackend":
+            from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            session = self._backend._get_session(info)
+            stmt = select(model)
+            if repo is not None:
+                stmt = repo.scope_query(stmt, info)
+            if "pk" in filters:
+                pk_value = filters.pop("pk")
+                pk_names = list(self._backend._get_pk_names(model))
+                pk_col = getattr(model, pk_names[0])
+                stmt = stmt.where(pk_col == pk_value)
+            for key, value in filters.items():
+                stmt = stmt.where(getattr(model, key) == value)
+            if isinstance(session, AsyncSession):
+                result = await session.execute(stmt)
+            else:
+                result = session.execute(stmt)
+            return list(result.scalars().all())
+
+        if backend_name == "DjangoBackend":
+            return self._find_by_where_sync(model, where, info)
+
+        raise ValueError(f"Unsupported backend for upsert: {backend_name}")
+
+    def _upsert_sync(
+        self,
+        model: type,
+        payload: Any,
+        info: Any,
+        *,
+        project: Any,
+        parent_link: tuple[str, Any] | None = None,
+    ) -> Any:
+        values = _input_values(payload)
+        where = _input_values(values["where"])
+        create_payload = values.get("create")
+        update_payload = values.get("update")
+
+        matches = self._find_by_where_sync(model, where, info)
+        if len(matches) > 1:
+            raise ValueError(
+                f"Upsert for {model.__name__} matched {len(matches)} rows; "
+                f"where must match at most one"
+            )
+        if len(matches) == 1:
+            update_values = (
+                _input_values(update_payload) if update_payload is not None else {}
+            )
+            update_values["id"] = strawberry.ID(str(_primary_key_value(matches[0])))
+            update_input = self._update_input(model, project, include_id=True)
+            return self._update_sync(
+                model,
+                self._build_input_instance(update_input, update_values),
+                info,
+                parent_link=parent_link,
+            )
+
+        create_values = (
+            _input_values(create_payload) if create_payload is not None else {}
+        )
+        merged = {**where, **create_values}
+        if "id" in merged:
+            # Synthetic GraphQL id is not a create column
+            merged.pop("id")
+        create_input = self._create_input(model, project)
+        return self._create_sync(
+            model,
+            self._build_input_instance(create_input, merged),
+            info,
+            parent_link=parent_link,
+        )
+
+    async def _upsert_async(
+        self,
+        model: type,
+        payload: Any,
+        info: Any,
+        *,
+        project: Any,
+        parent_link: tuple[str, Any] | None = None,
+    ) -> Any:
+        values = _input_values(payload)
+        where = _input_values(values["where"])
+        create_payload = values.get("create")
+        update_payload = values.get("update")
+
+        matches = await self._find_by_where_async(model, where, info)
+        if len(matches) > 1:
+            raise ValueError(
+                f"Upsert for {model.__name__} matched {len(matches)} rows; "
+                f"where must match at most one"
+            )
+        if len(matches) == 1:
+            update_values = (
+                _input_values(update_payload) if update_payload is not None else {}
+            )
+            update_values["id"] = strawberry.ID(str(_primary_key_value(matches[0])))
+            update_input = self._update_input(model, project, include_id=True)
+            return await self._update_async(
+                model,
+                self._build_input_instance(update_input, update_values),
+                info,
+                parent_link=parent_link,
+            )
+
+        create_values = (
+            _input_values(create_payload) if create_payload is not None else {}
+        )
+        merged = {**where, **create_values}
+        if "id" in merged:
+            merged.pop("id")
+        create_input = self._create_input(model, project)
+        return await self._create_async(
+            model,
+            self._build_input_instance(create_input, merged),
+            info,
+            parent_link=parent_link,
+        )
 
     def _create_sync(
         self,
@@ -695,10 +1263,14 @@ class MutationNamespace:
                 operation, nested_payload, _delete_previous = (
                     self._resolve_single_wrapper(wrapper)
                 )
-                related = (
-                    self._create_sync(spec.related_model, nested_payload, info)
-                    if operation == "create"
-                    else self._update_sync(spec.related_model, nested_payload, info)
+                related = self._execute_relation_op_sync(
+                    spec.related_model,
+                    operation,
+                    nested_payload,
+                    info,
+                    project=getattr(
+                        wrapper.__class__, "__child_project__", _PROJECT_UNBOUNDED
+                    ),
                 )
                 scalar_values[field_name] = related
                 relation_values.pop(field_name)
@@ -799,12 +1371,14 @@ class MutationNamespace:
                 operation, nested_payload, _delete_previous = (
                     self._resolve_single_wrapper(wrapper)
                 )
-                related = (
-                    await self._create_async(spec.related_model, nested_payload, info)
-                    if operation == "create"
-                    else await self._update_async(
-                        spec.related_model, nested_payload, info
-                    )
+                related = await self._execute_relation_op_async(
+                    spec.related_model,
+                    operation,
+                    nested_payload,
+                    info,
+                    project=getattr(
+                        wrapper.__class__, "__child_project__", _PROJECT_UNBOUNDED
+                    ),
                 )
                 scalar_values[field_name] = related
                 relation_values.pop(field_name)
@@ -889,10 +1463,12 @@ class MutationNamespace:
         repo = self._backend.get_repo(spec.related_model)
         operation, payload, on_replace = self._resolve_single_wrapper(wrapper)
         current = getattr(instance, spec.name, None)
-        related = (
-            self._create_sync(spec.related_model, payload, info)
-            if operation == "create"
-            else self._update_sync(spec.related_model, payload, info)
+        related = self._execute_relation_op_sync(
+            spec.related_model,
+            operation,
+            payload,
+            info,
+            project=getattr(wrapper.__class__, "__child_project__", _PROJECT_UNBOUNDED),
         )
         _check_auth(repo, "can_link", instance, spec.name, related, info)
         setattr(instance, spec.name, related)
@@ -901,7 +1477,8 @@ class MutationNamespace:
         else:
             _sync_save_instance(self._backend, instance, info)
         if (
-            on_replace == "DELETE"
+            operation in {"create", "upsert"}
+            and on_replace == "DELETE"
             and current is not None
             and _primary_key_value(current) != _primary_key_value(related)
         ):
@@ -920,10 +1497,12 @@ class MutationNamespace:
         repo = self._backend.get_repo(spec.related_model)
         operation, payload, on_replace = self._resolve_single_wrapper(wrapper)
         current = getattr(instance, spec.name, None)
-        related = (
-            await self._create_async(spec.related_model, payload, info)
-            if operation == "create"
-            else await self._update_async(spec.related_model, payload, info)
+        related = await self._execute_relation_op_async(
+            spec.related_model,
+            operation,
+            payload,
+            info,
+            project=getattr(wrapper.__class__, "__child_project__", _PROJECT_UNBOUNDED),
         )
         _check_auth(repo, "can_link", instance, spec.name, related, info)
         setattr(instance, spec.name, related)
@@ -932,7 +1511,8 @@ class MutationNamespace:
         else:
             await _async_save_instance(self._backend, instance, info)
         if (
-            on_replace == "DELETE"
+            operation in {"create", "upsert"}
+            and on_replace == "DELETE"
             and current is not None
             and _primary_key_value(current) != _primary_key_value(related)
         ):
@@ -947,7 +1527,7 @@ class MutationNamespace:
         self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
     ) -> None:
         if spec.relation_mode == "many_to_many":
-            self._backend.apply_ref_list(instance, spec.name, refs, info)
+            self._apply_m2m_sync(instance, spec, refs, info)
             return
         self._apply_reverse_many_sync(instance, spec, refs, info)
 
@@ -955,9 +1535,65 @@ class MutationNamespace:
         self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
     ) -> None:
         if spec.relation_mode == "many_to_many":
-            await self._backend.apply_ref_list(instance, spec.name, refs, info)
+            await self._apply_m2m_async(instance, spec, refs, info)
             return
         await self._apply_reverse_many_async(instance, spec, refs, info)
+
+    def _apply_m2m_sync(
+        self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
+    ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        child_project = (
+            getattr(refs[0].__class__, "__child_project__", None) if refs else None
+        )
+        other_refs: list[Any] = []
+        for ref in refs:
+            ref_upsert = getattr(ref, "upsert", strawberry.UNSET)
+            if ref_upsert is not strawberry.UNSET and ref_upsert is not None:
+                if child_project is None:
+                    child_project = ref.__class__.__child_project__
+                related = self._upsert_sync(
+                    spec.related_model, ref_upsert, info, project=child_project
+                )
+                repo = self._backend.get_repo(spec.related_model)
+                _check_auth(repo, "can_link", instance, spec.name, related, info)
+                related_list = list(getattr(instance, spec.name))
+                if related not in related_list:
+                    related_list.append(related)
+                setattr(instance, spec.name, related_list)
+            else:
+                other_refs.append(ref)
+        if other_refs:
+            self._backend.apply_ref_list(instance, spec.name, other_refs, info)
+
+    async def _apply_m2m_async(
+        self, instance: Any, spec: RelationSpec, refs: list[Any], info: Any
+    ) -> None:
+        from strawberry_orm.repo import _check_auth
+
+        child_project = (
+            getattr(refs[0].__class__, "__child_project__", None) if refs else None
+        )
+        other_refs: list[Any] = []
+        for ref in refs:
+            ref_upsert = getattr(ref, "upsert", strawberry.UNSET)
+            if ref_upsert is not strawberry.UNSET and ref_upsert is not None:
+                if child_project is None:
+                    child_project = ref.__class__.__child_project__
+                related = await self._upsert_async(
+                    spec.related_model, ref_upsert, info, project=child_project
+                )
+                repo = self._backend.get_repo(spec.related_model)
+                _check_auth(repo, "can_link", instance, spec.name, related, info)
+                related_list = list(getattr(instance, spec.name))
+                if related not in related_list:
+                    related_list.append(related)
+                setattr(instance, spec.name, related_list)
+            else:
+                other_refs.append(ref)
+        if other_refs:
+            await self._backend.apply_ref_list(instance, spec.name, other_refs, info)
 
     def _apply_reverse_many_sync(
         self,
@@ -973,6 +1609,7 @@ class MutationNamespace:
         for ref in refs:
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_upsert = getattr(ref, "upsert", strawberry.UNSET)
             ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
@@ -998,6 +1635,14 @@ class MutationNamespace:
                     spec.related_model,
                     ref_update,
                     info,
+                    parent_link=(spec.remote_attr, instance),
+                )
+            elif ref_upsert is not strawberry.UNSET and ref_upsert is not None:
+                self._upsert_sync(
+                    spec.related_model,
+                    ref_upsert,
+                    info,
+                    project=ref.__class__.__child_project__,
                     parent_link=(spec.remote_attr, instance),
                 )
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
@@ -1043,6 +1688,7 @@ class MutationNamespace:
         for ref in refs:
             ref_create = getattr(ref, "create", strawberry.UNSET)
             ref_update = getattr(ref, "update", strawberry.UNSET)
+            ref_upsert = getattr(ref, "upsert", strawberry.UNSET)
             ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
@@ -1068,6 +1714,14 @@ class MutationNamespace:
                     spec.related_model,
                     ref_update,
                     info,
+                    parent_link=(spec.remote_attr, instance),
+                )
+            elif ref_upsert is not strawberry.UNSET and ref_upsert is not None:
+                await self._upsert_async(
+                    spec.related_model,
+                    ref_upsert,
+                    info,
+                    project=ref.__class__.__child_project__,
                     parent_link=(spec.remote_attr, instance),
                 )
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
