@@ -538,6 +538,7 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy.orm import joinedload, load_only, selectinload
 
         from strawberry_orm.optimizer.selections import (
+            field_nodes_from_info,
             fragments_from_info,
             iter_field_nodes,
         )
@@ -716,7 +717,7 @@ class SQLAlchemyBackend(BaseBackend):
                 loaders.append(parent_loader)
             return loaders
 
-        for field_node in info.field_nodes:
+        for field_node in field_nodes_from_info(info):
             query = _apply_loads(query, field_node.selection_set, mapper)
         return self._execute_stmt(query, info)
 

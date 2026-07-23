@@ -603,6 +603,7 @@ class DjangoBackend(BaseBackend):
         import re
 
         from strawberry_orm.optimizer.selections import (
+            field_nodes_from_info,
             fragments_from_info,
             iter_field_nodes,
         )
@@ -802,14 +803,14 @@ class DjangoBackend(BaseBackend):
                                 else:
                                     prefetch_related.append(rel_path)
 
-            for field_node in info.field_nodes:
+            for field_node in field_nodes_from_info(info):
                 _walk_selections(field_node.selection_set, model)
 
             only_fields: list[str] = []
 
             type_name_root = self._type_name_for_model(model)
             if type_name_root and store:
-                for field_node in info.field_nodes:
+                for field_node in field_nodes_from_info(info):
                     if field_node.selection_set:
                         for sel in iter_field_nodes(
                             field_node.selection_set, fragments

@@ -2,7 +2,11 @@
 
 from graphql import parse
 
-from strawberry_orm.optimizer.selections import fragments_from_info, iter_field_nodes
+from strawberry_orm.optimizer.selections import (
+    field_nodes_from_info,
+    fragments_from_info,
+    iter_field_nodes,
+)
 
 
 class TestIterFieldNodes:
@@ -170,3 +174,26 @@ class TestIterFieldNodes:
             node.name.value for node in iter_field_nodes(field_node.selection_set, {})
         ]
         assert names == ["posts"]
+
+
+class TestFieldNodesFromInfo:
+    def test_reads_field_nodes_from_raw_resolve_info(self):
+        # Strawberry's ``Info`` exposes the graphql-core resolve info as
+        # ``_raw_info`` and, since strawberry-graphql 0.321, no longer carries a
+        # ``field_nodes`` attribute of its own.
+        doc = parse("{ posts { id } }")
+        field_nodes = doc.definitions[0].selection_set.selections
+        raw_info = type("RawInfo", (), {"field_nodes": field_nodes})()
+        wrapped = type("Info", (), {"_raw_info": raw_info})()
+        assert not hasattr(wrapped, "field_nodes")
+        assert field_nodes_from_info(wrapped) == list(field_nodes)
+
+    def test_falls_back_to_raw_graphql_resolve_info(self):
+        # A bare graphql-core ``GraphQLResolveInfo`` carries ``field_nodes`` directly.
+        doc = parse("{ posts { id } }")
+        field_nodes = doc.definitions[0].selection_set.selections
+        raw_info = type("RawInfo", (), {"field_nodes": field_nodes})()
+        assert field_nodes_from_info(raw_info) == list(field_nodes)
+
+    def test_returns_empty_when_missing(self):
+        assert field_nodes_from_info(type("Info", (), {})()) == []
