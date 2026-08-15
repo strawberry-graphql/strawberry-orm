@@ -98,7 +98,7 @@ class AuditUserTypeA:
 
 @strawberry.type
 class QueryVulnA:
-    users: list[AuditUserTypeA] = _orm_vuln_a.field()
+    users: list[AuditUserTypeA] = _orm_vuln_a.field.auto()
 
 
 _schema_vuln_a = strawberry.Schema(

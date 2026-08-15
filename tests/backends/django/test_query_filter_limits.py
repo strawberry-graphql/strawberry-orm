@@ -19,7 +19,7 @@ class TestQueryFilterLimits:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
 

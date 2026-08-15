@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+from contextlib import contextmanager
 from decimal import Decimal
 from inspect import iscoroutinefunction
 from typing import Any
@@ -14,6 +15,7 @@ from strawberry_orm._async import async_safe_resolver, materialize_result, run_s
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
+from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 
@@ -307,8 +309,15 @@ class DjangoBackend(BaseBackend):
                     if authorize and not authorize("create", rel_model, None, info):
                         continue
                     data = input_to_dict(ref_create)
+                    if repo is not None:
+                        data = repo.on_before_create(data, info)
                     _check_auth(repo, "can_create", data, info)
-                    obj = rel_model.objects.create(**data)
+                    if repo is not None:
+                        obj = repo._create(rel_model, data, info)
+                    else:
+                        obj = rel_model.objects.create(**data)
+                    if repo is not None:
+                        repo.on_after_create(obj, info)
                     to_add.append(obj)
                 elif ref_update is not strawberry.UNSET and ref_update is not None:
                     data = input_to_dict(ref_update)
@@ -320,12 +329,18 @@ class DjangoBackend(BaseBackend):
                     else:
                         obj = rel_model.objects.filter(pk=pk).first()
                     if obj is not None:
+                        if repo is not None:
+                            data = repo.on_before_update(obj, data, info)
                         _check_auth(repo, "can_update", obj, data, info)
                         _check_auth(repo, "can_link", instance, field, obj, info)
                         if data:
                             for k, v in data.items():
                                 setattr(obj, k, v)
-                            obj.save()
+                            if repo is not None:
+                                repo._save(obj, info)
+                                repo.on_after_update(obj, info)
+                            else:
+                                obj.save()
                         to_add.append(obj)
                 elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                     if authorize and not authorize(
@@ -350,6 +365,8 @@ class DjangoBackend(BaseBackend):
                         obj = rel_model.objects.filter(pk=ref_delete.id).first()
                     if obj is not None:
                         _check_auth(repo, "can_delete", obj, info)
+                        if repo is not None:
+                            repo.on_before_delete(obj, info)
                         to_delete_ids.append(ref_delete.id)
 
             if to_add:
@@ -357,18 +374,27 @@ class DjangoBackend(BaseBackend):
             if to_unlink:
                 manager.remove(*rel_model.objects.filter(pk__in=to_unlink))
             if to_delete_ids:
-                manager.remove(*rel_model.objects.filter(pk__in=to_delete_ids))
-                rel_model.objects.filter(pk__in=to_delete_ids).delete()
+                doomed = list(rel_model.objects.filter(pk__in=to_delete_ids))
+                manager.remove(*doomed)
+                if repo is not None:
+                    for obj in doomed:
+                        repo._delete(obj, info)
+                else:
+                    rel_model.objects.filter(pk__in=to_delete_ids).delete()
 
         return run_sync(apply, thread_sensitive=True)
 
     # -- Query application ----------------------------------------------------
 
-    def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
+    def apply_filters(
+        self, query: Any, filter_input: Any, model: type, info: Any = None
+    ) -> Any:
         q_obj, query = _build_django_filter(
             filter_input,
             query=query,
             model=model,
+            info=info,
+            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -378,11 +404,15 @@ class DjangoBackend(BaseBackend):
             query = query.filter(q_obj)
         return query
 
-    def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
+    def apply_ordering(
+        self, query: Any, order_input: Any, model: type, info: Any = None
+    ) -> Any:
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[Any] = []
         for entry in order_list:
-            entry_clauses, query = _build_django_ordering(entry, query=query)
+            entry_clauses, query = _build_django_ordering(
+                entry, query=query, model=model, info=info, backend=self
+            )
             clauses.extend(entry_clauses)
         if clauses:
             query = query.order_by(*clauses)
@@ -541,6 +571,96 @@ class DjangoBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    def relation_names(self, model: type) -> set[str]:
+        return {
+            f.name
+            for f in model._meta.get_fields()  # type: ignore[attr-defined]
+            if getattr(f, "is_relation", False)
+        }
+
+    def _relation_target_model(self, model: type, relation: str) -> type | None:
+        try:
+            field = model._meta.get_field(relation)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        return getattr(field, "related_model", None)
+
+    def instance_pk(self, instance: Any) -> Any:
+        return getattr(instance, "pk", None)
+
+    def split_parent_predicate(
+        self, query: Any, parent_pk: Any
+    ) -> tuple[str, Any, Any] | None:
+        from django.db.models.sql.where import AND, WhereNode
+
+        inner = query.query
+        if inner.combinator or inner.distinct_fields or inner.extra:
+            return None
+        if inner.low_mark or inner.high_mark is not None:
+            return None
+
+        remainder = query._chain()
+        where = remainder.query.where
+        if where.connector != AND or where.negated:
+            return None
+
+        # The key is read back off each result row, so the predicate has to sit
+        # on the row's own table. A joined column (``tags__posts__author``)
+        # would group rows by a value that is not the one the join matched.
+        base_alias = getattr(remainder.query, "base_table", None)
+
+        hits = []
+        for child in where.children:
+            if isinstance(child, WhereNode):
+                # A nested group is fine as long as the parent key is not
+                # inside it; an OR arm mentioning the parent is not rewritable.
+                if _references_parent(child, parent_pk):
+                    return None
+                continue
+            if _is_parent_predicate(child, parent_pk, base_alias):
+                hits.append(child)
+
+        if len(hits) != 1:
+            return None
+
+        hit = hits[0]
+        attname = hit.lhs.target.attname
+        where.children = [child for child in where.children if child is not hit]
+        return attname, attname, remainder
+
+    def query_signature(self, query: Any) -> str | None:
+        # ``str(query.query)`` inlines parameters without quoting or type
+        # information, so ``title=1`` and ``title="1"`` render identically even
+        # though a strictly typed database treats them differently. Sign the
+        # parameterised SQL plus typed parameters instead.
+        try:
+            sql, params = query.query.get_compiler(using=query.db).as_sql()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        typed = tuple((type(param).__name__, repr(param)) for param in params)
+        return repr((sql, typed))
+
+    def apply_key_filter(
+        self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
+    ) -> Any:
+        return query.filter(**{f"{attr_name}__in": list(keys)})
+
+    @contextmanager
+    def query_probe(self, info: Any) -> Any:
+        """Count statements issued on the default connection while running."""
+        from django.db import connection
+
+        from strawberry_orm.lazy_resolution import QueryProbe
+
+        probe = QueryProbe()
+
+        def _wrapper(execute: Any, sql: Any, params: Any, many: Any, ctx: Any) -> Any:
+            probe.count += 1
+            return execute(sql, params, many, ctx)
+
+        with connection.execute_wrapper(_wrapper):
+            yield probe
+
     def count_query(self, query: Any, info: Any) -> int:
         return query.count()
 
@@ -631,16 +751,16 @@ class DjangoBackend(BaseBackend):
                 field_name: str,
                 related_model: type,
             ) -> Any:
-                """Build a custom queryset if the field has a load callable or
-                the related model's type defines get_queryset."""
+                """Build a custom queryset if the field has a scope callable or
+                the related model's type defines scope_rows."""
                 get_qs = self._type_querysets.get(related_model)
 
                 type_name = self._type_name_for_model(parent_model)
                 load_fn = None
                 if type_name and store:
                     hints = store.get(type_name, field_name)
-                    if hints and callable(hints.load):
-                        load_fn = hints.load
+                    if hints and hints.scope is not None:
+                        load_fn = hints.scope
 
                 if get_qs is None and load_fn is None:
                     return None
@@ -649,7 +769,7 @@ class DjangoBackend(BaseBackend):
                 if get_qs is not None:
                     qs = get_qs(qs, info)
                 if load_fn is not None:
-                    qs = load_fn(qs)
+                    qs = call_scope(load_fn, qs, info)
                 return qs
 
             def _walk_selections(
@@ -664,6 +784,32 @@ class DjangoBackend(BaseBackend):
                 for node in iter_field_nodes(selection_set, fragments):
                     field_name = _to_snake(node.name.value)
                     full_path = f"{prefix}__{field_name}" if prefix else field_name
+
+                    # Eager-load hints are declared against the field name, so they
+                    # apply to computed fields that are not ORM fields themselves.
+                    type_name = self._type_name_for_model(current_model)
+                    if type_name and store:
+                        hints = store.get(type_name, field_name)
+                        if hints and not hints.disable_optimization and hints.using:
+                            for rel_name in hints.using:
+                                try:
+                                    rel_field = meta.get_field(rel_name)
+                                except Exception:
+                                    continue
+                                rel_class = type(rel_field).__name__
+                                rel_path = (
+                                    f"{prefix}__{rel_name}" if prefix else rel_name
+                                )
+                                is_fk = rel_class in (
+                                    "ForeignKey",
+                                    "OneToOneField",
+                                    "OneToOneRel",
+                                )
+                                if is_fk and not in_prefetch:
+                                    select_related.append(rel_path)
+                                else:
+                                    prefetch_related.append(rel_path)
+
                     try:
                         field_obj = meta.get_field(field_name)
                     except Exception:
@@ -775,57 +921,13 @@ class DjangoBackend(BaseBackend):
                                 in_prefetch=True,
                             )
 
-                    type_name = self._type_name_for_model(current_model)
-                    if type_name and store:
-                        hints = store.get(type_name, field_name)
-                        if (
-                            hints
-                            and not hints.disable_optimization
-                            and hints.load
-                            and not callable(hints.load)
-                        ):
-                            for rel_name in hints.load:
-                                try:
-                                    rel_field = meta.get_field(rel_name)
-                                except Exception:
-                                    continue
-                                rel_class = type(rel_field).__name__
-                                rel_path = (
-                                    f"{prefix}__{rel_name}" if prefix else rel_name
-                                )
-                                is_fk = rel_class in (
-                                    "ForeignKey",
-                                    "OneToOneField",
-                                    "OneToOneRel",
-                                )
-                                if is_fk and not in_prefetch:
-                                    select_related.append(rel_path)
-                                else:
-                                    prefetch_related.append(rel_path)
-
             for field_node in field_nodes_from_info(info):
                 _walk_selections(field_node.selection_set, model)
-
-            only_fields: list[str] = []
-
-            type_name_root = self._type_name_for_model(model)
-            if type_name_root and store:
-                for field_node in field_nodes_from_info(info):
-                    if field_node.selection_set:
-                        for sel in iter_field_nodes(
-                            field_node.selection_set, fragments
-                        ):
-                            fname = _to_snake(sel.name.value)
-                            hints = store.get(type_name_root, fname)
-                            if hints and hints.only:
-                                only_fields.extend(hints.only)
 
             if select_related:
                 optimized_query = optimized_query.select_related(*select_related)
             if prefetch_related:
                 optimized_query = optimized_query.prefetch_related(*prefetch_related)
-            if only_fields:
-                optimized_query = optimized_query.only(*only_fields)
 
             return list(optimized_query)
 
@@ -837,6 +939,41 @@ class DjangoBackend(BaseBackend):
 # ---------------------------------------------------------------------------
 
 
+def _is_parent_predicate(
+    child: Any, parent_pk: Any, base_alias: str | None = None
+) -> bool:
+    """True when *child* is ``<fk column> = <parent pk>``.
+
+    The column must be a relation, otherwise a boolean column compared to
+    ``True`` would match a parent whose primary key is ``1``. When *base_alias*
+    is given the column must also belong to the queried table, so a predicate
+    reached through a join is not mistaken for the row's own key.
+    """
+    if getattr(child, "lookup_name", None) != "exact":
+        return False
+    lhs = getattr(child, "lhs", None)
+    target = getattr(lhs, "target", None)
+    if target is None or not getattr(target, "is_relation", False):
+        return False
+    if base_alias is not None and getattr(lhs, "alias", None) != base_alias:
+        return False
+    rhs = child.rhs
+    value = getattr(rhs, "pk", rhs)
+    return bool(value == parent_pk)
+
+
+def _references_parent(node: Any, parent_pk: Any) -> bool:
+    from django.db.models.sql.where import WhereNode
+
+    for child in node.children:
+        if isinstance(child, WhereNode):
+            if _references_parent(child, parent_pk):
+                return True
+        elif _is_parent_predicate(child, parent_pk):
+            return True
+    return False
+
+
 def _make_dj_rel_resolver(
     backend: Any,
     fname: str,
@@ -845,44 +982,54 @@ def _make_dj_rel_resolver(
     order_type: Any,
 ) -> Any:
     """Create a Strawberry field for a Django many-relation with filter/order."""
+    info_type = strawberry.types.Info
 
     def _resolve(
         self: Any,
+        info: Any,
         filter: Any = None,
         order: Any = None,
     ) -> list[Any]:
         qs = getattr(self, fname).all()
         if filter is not None:
-            qs = backend.apply_filters(qs, filter, rel_model)
+            qs = backend.apply_filters(qs, filter, rel_model, info=info)
         if order is not None:
-            qs = backend.apply_ordering(qs, order, rel_model)
+            qs = backend.apply_ordering(qs, order, rel_model, info=info)
         return list(qs)
 
     if filter_type and order_type:
 
         def resolver(
             self: Any,
+            info: Any,
             filter: Any = None,
             order: Any = None,
         ) -> list[Any]:
-            return _resolve(self, filter=filter, order=order)
+            return _resolve(self, info, filter=filter, order=order)
 
         resolver.__annotations__ = {
+            "info": info_type,
             "filter": filter_type | None,
             "order": list[order_type] | None,
         }
     elif filter_type:
 
-        def resolver(self: Any, filter: Any = None) -> list[Any]:
-            return _resolve(self, filter=filter, order=None)
+        def resolver(self: Any, info: Any, filter: Any = None) -> list[Any]:
+            return _resolve(self, info, filter=filter, order=None)
 
-        resolver.__annotations__ = {"filter": filter_type | None}
+        resolver.__annotations__ = {
+            "info": info_type,
+            "filter": filter_type | None,
+        }
     else:
 
-        def resolver(self: Any, order: Any = None) -> list[Any]:
-            return _resolve(self, filter=None, order=order)
+        def resolver(self: Any, info: Any, order: Any = None) -> list[Any]:
+            return _resolve(self, info, filter=None, order=order)
 
-        resolver.__annotations__ = {"order": list[order_type] | None}
+        resolver.__annotations__ = {
+            "info": info_type,
+            "order": list[order_type] | None,
+        }
 
     if getattr(backend, "_django_async_safe", False):
         resolver = async_safe_resolver(resolver)
@@ -935,12 +1082,49 @@ def _django_related_model(model: type, rel_name: str) -> type | None:
     return None
 
 
+def _django_traversal_model(model: type | None, rel_name: str) -> type | None:
+    """Model reached by *rel_name*, including reverse and m2m relations.
+
+    ``_django_related_model`` deliberately covers only forward keys, which the
+    foreign-key shortcut needs. Traversal has to keep following reverse
+    relations too, or the far side is left unscoped.
+    """
+    if model is None:
+        return None
+    try:
+        field = model._meta.get_field(rel_name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return getattr(field, "related_model", None)
+
+
+def _django_relation_scope_q(
+    backend: Any, model: type | None, relation: str, info: Any, prefix: str
+) -> Any | None:
+    """``Q`` restricting *relation* to the rows its scoping allows.
+
+    Covers both the related type's ``scope_rows`` and any ``scope=`` on this
+    edge, so a filter cannot reach rows the read path hides.
+    """
+    if backend is None or model is None:
+        return None
+    get_qs = backend.relation_scope(model, relation, info)
+    if get_qs is None:
+        return None
+    from django.db.models import Q
+
+    related = backend._relation_target_model(model, relation)
+    scoped = get_qs(related._default_manager.all(), info)
+    return Q(**{f"{prefix}{relation}__in": scoped})
+
+
 def _build_django_filter(
     filter_input: Any,
     *,
     query: Any = None,
     model: type | None = None,
     info: Any = None,
+    backend: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = False,
@@ -964,6 +1148,7 @@ def _build_django_filter(
         query=query,
         model=model,
         info=info,
+        backend=backend,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -999,11 +1184,17 @@ def _build_django_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
-                rel_model = (
-                    _django_related_model(model, rel_name)
-                    if model is not None
-                    else None
+                rel_model = _django_traversal_model(model, rel_name)
+                # Traversal joins straight to the related table, so the related
+                # type's row scoping has to be re-applied or it is bypassed.
+                scope_q = _django_relation_scope_q(
+                    backend, model, rel_name, info, _prefix
                 )
+                if scope_q is not None:
+                    is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
+                    if is_null_val is not strawberry.UNSET and is_null_val is not None:
+                        # "Has no related row" has to mean "none the caller can see".
+                        return (~scope_q if is_null_val else scope_q), query
                 if model is not None:
                     fk_attname = _django_forward_fk_attname(model, rel_name)
                     if fk_attname is not None:
@@ -1018,12 +1209,15 @@ def _build_django_filter(
                             max_in_list_size=max_in_list_size,
                         )
                         if fk_clause is not None:
+                            if scope_q is not None:
+                                fk_clause = fk_clause & scope_q
                             return fk_clause, query
-                return _build_django_filter(
+                nested_clause, query = _build_django_filter(
                     nested_filter,
                     query=query,
                     model=rel_model,
                     info=info,
+                    backend=backend,
                     max_depth=max_depth,
                     max_branches=max_branches,
                     enable_regex=enable_regex,
@@ -1031,6 +1225,9 @@ def _build_django_filter(
                     _depth=_depth + 1,
                     _prefix=f"{_prefix}{rel_name}__",
                 )
+                if nested_clause is not None and scope_q is not None:
+                    nested_clause = nested_clause & scope_q
+                return nested_clause, query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -1277,6 +1474,8 @@ def _build_django_ordering(
     *,
     query: Any = None,
     info: Any = None,
+    model: type | None = None,
+    backend: Any = None,
 ) -> tuple[list[Any], Any]:
     """Return ``(order_clauses, query)``."""
     clauses: list[Any] = []
@@ -1296,8 +1495,17 @@ def _build_django_ordering(
                 nested = getattr(val, rel_name)
                 if nested is strawberry.UNSET or nested is None:
                     continue
+                if backend is not None and model is not None:
+                    backend.reject_scoped_order_traversal(
+                        model, rel_name, type(order_input)
+                    )
                 sub_clauses, query = _build_django_ordering(
-                    nested, _prefix=f"{_prefix}{rel_name}__", query=query, info=info
+                    nested,
+                    _prefix=f"{_prefix}{rel_name}__",
+                    query=query,
+                    info=info,
+                    model=_django_traversal_model(model, rel_name),
+                    backend=backend,
                 )
                 clauses.extend(sub_clauses)
         elif key in custom_orders:

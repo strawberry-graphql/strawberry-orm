@@ -65,7 +65,7 @@ class _UserType:
 
 @strawberry.type
 class _Query:
-    posts: list[_PostType] = _orm.field()
+    posts: list[_PostType] = _orm.field.auto()
 
 
 _projected_schema = strawberry.Schema(

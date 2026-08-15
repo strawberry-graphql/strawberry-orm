@@ -68,7 +68,7 @@ class AbstractTestQueryTypeGeneration:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = orm.schema(query=Query)
         extension_names = [ext.__name__ for ext in schema.extensions]
@@ -82,7 +82,7 @@ class AbstractTestQueryTypeGeneration:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = orm.schema(query=Query, optimizer=False)
         extension_names = [ext.__name__ for ext in schema.extensions]
@@ -98,7 +98,7 @@ class AbstractTestQueryTypeGeneration:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = orm.schema(
             query=Query,
@@ -121,7 +121,7 @@ class AbstractTestQueryTypeGeneration:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         monkeypatch.setattr(orm._backend, "_lazy_resolution", "warn")
         schema = orm.schema(
@@ -144,7 +144,10 @@ class AbstractTestQueryTypeGeneration:
             if name.startswith("LazyResolutionExtension_")
         )
         assert lazy_index == optimizer_index + 1
-        assert extension_names == [
+        # Batching goes first: index 0 is the innermost wrapper, so it sees
+        # unexecuted resolver output rather than materialized rows.
+        assert extension_names[0].startswith("BatchingExtension_")
+        assert extension_names[1:] == [
             "_StubExtension",
             extension_names[optimizer_index],
             extension_names[lazy_index],

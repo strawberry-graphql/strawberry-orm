@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from collections.abc import Callable
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -22,6 +23,7 @@ from strawberry_orm.backends._base import (
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
+from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 from strawberry_orm.types import DateGroupByInterval
@@ -219,8 +221,10 @@ class SQLAlchemyBackend(BaseBackend):
             defaults[fname] = strawberry.UNSET
 
         type_name = name or f"{model.__name__}Input"
+        self._check_input_does_not_expose_excluded(model, type_name, annotations)
         ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
         cls = type(type_name, (), ns)
+        self._input_registry.setdefault(model, []).append((type_name, set(annotations)))
         return strawberry.input(cls)
 
     def apply_ref_list(
@@ -254,11 +258,15 @@ class SQLAlchemyBackend(BaseBackend):
 
     # -- Query application ----------------------------------------------------
 
-    def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
+    def apply_filters(
+        self, query: Any, filter_input: Any, model: type, info: Any = None
+    ) -> Any:
         clause, query = _build_sa_filter(
             filter_input,
             model,
             query=query,
+            info=info,
+            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -268,13 +276,15 @@ class SQLAlchemyBackend(BaseBackend):
             query = query.where(clause)
         return query
 
-    def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
+    def apply_ordering(
+        self, query: Any, order_input: Any, model: type, info: Any = None
+    ) -> Any:
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[Any] = []
         joins: list[Any] = []
         for entry in order_list:
             entry_clauses, entry_joins, query = _build_sa_ordering(
-                entry, model, query=query
+                entry, model, query=query, backend=self
             )
             clauses.extend(entry_clauses)
             joins.extend(entry_joins)
@@ -497,6 +507,124 @@ class SQLAlchemyBackend(BaseBackend):
 
         return isinstance(value, Select)
 
+    def relation_names(self, model: type) -> set[str]:
+        from sqlalchemy import inspect as sa_inspect
+
+        return set(sa_inspect(model).relationships.keys())
+
+    def _relation_target_model(self, model: type, relation: str) -> type | None:
+        from sqlalchemy import inspect as sa_inspect
+
+        try:
+            rel = sa_inspect(model).relationships.get(relation)
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return rel.mapper.class_ if rel is not None else None
+
+    def instance_pk(self, instance: Any) -> Any:
+        from sqlalchemy import inspect as sa_inspect
+
+        try:
+            identity = sa_inspect(instance).identity
+        except Exception:  # pragma: no cover - defensive
+            return None
+        if not identity or len(identity) != 1:
+            return None
+        return identity[0]
+
+    def split_parent_predicate(
+        self, query: Any, parent_pk: Any
+    ) -> tuple[str, Any, Any] | None:
+        from sqlalchemy.sql import operators
+        from sqlalchemy.sql.elements import BinaryExpression
+
+        if query._limit_clause is not None or query._offset_clause is not None:
+            return None
+        criteria = list(getattr(query, "_where_criteria", ()))
+        if not criteria:
+            return None
+
+        # The key is read back off each result row, so the predicate must sit on
+        # the selected entity's own table; a joined column would group rows by a
+        # value that is not the one the join matched.
+        try:
+            entity = query.column_descriptions[0]["entity"]
+            base_table = entity.__table__
+        except (AttributeError, IndexError, KeyError):
+            return None
+
+        hits = []
+        for clause in criteria:
+            if not isinstance(clause, BinaryExpression):
+                # A BooleanClauseList here means OR / NOT; not rewritable.
+                return None
+            if clause.operator is not operators.eq:
+                continue
+            column = clause.left
+            bound = getattr(clause.right, "value", None)
+            # Require a foreign-key column: a boolean column compared to True
+            # would otherwise match a parent whose primary key is 1.
+            if not getattr(column, "foreign_keys", None):
+                continue
+            if getattr(column, "table", None) is not base_table:
+                continue
+            if bound is not None and bound == parent_pk:
+                hits.append((clause, column))
+
+        if len(hits) != 1:
+            return None
+
+        hit, column = hits[0]
+        remainder = query._clone()
+        remainder._where_criteria = tuple(c for c in criteria if c is not hit)
+        return column.key, column, remainder
+
+    def query_signature(self, query: Any) -> str | None:
+        # Rendering literals inline loses type information, so ``title == 1``
+        # and ``title == "1"`` would sign identically even though a strictly
+        # typed database treats them differently. Sign the parameterised SQL
+        # plus typed bind values instead.
+        try:
+            compiled = query.compile()
+            params = compiled.params
+        except Exception:  # pragma: no cover - defensive
+            return None
+        typed = tuple(
+            (key, type(params[key]).__name__, repr(params[key]))
+            for key in sorted(params)
+        )
+        return repr((str(compiled), typed))
+
+    def apply_key_filter(
+        self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
+    ) -> Any:
+        return query.where(key_handle.in_(list(keys)))
+
+    @contextmanager
+    def query_probe(self, info: Any) -> Any:
+        """Count ORM statements issued on the request session while running."""
+        from sqlalchemy import event
+
+        from strawberry_orm.lazy_resolution import QueryProbe
+
+        probe = QueryProbe()
+        try:
+            session = self._get_session(info)
+        except Exception:
+            yield probe
+            return
+
+        def _on_execute(state: Any) -> None:
+            probe.count += 1
+
+        # AsyncSession rejects listeners; they must go on its sync_session.
+        target = getattr(session, "sync_session", session)
+        event.listen(target, "do_orm_execute", _on_execute)
+        try:
+            yield probe
+        finally:
+            event.remove(target, "do_orm_execute", _on_execute)
+
     def count_query(self, query: Any, info: Any) -> int:
         from sqlalchemy import func, select
 
@@ -528,14 +656,14 @@ class SQLAlchemyBackend(BaseBackend):
         type_name = self._type_name_for_model(parent_entity)
         if type_name:
             hints = self._store.get(type_name, field_name)
-            if hints and callable(hints.load):
-                stmt = hints.load(stmt)
+            if hints and hints.scope is not None:
+                stmt = call_scope(hints.scope, stmt, info)
 
         return stmt
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy.orm import joinedload, load_only, selectinload
+        from sqlalchemy.orm import joinedload, selectinload
 
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
@@ -569,7 +697,7 @@ class SQLAlchemyBackend(BaseBackend):
             field_name: str,
             related_entity: type,
         ) -> Any:
-            """Extract WHERE criteria from load callable / nested get_queryset."""
+            """Extract WHERE criteria from a scope callable / nested scope_rows."""
             from sqlalchemy import select as sa_select
 
             criteria_parts: list[Any] = []
@@ -583,8 +711,8 @@ class SQLAlchemyBackend(BaseBackend):
             type_name = self._type_name_for_model(parent_entity)
             if type_name and store:
                 hints = store.get(type_name, field_name)
-                if hints and callable(hints.load):
-                    temp_stmt = hints.load(sa_select(related_entity))
+                if hints and hints.scope is not None:
+                    temp_stmt = call_scope(hints.scope, sa_select(related_entity), info)
                     if temp_stmt.whereclause is not None:
                         criteria_parts.append(temp_stmt.whereclause)
 
@@ -625,6 +753,20 @@ class SQLAlchemyBackend(BaseBackend):
                     return parent_loader.joinedload(rel_attr.and_(criteria))
                 return parent_loader.joinedload(rel_attr)
 
+        def _hint_relations(current_mapper: Any, field_name: str) -> list[str]:
+            """Relation names declared via ``using=`` for *field_name*.
+
+            Keyed on the field name alone, so computed fields that are not mapped
+            attributes can still declare the relations their resolver reads.
+            """
+            type_name = self._type_name_for_model(current_mapper.entity)
+            hints = store.get(type_name, field_name) if type_name and store else None
+            if not hints or hints.disable_optimization or not hints.using:
+                return []
+            return [
+                name for name in hints.using if name in current_mapper.relationships
+            ]
+
         def _apply_loads(stmt: Any, selection_set: Any, current_mapper: Any) -> Any:
             if selection_set is None:
                 return stmt
@@ -651,29 +793,14 @@ class SQLAlchemyBackend(BaseBackend):
                     else:
                         stmt = stmt.options(base_loader)
 
-                type_name = self._type_name_for_model(current_mapper.entity)
-                if type_name and store:
-                    hints = store.get(type_name, field_name)
-                    if hints and not hints.disable_optimization:
-                        if hints.load and not callable(hints.load):
-                            for rel_name in hints.load:
-                                if rel_name in current_mapper.relationships:
-                                    extra_rel = current_mapper.relationships[rel_name]
-                                    extra_attr = getattr(
-                                        current_mapper.entity, rel_name
-                                    )
-                                    if extra_rel.uselist:
-                                        stmt = stmt.options(selectinload(extra_attr))
-                                    else:
-                                        stmt = stmt.options(joinedload(extra_attr))
-                        if hints.only:
-                            cols = [
-                                getattr(current_mapper.entity, c)
-                                for c in hints.only
-                                if hasattr(current_mapper.entity, c)
-                            ]
-                            if cols:
-                                stmt = stmt.options(load_only(*cols))
+                for rel_name in _hint_relations(current_mapper, field_name):
+                    extra_rel = current_mapper.relationships[rel_name]
+                    extra_attr = getattr(current_mapper.entity, rel_name)
+                    if extra_rel.uselist:
+                        stmt = stmt.options(selectinload(extra_attr))
+                    else:
+                        stmt = stmt.options(joinedload(extra_attr))
+
             return stmt
 
         def _collect_nested_loaders(
@@ -690,6 +817,19 @@ class SQLAlchemyBackend(BaseBackend):
             has_child_rels = False
             for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
+
+                for rel_name in _hint_relations(child_mapper, field_name):
+                    has_child_rels = True
+                    hint_rel = child_mapper.relationships[rel_name]
+                    loaders.append(
+                        _make_chained_loader(
+                            parent_loader,
+                            getattr(child_mapper.entity, rel_name),
+                            hint_rel.uselist,
+                            None,
+                        )
+                    )
+
                 if field_name in child_mapper.relationships:
                     has_child_rels = True
                     rel = child_mapper.relationships[field_name]
@@ -812,9 +952,16 @@ class SQLAlchemyBackend(BaseBackend):
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
+                if repo is not None:
+                    data = repo.on_before_create(data, info)
                 _check_auth(repo, "can_create", data, info)
-                obj = target_model(**data)
-                session.add(obj)
+                if repo is not None:
+                    obj = repo._create(target_model, data, info)
+                else:
+                    obj = target_model(**data)
+                    session.add(obj)
+                if repo is not None:
+                    repo.on_after_create(obj, info)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
@@ -826,10 +973,15 @@ class SQLAlchemyBackend(BaseBackend):
                 else:
                     obj = session.get(target_model, pk)
                 if obj is not None:
+                    if repo is not None:
+                        data = repo.on_before_update(obj, data, info)
                     _check_auth(repo, "can_update", obj, data, info)
                     _check_auth(repo, "can_link", instance, field, obj, info)
                     for k, v in data.items():
                         setattr(obj, k, v)
+                    if repo is not None:
+                        repo._save(obj, info)
+                        repo.on_after_update(obj, info)
                     to_add.append(obj)
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                 if authorize and not authorize(
@@ -854,6 +1006,8 @@ class SQLAlchemyBackend(BaseBackend):
                     obj = session.get(target_model, ref_delete.id)
                 if obj is not None:
                     _check_auth(repo, "can_delete", obj, info)
+                    if repo is not None:
+                        repo.on_before_delete(obj, info)
                     to_delete.append(obj)
 
         existing = list(getattr(instance, field))
@@ -895,9 +1049,16 @@ class SQLAlchemyBackend(BaseBackend):
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
+                if repo is not None:
+                    data = repo.on_before_create(data, info)
                 _check_auth(repo, "can_create", data, info)
-                obj = target_model(**data)
-                session.add(obj)
+                if repo is not None:
+                    obj = await repo._create_async(target_model, data, info)
+                else:
+                    obj = target_model(**data)
+                    session.add(obj)
+                if repo is not None:
+                    repo.on_after_create(obj, info)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
@@ -909,10 +1070,15 @@ class SQLAlchemyBackend(BaseBackend):
                 else:
                     obj = await session.get(target_model, pk)
                 if obj is not None:
+                    if repo is not None:
+                        data = repo.on_before_update(obj, data, info)
                     _check_auth(repo, "can_update", obj, data, info)
                     _check_auth(repo, "can_link", instance, field, obj, info)
                     for k, v in data.items():
                         setattr(obj, k, v)
+                    if repo is not None:
+                        await repo._save_async(obj, info)
+                        repo.on_after_update(obj, info)
                     to_add.append(obj)
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                 if authorize and not authorize(
@@ -937,6 +1103,8 @@ class SQLAlchemyBackend(BaseBackend):
                     obj = await session.get(target_model, ref_delete.id)
                 if obj is not None:
                     _check_auth(repo, "can_delete", obj, info)
+                    if repo is not None:
+                        repo.on_before_delete(obj, info)
                     to_delete.append(obj)
 
         await session.refresh(instance, [field])
@@ -996,9 +1164,9 @@ def _make_sa_rel_resolver(
                 return getattr(self, fname)
             stmt = _build_stmt(self, info)
             if filter is not None:
-                stmt = backend.apply_filters(stmt, filter, rel_model)
+                stmt = backend.apply_filters(stmt, filter, rel_model, info=info)
             if order is not None:
-                stmt = backend.apply_ordering(stmt, order, rel_model)
+                stmt = backend.apply_ordering(stmt, order, rel_model, info=info)
             return _execute(stmt, info)
 
         resolver.__annotations__ = {
@@ -1012,7 +1180,7 @@ def _make_sa_rel_resolver(
             if filter is None:
                 return getattr(self, fname)
             stmt = _build_stmt(self, info)
-            stmt = backend.apply_filters(stmt, filter, rel_model)
+            stmt = backend.apply_filters(stmt, filter, rel_model, info=info)
             return _execute(stmt, info)
 
         resolver.__annotations__ = {
@@ -1025,7 +1193,7 @@ def _make_sa_rel_resolver(
             if order is None:
                 return getattr(self, fname)
             stmt = _build_stmt(self, info)
-            stmt = backend.apply_ordering(stmt, order, rel_model)
+            stmt = backend.apply_ordering(stmt, order, rel_model, info=info)
             return _execute(stmt, info)
 
         resolver.__annotations__ = {
@@ -1131,12 +1299,38 @@ _LOOKUP_TO_SA_OP: dict[str, str] = {
 }
 
 
+def _sa_relation_scope_criteria(
+    backend: Any, model: type, relation: str, info: Any
+) -> Any | None:
+    """Criteria limiting *relation* to the rows its type's scope allows.
+
+    The whole scoped statement is embedded as a subquery over primary keys
+    rather than lifting its WHERE clause, so joins, limits and anything else
+    ``scope_rows`` adds are carried across intact. Any ``scope=`` on this
+    edge is applied too, so a filter cannot reach rows the read path hides.
+    """
+    if backend is None:
+        return None
+    get_qs = backend.relation_scope(model, relation, info)
+    if get_qs is None:
+        return None
+
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import select as sa_select
+
+    related = backend._relation_target_model(model, relation)
+    scoped = get_qs(sa_select(related), info)
+    pk_col = sa_inspect(related).primary_key[0]
+    return pk_col.in_(scoped.with_only_columns(pk_col).scalar_subquery())
+
+
 def _build_sa_filter(
     filter_input: Any,
     model: type,
     *,
     query: Any = None,
     info: Any = None,
+    backend: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = True,
@@ -1157,6 +1351,7 @@ def _build_sa_filter(
     recurse_kw = dict(
         query=query,
         info=info,
+        backend=backend,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -1188,6 +1383,11 @@ def _build_sa_filter(
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
                 relationship_prop = getattr(model, rel_name)
+                # Traversal reaches the related table directly, so the related
+                # type's row scoping has to be re-applied here or it is bypassed.
+                scope_criteria = _sa_relation_scope_criteria(
+                    backend, model, rel_name, info
+                )
                 is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
                 if is_null_val is not strawberry.UNSET and is_null_val is not None:
                     if relationship_prop.property.uselist:
@@ -1196,6 +1396,10 @@ def _build_sa_filter(
                             f"'{rel_name}'. Use a custom @filter_field for M2M "
                             "presence."
                         )
+                    if scope_criteria is not None:
+                        # "Has a related row" must mean "has a *visible* one".
+                        present = relationship_prop.has(scope_criteria)
+                        return (not_(present) if is_null_val else present), query
                     local_col = list(relationship_prop.property.local_columns)[0]
                     clause = (
                         local_col.is_(None) if is_null_val else local_col.isnot(None)
@@ -1214,6 +1418,10 @@ def _build_sa_filter(
                         max_in_list_size=max_in_list_size,
                     )
                     if fk_clause is not None:
+                        if scope_criteria is not None:
+                            fk_clause = and_(
+                                fk_clause, relationship_prop.has(scope_criteria)
+                            )
                         return fk_clause, query
                 inner, query = _build_sa_filter(
                     nested_filter,
@@ -1221,6 +1429,8 @@ def _build_sa_filter(
                     **{**recurse_kw, "query": query},
                 )
                 if inner is not None:
+                    if scope_criteria is not None:
+                        inner = and_(inner, scope_criteria)
                     if relationship_prop.property.uselist:
                         return relationship_prop.any(inner), query
                     else:
@@ -1494,6 +1704,7 @@ def _build_sa_ordering(
     *,
     query: Any = None,
     info: Any = None,
+    backend: Any = None,
 ) -> tuple[list[Any], list[Any], Any]:
     """Return ``(clauses, joins, query)``."""
     clauses: list[Any] = []
@@ -1514,11 +1725,15 @@ def _build_sa_ordering(
                 nested = getattr(val, rel_name)
                 if nested is strawberry.UNSET or nested is None:
                     continue
+                if backend is not None:
+                    backend.reject_scoped_order_traversal(
+                        model, rel_name, type(order_input)
+                    )
                 relationship_prop = getattr(model, rel_name)
                 rel_model = relationship_prop.property.mapper.class_
                 joins.append(relationship_prop)
                 sub_clauses, sub_joins, query = _build_sa_ordering(
-                    nested, rel_model, query=query, info=info
+                    nested, rel_model, query=query, info=info, backend=backend
                 )
                 clauses.extend(sub_clauses)
                 joins.extend(sub_joins)

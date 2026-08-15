@@ -86,8 +86,8 @@ class SecretUserType:
 
 @strawberry.type
 class Query:
-    users: list[SecretUserType] = orm.field()
-    notes: list[SecretNoteType] = orm.field()
+    users: list[SecretUserType] = orm.field.auto()
+    notes: list[SecretNoteType] = orm.field.auto()
 
     @strawberry.field
     def user(self, info: strawberry.types.Info, id: int) -> SecretUserType | None:

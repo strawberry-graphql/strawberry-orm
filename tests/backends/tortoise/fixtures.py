@@ -108,9 +108,9 @@ TagRef = _main_orm.ref(
 
 @strawberry.type
 class _MainQuery:
-    users: list[UserType] = _main_orm.field()
-    posts: list[PostType] = _main_orm.field()
-    comments: list[CommentType] = _main_orm.field()
+    users: list[UserType] = _main_orm.field.auto()
+    posts: list[PostType] = _main_orm.field.auto()
+    comments: list[CommentType] = _main_orm.field.auto()
 
     @strawberry.field
     async def user(self, id: int) -> UserType | None:
@@ -265,26 +265,33 @@ def _build_node_mutation_schema():
 
     CreateNodeInput = node_orm.mutations.create_node_input(name="CreateNodeInput")
     UpdateNodeInput = node_orm.mutations.update_node_input(name="UpdateNodeInput")
+    ProjectedCreateNodeInput = node_orm.mutations.create_node_input(
+        project=node_project, name="ProjectedCreateNodeInput"
+    )
+    ProjectedUpdateNodeInput = node_orm.mutations.update_node_input(
+        project=node_project, name="ProjectedUpdateNodeInput"
+    )
 
     @strawberry.type(name="Mutation")
     class NodeMutation:
-        create_node = node_orm.mutations.create_node(input_name="CreateNodeInput")
-        update_node = node_orm.mutations.update_node(input_name="UpdateNodeInput")
-        projected_create_node = node_orm.mutations.create_node(
-            project=node_project,
-            input_name="ProjectedCreateNodeInput",
-        )
-        projected_update_node = node_orm.mutations.update_node(
-            project=node_project,
-            input_name="ProjectedUpdateNodeInput",
-        )
-
         @strawberry.field
         async def inspect_create_node_input(self, input: CreateNodeInput) -> str:
             return _selected_root_key(input)
 
         @strawberry.field
         async def inspect_update_node_input(self, input: UpdateNodeInput) -> str:
+            return _selected_root_key(input)
+
+        @strawberry.field
+        async def inspect_projected_create_node_input(
+            self, input: ProjectedCreateNodeInput
+        ) -> str:
+            return _selected_root_key(input)
+
+        @strawberry.field
+        async def inspect_projected_update_node_input(
+            self, input: ProjectedUpdateNodeInput
+        ) -> str:
             return _selected_root_key(input)
 
     return node_orm.schema(
@@ -361,7 +368,7 @@ class PublishedPostType:
     is_published: auto
 
     @classmethod
-    def get_queryset(cls, qs, info):
+    def scope_rows(cls, qs, info):
         return qs.filter(is_published=True)
 
 
@@ -382,7 +389,7 @@ class _GetQuerysetQuery:
         return TortUser.all()  # type: ignore[return-value]
 
 
-get_queryset_schema = _qs_orm.schema(
+scope_rows_schema = _qs_orm.schema(
     query=_GetQuerysetQuery,
 )
 
@@ -440,6 +447,17 @@ async def tortoise_db():
 @pytest.fixture
 def orm():
     return StrawberryORM.for_tortoise(lazy_resolution="off")
+
+
+@pytest.fixture
+def orm_factory():
+    """Build ORMs with custom kwargs (strict_hints, batch_relations, ...)."""
+
+    def _make(**kwargs):
+        kwargs.setdefault("lazy_resolution", "off")
+        return StrawberryORM.for_tortoise(**kwargs)
+
+    return _make
 
 
 # -- Model class fixtures ----------------------------------------------------
@@ -581,8 +599,8 @@ async def self_model_execute(seed):
 
 
 @pytest_asyncio.fixture
-async def get_queryset_execute(seed):
-    return _make_executor(get_queryset_schema)
+async def scope_rows_execute(seed):
+    return _make_executor(scope_rows_schema)
 
 
 @pytest_asyncio.fixture

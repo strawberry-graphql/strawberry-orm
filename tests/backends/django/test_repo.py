@@ -4,11 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 import strawberry
-from strawberry import relay
 
 from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.repo import _check_auth
-from strawberry_orm.types import auto
 from tests.backends.django.models import (
     Comment as DjComment,
 )
@@ -318,217 +316,73 @@ class TestRefListRepo:
 
 
 # ---------------------------------------------------------------------------
-# Module-level node schema (single ORM instance — registering the same Django
-# models on multiple StrawberryORM.for_django() instances breaks `auto` / Node resolution)
+# Lifecycle hooks
 # ---------------------------------------------------------------------------
-
-
-_repo_node_orm = StrawberryORM.for_django()
-
-
-@_repo_node_orm.type(DjUser)
-class _RepoUserNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-    email: auto
-
-
-@_repo_node_orm.type(DjTag)
-class _RepoTagNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-
-
-@_repo_node_orm.type(DjPost)
-class _RepoPostNode(relay.Node):
-    id: relay.NodeID[int]
-    title: auto
-    body: auto
-    is_published: auto
-
-
-@strawberry.type
-class _RepoNodeQuery:
-    @strawberry.field
-    def users(self) -> list[_RepoUserNode]:
-        return []
-
-    @strawberry.field
-    def tags(self) -> list[_RepoTagNode]:
-        return []
-
-    @strawberry.field
-    def posts(self) -> list[_RepoPostNode]:
-        return []
-
-
-@strawberry.type
-class _RepoNodeMutation:
-    create_node = _repo_node_orm.mutations.create_node(input_name="DjRepoCIn")
-    update_node = _repo_node_orm.mutations.update_node(input_name="DjRepoUIn")
-
-
-_repo_node_schema = strawberry.Schema(
-    query=_RepoNodeQuery,
-    mutation=_RepoNodeMutation,
-)
 
 
 @pytest.mark.django_db(transaction=True)
 class TestLifecycleHooks:
-    def test_on_before_create_transforms_data(self, setup_tables):
-        _seed()
-        LifecycleTagRepo.calls = []
-        _repo_node_orm._backend._repos = {DjTag: LifecycleTagRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    createNode(input: { tag: { name: "hooks" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
+    """Hooks fire on the writes the library performs, i.e. through ref lists."""
 
-        assert result.errors is None
-        tag = DjTag.objects.filter(name="HOOKS").first()
-        assert tag is not None, "on_before_create should have uppercased the name"
+    def _ref_list(self, orm, post, ref):
+        orm.apply_ref_list(post, "tags", [ref], SimpleNamespace(context={}))
+
+    def test_on_before_create_transforms_data(self, setup_tables):
+        data = _seed()
+        LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_django()
+        orm._backend._repos = {DjTag: LifecycleTagRepo}
+
+        @strawberry.input
+        class DjLifecycleCreateTag:
+            name: str
+
+        ref_type = orm.ref(DjTag, create=DjLifecycleCreateTag)
+        self._ref_list(
+            orm, data["post"], ref_type(create=DjLifecycleCreateTag(name="hooks"))
+        )
+
+        assert DjTag.objects.filter(name="HOOKS").exists(), (
+            "on_before_create should have uppercased the name"
+        )
         assert "before_create" in LifecycleTagRepo.calls
         assert "after_create" in LifecycleTagRepo.calls
 
     def test_on_before_update_called(self, setup_tables):
-        _seed()
+        data = _seed()
         LifecycleTagRepo.calls = []
-        _repo_node_orm._backend._repos = {DjTag: LifecycleTagRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    updateNode(input: { tag: { id: "1", name: "updated" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
+        orm = StrawberryORM.for_django()
+        orm._backend._repos = {DjTag: LifecycleTagRepo}
 
-        assert result.errors is None
+        @strawberry.input
+        class DjLifecycleUpdateTag:
+            id: strawberry.ID
+            name: str
+
+        ref_type = orm.ref(DjTag, update=DjLifecycleUpdateTag)
+        self._ref_list(
+            orm,
+            data["post"],
+            ref_type(update=DjLifecycleUpdateTag(id="1", name="updated")),
+        )
+
         assert "before_update" in LifecycleTagRepo.calls
         assert "after_update" in LifecycleTagRepo.calls
+        data["python"].refresh_from_db()
+        assert data["python"].name == "updated"
 
-    def teardown_method(self):
-        _repo_node_orm._backend._repos = {}
+    def test_on_before_delete_called(self, setup_tables):
+        data = _seed()
+        LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_django()
+        orm._backend._repos = {DjTag: LifecycleTagRepo}
 
+        @strawberry.input
+        class DjLifecycleDeleteTag:
+            id: strawberry.ID
 
-@pytest.mark.django_db(transaction=True)
-class TestNodeMutationRepo:
-    def test_create_node_denied(self, setup_tables):
-        _seed()
-        _repo_node_orm._backend._repos = {DjUser: DenyAllUserRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    createNode(input: { user: { name: "Evil", email: "e@e.com" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
+        ref_type = orm.ref(DjTag, delete=True)
+        self._ref_list(orm, data["post"], ref_type(delete=DjLifecycleDeleteTag(id="1")))
 
-        assert result.errors is not None
-        assert "can_create denied" in str(result.errors[0])
-
-    def test_update_node_denied(self, setup_tables):
-        _seed()
-        _repo_node_orm._backend._repos = {DjUser: DenyUpdateUserRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    updateNode(input: { user: { id: "1", name: "Renamed" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
-
-        assert result.errors is not None
-        assert "can_update denied" in str(result.errors[0])
-
-    def test_update_node_scoped(self, setup_tables):
-        _seed()
-        _repo_node_orm._backend._repos = {DjUser: ScopingUserRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    updateNode(input: { user: { id: "1", name: "Hacked" } }) {
-                        __typename
-                    }
-                }
-                """,
-                context_value={"allowed_ids": [999]},
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
-
-        assert result.errors is not None
-        assert "does not exist" in str(result.errors[0])
-
-        user = DjUser.objects.get(pk=1)
-        assert user.name == "Alice"
-
-    def test_default_repo_allows_all(self, setup_tables):
-        _seed()
-
-        class AllowAllUserRepo(AbstractRepo[DjUser]):
-            pass
-
-        _repo_node_orm._backend._repos = {DjUser: AllowAllUserRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    createNode(input: { user: { name: "New", email: "new@e.com" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
-
-        assert result.errors is None
-        assert result.data["createNode"]["__typename"] == "Repousernode"
-
-    def test_repo_only_affects_registered_model(self, setup_tables):
-        """A repo for DjUser should not block Tag creation."""
-        _seed()
-        _repo_node_orm._backend._repos = {DjUser: DenyAllUserRepo}
-        try:
-            result = _repo_node_schema.execute_sync(
-                """
-                mutation {
-                    createNode(input: { tag: { name: "NewTag" } }) {
-                        __typename
-                    }
-                }
-                """,
-            )
-        finally:
-            _repo_node_orm._backend._repos = {}
-
-        assert result.errors is None
-        assert result.data["createNode"]["__typename"] == "Repotagnode"
-
-    def teardown_method(self):
-        _repo_node_orm._backend._repos = {}
+        assert "before_delete" in LifecycleTagRepo.calls
+        assert not DjTag.objects.filter(pk=1).exists()

@@ -9,26 +9,31 @@ def build_root_only_hint_schema(orm, User, *, include_email: bool):
     @orm.type(User)
     class UserType:
         id: auto
-        name: auto = orm.field(only=["name"])
+        name: auto = orm.field.auto()
         email: auto
 
     @strawberry.type
     class Query:
-        users: list[UserType] = orm.field()
+        users: list[UserType] = orm.field.auto()
 
     query = "{ users { name email } }" if include_email else "{ users { name } }"
     return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()]), query
 
 
 def build_invalid_load_hint_schema(orm, User):
+    """Build a schema whose hint names a relation that does not exist.
+
+    Only reachable with ``strict_hints=False``; the strict default raises.
+    """
+
     @orm.type(User)
     class UserType:
         id: auto
-        name: auto = orm.field(load=["does_not_exist"])
+        name: auto = orm.field.auto(using=["does_not_exist"])
 
     @strawberry.type
     class Query:
-        users: list[UserType] = orm.field()
+        users: list[UserType] = orm.field.auto()
 
     return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
 
@@ -55,7 +60,7 @@ class AbstractTestQueryHintEdgeCasesSync:
     def test_invalid_load_hint_is_ignored(
         self, make_basic_orm, schema_execute, User, seed
     ):
-        orm = make_basic_orm()
+        orm = make_basic_orm(strict_hints=False)
         schema = build_invalid_load_hint_schema(orm, User)
         result = schema_execute(schema, "{ users { name } }")
         assert result.errors is None
@@ -90,7 +95,7 @@ class AbstractTestQueryHintEdgeCasesAsync:
     async def test_invalid_load_hint_is_ignored(
         self, make_basic_orm, schema_execute_async, User, seed
     ):
-        orm = make_basic_orm()
+        orm = make_basic_orm(strict_hints=False)
         schema = build_invalid_load_hint_schema(orm, User)
         result = await schema_execute_async(schema, "{ users { name } }")
         assert result.errors is None

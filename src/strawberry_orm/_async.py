@@ -143,7 +143,10 @@ def async_safe_resolver(
             return result
 
         if not in_async_context():
-            return run()
+            # Materialization only exists to keep a lazy queryset from being
+            # iterated on the event loop; under sync execution it would just
+            # deny the optimizer and the batcher a query object to work with.
+            return func(*args, **kwargs)
         return run_sync(run, thread_sensitive=thread_sensitive)
 
     return wrapper

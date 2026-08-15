@@ -24,7 +24,7 @@ class TestRelayConnectionFilteringAndOrdering:
 
         @strawberry.type
         class Query:
-            @orm.field()
+            @orm.field.auto()
             def users(self) -> list[UserNode]:
                 return orm.get_default_queryset(User)
 

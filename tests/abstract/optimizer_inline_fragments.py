@@ -30,7 +30,7 @@ class AbstractTestOptimizerInlineFragmentsSync:
         @orm.type(User)
         class UsersQueryType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class InlineFragmentsQuery:
@@ -81,7 +81,7 @@ class AbstractTestOptimizerInlineFragmentsSync:
         @orm.type(User)
         class UsersWithPostsType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class InlineFragmentBranchQuery:
@@ -136,7 +136,7 @@ class AbstractTestOptimizerInlineFragmentsSync:
         @orm.type(User)
         class UsersFragmentSpreadType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class FragmentSpreadQuery:
@@ -193,7 +193,7 @@ class AbstractTestOptimizerInlineFragmentsSync:
         @orm.type(User)
         class UsersNestedType:
             id: auto
-            posts: list[PostFullNested] = orm.field()
+            posts: list[PostFullNested] = orm.field.auto()
 
         @strawberry.type
         class NestedInlineFragmentQuery:
@@ -238,7 +238,7 @@ class AbstractTestOptimizerInlineFragmentsSync:
         @orm.type(User)
         class PlainUsersType:
             id: auto
-            posts: list[PlainPostType] = orm.field()
+            posts: list[PlainPostType] = orm.field.auto()
 
         @strawberry.type
         class PlainFieldsQuery:
@@ -304,7 +304,7 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         @orm.type(User)
         class UsersQueryType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class InlineFragmentsQuery:
@@ -353,7 +353,7 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         @orm.type(User)
         class UsersWithPostsType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class InlineFragmentBranchQuery:
@@ -406,7 +406,7 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         @orm.type(User)
         class UsersFragmentSpreadType:
             id: auto
-            posts: list[PostFull] = orm.field()
+            posts: list[PostFull] = orm.field.auto()
 
         @strawberry.type
         class FragmentSpreadQuery:
@@ -463,7 +463,7 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         @orm.type(User)
         class UsersNestedType:
             id: auto
-            posts: list[PostFullNested] = orm.field()
+            posts: list[PostFullNested] = orm.field.auto()
 
         @strawberry.type
         class NestedInlineFragmentQuery:
@@ -506,7 +506,7 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         @orm.type(User)
         class PlainUsersType:
             id: auto
-            posts: list[PlainPostType] = orm.field()
+            posts: list[PlainPostType] = orm.field.auto()
 
         @strawberry.type
         class PlainFieldsQuery:

@@ -218,8 +218,8 @@ class TestAsyncSessionMutations:
 
         @strawberry.type
         class Query:
-            tags: list[TagType] = orm.field()
-            posts: list[PostType] = orm.field()
+            tags: list[TagType] = orm.field.auto()
+            posts: list[PostType] = orm.field.auto()
 
         @strawberry.type
         class Mutation:
@@ -302,8 +302,8 @@ class TestAsyncSessionMutations:
 
         @strawberry.type
         class Query:
-            posts: list[PostType] = orm.field()
-            tags: list[TagType] = orm.field()
+            posts: list[PostType] = orm.field.auto()
+            tags: list[TagType] = orm.field.auto()
 
         @strawberry.type
         class Mutation:

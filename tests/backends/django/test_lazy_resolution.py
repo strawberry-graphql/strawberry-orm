@@ -138,7 +138,7 @@ class TestLazyResolutionRuntime:
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
 
-        with pytest.warns(UserWarning, match="query path: query \\{ posts \\{ author"):
+        with pytest.warns(UserWarning, match="path: query \\{ posts \\{ author"):
             result = schema.execute_sync("{ posts { author { name } } }")
 
         assert result.errors is None
@@ -153,10 +153,10 @@ class TestLazyResolutionRuntime:
 
         result = schema.execute_sync("{ posts { author { name } } }")
         assert result.errors is not None
-        assert "query path: query { posts { author { name } } }" in str(
+        assert "path: query { posts { author { name } } }" in str(
             result.errors[0].message
         )
-        assert "select_related('author')" in str(result.errors[0].message)
+        assert "fix: return a QuerySet instead of list" in str(result.errors[0].message)
 
     def test_runtime_no_warning_when_optimizer_prefetches(self, seed):
         orm = StrawberryORM.for_django(lazy_resolution="off")
@@ -174,7 +174,7 @@ class TestLazyResolutionRuntime:
 
         @strawberry.type
         class Query:
-            posts: list[PostType] = orm.field()
+            posts: list[PostType] = orm.field.auto()
 
         schema = strawberry.Schema(
             query=Query,

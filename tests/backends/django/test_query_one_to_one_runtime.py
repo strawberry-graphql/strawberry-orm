@@ -64,7 +64,7 @@ class TestQueryOneToOneRuntime:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
         result = schema.execute_sync("{ users { name profile { bio } } }")
@@ -114,7 +114,7 @@ class TestQueryOneToOneRuntime:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
         result = schema.execute_sync(
@@ -137,7 +137,7 @@ class TestQueryOneToOneRuntime:
             bio: auto
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(is_public=True)
 
         @orm.type(DjUser)
@@ -155,7 +155,7 @@ class TestQueryOneToOneRuntime:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
         result = schema.execute_sync("{ users { name profile { bio } } }")

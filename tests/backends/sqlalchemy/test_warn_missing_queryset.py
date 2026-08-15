@@ -1,4 +1,4 @@
-"""Tests for missing get_queryset warnings on @orm.type registration."""
+"""Tests for missing scope_rows warnings on @orm.type registration."""
 
 import warnings
 
@@ -8,18 +8,18 @@ from strawberry_orm.types import auto
 
 
 class TestWarnMissingQueryset:
-    def test_warns_when_get_queryset_missing(self, User):
+    def test_warns_when_scope_rows_missing(self, User):
         from strawberry_orm import StrawberryORM
 
         orm = StrawberryORM.for_sqlalchemy(
             dialect="sqlite",
             lazy_resolution="off",
-            warn_missing_queryset=True,
+            warn_missing_scope=True,
         )
 
         with pytest.warns(
             UserWarning,
-            match=r"GraphQL type 'UserType' \(model User\) has no get_queryset",
+            match=r"GraphQL type 'UserType' \(model User\) has no scope_rows",
         ):
 
             @orm.type(User)
@@ -27,13 +27,13 @@ class TestWarnMissingQueryset:
                 id: auto
                 name: auto
 
-    def test_no_warn_when_get_queryset_defined(self, User):
+    def test_no_warn_when_scope_rows_defined(self, User):
         from strawberry_orm import StrawberryORM
 
         orm = StrawberryORM.for_sqlalchemy(
             dialect="sqlite",
             lazy_resolution="off",
-            warn_missing_queryset=True,
+            warn_missing_scope=True,
         )
 
         with warnings.catch_warnings():
@@ -45,16 +45,16 @@ class TestWarnMissingQueryset:
                 name: auto
 
                 @classmethod
-                def get_queryset(cls, qs, info):
+                def scope_rows(cls, qs, info):
                     return qs.where(User.is_active.is_(True))
 
-    def test_disabled_when_warn_missing_queryset_false(self, User):
+    def test_disabled_when_warn_missing_scope_false(self, User):
         from strawberry_orm import StrawberryORM
 
         orm = StrawberryORM.for_sqlalchemy(
             dialect="sqlite",
             lazy_resolution="off",
-            warn_missing_queryset=False,
+            warn_missing_scope=False,
         )
 
         with warnings.catch_warnings():
@@ -66,4 +66,4 @@ class TestWarnMissingQueryset:
                 name: auto
 
     def test_disabled_under_pytest_by_default(self, orm):
-        assert orm._backend._warn_missing_queryset is False
+        assert orm._backend._warn_missing_scope is False

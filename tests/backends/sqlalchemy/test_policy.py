@@ -8,11 +8,9 @@ import pytest
 import strawberry
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from strawberry import relay
 
 from strawberry_orm import MutationPolicy, StrawberryORM
 from strawberry_orm.policy import _check_policy
-from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
 )
@@ -253,122 +251,3 @@ class TestRefListPolicy:
         )
         new_tags = [t.name for t in data["post"].tags]
         assert "allowed" in new_tags
-
-
-# ---------------------------------------------------------------------------
-# Node mutation policy tests
-# ---------------------------------------------------------------------------
-
-
-class TestNodeMutationPolicy:
-    def _build_schema(self, policy):
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=policy)
-
-        @orm.type(SAUser)
-        class UserNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-            email: auto
-
-        @orm.type(SATag)
-        class TagNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-
-        @orm.type(SAPost)
-        class PostNode(relay.Node):
-            id: relay.NodeID[int]
-            title: auto
-            body: auto
-            is_published: auto
-
-        @strawberry.type
-        class Q:
-            @strawberry.field
-            def ok(self) -> bool:
-                return True
-
-        @strawberry.type
-        class M:
-            create_node = orm.mutations.create_node(input_name="CIn")
-            update_node = orm.mutations.update_node(input_name="UIn")
-
-        return strawberry.Schema(
-            query=Q, mutation=M, types=[UserNode, TagNode, PostNode]
-        )
-
-    def test_create_node_denied(self):
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema(DenyAllPolicy())
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { user: { name: "Evil", email: "e@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is not None
-        assert "can_create denied" in str(result.errors[0])
-
-    def test_update_node_denied(self):
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema(DenyUpdatePolicy())
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Renamed" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is not None
-        assert "can_update denied" in str(result.errors[0])
-
-    def test_update_node_scoped(self):
-        """scope_query should prevent loading the instance entirely."""
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema(ScopingPolicy())
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Hacked" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session, "allowed_ids": [999]},
-        )
-        assert result.errors is not None
-        assert "does not exist" in str(result.errors[0])
-
-        user = session.get(SAUser, 1)
-        assert user.name == "Alice"
-
-    def test_default_policy_allows_all(self):
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema(MutationPolicy())
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { user: { name: "New", email: "new@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is None
-        assert result.data["createNode"]["__typename"] == "UserNode"

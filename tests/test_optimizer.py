@@ -8,13 +8,12 @@ from strawberry_orm.optimizer import FieldHints, OptimizerStore
 class TestOptimizerStore:
     def test_register_and_get(self):
         store = OptimizerStore()
-        hints = FieldHints(load=["posts", "tags"], only=["id", "name"])
+        hints = FieldHints(using=["posts", "tags"])
         store.register("UserType", "posts", hints)
 
         retrieved = store.get("UserType", "posts")
         assert retrieved is hints
-        assert retrieved.load == ["posts", "tags"]
-        assert retrieved.only == ["id", "name"]
+        assert retrieved.using == ["posts", "tags"]
 
     def test_get_missing_returns_none(self):
         store = OptimizerStore()
@@ -23,8 +22,8 @@ class TestOptimizerStore:
 
     def test_multiple_types(self):
         store = OptimizerStore()
-        store.register("UserType", "posts", FieldHints(load=["posts"]))
-        store.register("PostType", "author", FieldHints(load=["author"]))
+        store.register("UserType", "posts", FieldHints(using=["posts"]))
+        store.register("PostType", "author", FieldHints(using=["author"]))
 
         assert store.get("UserType", "posts") is not None
         assert store.get("PostType", "author") is not None

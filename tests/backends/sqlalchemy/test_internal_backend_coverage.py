@@ -187,15 +187,16 @@ class TestInternalBackendCoverage:
 
         class QueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(User.name == "Alice")
 
-        backend._type_querysets[User] = QueryType.get_queryset
+        backend._type_querysets[User] = QueryType.scope_rows
         backend._store.hints = {
             "UserType": {
                 "name": SimpleNamespace(
-                    load=lambda stmt: stmt.where(User.email.like("%example.com")),
-                    only=None,
+                    scope=lambda stmt, info: stmt.where(
+                        User.email.like("%example.com")
+                    ),
                     disable_optimization=False,
                 )
             }
@@ -388,15 +389,14 @@ class TestInternalBackendCoverage:
 
         class QueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(User.name != "missing")
 
-        backend._type_querysets[Post] = QueryType.get_queryset
+        backend._type_querysets[Post] = QueryType.scope_rows
         backend._store.hints = {
             "UserType": {
                 "posts": SimpleNamespace(
-                    load=lambda stmt: stmt.where(Post.is_published.is_(True)),
-                    only=["title"],
+                    scope=lambda stmt, info: stmt.where(Post.is_published.is_(True)),
                     disable_optimization=False,
                 )
             }
@@ -434,29 +434,28 @@ class TestInternalBackendCoverage:
 
         class PostQueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published.is_(True))
 
         class CommentQueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(SAComment.body != "")
 
-        backend._type_querysets[Post] = PostQueryType.get_queryset
-        backend._type_querysets[SAComment] = CommentQueryType.get_queryset
-        backend._type_querysets[User] = PostQueryType.get_queryset
+        backend._type_querysets[Post] = PostQueryType.scope_rows
+        backend._type_querysets[SAComment] = CommentQueryType.scope_rows
+        backend._type_querysets[User] = PostQueryType.scope_rows
         backend._store.hints = {
             "UserType": {
                 "name": SimpleNamespace(
-                    load=["posts"],
-                    only=["name", "email"],
+                    using=["posts"],
+                    scope=None,
                     disable_optimization=False,
                 )
             },
             "PostType": {
                 "comments": SimpleNamespace(
-                    load=lambda stmt: stmt.where(SAComment.body.like("%")),
-                    only=None,
+                    scope=lambda stmt, info: stmt.where(SAComment.body.like("%")),
                     disable_optimization=False,
                 )
             },
@@ -500,8 +499,8 @@ class TestInternalBackendCoverage:
         backend._store.hints = {
             "UserType": {
                 "posts": SimpleNamespace(
-                    load=["comments"],
-                    only=None,
+                    using=["comments"],
+                    scope=None,
                     disable_optimization=False,
                 )
             }
@@ -556,16 +555,16 @@ class TestInternalBackendCoverage:
 
         class PostQueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published.is_(True))
 
         class UserQueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(User.name != "")
 
-        backend._type_querysets[Post] = PostQueryType.get_queryset
-        backend._type_querysets[User] = UserQueryType.get_queryset
+        backend._type_querysets[Post] = PostQueryType.scope_rows
+        backend._type_querysets[User] = UserQueryType.scope_rows
         author_field = FieldNode(
             alias=None,
             name=NameNode(value="author"),
@@ -607,10 +606,10 @@ class TestInternalBackendCoverage:
 
         class TagQueryType:
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Tag.name != "")
 
-        backend._type_querysets[Tag] = TagQueryType.get_queryset
+        backend._type_querysets[Tag] = TagQueryType.scope_rows
         tags_field = FieldNode(
             alias=None,
             name=NameNode(value="tags"),

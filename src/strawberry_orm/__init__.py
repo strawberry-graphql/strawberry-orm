@@ -1,7 +1,6 @@
 """strawberry-orm: Unified, backend-agnostic ORM abstraction for Strawberry GraphQL."""
 
 from strawberry_orm.core import StrawberryORM
-from strawberry_orm.fields import make_field
 from strawberry_orm.filters import (
     BooleanLookup,
     DateComparisonLookup,
@@ -63,7 +62,6 @@ __all__ = [
     "auto",
     "filter_field",
     "group_field",
-    "make_field",
     "make_ref_type",
     "order_field",
 ]

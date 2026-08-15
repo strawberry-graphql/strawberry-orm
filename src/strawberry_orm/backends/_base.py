@@ -11,6 +11,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from difflib import get_close_matches
 from typing import Any, Literal
 
 import strawberry
@@ -53,8 +54,51 @@ def _annotate_filter_relation_presence(FilterCls: type) -> None:
     FilterCls.is_null = strawberry.UNSET
 
 
+_ROW_SCOPE_HOOK = "scope_rows"
+
+
 _KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
 _KNOWN_ORDER_KEYS = frozenset({"field", "object"})
+
+
+def _set_scoped_ordering_allowance(order_type: type, model: type, allowed: Any) -> None:
+    """Record which relations may be ordered through into a scoped type.
+
+    Kept on the order type rather than keyed by model, so one order input
+    opting in cannot widen another order input over the same model.
+    """
+    names = frozenset(allowed or ())
+    order_type._scoped_ordering_allowed = names  # type: ignore[attr-defined]
+    unknown = names - set(getattr(order_type, "_relation_models", {}))
+    if unknown:
+        raise ValueError(
+            f"allow_scoped_ordering names {sorted(unknown)} on "
+            f"{model.__name__}, which {order_type.__name__} cannot order "
+            f"through. Expected one of: "
+            f"{sorted(getattr(order_type, '_relation_models', {})) or 'none'}."
+        )
+
+
+def scoped_ordering_allowed(order_type: Any, relation: str) -> bool:
+    """Whether *order_type* opted out of the scoped-ordering restriction."""
+    return relation in getattr(order_type, "_scoped_ordering_allowed", ())
+
+
+def _nested_order_types(order_type: Any) -> dict[str, type]:
+    """Order input reachable through each relation, by relation name.
+
+    Read off the annotations rather than the model-keyed registry: the nested
+    input was captured when this order type was built, so a later order type
+    over the same model is a different class and must not stand in for it.
+    """
+    object_type = getattr(order_type, "_object_type", None)
+    nested: dict[str, type] = {}
+    for relation, annotation in getattr(object_type, "__annotations__", {}).items():
+        for arg in typing.get_args(annotation):
+            if isinstance(arg, type) and arg is not type(None):
+                nested[relation] = arg
+                break
+    return nested
 
 
 @dataclass
@@ -241,8 +285,9 @@ class BaseBackend:
         self._group_registry: dict[type, type] = {}
         self._aggregate_type_cache: dict[type, AggregateMeta] = {}
         self._type_querysets: dict[type, Any] = {}
+        self._type_queryset_owner: dict[type, str] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
-        self._warn_missing_queryset: bool = kwargs.get("warn_missing_queryset", True)
+        self._warn_missing_scope: bool = kwargs.get("warn_missing_scope", True)
         self._exclude_sensitive_fields: bool = kwargs.get(
             "exclude_sensitive_fields", True
         )
@@ -255,6 +300,10 @@ class BaseBackend:
         self._lazy_resolution: LazyResolutionMode = lazy_resolution
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
         self._enable_optimizer: bool = kwargs.get("enable_optimizer", True)
+        self._strict_hints: bool = kwargs.get("strict_hints", True)
+        self._batch_relations: bool = kwargs.get("batch_relations", True)
+        self._type_excludes: dict[type, set[str]] = {}
+        self._input_registry: dict[type, list[tuple[str, set[str]]]] = {}
 
     def get_repo(self, model: type) -> Any | None:
         """Return an instantiated repo for *model*, or ``None``."""
@@ -315,8 +364,10 @@ class BaseBackend:
             defaults[fname] = strawberry.UNSET
 
         type_name = name or f"{model.__name__}Input"
+        self._check_input_does_not_expose_excluded(model, type_name, annotations)
         ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
         cls = type(type_name, (), ns)
+        self._input_registry.setdefault(model, []).append((type_name, set(annotations)))
         return strawberry.input(cls)
 
     def _get_pk_names(self, model: type) -> set[str]:
@@ -487,7 +538,7 @@ class BaseBackend:
 
         if pending_self_relations:
             if project is None:
-                self._filter_registry[model] = FilterType
+                self._register_model_filter(model, FilterType)
             return self.filter(
                 model,
                 include=include,
@@ -496,7 +547,7 @@ class BaseBackend:
             )
 
         if project is None:
-            self._filter_registry[model] = FilterType
+            self._register_model_filter(model, FilterType)
         else:
             self._projected_filter_cache[cache_key] = FilterType
         return FilterType
@@ -552,6 +603,7 @@ class BaseBackend:
         model = model_or_type
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
+        allow_scoped_ordering = kwargs.get("allow_scoped_ordering")
 
         fields_meta = self._introspect_model(model)
 
@@ -612,6 +664,7 @@ class BaseBackend:
         if object_annotations:
             OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
         self._order_registry[model] = OrderType
         return OrderType
 
@@ -811,17 +864,26 @@ class BaseBackend:
         *,
         include: list[str] | tuple[str, ...] | set[str] | None = None,
         exclude: list[str] | tuple[str, ...] | set[str] | None = None,
+        allow_scoped_ordering: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> Callable[[type], type]:
         """Decorator that builds a ``@oneOf`` order input from a user class.
 
         ``auto`` annotations are expanded to ``Ordering | None``.
         Methods decorated with ``@order_field`` become additional top-level
         keys on the order input alongside ``field`` and ``object``.
+
+        ``allow_scoped_ordering`` names relations that may be ordered through
+        even though the type on the far side defines ``scope_rows``. See
+        :meth:`check_scoped_order_traversal`.
         """
 
         def decorator(cls: type) -> type:
             return self._build_custom_order_type(
-                cls, model, include=include, exclude=exclude
+                cls,
+                model,
+                include=include,
+                exclude=exclude,
+                allow_scoped_ordering=allow_scoped_ordering,
             )
 
         return decorator
@@ -833,6 +895,7 @@ class BaseBackend:
         *,
         include: Any = None,
         exclude: Any = None,
+        allow_scoped_ordering: Any = None,
     ) -> type:
         fields_meta = self._introspect_model(model)
         col_types = {
@@ -921,6 +984,7 @@ class BaseBackend:
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
         if custom_orders:
             OrderType._custom_orders = custom_orders  # type: ignore[attr-defined]
+        _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
 
         self._order_registry[model] = OrderType
         return OrderType
@@ -1170,6 +1234,11 @@ class BaseBackend:
         for fname, ftype, is_relation, _rel in fields_meta:
             if is_relation:
                 continue
+            # min/max return exact column values and the group key echoes them
+            # back, so a sensitive column is as exposed here as it would be on
+            # the output type. Filters, ordering and group-by already drop it.
+            if self._exclude_generated_sensitive_field(fname, include_fields):
+                continue
             if include_fields is not None and fname not in include_fields:
                 groupable_fields.append((fname, ftype))
                 continue
@@ -1247,11 +1316,11 @@ class BaseBackend:
     def field(self, **kwargs: Any) -> Any:
         from strawberry_orm.types import FieldDefinition
 
-        hint_keys = {"load", "only", "compute", "disable_optimization"}
+        hint_keys = {"using", "scope", "compute", "disable_optimization"}
         if hint_keys & set(kwargs):
             return FieldDefinition(
-                load=kwargs.get("load"),
-                only=kwargs.get("only"),
+                using=kwargs.get("using"),
+                scope=kwargs.get("scope"),
                 compute=kwargs.get("compute"),
                 disable_optimization=kwargs.get("disable_optimization", False),
                 description=kwargs.get("description"),
@@ -1296,6 +1365,338 @@ class BaseBackend:
         )
 
     # -- Shared helpers ------------------------------------------------------
+
+    def _relation_target_model(self, model: type, relation: str) -> type | None:
+        """Model on the far side of *relation*, or ``None`` if unknown."""
+        return None
+
+    def apply_type_scope(self, query: Any, model: type | None, info: Any) -> Any:
+        """Apply *model*'s ``scope_rows`` to *query*, if one is registered."""
+        if model is None:
+            return query
+        get_qs = self._type_querysets.get(model)
+        return query if get_qs is None else get_qs(query, info)
+
+    # -- Scoping across relation traversal -----------------------------------
+
+    def _field_scope(self, model: type, relation: str) -> Any | None:
+        """The ``scope=`` declared on *model*'s own ``relation`` field, if any."""
+        type_name = self._type_name_for_model(model)
+        if type_name is None:
+            return None
+        hints = self._store.get(type_name, relation)
+        return getattr(hints, "scope", None) if hints else None
+
+    def relation_scope(self, model: type, relation: str, info: Any) -> Any | None:
+        """Everything that restricts the far side of *relation*, or ``None``.
+
+        Filtering reaches the related table directly, which would otherwise
+        bypass the row scoping applied when that relation is read. Both layers
+        count: the related type's ``scope_rows`` and any ``scope=`` on this
+        edge. They are composed in that order, the same order the read path
+        uses.
+        """
+        related = self._relation_target_model(model, relation)
+        if related is None:
+            return None
+        get_qs = self._type_querysets.get(related)
+        field_scope = self._field_scope(model, relation)
+        if get_qs is None and field_scope is None:
+            return None
+        if info is None:
+            raise ValueError(
+                f"Cannot filter through {model.__name__}.{relation}: "
+                f"{related.__name__} is row-scoped and applying that needs the "
+                f"resolver's info. Pass info= to apply_filters()."
+            )
+
+        from strawberry_orm.fields import call_scope
+
+        def restrict(query: Any, resolver_info: Any) -> Any:
+            if get_qs is not None:
+                query = get_qs(query, resolver_info)
+            if field_scope is not None:
+                query = call_scope(field_scope, query, resolver_info)
+            return query
+
+        return restrict
+
+    def reject_scoped_order_traversal(
+        self, model: type, relation: str, order_type: Any = None
+    ) -> None:
+        """Refuse to order by a relation whose rows the caller cannot read.
+
+        Unlike filtering, ordering cannot be made safe by restricting the join:
+        the resulting sequence itself ranks the hidden rows.
+
+        ``orm.schema()`` rejects these at build time. This is the backstop for
+        schemas built with ``strawberry.Schema`` directly, which skips that
+        check.
+        """
+        related = self._relation_target_model(model, relation)
+        if related is None or related not in self._type_querysets:
+            return
+        if scoped_ordering_allowed(order_type, relation):
+            return
+        raise ValueError(self._scoped_order_message(model, relation, related))
+
+    @staticmethod
+    def _scoped_order_message(model: type, relation: str, related: type) -> str:
+        return (
+            f"Cannot order by {model.__name__}.{relation}: {related.__name__} is "
+            f"scoped by scope_rows, so ordering would rank rows the caller "
+            f"cannot read. Order by a column on {model.__name__}, or pass "
+            f"allow_scoped_ordering=['{relation}'] when building the order type "
+            f"for {model.__name__} if every readable {model.__name__} is "
+            f"guaranteed to have a readable {related.__name__}."
+        )
+
+    def check_scoped_order_traversal(self) -> None:
+        """Raise if any exposed order input can sort by rows scoping hides.
+
+        Runs at schema build so the problem surfaces on startup rather than on
+        the first client query that happens to use that sort.
+        """
+        problems: list[str] = []
+        seen: set[tuple[int, int]] = set()
+
+        def walk(order_type: Any, model: type) -> None:
+            key = (id(order_type), id(model))
+            if order_type is None or key in seen:
+                return
+            seen.add(key)
+            nested = _nested_order_types(order_type)
+            for relation, related in getattr(
+                order_type, "_relation_models", {}
+            ).items():
+                if related in self._type_querysets and not scoped_ordering_allowed(
+                    order_type, relation
+                ):
+                    problems.append(
+                        self._scoped_order_message(model, relation, related)
+                    )
+                walk(nested.get(relation), related)
+
+        for model, graphql_type in self._graphql_type_registry.items():
+            walk(getattr(graphql_type, "__orm_order__", None), model)
+
+        if problems:
+            raise ValueError("\n".join(dict.fromkeys(problems)))
+
+    def _check_input_does_not_expose_excluded(
+        self, model: type, type_name: str, fields: dict[str, Any]
+    ) -> None:
+        """Reject a mutation input that can write a column the type hides.
+
+        Excluding a column from the output type is a read control; it does not
+        touch the generated input, so the field stays writable. That is mass
+        assignment: a caller can set a value they are not allowed to read back.
+        """
+        hidden = self._type_excludes.get(model)
+        if not hidden:
+            return
+        leaked = sorted(hidden & set(fields))
+        if leaked:
+            raise ValueError(
+                f"{type_name} can write {leaked}, which the GraphQL type for "
+                f"{model.__name__} excludes. Hiding a column from reads leaves it "
+                f"writable unless the input excludes it too. Pass "
+                f"exclude={leaked!r} to the orm.input()/orm.partial() call."
+            )
+
+    def _check_excluded_fields_are_not_writable(
+        self,
+        model: type,
+        type_name: str,
+        exclude: list[str] | tuple[str, ...] | set[str] | None,
+    ) -> None:
+        """The same check for inputs generated *before* the type was declared."""
+        if not exclude:
+            return
+        excluded = set(exclude)
+        for input_name, fields in self._input_registry.get(model, []):
+            leaked = sorted(excluded & fields)
+            if leaked:
+                raise ValueError(
+                    f"{type_name} excludes {leaked} but {input_name} can still "
+                    f"write them, so a caller can set values they cannot read. "
+                    f"Pass exclude={leaked!r} to the orm.input()/orm.partial() "
+                    f"call that builds {input_name}."
+                )
+
+    def _register_model_filter(self, model: type, filter_type: type) -> None:
+        """Record the filter used for *model*, refusing to widen it silently.
+
+        Nested ``object:`` traversal reuses the filter registered for the
+        related model, and the registry is keyed by model. A second, broader
+        filter built anywhere for the same model therefore re-exposes columns a
+        narrower filter had excluded - including through other types' filters.
+        """
+        existing = self._filter_registry.get(model)
+        if existing is not None and existing is not filter_type:
+            before = self._generated_input_field_names(existing)
+            after = self._generated_input_field_names(filter_type)
+            widened = sorted(after - before)
+            if widened:
+                raise ValueError(
+                    f"A filter for {model.__name__} already excludes {widened}, "
+                    f"but another orm.filter({model.__name__}) call exposes them. "
+                    f"Nested object traversal reuses one filter per model, so the "
+                    f"broader one would re-expose those columns everywhere. Build "
+                    f"a single filter per model, or pass the same exclude to both."
+                )
+        self._filter_registry[model] = filter_type
+
+    @staticmethod
+    def _generated_input_field_names(input_cls: Any) -> set[str]:
+        """Column names reachable through a generated filter/order input."""
+        if input_cls is None:
+            return set()
+        nested = getattr(input_cls, "__annotations__", {}).get("field")
+        args = getattr(nested, "__args__", None)
+        inner = args[0] if args else nested
+        return set(getattr(inner, "__annotations__", {}))
+
+    def _check_excluded_fields_are_not_queryable(
+        self,
+        type_name: str,
+        exclude: list[str] | tuple[str, ...] | set[str] | None,
+        filters: Any,
+        order: Any,
+        group: Any,
+    ) -> None:
+        """Refuse to expose an excluded column through filter/order/group.
+
+        Hiding a column from the output type but leaving it filterable turns it
+        into an oracle: ``startsWith`` probes read the value one character at a
+        time. The generated inputs are built from the model, so they do not know
+        about the type's ``exclude`` unless it is passed to them as well.
+        """
+        if not exclude:
+            return
+
+        excluded = set(exclude)
+        for label, input_cls in (
+            ("filters", filters),
+            ("order", order),
+            ("group", group),
+        ):
+            leaked = sorted(excluded & self._generated_input_field_names(input_cls))
+            if leaked:
+                raise ValueError(
+                    f"{type_name} excludes {leaked} but its {label} input still "
+                    f"exposes them, which makes the hidden values readable one "
+                    f"probe at a time. Pass exclude={leaked!r} to the "
+                    f"orm.{'filter' if label == 'filters' else label}() call too."
+                )
+
+    def _register_type_scope(self, cls: type, model: type, type_name: str) -> None:
+        """Record ``scope_rows`` for *model*, refusing to silently replace it.
+
+        Row scoping is resolved from the model, because at prefetch time the
+        optimizer only knows which table it is loading. Two GraphQL types over
+        the same model therefore cannot each carry their own scope: the second
+        registration would overwrite the first and every reader would silently
+        get the last one, turning a restrictive scope into a permissive one.
+        That is an authorization bypass, so it is rejected outright.
+        """
+        existing = self._type_querysets.get(model)
+        new = getattr(cls, _ROW_SCOPE_HOOK)
+        if existing is not None and getattr(existing, "__func__", existing) is not (
+            getattr(new, "__func__", new)
+        ):
+            previous = self._type_queryset_owner.get(model, "another type")
+            raise ValueError(
+                f"{type_name} and {previous} both define scope_rows for "
+                f"{model.__name__}. Row scoping is resolved per model, so the "
+                f"second definition would silently replace the first for every "
+                f"reader. Expose one GraphQL type per model, or move the "
+                f"difference into the resolver that returns each type."
+            )
+        self._type_querysets[model] = new
+        self._type_queryset_owner[model] = type_name
+
+    def relation_names(self, model: type) -> set[str]:
+        """Return the names of *model*'s relations, for hint validation."""
+        raise NotImplementedError
+
+    # -- Relation batching ---------------------------------------------------
+    #
+    # Backends that can introspect a query opt in by overriding these three.
+    # The default refuses to batch, which is always correct - just slower.
+
+    def instance_pk(self, instance: Any) -> Any:
+        """Primary key of *instance*, used to key batched rows back to parents."""
+        return None
+
+    def split_parent_predicate(
+        self, query: Any, parent_pk: Any
+    ) -> tuple[str, Any, Any] | None:
+        """Split *query* into its parent predicate and the rest.
+
+        Returns ``(attr_name, key_handle, remainder)`` when exactly one
+        top-level equality predicate matches *parent_pk*, or ``None`` when the
+        rewrite cannot be proven equivalent.
+        """
+        return None
+
+    def query_signature(self, query: Any) -> str | None:
+        """Stable structural signature of *query*, or ``None`` if uncomputable."""
+        return None
+
+    def apply_key_filter(
+        self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
+    ) -> Any:
+        """Restrict *query* to rows whose parent key is one of *keys*."""
+        raise NotImplementedError  # pragma: no cover
+
+    def _validate_scoped_relation(
+        self,
+        model: type,
+        type_name: str,
+        field_name: str,
+        hints: Any,
+    ) -> None:
+        """A scope narrows a relation, so the field has to be one."""
+        if hints.scope is None or not self._strict_hints:
+            return
+        names = self.relation_names(model)
+        if field_name in names:
+            return
+        suggestion = get_close_matches(field_name, sorted(names), n=1)
+        hint_text = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+        raise ValueError(
+            f"{type_name}.{field_name}: scope= narrows the rows loaded through a "
+            f"relation, but {model.__name__} has no relation {field_name!r}."
+            f"{hint_text}"
+        )
+
+    def _validate_hints(
+        self,
+        model: type,
+        type_name: str,
+        field_name: str,
+        hints: Any,
+    ) -> None:
+        """Reject ``using=`` names that can never resolve, at schema-build time."""
+        if not self._strict_hints or not hints.using:
+            return
+
+        names = self.relation_names(model)
+        for rel in hints.using:
+            if rel in names:
+                continue
+            where = f"{type_name}.{field_name}: "
+            if "__" in rel or "." in rel:
+                raise ValueError(
+                    f"{where}multi-hop using={rel!r} is not supported. Declare the "
+                    f"first hop only, or scope the relation on its own type."
+                )
+            suggestion = get_close_matches(rel, sorted(names), n=1)
+            hint_text = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+            raise ValueError(
+                f"{where}{model.__name__} has no relation {rel!r}.{hint_text}"
+            )
 
     def _type_name_for_model(self, model: type) -> str | None:
         for type_name, m in self._type_registry.items():
@@ -1347,7 +1748,7 @@ class BaseBackend:
             message = (
                 f"Field '{field_name}' on {model.__name__} resolves a related ORM "
                 f"type lazily. Add an explicit resolver, use "
-                f"orm.field(load=[...], disable_optimization=True) to silence, and "
+                f"orm.field(disable_optimization=True) to silence, and "
                 f"use orm.schema(...) (optimizer enabled by default) for "
                 f"eager loading."
             )
@@ -1355,16 +1756,16 @@ class BaseBackend:
                 raise ValueError(message)
             warnings.warn(message, stacklevel=4)
 
-    def _check_missing_queryset(self, cls: type, model: type, type_name: str) -> None:
-        if not self._warn_missing_queryset:
+    def _check_missing_scope(self, cls: type, model: type, type_name: str) -> None:
+        if not self._warn_missing_scope:
             return
         if model in self._type_querysets:
             return
         warnings.warn(
             f"GraphQL type '{type_name}' (model {model.__name__}) has no "
-            f"get_queryset classmethod. Row-level scoping is not applied when "
-            f"this model's rows load — define get_queryset on the @orm.type "
-            f"class or set warn_missing_queryset=False on the ORM.",
+            f"scope_rows classmethod. Row-level scoping is not applied when "
+            f"this model's rows load — define scope_rows on the @orm.type "
+            f"class or set warn_missing_scope=False on the ORM.",
             stacklevel=4,
         )
 
@@ -1386,7 +1787,7 @@ class BaseBackend:
 
         Replaces ``strawberry.auto`` annotations, sets ``__orm_model__`` and
         friends, processes ``FieldDefinition`` / ``_orm_auto_field`` attrs,
-        registers ``get_queryset``, and returns the resolved type name.
+        registers ``scope_rows``, and returns the resolved type name.
         """
         from strawberry_orm.types import FieldDefinition
 
@@ -1428,17 +1829,25 @@ class BaseBackend:
 
         type_name = name or cls.__name__
 
-        if hasattr(cls, "get_queryset") and isinstance(
-            vars(cls).get("get_queryset"), classmethod
-        ):
-            self._type_querysets[model] = cls.get_queryset
+        self._check_excluded_fields_are_not_queryable(
+            type_name, exclude, filters, order, group
+        )
+        self._check_excluded_fields_are_not_writable(model, type_name, exclude)
+        if exclude:
+            self._type_excludes.setdefault(model, set()).update(exclude)
 
-        self._check_missing_queryset(cls, model, type_name)
+        if isinstance(vars(cls).get(_ROW_SCOPE_HOOK), classmethod):
+            self._register_type_scope(cls, model, type_name)
+
+        self._check_missing_scope(cls, model, type_name)
 
         for attr_name in list(vars(cls)):
             val = getattr(cls, attr_name, None)
             if isinstance(val, FieldDefinition):
-                self._store.register(type_name, attr_name, val.to_hints())
+                hints = val.to_hints()
+                self._validate_scoped_relation(model, type_name, attr_name, hints)
+                self._validate_hints(model, type_name, attr_name, hints)
+                self._store.register(type_name, attr_name, hints)
                 if getattr(val, "permission_classes", None):
                     setattr(
                         cls,
@@ -1450,6 +1859,11 @@ class BaseBackend:
                     )
                 else:
                     delattr(cls, attr_name)
+            elif getattr(val, "_orm_computed_hints", None) is not None:
+                self._validate_hints(
+                    model, type_name, attr_name, val._orm_computed_hints
+                )
+                self._store.register(type_name, attr_name, val._orm_computed_hints)
             elif getattr(val, "_orm_auto_field", False):
                 delattr(cls, attr_name)
 

@@ -46,9 +46,9 @@ class TestLazyQueryLogging:
         message = lazy_logs[0].message
         assert "Unoptimized relation loads detected" in message
         assert "PostType.author" in message
-        assert "query path: query { posts { author { name } } }" in message
+        assert "path: query { posts { author { name } } }" in message
         assert "Post.author" in message
-        assert "select_related('author')" in message
+        assert "fix: return a QuerySet instead of list" in message
 
     def test_no_lazy_query_log_when_optimizer_prefetches(self, caplog, seed):
         from strawberry_orm import StrawberryORM
@@ -70,7 +70,7 @@ class TestLazyQueryLogging:
 
         @strawberry.type
         class Query:
-            posts: list[PostType] = orm.field()
+            posts: list[PostType] = orm.field.auto()
 
         schema = strawberry.Schema(
             query=Query,
@@ -90,7 +90,7 @@ class TestLazyQueryLogging:
 
         orm = StrawberryORM.for_django(
             lazy_resolution="warn",
-            warn_missing_queryset=False,
+            warn_missing_scope=False,
         )
 
         @orm.type(DjPost)
@@ -106,7 +106,7 @@ class TestLazyQueryLogging:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
+            users: list[UserType] = orm.field.auto()
 
         schema = orm.schema(query=Query)
         extension_names = [ext.__name__ for ext in schema.extensions]
@@ -151,6 +151,6 @@ class TestLazyQueryLogging:
         message = lazy_logs[0].message
         assert "Unoptimized relation loads detected" in message
         assert "UserType.posts" in message
-        assert "query path: query { users { posts { title } } }" in message
+        assert "path: query { users { posts { title } } }" in message
         assert "User.posts" in message
-        assert "prefetch_related('posts')" in message
+        assert "fix: return a QuerySet instead of list" in message

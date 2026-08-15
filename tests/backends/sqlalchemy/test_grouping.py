@@ -433,6 +433,66 @@ class TestAggregation:
         assert data["orders"]["aggregates"]["sum"]["amount"] > 0
 
 
+class TestScopingSecurity:
+    def test_connection_aggregates_and_groups_respect_scope_rows(self, session, seed):
+        scoped_orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
+            lazy_resolution="off",
+        )
+        ScopedOrderFilter = scoped_orm.filter(Order)
+        ScopedOrderOrder = scoped_orm.order(Order)
+        ScopedOrderGroup = scoped_orm.group(Order)
+
+        @scoped_orm.type(
+            Order,
+            filters=ScopedOrderFilter,
+            order=ScopedOrderOrder,
+            group=ScopedOrderGroup,
+        )
+        class ScopedOrderType(relay.Node):
+            id: relay.NodeID[int]
+            status: auto
+
+            @classmethod
+            def scope_rows(cls, query, info):
+                return query.where(Order.status == "shipped")
+
+        @strawberry.type
+        class ScopedQuery:
+            orders: ORMListConnection[ScopedOrderType] = scoped_orm.connection()
+
+        scoped_schema = scoped_orm.schema(query=ScopedQuery)
+        result = scoped_schema.execute_sync(
+            """
+            query {
+                orders(
+                    first: 20
+                    groupBy: [{ field: { status: true } }]
+                ) {
+                    totalCount
+                    edges { node { status } }
+                    aggregates { count }
+                    groups {
+                        key { status }
+                        aggregates { count }
+                    }
+                }
+            }
+            """,
+            context_value={"session": session},
+        )
+
+        assert result.errors is None
+        orders = result.data["orders"]
+        assert {edge["node"]["status"] for edge in orders["edges"]} == {"shipped"}
+        assert orders["totalCount"] == 9
+        assert orders["aggregates"]["count"] == 9
+        assert [
+            (group["key"]["status"], group["aggregates"]["count"])
+            for group in orders["groups"]
+        ] == [("shipped", 9)]
+
+
 # ===========================================================================
 # Page aggregates tests (10c cont.)
 # ===========================================================================

@@ -4,11 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 import strawberry
-from strawberry import relay
 
 from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.repo import _check_auth
-from strawberry_orm.types import auto
 from tests.backends.tortoise.models import (
     Comment as TortComment,
 )
@@ -334,258 +332,77 @@ class TestRefListRepo:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle hook tests (module-level schema — Tortoise needs concrete Node
-# types registered via the query type, same pattern as test_policy.py)
+# Lifecycle hooks
 # ---------------------------------------------------------------------------
 
 
-_lifecycle_orm = StrawberryORM.for_tortoise()
-
-
-@_lifecycle_orm.type(TortUser)
-class _LCUserNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-    email: auto
-
-
-@_lifecycle_orm.type(TortTag)
-class _LCTagNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-
-
-@_lifecycle_orm.type(TortPost)
-class _LCPostNode(relay.Node):
-    id: relay.NodeID[int]
-    title: auto
-    body: auto
-    is_published: auto
-
-
-@strawberry.type
-class _LCNodeQuery:
-    @strawberry.field
-    def users(self) -> list[_LCUserNode]:
-        return []
-
-    @strawberry.field
-    def tags(self) -> list[_LCTagNode]:
-        return []
-
-    @strawberry.field
-    def posts(self) -> list[_LCPostNode]:
-        return []
-
-
-@strawberry.type
-class _LCNodeMutation:
-    create_node = _lifecycle_orm.mutations.create_node(input_name="TortLCCIn")
-    update_node = _lifecycle_orm.mutations.update_node(input_name="TortLCUIn")
-
-
-_lifecycle_schema = strawberry.Schema(
-    query=_LCNodeQuery,
-    mutation=_LCNodeMutation,
-)
-
-
-@pytest.mark.asyncio
 class TestLifecycleHooks:
-    def _set_repos(self, repos):
-        _lifecycle_orm._backend._repos = repos
+    """Hooks fire on the writes the library performs, i.e. through ref lists."""
 
     async def test_on_before_create_transforms_data(self, tortoise_db):
-        await _seed()
+        data = await _seed()
         LifecycleTagRepo.calls = []
-        self._set_repos({TortTag: LifecycleTagRepo})
+        orm = StrawberryORM.for_tortoise()
+        orm._backend._repos = {TortTag: LifecycleTagRepo}
 
-        result = await _lifecycle_schema.execute(
-            """
-            mutation {
-                createNode(input: { tag: { name: "hooks" } }) {
-                    __typename
-                }
-            }
-            """,
+        @strawberry.input
+        class TortLifecycleCreateTag:
+            name: str
+
+        ref_type = orm.ref(TortTag, create=TortLifecycleCreateTag)
+        await orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(create=TortLifecycleCreateTag(name="hooks"))],
+            _make_info(),
         )
-        assert result.errors is None
-        tag = await TortTag.filter(name="HOOKS").first()
-        assert tag is not None, "on_before_create should have uppercased the name"
+
+        assert await TortTag.filter(name="HOOKS").exists(), (
+            "on_before_create should have uppercased the name"
+        )
         assert "before_create" in LifecycleTagRepo.calls
         assert "after_create" in LifecycleTagRepo.calls
 
     async def test_on_before_update_called(self, tortoise_db):
-        await _seed()
+        data = await _seed()
         LifecycleTagRepo.calls = []
-        self._set_repos({TortTag: LifecycleTagRepo})
+        orm = StrawberryORM.for_tortoise()
+        orm._backend._repos = {TortTag: LifecycleTagRepo}
 
-        result = await _lifecycle_schema.execute(
-            """
-            mutation {
-                updateNode(input: { tag: { id: "1", name: "updated" } }) {
-                    __typename
-                }
-            }
-            """,
+        @strawberry.input
+        class TortLifecycleUpdateTag:
+            id: strawberry.ID
+            name: str
+
+        ref_type = orm.ref(TortTag, update=TortLifecycleUpdateTag)
+        await orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(update=TortLifecycleUpdateTag(id="1", name="updated"))],
+            _make_info(),
         )
-        assert result.errors is None
+
         assert "before_update" in LifecycleTagRepo.calls
         assert "after_update" in LifecycleTagRepo.calls
+        assert await TortTag.filter(name="updated").exists()
 
-    def teardown_method(self):
-        _lifecycle_orm._backend._repos = {}
+    async def test_on_before_delete_called(self, tortoise_db):
+        data = await _seed()
+        LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_tortoise()
+        orm._backend._repos = {TortTag: LifecycleTagRepo}
 
+        @strawberry.input
+        class TortLifecycleDeleteTag:
+            id: strawberry.ID
 
-# ---------------------------------------------------------------------------
-# Node mutation repo tests (module-level schema for type resolution)
-# ---------------------------------------------------------------------------
-
-
-_repo_node_orm = StrawberryORM.for_tortoise()
-
-
-@_repo_node_orm.type(TortUser)
-class _RepoUserNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-    email: auto
-
-
-@_repo_node_orm.type(TortTag)
-class _RepoTagNode(relay.Node):
-    id: relay.NodeID[int]
-    name: auto
-
-
-@_repo_node_orm.type(TortPost)
-class _RepoPostNode(relay.Node):
-    id: relay.NodeID[int]
-    title: auto
-    body: auto
-    is_published: auto
-
-
-@strawberry.type
-class _RepoNodeQuery:
-    @strawberry.field
-    def users(self) -> list[_RepoUserNode]:
-        return []
-
-    @strawberry.field
-    def tags(self) -> list[_RepoTagNode]:
-        return []
-
-    @strawberry.field
-    def posts(self) -> list[_RepoPostNode]:
-        return []
-
-
-@strawberry.type
-class _RepoNodeMutation:
-    create_node = _repo_node_orm.mutations.create_node(input_name="TortRepoCIn")
-    update_node = _repo_node_orm.mutations.update_node(input_name="TortRepoUIn")
-
-
-_repo_node_schema = strawberry.Schema(
-    query=_RepoNodeQuery,
-    mutation=_RepoNodeMutation,
-)
-
-
-@pytest.mark.asyncio
-class TestNodeMutationRepo:
-    def _set_repos(self, repos):
-        _repo_node_orm._backend._repos = repos
-
-    async def test_create_node_denied(self, tortoise_db):
-        await _seed()
-        self._set_repos({TortUser: DenyAllUserRepo})
-
-        result = await _repo_node_schema.execute(
-            """
-            mutation {
-                createNode(input: { user: { name: "Evil", email: "e@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
+        ref_type = orm.ref(TortTag, delete=True)
+        await orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(delete=TortLifecycleDeleteTag(id="1"))],
+            _make_info(),
         )
-        assert result.errors is not None
-        assert "can_create denied" in str(result.errors[0])
 
-    async def test_update_node_denied(self, tortoise_db):
-        await _seed()
-        self._set_repos({TortUser: DenyUpdateUserRepo})
-
-        result = await _repo_node_schema.execute(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Renamed" } }) {
-                    __typename
-                }
-            }
-            """,
-        )
-        assert result.errors is not None
-        assert "can_update denied" in str(result.errors[0])
-
-    async def test_update_node_scoped(self, tortoise_db):
-        await _seed()
-        self._set_repos({TortUser: ScopingUserRepo})
-
-        result = await _repo_node_schema.execute(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Hacked" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"allowed_ids": [999]},
-        )
-        assert result.errors is not None
-        assert "does not exist" in str(result.errors[0])
-
-        user = await TortUser.get(pk=1)
-        assert user.name == "Alice"
-
-    async def test_default_repo_allows_all(self, tortoise_db):
-        await _seed()
-
-        class AllowAllUserRepo(AbstractRepo[TortUser]):
-            pass
-
-        self._set_repos({TortUser: AllowAllUserRepo})
-
-        result = await _repo_node_schema.execute(
-            """
-            mutation {
-                createNode(input: { user: { name: "New", email: "new@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
-        )
-        assert result.errors is None
-        assert "Repousernode" in result.data["createNode"]["__typename"]
-
-    async def test_repo_only_affects_registered_model(self, tortoise_db):
-        """A repo for TortUser should not block Tag creation."""
-        await _seed()
-        self._set_repos({TortUser: DenyAllUserRepo})
-
-        result = await _repo_node_schema.execute(
-            """
-            mutation {
-                createNode(input: { tag: { name: "NewTag" } }) {
-                    __typename
-                }
-            }
-            """,
-        )
-        assert result.errors is None
-        assert "Repotagnode" in result.data["createNode"]["__typename"]
-
-    def teardown_method(self):
-        _repo_node_orm._backend._repos = {}
+        assert "before_delete" in LifecycleTagRepo.calls
+        assert not await TortTag.filter(pk=1).exists()

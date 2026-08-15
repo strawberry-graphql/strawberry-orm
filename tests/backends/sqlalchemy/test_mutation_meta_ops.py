@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import strawberry
-from sqlalchemy import select
 from strawberry import relay
 from strawberry.types.cast import cast as strawberry_cast
 
@@ -74,19 +71,28 @@ def _field_names(type_: type) -> set[str]:
     return {f.name for f in type_.__strawberry_definition__.fields}
 
 
+def _inspect_field(input_type):
+    """A hand-written resolver that only has to accept the generated input."""
+
+    def resolver(self, input) -> bool:
+        return True
+
+    resolver.__annotations__ = {"input": input_type, "return": bool}
+    return strawberry.field(resolver=resolver)
+
+
 def _make_schema(orm, *, project, models, input_prefix: str, types):
+    create_input = orm.mutations.create_node_input(
+        models=models, project=project, name=f"{input_prefix}CreateNodeInput"
+    )
+    update_input = orm.mutations.update_node_input(
+        models=models, project=project, name=f"{input_prefix}UpdateNodeInput"
+    )
+
     @strawberry.type
     class Mutation:
-        create_node = orm.mutations.create_node(
-            models=models,
-            project=project,
-            input_name=f"{input_prefix}CreateNodeInput",
-        )
-        update_node = orm.mutations.update_node(
-            models=models,
-            project=project,
-            input_name=f"{input_prefix}UpdateNodeInput",
-        )
+        inspect_create_node = _inspect_field(create_input)
+        inspect_update_node = _inspect_field(update_input)
 
     @strawberry.type
     class Query:
@@ -474,338 +480,8 @@ class TestOpFieldInputs:
 # ---------------------------------------------------------------------------
 
 
-class TestUpsertRuntime:
-    def test_upsert_author_miss_creates_and_hit_updates(self, orm, sa_session, seed):
-        project = {
-            "post": {
-                "author": {
-                    "_meta": {
-                        "create": ["email", "name"],
-                        "update": ["name"],
-                        "upsert": {"where": ["email"]},
-                        "onReplace": "DISCONNECT",
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="AuthorUpsert",
-            types=[UserNode, PostNode],
-        )
-
-        create_data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              createNode(input: {
-                post: {
-                  title: "Upsert Post"
-                  body: "Body"
-                  author: {
-                    upsert: {
-                      where: { email: "upsert@example.com" }
-                      create: { email: "upsert@example.com", name: "Upsert User" }
-                      update: { name: "Should Not Apply" }
-                    }
-                  }
-                }
-              }) {
-                ... on PostNode {
-                  title
-                  author { name email }
-                }
-              }
-            }
-            """,
-        )
-        assert create_data["createNode"]["author"] == {
-            "name": "Upsert User",
-            "email": "upsert@example.com",
-        }
-
-        post_id = (
-            sa_session.execute(select(SAPost).where(SAPost.title == "Upsert Post"))
-            .scalar_one()
-            .id
-        )
-        update_data = _execute(
-            schema,
-            sa_session,
-            f"""
-            mutation {{
-              updateNode(input: {{
-                post: {{
-                  id: "{post_id}"
-                  author: {{
-                    upsert: {{
-                      where: {{ email: "upsert@example.com" }}
-                      create: {{ email: "upsert@example.com", name: "Ignored On Hit" }}
-                      update: {{ name: "Upserted Again" }}
-                    }}
-                  }}
-                }}
-              }}) {{
-                ... on PostNode {{
-                  author {{ name email }}
-                }}
-              }}
-            }}
-            """,
-        )
-        assert update_data["updateNode"]["author"] == {
-            "name": "Upserted Again",
-            "email": "upsert@example.com",
-        }
-        assert (
-            len(
-                sa_session.execute(
-                    select(SAUser).where(SAUser.email == "upsert@example.com")
-                )
-                .scalars()
-                .all()
-            )
-            == 1
-        )
-
-    def test_miss_merges_where_into_create_and_create_wins_overlap(
-        self, orm, sa_session, seed
-    ):
-        project = {
-            "post": {
-                "author": {
-                    "_meta": {
-                        "create": ["email", "name"],
-                        "upsert": {"where": ["email"]},
-                        "onReplace": "DISCONNECT",
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="MergeWhere",
-            types=[UserNode, PostNode],
-        )
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              createNode(input: {
-                post: {
-                  title: "Merge Post"
-                  body: "Body"
-                  author: {
-                    upsert: {
-                      where: { email: "merge@example.com" }
-                      create: { email: "merge-override@example.com", name: "Merged" }
-                    }
-                  }
-                }
-              }) {
-                ... on PostNode { author { name email } }
-              }
-            }
-            """,
-        )
-        # create wins on overlap for email
-        assert data["createNode"]["author"] == {
-            "name": "Merged",
-            "email": "merge-override@example.com",
-        }
-
-    def test_miss_uses_where_when_create_omitted(self, orm, sa_session, seed):
-        project = {
-            "post": {
-                "tags": {"_meta": {"upsert": {"where": ["name"]}}},
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="WhereOnlyCreate",
-            types=[TagNode, PostNode],
-        )
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "1"
-                  tags: [{ upsert: { where: { name: "from-where-only" } } }]
-                }
-              }) {
-                ... on PostNode { tags { name } }
-              }
-            }
-            """,
-        )
-        names = {t["name"] for t in data["updateNode"]["tags"]}
-        assert "from-where-only" in names
-        assert (
-            len(
-                sa_session.execute(select(SATag).where(SATag.name == "from-where-only"))
-                .scalars()
-                .all()
-            )
-            == 1
-        )
-
-    def test_hit_with_empty_update_links_without_changing_fields(
-        self, orm, sa_session, seed
-    ):
-        project = {
-            "post": {
-                "tags": {"_meta": {"upsert": {"where": ["name"]}}},
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="EmptyUpdateLink",
-            types=[TagNode, PostNode],
-        )
-        before = sa_session.get(SATag, 1)
-        assert before is not None
-        assert before.name == "python"
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "3"
-                  tags: [{ upsert: { where: { name: "python" }, update: {} } }]
-                }
-              }) {
-                ... on PostNode { tags { name } }
-              }
-            }
-            """,
-        )
-        names = {t["name"] for t in data["updateNode"]["tags"]}
-        assert "python" in names
-        sa_session.refresh(before)
-        assert before.name == "python"
-
-    def test_upsert_tag_by_name_create_and_link(self, orm, sa_session, seed):
-        project = {
-            "post": {
-                "tags": {
-                    "_meta": {
-                        "upsert": {"where": ["name"]},
-                        "unlink": True,
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="TagUpsert",
-            types=[TagNode, PostNode],
-        )
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "1"
-                  tags: [
-                    { upsert: { where: { name: "python" }, update: {} } }
-                    { upsert: { where: { name: "new-tag" }, create: { name: "new-tag" } } }
-                  ]
-                }
-              }) {
-                ... on PostNode { tags { name } }
-              }
-            }
-            """,
-        )
-        names = {t["name"] for t in data["updateNode"]["tags"]}
-        assert "python" in names
-        assert "new-tag" in names
-
-    def test_upsert_where_by_id(self, orm, sa_session, seed):
-        project = {
-            "post": {
-                "author": {
-                    "_meta": {
-                        "update": ["name"],
-                        "upsert": {"where": ["id"]},
-                        "onReplace": "DISCONNECT",
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="WhereById",
-            types=[UserNode, PostNode],
-        )
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "1"
-                  author: {
-                    upsert: {
-                      where: { id: "2" }
-                      update: { name: "Bob Via Upsert Id" }
-                    }
-                  }
-                }
-              }) {
-                ... on PostNode { author { id name } }
-              }
-            }
-            """,
-        )
-        author = data["updateNode"]["author"]
-        assert author["name"] == "Bob Via Upsert Id"
-        # Relay global id may encode type; compare decoded/raw via DB
-        bob = sa_session.get(SAUser, 2)
-        assert bob is not None
-        assert bob.name == "Bob Via Upsert Id"
-
-    def test_ambiguous_where_errors(self, orm, sa_session, seed):
-        # Two users with same name after we duplicate
-        sa_session.add(SAUser(id=90, name="Alice", email="alice2@example.com"))
-        sa_session.flush()
-
-        project = orm.mutations._normalize_model_project(
-            SAUser, {"_meta": {"upsert": {"where": ["name"]}, "update": ["email"]}}
-        )
-        upsert_type = orm.mutations._upsert_input(SAUser, project)
-        where_type = orm.mutations._where_input(SAUser, project)
-        update_type = orm.mutations._update_input(SAUser, project, include_id=False)
-
-        payload = upsert_type(
-            where=where_type(name="Alice"),
-            update=update_type(email="should-not-write@example.com"),
-        )
-        info = SimpleNamespace(context={"session": sa_session})
-        with pytest.raises(ValueError, match="matched 2 rows"):
-            orm.mutations._upsert_sync(SAUser, payload, info, project=project)
+class TestUpsertInputShape:
+    """Upsert ``_meta`` narrows the generated input; the schema enforces it."""
 
     def test_graphql_rejects_omitted_create_branch(self, orm, sa_session, seed):
         project = {
@@ -825,12 +501,12 @@ class TestUpsertRuntime:
             sa_session,
             """
             mutation {
-              updateNode(input: {
+              inspectUpdateNode(input: {
                 post: {
                   id: "1"
                   author: { create: { name: "X", email: "x@example.com" } }
                 }
-              }) { ... on PostNode { id } }
+              })
             }
             """,
         )
@@ -859,7 +535,7 @@ class TestUpsertRuntime:
             sa_session,
             """
             mutation {
-              createNode(input: {
+              inspectCreateNode(input: {
                 post: {
                   title: "T"
                   body: "B"
@@ -867,179 +543,8 @@ class TestUpsertRuntime:
                     create: { name: "X", email: "x@example.com" }
                   }
                 }
-              }) { ... on PostNode { id } }
+              })
             }
             """,
         )
         assert "email" in err.lower() or "Field" in err
-
-    def test_bare_create_and_update_still_work_with_upsert_enabled(
-        self, orm, sa_session, seed
-    ):
-        project = {
-            "post": {
-                "author": {
-                    "_meta": {
-                        "create": ["email", "name"],
-                        "update": ["name"],
-                        "upsert": {"where": ["email"]},
-                        "onReplace": "DISCONNECT",
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="BareOps",
-            types=[UserNode, PostNode],
-        )
-        created = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              createNode(input: {
-                post: {
-                  title: "Bare Create"
-                  body: "Body"
-                  author: {
-                    create: { email: "bare@example.com", name: "Bare" }
-                  }
-                }
-              }) {
-                ... on PostNode { author { name email } }
-              }
-            }
-            """,
-        )
-        assert created["createNode"]["author"]["email"] == "bare@example.com"
-
-        post_id = (
-            sa_session.execute(select(SAPost).where(SAPost.title == "Bare Create"))
-            .scalar_one()
-            .id
-        )
-        updated = _execute(
-            schema,
-            sa_session,
-            f"""
-            mutation {{
-              updateNode(input: {{
-                post: {{
-                  id: "{post_id}"
-                  author: {{
-                    update: {{ id: "1", name: "Alice Renamed Via Bare Update" }}
-                  }}
-                }}
-              }}) {{
-                ... on PostNode {{ author {{ id name }} }}
-              }}
-            }}
-            """,
-        )
-        assert (
-            updated["updateNode"]["author"]["name"] == "Alice Renamed Via Bare Update"
-        )
-
-    def test_upsert_on_replace_delete_removes_previous_author(
-        self, orm, sa_session, seed
-    ):
-        disposable = SAUser(
-            id=91, name="Disposable Author", email="disposable-author@example.com"
-        )
-        sa_session.add(disposable)
-        sa_session.flush()
-        post = sa_session.get(SAPost, 1)
-        assert post is not None
-        post.author_id = disposable.id
-        sa_session.flush()
-
-        project = {
-            "post": {
-                "author": {
-                    "_meta": {
-                        "create": ["email", "name"],
-                        "upsert": {"where": ["email"]},
-                        "onReplace": "DELETE",
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="OnReplaceUpsert",
-            types=[UserNode, PostNode],
-        )
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "1"
-                  author: {
-                    upsert: {
-                      where: { email: "replacement@example.com" }
-                      create: {
-                        email: "replacement@example.com"
-                        name: "Replacement"
-                      }
-                    }
-                  }
-                }
-              }) {
-                ... on PostNode { author { name email } }
-              }
-            }
-            """,
-        )
-        assert data["updateNode"]["author"]["email"] == "replacement@example.com"
-        assert sa_session.get(SAUser, disposable.id) is None
-
-    def test_list_upsert_with_unlink(self, orm, sa_session, seed):
-        project = {
-            "post": {
-                "tags": {
-                    "_meta": {
-                        "upsert": {"where": ["name"]},
-                        "unlink": True,
-                    }
-                },
-            }
-        }
-        schema = _make_schema(
-            orm,
-            project=project,
-            models=[SAPost],
-            input_prefix="UpsertUnlink",
-            types=[TagNode, PostNode],
-        )
-        # post 2 starts with python + graphql
-        data = _execute(
-            schema,
-            sa_session,
-            """
-            mutation {
-              updateNode(input: {
-                post: {
-                  id: "2"
-                  tags: [
-                    { unlink: { id: "1" } }
-                    { upsert: { where: { name: "rust" }, update: {} } }
-                  ]
-                }
-              }) {
-                ... on PostNode { tags { name } }
-              }
-            }
-            """,
-        )
-        names = {t["name"] for t in data["updateNode"]["tags"]}
-        assert "python" not in names
-        assert "rust" in names
-        assert "graphql" in names  # untouched existing link remains

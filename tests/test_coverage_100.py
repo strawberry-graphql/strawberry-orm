@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import django
 import pytest
@@ -58,18 +58,14 @@ from strawberry_orm.backends.sqlalchemy import (
 from strawberry_orm.filters import StringLookup
 from strawberry_orm.lazy_resolution import (
     LazyResolutionExtension,
-    _django_relation_hint,
     _django_relation_prefetched,
     _format_selection_set,
     _parent_graphql_type,
     _query_selection_path,
+    _relation_hint,
     _sqlalchemy_relation_prefetched,
     _tortoise_relation_prefetched,
     relation_is_prefetched,
-)
-from strawberry_orm.mutations import (
-    MutationNamespace,
-    _async_get_many_related,
 )
 from strawberry_orm.relay.connection import _get_items_arg
 from strawberry_orm.types import (
@@ -174,137 +170,19 @@ class TestAsyncRemaining:
 
         assert coro_resolver is not await coro_resolver()
 
-    def test_async_safe_resolver_without_django_queryset_import(self):
+    @pytest.mark.asyncio
+    async def test_async_safe_resolver_without_django_queryset_import(self):
+        """Only the async path materializes, so this must run under a loop."""
+
         class FakeQS(list):
             pass
 
         def resolver() -> FakeQS:
             return FakeQS([1])
 
-        with (
-            patch(
-                "strawberry_orm._async.asyncio.get_running_loop",
-                side_effect=RuntimeError,
-            ),
-            patch.dict("sys.modules", {"django.db.models": None}),
-        ):
+        with patch.dict("sys.modules", {"django.db.models": None}):
             wrapped = async_safe_resolver(resolver)
-            assert wrapped() == [1]
-
-
-class TestMutationsRemaining:
-    def test_reverse_many_delete_removes_from_sqlalchemy_list(
-        self, sa_session, seed, Post
-    ):
-        backend = SQLAlchemyBackend(dialect="sqlite")
-        ns = MutationNamespace(backend)
-        info = SimpleNamespace(context={"session": sa_session})
-        post = sa_session.get(SAPost, 1)
-        spec = ns._relation_specs(SAPost)["comments"]
-        child = sa_session.get(SAComment, 2)
-        assert child in post.comments
-
-        @strawberry.input
-        class DeleteRef:
-            id: strawberry.ID
-
-        delete_ref = SimpleNamespace(
-            create=strawberry.UNSET,
-            update=strawberry.UNSET,
-            unlink=strawberry.UNSET,
-            delete=DeleteRef(id=strawberry.ID("2")),
-        )
-        ns._apply_reverse_many_sync(post, spec, [delete_ref], info)
-        sa_session.flush()
-        assert child not in post.comments
-
-    def test_detach_reverse_sync_with_repo(self, sa_session, seed):
-        from dataclasses import replace
-
-        class CommentRepo(AbstractRepo[SAComment]):
-            pass
-
-        backend = SQLAlchemyBackend(dialect="sqlite")
-        backend._repos = {SAComment: CommentRepo}
-        ns = MutationNamespace(backend)
-        info = SimpleNamespace(context={"session": sa_session})
-        child = sa_session.get(SAComment, 1)
-        spec = replace(ns._relation_specs(SAPost)["comments"], nullable=True)
-
-        with patch.object(CommentRepo, "_save") as save_mock:
-            ns._detach_reverse_sync(child, spec, info)
-            save_mock.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_reverse_many_async_repo_unlink_and_delete(
-        self, sa_session, seed, Post
-    ):
-        from dataclasses import replace
-
-        class CommentRepo(AbstractRepo[SAComment]):
-            pass
-
-        backend = SQLAlchemyBackend(dialect="sqlite")
-        backend._repos = {SAComment: CommentRepo}
-        ns = MutationNamespace(backend)
-        info = SimpleNamespace(context={"session": sa_session})
-        post = sa_session.get(SAPost, 1)
-        spec = replace(ns._relation_specs(SAPost)["comments"], nullable=True)
-
-        @strawberry.input
-        class IdRef:
-            id: strawberry.ID
-
-        unlink_ref = SimpleNamespace(
-            create=strawberry.UNSET,
-            update=strawberry.UNSET,
-            unlink=IdRef(id=strawberry.ID("2")),
-            delete=strawberry.UNSET,
-        )
-        with patch.object(ns, "_detach_reverse_async", AsyncMock()) as detach:
-            await ns._apply_reverse_many_async(post, spec, [unlink_ref], info)
-            detach.assert_awaited()
-
-        extra = SAComment(body="gone", post_id=post.id, author_id=1)
-        sa_session.add(extra)
-        sa_session.flush()
-        delete_ref = SimpleNamespace(
-            create=strawberry.UNSET,
-            update=strawberry.UNSET,
-            unlink=strawberry.UNSET,
-            delete=IdRef(id=strawberry.ID(str(extra.id))),
-        )
-        with patch.object(CommentRepo, "_delete_async", AsyncMock()) as delete_mock:
-            await ns._apply_reverse_many_async(post, spec, [delete_ref], info)
-            delete_mock.assert_awaited()
-
-    @pytest.mark.asyncio
-    async def test_detach_reverse_async_repo_save(self, sa_session, seed):
-        from dataclasses import replace
-
-        class CommentRepo(AbstractRepo[SAComment]):
-            pass
-
-        backend = SQLAlchemyBackend(dialect="sqlite")
-        backend._repos = {SAComment: CommentRepo}
-        ns = MutationNamespace(backend)
-        info = SimpleNamespace(context={"session": sa_session})
-        child = sa_session.get(SAComment, 1)
-        spec = replace(ns._relation_specs(SAPost)["comments"], nullable=True)
-
-        with patch.object(CommentRepo, "_save_async", AsyncMock()) as save_mock:
-            await ns._detach_reverse_async(child, spec, info)
-            save_mock.assert_awaited()
-
-    @pytest.mark.asyncio
-    async def test_async_get_many_related(self):
-        class Manager:
-            async def all(self) -> list[int]:
-                return [1, 2, 3]
-
-        instance = SimpleNamespace(tags=Manager())
-        result = await _async_get_many_related(object(), instance, "tags", None)
-        assert result == [1, 2, 3]
+            assert await wrapped() == [1]
 
 
 class TestLazyResolutionRemaining:
@@ -366,18 +244,17 @@ class TestLazyResolutionRemaining:
         assert _parent_graphql_type(SimpleNamespace(parent_type=None)) == "?"
 
     def test_django_generic_relation_hint(self):
-        from tests.backends.django.models import Post as DjPost
+        from strawberry_orm.backends.django import DjangoBackend
 
-        post = DjPost()
-        hint = _django_relation_hint(post, "nonexistent_field_xyz", "Post")
-        assert "optimizer eager-loads" in hint
+        hint = _relation_hint(DjangoBackend())
+        assert hint == "return a QuerySet instead of list"
 
     def test_django_m2m_relation_hint(self):
-        from tests.backends.django.models import Post as DjPost
+        from strawberry_orm.backends.django import DjangoBackend
 
-        post = DjPost()
-        hint = _django_relation_hint(post, "tags", "Post")
-        assert "prefetch_related('tags')" in hint
+        hint = _relation_hint(DjangoBackend())
+        assert "QuerySet" in hint
+        assert "instead of list" in hint
 
     def test_query_selection_path_op_type_only(self):
         posts = SimpleNamespace(
@@ -454,7 +331,7 @@ class TestLazyResolutionRemaining:
 
 class DummyCovBackend(BaseBackend):
     def __init__(self, **kwargs: Any) -> None:
-        super().__init__(warn_missing_queryset=False, **kwargs)
+        super().__init__(warn_missing_scope=False, **kwargs)
 
     def _introspect_model(self, model: type):
         return [
@@ -707,8 +584,8 @@ class TestSQLAlchemyRemaining:
         backend._store.hints = {
             "UserType": {
                 "name": SimpleNamespace(
-                    load=["posts"],
-                    only=["name"],
+                    using=["posts"],
+                    scope=None,
                     disable_optimization=False,
                 )
             }
@@ -820,10 +697,11 @@ class TestFinal100Coverage:
         assert any(row[0] == "flag" for row in meta)
 
     def test_lazy_resolution_remaining_branches(self, sa_session, seed):
+        from strawberry_orm.backends.sqlalchemy import SQLAlchemyBackend
         from strawberry_orm.lazy_resolution import (
             _django_relation_prefetched,
             _query_selection_path,
-            _sqlalchemy_relation_hint,
+            _relation_hint,
         )
 
         operation = SimpleNamespace(
@@ -859,7 +737,11 @@ class TestFinal100Coverage:
         assert _django_relation_prefetched(fk_post, "author") is True
 
         post = sa_session.get(SAPost, 1)
-        assert "selectinload" in _sqlalchemy_relation_hint(post, "comments", "Post")
+        assert post is not None
+        assert (
+            _relation_hint(SQLAlchemyBackend(dialect="sqlite"))
+            == "return a Select instead of list"
+        )
 
     def test_base_backend_direct_lazy_and_group_branches(self):
         backend = DummyCovBackend()

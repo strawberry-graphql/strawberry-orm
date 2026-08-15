@@ -123,11 +123,15 @@ class Backend(Protocol):
 
     # -- Query application ----------------------------------------------------
 
-    def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
+    def apply_filters(
+        self, query: Any, filter_input: Any, model: type, info: Any = None
+    ) -> Any:
         """Translate a filter input object into ORM-specific query conditions."""
         ...
 
-    def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
+    def apply_ordering(
+        self, query: Any, order_input: Any, model: type, info: Any = None
+    ) -> Any:
         """Translate a list of ``@oneOf`` order entries into ORM-specific ordering.
 
         Each entry represents one column; list position determines tie-break
@@ -195,6 +199,34 @@ class Backend(Protocol):
 
     def is_query_object(self, value: Any) -> bool:
         """Return ``True`` if *value* is a query object the optimizer can handle."""
+        ...
+
+    def relation_names(self, model: type) -> set[str]:
+        """Return the names of *model*'s relations, for hint validation."""
+        ...
+
+    def query_probe(self, info: Any) -> Any:
+        """Context manager counting SQL statements issued while it is open."""
+        ...
+
+    def instance_pk(self, instance: Any) -> Any:
+        """Primary key of *instance*, used to key batched rows back to parents."""
+        ...
+
+    def split_parent_predicate(
+        self, query: Any, parent_pk: Any
+    ) -> tuple[str, Any, Any] | None:
+        """Split *query* into its parent predicate and the rest, if safe."""
+        ...
+
+    def query_signature(self, query: Any) -> str | None:
+        """Stable structural signature of *query*, for grouping batches."""
+        ...
+
+    def apply_key_filter(
+        self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
+    ) -> Any:
+        """Restrict *query* to rows whose parent key is one of *keys*."""
         ...
 
     def materialize_query(self, query: Any, info: Any) -> AwaitableOrValue[list[Any]]:

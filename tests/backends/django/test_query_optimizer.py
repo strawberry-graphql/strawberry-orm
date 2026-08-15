@@ -142,7 +142,7 @@ class TestQueryOptimizerEagerLoading:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=["author"], disable_optimization=True)
+            tags: list[TT] = orm.field.auto(using=["author"], disable_optimization=True)
 
         @orm.type(User)
         class UT:
@@ -153,7 +153,7 @@ class TestQueryOptimizerEagerLoading:
         hints = orm.backend._store.get("PT", "tags")
         assert hints is not None
         assert hints.disable_optimization is True
-        assert hints.load == ["author"]
+        assert hints.using == ["author"]
 
         @strawberry.type
         class Q:

@@ -39,7 +39,7 @@ def build_ref_list_authorize_schema():
 
         @strawberry.type
         class Query:
-            tags: list[TagType] = orm.field()
+            tags: list[TagType] = orm.field.auto()
 
         @strawberry.type
         class Mutation:

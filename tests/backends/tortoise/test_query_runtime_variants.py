@@ -63,11 +63,11 @@ class TestQueryRuntimeVariants:
 
         @strawberry.type
         class Query:
-            filter_only_users: list[FilterOnlyUser] = orm.field()
-            order_only_users: list[OrderOnlyUser] = orm.field()
-            plain_users: list[PlainUser] = orm.field()
-            users_with_filtered_posts: list[UserWithFilteredPosts] = orm.field()
-            users_with_ordered_posts: list[UserWithOrderedPosts] = orm.field()
+            filter_only_users: list[FilterOnlyUser] = orm.field.auto()
+            order_only_users: list[OrderOnlyUser] = orm.field.auto()
+            plain_users: list[PlainUser] = orm.field.auto()
+            users_with_filtered_posts: list[UserWithFilteredPosts] = orm.field.auto()
+            users_with_ordered_posts: list[UserWithOrderedPosts] = orm.field.auto()
             users_connection = orm.connection(ORMListConnection[UserNode])
 
         return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])

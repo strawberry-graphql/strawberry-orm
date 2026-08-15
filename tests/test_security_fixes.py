@@ -153,7 +153,7 @@ class TestFix1_LikeWildcardEscaping:
 
         @strawberry.type
         class Q:
-            accounts: list[AccountType] = orm.field()
+            accounts: list[AccountType] = orm.field.auto()
 
         self.schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
 
@@ -342,7 +342,7 @@ class TestFix4_LikeEscapeInSQL:
 
         @strawberry.type
         class Q:
-            accounts: list[AT] = orm.field()
+            accounts: list[AT] = orm.field.auto()
 
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
         schema.execute_sync(
@@ -389,7 +389,7 @@ class TestFix5_FilterDepthLimit:
 
         @strawberry.type
         class Q:
-            accounts: list[AT] = self.orm.field()
+            accounts: list[AT] = self.orm.field.auto()
 
         self.schema = strawberry.Schema(
             query=Q, extensions=[self.orm.optimizer_extension()]
@@ -468,7 +468,7 @@ class TestFix6_RegexValidation:
 
         @strawberry.type
         class Q:
-            accounts: list[AT] = self.orm.field()
+            accounts: list[AT] = self.orm.field.auto()
 
         self.schema = strawberry.Schema(
             query=Q, extensions=[self.orm.optimizer_extension()]
@@ -764,7 +764,7 @@ class TestFix9_ErrorSanitization:
 
         @strawberry.type
         class Q:
-            accounts: list[AT] = orm.field()
+            accounts: list[AT] = orm.field.auto()
 
         self.schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
 
@@ -868,7 +868,7 @@ class TestFix10_FilterExclude:
 
         @strawberry.type
         class Q:
-            accounts: list[AT] = orm.field()
+            accounts: list[AT] = orm.field.auto()
 
         schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
 

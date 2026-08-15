@@ -10,7 +10,7 @@ from tests.abstract.query_scoping_hook_order import (
     SCOPE_PREFIX,
     _posts_load_exclude_guide,
     _published_posts_queryset,
-    assert_get_queryset_before_load,
+    assert_scope_rows_before_load,
     scope_messages,
 )
 
@@ -36,7 +36,7 @@ def _install_print_tracker(monkeypatch) -> list[str]:
     return calls
 
 
-def _build_schema_get_queryset_only(orm, Post, User, *, optimizer: bool = True):
+def _build_schema_scope_rows_only(orm, Post, User, *, optimizer: bool = True):
     backend_name = orm._backend_name
 
     @orm.type(Post)
@@ -45,8 +45,8 @@ def _build_schema_get_queryset_only(orm, Post, User, *, optimizer: bool = True):
         title: auto
 
         @classmethod
-        def get_queryset(cls, qs, info):
-            print(f"{SCOPE_PREFIX}PostType.get_queryset", flush=True)
+        def scope_rows(cls, qs, info):
+            print(f"{SCOPE_PREFIX}PostType.scope_rows", flush=True)
             return _published_posts_queryset(Post, backend_name, qs)
 
     @orm.type(User)
@@ -64,7 +64,7 @@ def _build_schema_get_queryset_only(orm, Post, User, *, optimizer: bool = True):
     return orm.schema(query=Query, optimizer=optimizer)
 
 
-def _build_schema_get_queryset_and_load(orm, Post, User):
+def _build_schema_scope_rows_and_load(orm, Post, User):
     backend_name = orm._backend_name
 
     @orm.type(Post)
@@ -73,11 +73,11 @@ def _build_schema_get_queryset_and_load(orm, Post, User):
         title: auto
 
         @classmethod
-        def get_queryset(cls, qs, info):
-            print(f"{SCOPE_PREFIX}PostType.get_queryset", flush=True)
+        def scope_rows(cls, qs, info):
+            print(f"{SCOPE_PREFIX}PostType.scope_rows", flush=True)
             return _published_posts_queryset(Post, backend_name, qs)
 
-    def posts_load(qs):
+    def posts_load(qs, info):
         print(f"{SCOPE_PREFIX}UserType.posts.load", flush=True)
         return _posts_load_exclude_guide(Post, backend_name, qs)
 
@@ -85,7 +85,7 @@ def _build_schema_get_queryset_and_load(orm, Post, User):
     class UserType:
         id: auto
         name: auto
-        posts: list[PostType] = orm.field(load=posts_load)
+        posts: list[PostType] = orm.field.auto(scope=posts_load)
 
     @strawberry.type
     class Query:
@@ -100,7 +100,7 @@ class TestScopingHookOrder:
     USERS_POSTS_QUERY = "{ users { name posts { title } } }"
 
     @pytest.mark.asyncio
-    async def test_get_queryset_runs_during_optimizer_prefetch(
+    async def test_scope_rows_runs_during_optimizer_prefetch(
         self,
         monkeypatch,
         orm,
@@ -110,15 +110,15 @@ class TestScopingHookOrder:
         User,
     ):
         calls = _install_print_tracker(monkeypatch)
-        schema = _build_schema_get_queryset_only(orm, Post, User)
+        schema = _build_schema_scope_rows_only(orm, Post, User)
         result = await schema_execute_async(schema, self.USERS_POSTS_QUERY)
         assert result.errors is None
         messages = scope_messages(calls)
-        assert messages.count(f"{SCOPE_PREFIX}PostType.get_queryset") >= 1
+        assert messages.count(f"{SCOPE_PREFIX}PostType.scope_rows") >= 1
         assert f"{SCOPE_PREFIX}UserType.posts.load" not in messages
 
     @pytest.mark.asyncio
-    async def test_get_queryset_runs_before_load_callable(
+    async def test_scope_rows_runs_before_load_callable(
         self,
         monkeypatch,
         orm,
@@ -128,8 +128,8 @@ class TestScopingHookOrder:
         User,
     ):
         calls = _install_print_tracker(monkeypatch)
-        schema = _build_schema_get_queryset_and_load(orm, Post, User)
+        schema = _build_schema_scope_rows_and_load(orm, Post, User)
         result = await schema_execute_async(schema, self.USERS_POSTS_QUERY)
         assert result.errors is None
         messages = scope_messages(calls)
-        assert_get_queryset_before_load(messages)
+        assert_scope_rows_before_load(messages)

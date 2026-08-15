@@ -8,11 +8,9 @@ import pytest
 import strawberry
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from strawberry import relay
 
 from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.repo import _check_auth
-from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
 )
@@ -380,228 +378,83 @@ class TestRefListRepo:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle hook tests
+# Lifecycle hooks
 # ---------------------------------------------------------------------------
 
 
 class TestLifecycleHooks:
-    def _build_schema(self, repos):
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos=repos)
-
-        @orm.type(SAUser)
-        class LCUserNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-            email: auto
-
-        @orm.type(SATag)
-        class LCTagNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-
-        @orm.type(SAPost)
-        class LCPostNode(relay.Node):
-            id: relay.NodeID[int]
-            title: auto
-            body: auto
-            is_published: auto
-
-        @strawberry.type
-        class Q:
-            @strawberry.field
-            def ok(self) -> bool:
-                return True
-
-        @strawberry.type
-        class M:
-            create_node = orm.mutations.create_node(input_name="LCSACIn")
-            update_node = orm.mutations.update_node(input_name="LCSAUIn")
-
-        return strawberry.Schema(
-            query=Q, mutation=M, types=[LCUserNode, LCTagNode, LCPostNode]
-        )
+    """Hooks fire on the writes the library performs, i.e. through ref lists."""
 
     def test_on_before_create_transforms_data(self):
         session = _make_session()
-        _seed(session)
+        data = _seed(session)
         LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        orm._backend._repos = {SATag: LifecycleTagRepo}
 
-        schema = self._build_schema({SATag: LifecycleTagRepo})
+        @strawberry.input
+        class SALifecycleCreateTag:
+            name: str
 
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { tag: { name: "hooks" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
+        ref_type = orm.ref(SATag, create=SALifecycleCreateTag)
+        orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(create=SALifecycleCreateTag(name="hooks"))],
+            _make_info(session),
         )
-        assert result.errors is None
-        tag = session.query(SATag).filter_by(name="HOOKS").first()
-        assert tag is not None, "on_before_create should have uppercased the name"
+        session.commit()
+
+        assert "HOOKS" in [tag.name for tag in data["post"].tags], (
+            "on_before_create should have uppercased the name"
+        )
         assert "before_create" in LifecycleTagRepo.calls
         assert "after_create" in LifecycleTagRepo.calls
 
     def test_on_before_update_called(self):
         session = _make_session()
-        _seed(session)
+        data = _seed(session)
         LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        orm._backend._repos = {SATag: LifecycleTagRepo}
 
-        schema = self._build_schema({SATag: LifecycleTagRepo})
+        @strawberry.input
+        class SALifecycleUpdateTag:
+            id: strawberry.ID
+            name: str
 
-        result = schema.execute_sync(
-            """
-            mutation {
-                updateNode(input: { tag: { id: "1", name: "updated" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
+        ref_type = orm.ref(SATag, update=SALifecycleUpdateTag)
+        orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(update=SALifecycleUpdateTag(id="1", name="updated"))],
+            _make_info(session),
         )
-        assert result.errors is None
+        session.commit()
+
         assert "before_update" in LifecycleTagRepo.calls
         assert "after_update" in LifecycleTagRepo.calls
+        assert "updated" in [tag.name for tag in data["post"].tags]
 
-
-# ---------------------------------------------------------------------------
-# Node mutation repo tests
-# ---------------------------------------------------------------------------
-
-
-class TestNodeMutationRepo:
-    def _build_schema(self, repos):
-        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", repos=repos)
-
-        @orm.type(SAUser)
-        class UserNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-            email: auto
-
-        @orm.type(SATag)
-        class TagNode(relay.Node):
-            id: relay.NodeID[int]
-            name: auto
-
-        @orm.type(SAPost)
-        class PostNode(relay.Node):
-            id: relay.NodeID[int]
-            title: auto
-            body: auto
-            is_published: auto
-
-        @strawberry.type
-        class Q:
-            @strawberry.field
-            def ok(self) -> bool:
-                return True
-
-        @strawberry.type
-        class M:
-            create_node = orm.mutations.create_node(input_name="RepoSACIn")
-            update_node = orm.mutations.update_node(input_name="RepoSAUIn")
-
-        return strawberry.Schema(
-            query=Q, mutation=M, types=[UserNode, TagNode, PostNode]
-        )
-
-    def test_create_node_denied(self):
+    def test_on_before_delete_called(self):
         session = _make_session()
-        _seed(session)
-        schema = self._build_schema({SAUser: DenyAllUserRepo})
+        data = _seed(session)
+        LifecycleTagRepo.calls = []
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        orm._backend._repos = {SATag: LifecycleTagRepo}
 
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { user: { name: "Evil", email: "e@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
+        @strawberry.input
+        class SALifecycleDeleteTag:
+            id: strawberry.ID
+
+        ref_type = orm.ref(SATag, delete=True)
+        orm.apply_ref_list(
+            data["post"],
+            "tags",
+            [ref_type(delete=SALifecycleDeleteTag(id="1"))],
+            _make_info(session),
         )
-        assert result.errors is not None
-        assert "can_create denied" in str(result.errors[0])
+        session.commit()
 
-    def test_update_node_denied(self):
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema({SAUser: DenyUpdateUserRepo})
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Renamed" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is not None
-        assert "can_update denied" in str(result.errors[0])
-
-    def test_update_node_scoped(self):
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema({SAUser: ScopingUserRepo})
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                updateNode(input: { user: { id: "1", name: "Hacked" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session, "allowed_ids": [999]},
-        )
-        assert result.errors is not None
-        assert "does not exist" in str(result.errors[0])
-
-        user = session.get(SAUser, 1)
-        assert user.name == "Alice"
-
-    def test_default_repo_allows_all(self):
-        session = _make_session()
-        _seed(session)
-
-        class AllowAllUserRepo(AbstractRepo[SAUser]):
-            pass
-
-        schema = self._build_schema({SAUser: AllowAllUserRepo})
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { user: { name: "New", email: "new@e.com" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is None
-        assert result.data["createNode"]["__typename"] == "UserNode"
-
-    def test_repo_only_affects_registered_model(self):
-        """A repo for SAUser should not block Tag creation."""
-        session = _make_session()
-        _seed(session)
-        schema = self._build_schema({SAUser: DenyAllUserRepo})
-
-        result = schema.execute_sync(
-            """
-            mutation {
-                createNode(input: { tag: { name: "NewTag" } }) {
-                    __typename
-                }
-            }
-            """,
-            context_value={"session": session},
-        )
-        assert result.errors is None
-        assert result.data["createNode"]["__typename"] == "TagNode"
+        assert "before_delete" in LifecycleTagRepo.calls
+        assert session.get(SATag, 1) is None

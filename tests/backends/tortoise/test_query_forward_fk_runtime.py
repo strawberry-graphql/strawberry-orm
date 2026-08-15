@@ -8,7 +8,7 @@ from strawberry_orm.types import auto
 
 
 class TestQueryForwardFKRuntime:
-    def _build_schema(self, User, Post, *, author_get_queryset=None):
+    def _build_schema(self, User, Post, *, author_scope_rows=None):
         orm = StrawberryORM.for_tortoise()
 
         @orm.type(User)
@@ -17,11 +17,11 @@ class TestQueryForwardFKRuntime:
             name: auto
             email: auto
 
-            if author_get_queryset is not None:
+            if author_scope_rows is not None:
 
                 @classmethod
-                def get_queryset(cls, qs, info):
-                    return author_get_queryset(qs, info)
+                def scope_rows(cls, qs, info):
+                    return author_scope_rows(qs, info)
 
         @orm.type(Post)
         class PostType:
@@ -37,8 +37,8 @@ class TestQueryForwardFKRuntime:
 
         @strawberry.type
         class Query:
-            users: list[UserType] = orm.field()
-            posts: list[PostType] = orm.field()
+            users: list[UserType] = orm.field.auto()
+            posts: list[PostType] = orm.field.auto()
 
         return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
 
@@ -113,11 +113,11 @@ class TestQueryForwardFKRuntime:
     @pytest.mark.xfail(
         reason="Tortoise custom forward-FK queryset prefetch is still broken",
     )
-    async def test_forward_fk_respects_type_level_get_queryset(self, seed, User, Post):
+    async def test_forward_fk_respects_type_level_scope_rows(self, seed, User, Post):
         schema = self._build_schema(
             User,
             Post,
-            author_get_queryset=lambda qs, info: qs.filter(email__contains="@"),
+            author_scope_rows=lambda qs, info: qs.filter(email__contains="@"),
         )
         result = await schema.execute(
             """

@@ -1,6 +1,6 @@
 """N+1 prevention tests: verify the optimizer prevents N+1 at various depths,
-with custom queryset overrides, load=[...] field hints, load callables, and
-nested get_queryset application for the Tortoise backend."""
+with custom queryset overrides, using=[...] field hints, load callables, and
+nested scope_rows application for the Tortoise backend."""
 
 import pytest
 import pytest_asyncio
@@ -209,7 +209,7 @@ class TestQueryNPlusOnePrevention:
 
 class TestQueryCustomQuerysetNoNPlusOne:
     @pytest.mark.asyncio
-    async def test_get_queryset_with_nested_relationships(self, seed, Post, Tag, User):
+    async def test_scope_rows_with_nested_relationships(self, seed, Post, Tag, User):
         orm = StrawberryORM.for_tortoise()
 
         @orm.type(Tag)
@@ -224,7 +224,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
             tags: list[TT]
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(is_published=True)
 
         @orm.type(User)
@@ -247,7 +247,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
         assert result.data is not None
 
     @pytest.mark.asyncio
-    async def test_get_queryset_preserves_optimizer_eager_loads(self, seed, Post, User):
+    async def test_scope_rows_preserves_optimizer_eager_loads(self, seed, Post, User):
         orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
@@ -262,7 +262,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
             posts: list[PT]
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(email__contains="example.com")
 
         @strawberry.type
@@ -291,7 +291,7 @@ class TestQueryLoadHintNoNPlusOne:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=["author"])
+            tags: list[TT] = orm.field.auto(using=["author"])
 
         @orm.type(User)
         class UT:
@@ -332,7 +332,7 @@ class TestQueryLoadHintNoNPlusOne:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=["comments"])
+            tags: list[TT] = orm.field.auto(using=["comments"])
             comments: list[CT]
 
         @orm.type(User)
@@ -369,7 +369,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda qs: qs.filter(is_published=True))
+            posts: list[PT] = orm.field.auto(
+                scope=lambda qs, info: qs.filter(is_published=True)
+            )
 
         @strawberry.type
         class Q:
@@ -422,7 +424,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda qs: qs.filter(is_published=True))
+            posts: list[PT] = orm.field.auto(
+                scope=lambda qs, info: qs.filter(is_published=True)
+            )
 
         @strawberry.type
         class Q:
@@ -454,7 +458,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda qs: qs.filter(is_published=True))
+            posts: list[PT] = orm.field.auto(
+                scope=lambda qs, info: qs.filter(is_published=True)
+            )
 
         @strawberry.type
         class Q:
@@ -470,7 +476,7 @@ class TestQueryLoadCallable:
 
 class TestQueryNestedGetQueryset:
     @pytest.mark.asyncio
-    async def test_get_queryset_filters_nested_relation(self, seed, Post, User):
+    async def test_scope_rows_filters_nested_relation(self, seed, Post, User):
         orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
@@ -479,7 +485,7 @@ class TestQueryNestedGetQueryset:
             title: auto
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(is_published=True)
 
         @orm.type(User)
@@ -508,7 +514,7 @@ class TestQueryNestedGetQueryset:
         }
 
     @pytest.mark.asyncio
-    async def test_get_queryset_still_applies_with_nested_filter_argument(
+    async def test_scope_rows_still_applies_with_nested_filter_argument(
         self, seed, Post, User
     ):
         orm = StrawberryORM.for_tortoise()
@@ -521,7 +527,7 @@ class TestQueryNestedGetQueryset:
             is_published: auto
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(is_published=True)
 
         @orm.type(User)
@@ -560,8 +566,8 @@ class TestQueryNestedGetQueryset:
         }
 
     @pytest.mark.asyncio
-    async def test_get_queryset_composes_with_load_callable(self, seed, Post, User):
-        """Both type-level get_queryset and field-level load callable should compose."""
+    async def test_scope_rows_composes_with_load_callable(self, seed, Post, User):
+        """Both type-level scope_rows and field-level load callable should compose."""
         orm = StrawberryORM.for_tortoise()
 
         @orm.type(Post)
@@ -570,15 +576,15 @@ class TestQueryNestedGetQueryset:
             title: auto
 
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(is_published=True)
 
         @orm.type(User)
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(
-                load=lambda qs: qs.exclude(title="GraphQL Guide"),
+            posts: list[PT] = orm.field.auto(
+                scope=lambda qs, info: qs.exclude(title="GraphQL Guide"),
             )
 
         @strawberry.type
@@ -610,7 +616,9 @@ class TestQueryNestedGetQueryset:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=lambda qs: qs.filter(name="rust"))
+            tags: list[TT] = orm.field.auto(
+                scope=lambda qs, info: qs.filter(name="rust")
+            )
 
         @strawberry.type
         class Q:

@@ -1,6 +1,6 @@
 """N+1 prevention tests: verify the optimizer prevents N+1 at various depths,
-with custom queryset overrides, load=[...] field hints, load callables, and
-nested get_queryset application."""
+with custom queryset overrides, using=[...] field hints, load callables, and
+nested scope_rows application."""
 
 import strawberry
 from sqlalchemy import select
@@ -145,7 +145,7 @@ class TestQueryNPlusOnePrevention:
 
 
 class TestQueryCustomQuerysetNoNPlusOne:
-    def test_get_queryset_with_nested_relationships(
+    def test_scope_rows_with_nested_relationships(
         self, sa_session, seed, query_counter, Post, Tag, User
     ):
         qs_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
@@ -162,7 +162,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
             tags: list[TT]
 
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published == True)  # noqa: E712
 
         @qs_orm.type(User)
@@ -186,7 +186,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
         assert result.data is not None
         assert len(query_counter) <= 4
 
-    def test_get_queryset_preserves_optimizer_eager_loads(
+    def test_scope_rows_preserves_optimizer_eager_loads(
         self, sa_session, seed, query_counter, Post, User
     ):
         qs_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
@@ -203,7 +203,7 @@ class TestQueryCustomQuerysetNoNPlusOne:
             posts: list[PT]
 
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(User.email.like("%example.com"))
 
         @strawberry.type
@@ -235,7 +235,7 @@ class TestQueryLoadHintNoNPlusOne:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=["author"])
+            tags: list[TT] = orm.field.auto(using=["author"])
 
         @orm.type(User)
         class UT:
@@ -275,7 +275,7 @@ class TestQueryLoadHintNoNPlusOne:
         class PT:
             id: auto
             title: auto
-            tags: list[TT] = orm.field(load=["comments"])
+            tags: list[TT] = orm.field.auto(using=["comments"])
             comments: list[CT]
 
         @orm.type(User)
@@ -315,7 +315,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
+            posts: list[PT] = orm.field.auto(
+                scope=lambda stmt, info: stmt.where(Post.is_published)
+            )  # noqa: E712
 
         @strawberry.type
         class Q:
@@ -369,7 +371,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
+            posts: list[PT] = orm.field.auto(
+                scope=lambda stmt, info: stmt.where(Post.is_published)
+            )  # noqa: E712
 
         @strawberry.type
         class Q:
@@ -404,7 +408,9 @@ class TestQueryLoadCallable:
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(load=lambda stmt: stmt.where(Post.is_published))  # noqa: E712
+            posts: list[PT] = orm.field.auto(
+                scope=lambda stmt, info: stmt.where(Post.is_published)
+            )  # noqa: E712
 
         @strawberry.type
         class Q:
@@ -422,7 +428,7 @@ class TestQueryLoadCallable:
 
 
 class TestQueryNestedGetQueryset:
-    def test_get_queryset_filters_nested_relation(
+    def test_scope_rows_filters_nested_relation(
         self, sa_session, seed, query_counter, Post, User
     ):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
@@ -433,7 +439,7 @@ class TestQueryNestedGetQueryset:
             title: auto
 
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published == True)  # noqa: E712
 
         @orm.type(User)
@@ -474,7 +480,7 @@ class TestQueryNestedGetQueryset:
         }
         assert len(query_counter) <= 2
 
-    def test_get_queryset_still_applies_with_nested_filter_argument(
+    def test_scope_rows_still_applies_with_nested_filter_argument(
         self, sa_session, seed, Post, User
     ):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
@@ -487,7 +493,7 @@ class TestQueryNestedGetQueryset:
             is_published: auto
 
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published == True)  # noqa: E712
 
         @orm.type(User)
@@ -526,10 +532,10 @@ class TestQueryNestedGetQueryset:
             ]
         }
 
-    def test_get_queryset_composes_with_load_callable(
+    def test_scope_rows_composes_with_load_callable(
         self, sa_session, seed, query_counter, Post, User
     ):
-        """Both type-level get_queryset and field-level load callable should compose."""
+        """Both type-level scope_rows and field-level load callable should compose."""
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
         @orm.type(Post)
@@ -538,15 +544,15 @@ class TestQueryNestedGetQueryset:
             title: auto
 
             @classmethod
-            def get_queryset(cls, stmt, info):
+            def scope_rows(cls, stmt, info):
                 return stmt.where(Post.is_published == True)  # noqa: E712
 
         @orm.type(User)
         class UT:
             id: auto
             name: auto
-            posts: list[PT] = orm.field(
-                load=lambda stmt: stmt.where(Post.title != "GraphQL Guide")
+            posts: list[PT] = orm.field.auto(
+                scope=lambda stmt, info: stmt.where(Post.title != "GraphQL Guide")
             )
 
         @strawberry.type

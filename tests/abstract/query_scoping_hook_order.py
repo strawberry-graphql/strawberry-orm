@@ -23,8 +23,8 @@ def scope_messages(print_calls: list[str]) -> list[str]:
     return [msg for msg in print_calls if msg.startswith(SCOPE_PREFIX)]
 
 
-def assert_get_queryset_before_load(messages: list[str]) -> None:
-    get_qs = f"{SCOPE_PREFIX}PostType.get_queryset"
+def assert_scope_rows_before_load(messages: list[str]) -> None:
+    get_qs = f"{SCOPE_PREFIX}PostType.scope_rows"
     load = f"{SCOPE_PREFIX}UserType.posts.load"
     assert get_qs in messages
     assert load in messages

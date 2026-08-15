@@ -168,15 +168,14 @@ class TestInternalBackendCoverage:
 
         class QueryType:
             @classmethod
-            def get_queryset(cls, qs, info):
+            def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
-        backend._type_querysets[User] = QueryType.get_queryset
+        backend._type_querysets[User] = QueryType.scope_rows
         backend._store.hints = {
             "UserType": {
                 "name": SimpleNamespace(
-                    load=lambda qs: qs.filter(email__contains="example.com"),
-                    only=None,
+                    scope=lambda qs, info: qs.filter(email__contains="example.com"),
                     disable_optimization=False,
                 )
             }
@@ -580,8 +579,7 @@ class TestInternalBackendCoverage:
         backend._store.hints = {
             "UserType": {
                 "posts": SimpleNamespace(
-                    load=lambda qs: qs,
-                    only=None,
+                    scope=lambda qs, info: qs,
                     disable_optimization=False,
                 )
             }
@@ -674,3 +672,69 @@ class TestInternalBackendCoverage:
         info = _tortoise_info_with_aggregates(count=True)
         result = await backend.apply_aggregation(Post.filter(id=-999), info, meta)
         assert result.count == 0
+
+
+class TestTortoiseQueryProbe:
+    """The diagnostics probe wraps the client's execute methods."""
+
+    def test_probe_without_a_connection_counts_nothing(self):
+        backend = TortoiseBackend(warn_missing_scope=False)
+        with backend.query_probe(SimpleNamespace(context={})) as probe:
+            pass
+        assert probe.count == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_counts_statements(self, seed, Post):
+        backend = TortoiseBackend(warn_missing_scope=False)
+        with backend.query_probe(SimpleNamespace(context={})) as probe:
+            await Post.all()
+        assert probe.count == 1
+
+
+class TestQueryOrderingRegistry:
+    """Python-side orderings are keyed by ``id()``, which CPython recycles.
+
+    Without an identity check a brand-new queryset could inherit the ordering
+    of a dead one, silently reordering another query's rows.
+    """
+
+    def test_ordering_round_trips_for_the_same_object(self):
+        from strawberry_orm.backends.tortoise import (
+            _query_orderings,
+            _remember_query_ordering,
+        )
+
+        query = object()
+        ordering = [("title", True, None, None)]
+        _remember_query_ordering(query, ordering)
+        assert _query_orderings(query) == ordering
+
+    def test_recycled_id_does_not_inherit_a_stale_ordering(self):
+        from strawberry_orm.backends.tortoise import (
+            _QUERY_ORDERINGS,
+            _query_orderings,
+        )
+
+        fresh = object()
+        # Simulate a dead query whose id was handed to ``fresh``.
+        _QUERY_ORDERINGS[id(fresh)] = (object(), [("stale", True, None, None)])
+        assert _query_orderings(fresh) is None
+
+    def test_registry_is_bounded(self):
+        from strawberry_orm.backends.tortoise import (
+            _MAX_REMEMBERED_ORDERINGS,
+            _QUERY_ORDERINGS,
+            _remember_query_ordering,
+        )
+
+        keepalive = [object() for _ in range(_MAX_REMEMBERED_ORDERINGS + 50)]
+        for item in keepalive:
+            _remember_query_ordering(item, [("title", True, None, None)])
+        assert len(_QUERY_ORDERINGS) <= _MAX_REMEMBERED_ORDERINGS
+
+
+class TestRelationScopeCondition:
+    def test_without_a_backend_there_is_nothing_to_scope(self):
+        from strawberry_orm.backends.tortoise import _tortoise_relation_scope_q
+
+        assert _tortoise_relation_scope_q(None, None, "author", None, "") is None

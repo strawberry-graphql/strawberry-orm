@@ -62,7 +62,7 @@ def _build_projected_schema():
 
     @strawberry.type
     class Query:
-        posts: list[PostType] = orm.field()
+        posts: list[PostType] = orm.field.auto()
 
     return strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
 

@@ -1124,8 +1124,8 @@ class TestQuerySelfIsModel:
 
 class TestQueryGetQueryset:
     @pytest.mark.asyncio
-    async def test_get_queryset_filters_unpublished(self, get_queryset_execute):
-        data = await get_queryset_execute("{ posts { title isPublished } }")
+    async def test_scope_rows_filters_unpublished(self, scope_rows_execute):
+        data = await scope_rows_execute("{ posts { title isPublished } }")
         assert data == {
             "posts": [
                 {"title": "Hello World", "isPublished": True},
@@ -1135,13 +1135,13 @@ class TestQueryGetQueryset:
         }
 
     @pytest.mark.asyncio
-    async def test_published_count(self, get_queryset_execute):
-        data = await get_queryset_execute("{ posts { id } }")
+    async def test_published_count(self, scope_rows_execute):
+        data = await scope_rows_execute("{ posts { id } }")
         assert data == {"posts": [{"id": 1}, {"id": 2}, {"id": 4}]}
 
     @pytest.mark.asyncio
-    async def test_unscoped_type_returns_all(self, get_queryset_execute):
-        data = await get_queryset_execute("{ users { name } }")
+    async def test_unscoped_type_returns_all(self, scope_rows_execute):
+        data = await scope_rows_execute("{ users { name } }")
         assert data == {
             "users": [
                 {"name": "Alice"},

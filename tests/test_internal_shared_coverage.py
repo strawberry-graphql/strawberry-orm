@@ -7,7 +7,7 @@ import pytest
 import strawberry
 from strawberry import relay
 
-from strawberry_orm import StrawberryORM, make_field
+from strawberry_orm import StrawberryORM
 from strawberry_orm._async import await_maybe
 from strawberry_orm.backends._base import BaseBackend
 from strawberry_orm.core import (
@@ -24,7 +24,7 @@ from strawberry_orm.mutations import (
     _PROJECT_UNBOUNDED,
     MutationNamespace,
 )
-from strawberry_orm.types import auto
+from strawberry_orm.types import FieldDefinition, auto
 from tests.backends.sqlalchemy.models import User as SAUser
 
 
@@ -116,19 +116,19 @@ class TestInternalSharedCoverage:
         assert resolved == ["value"]
 
     def test_base_backend_and_mutation_namespace_validation_errors(self):
-        base = BaseBackend(warn_missing_queryset=False)
+        base = BaseBackend(warn_missing_scope=False)
         with pytest.raises(NotImplementedError):
             base._introspect_model(object)
 
-        backend = DummyBackend(warn_missing_queryset=False)
+        backend = DummyBackend(warn_missing_scope=False)
         input_type = backend.input(object)
         assert "password_hash" not in input_type.__dataclass_fields__
-        assert backend.field(load=["name"]).__class__.__name__ == "FieldDefinition"
+        assert backend.field(using=["name"]).__class__.__name__ == "FieldDefinition"
         assert backend._type_name_for_model(object) is None
 
         class Example:
             __annotations__ = {"id": auto, "name": auto, "password_hash": auto}
-            hinted = make_field(description="hinted")
+            hinted = FieldDefinition(description="hinted")
             generated = DummyAutoField()
 
         type_name = backend._process_type_annotations(
@@ -143,9 +143,14 @@ class TestInternalSharedCoverage:
         class ExcludedOnly:
             __annotations__ = {"id": auto, "name": auto}
 
+        # A distinct model: ``object`` already has a generated input above, and
+        # excluding a field a live input can still write is now rejected.
+        class _OtherModel:
+            pass
+
         backend._process_type_annotations(
             ExcludedOnly,
-            object,
+            _OtherModel,
             {"id": int, "name": str},
             exclude=["name"],
         )
@@ -182,34 +187,10 @@ class TestInternalSharedCoverage:
             ns._normalize_model_project(SAUser, {"_meta": "bad"})
         with pytest.raises(ValueError, match="Unknown _meta key"):
             ns._normalize_model_project(SAUser, {"_meta": {"bad": "value"}})
-        with pytest.raises(ValueError, match="does not have a registered relay.Node"):
-            ns._cast_node(SAUser, object())
-
-        @strawberry.input
-        class SingleWrapper:
-            create: int | None = None
-            update: int | None = None
-
-        SingleWrapper.__relation_policy__ = {
-            "default_on_replace": "DISCONNECT",
-            "allowed_ops": frozenset({"create", "update"}),
-        }
-        with pytest.raises(ValueError, match="exactly one of create, update"):
-            ns._resolve_single_wrapper(SingleWrapper(create=1, update=2))
 
         assert ns._child_project(_PROJECT_UNBOUNDED, "anything") == _PROJECT_UNBOUNDED
         assert ns._child_project(_PROJECT_SHALLOW, "anything") == _PROJECT_LEAF
         assert ns._child_project({"relations": {}}, "anything") == _PROJECT_SHALLOW
-
-        @strawberry.input
-        class RootInput:
-            a: int | None = None
-            b: int | None = None
-
-        with pytest.raises(ValueError, match="Exactly one root model must be selected"):
-            ns._select_model_payload(
-                RootInput(a=1, b=2), SimpleNamespace(__mutation_models__={})
-            )
 
     def test_node_input_allows_explicit_root_type_names(self):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
@@ -231,3 +212,60 @@ class TestInternalSharedCoverage:
 
         assert create_input.__name__ == "CreateNodeInput"
         assert update_input.__name__ == "UpdateNodeInput"
+
+
+def _minimal_backend(target=None):
+    """Backend that knows nothing about models beyond *target*."""
+    from strawberry_orm.backends._base import BaseBackend
+
+    class _MinimalBackend(BaseBackend):
+        def __init__(self):
+            super().__init__(warn_missing_scope=False)
+
+        def _introspect_model(self, model):  # pragma: no cover - unused
+            return []
+
+        def _relation_target_model(self, model, relation):
+            return target
+
+    return _MinimalBackend()
+
+
+class TestRelationScopeLookup:
+    """``relation_scope`` decides whether traversal needs restricting."""
+
+    def test_base_relation_target_model_defaults_to_unknown(self):
+        from strawberry_orm.backends._base import BaseBackend
+
+        class _NoIntrospection(BaseBackend):
+            def __init__(self):
+                super().__init__(warn_missing_scope=False)
+
+            def _introspect_model(self, model):  # pragma: no cover - unused
+                return []
+
+        assert _NoIntrospection()._relation_target_model(object, "anything") is None
+
+    def test_unknown_relation_needs_no_scoping(self):
+        backend = _minimal_backend(target=None)
+        assert backend.relation_scope(object, "anything", info=None) is None
+
+    def test_scoped_relation_without_info_fails_closed(self):
+        """``scope_rows`` needs info, so traversal must refuse rather than
+        quietly drop the restriction."""
+
+        class Related:
+            pass
+
+        backend = _minimal_backend(target=Related)
+        backend._type_querysets[Related] = lambda qs, info: qs
+
+        with pytest.raises(ValueError, match="Cannot filter through"):
+            backend.relation_scope(object, "rel", info=None)
+
+    def test_unscoped_relation_is_left_alone(self):
+        class Related:
+            pass
+
+        backend = _minimal_backend(target=Related)
+        assert backend.relation_scope(object, "rel", info=None) is None

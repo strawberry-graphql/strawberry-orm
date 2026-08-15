@@ -8,6 +8,7 @@ import warnings
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from strawberry.extensions import SchemaExtension
@@ -130,79 +131,13 @@ def _parent_graphql_type(info: Any) -> str:
     return str(getattr(parent, "name", parent))
 
 
-def _django_relation_hint(instance: Any, field_name: str, model_name: str) -> str:
-    try:
-        field = instance._meta.get_field(field_name)  # type: ignore[attr-defined]
-    except Exception:
-        return (
-            f"Return a queryset from the parent resolver via orm.field() and use "
-            f"orm.schema() so the optimizer eager-loads {model_name}.{field_name}."
-        )
-
-    field_class = type(field).__name__
-    if field_class in ("ForeignKey", "OneToOneField"):
-        return (
-            f"Return a queryset (not list(...)) from the parent field via orm.field(); "
-            f"orm.schema() will apply select_related('{field_name}') on {model_name}. "
-            f"Manual fix: {model_name}.objects...select_related('{field_name}')."
-        )
-    if field_class in (
-        "ManyToManyField",
-        "ManyToOneRel",
-        "ManyToManyRel",
-        "OneToOneRel",
-    ):
-        return (
-            f"Return a queryset from the parent field via orm.field(); "
-            f"orm.schema() will apply prefetch_related('{field_name}') on {model_name}. "
-            f"Manual fix: {model_name}.objects...prefetch_related('{field_name}')."
-        )
-    return (
-        f"Return a queryset from the parent resolver via orm.field() and use "
-        f"orm.schema() so the optimizer eager-loads {model_name}.{field_name}."
-    )
-
-
-def _sqlalchemy_relation_hint(instance: Any, field_name: str, model_name: str) -> str:
-    from sqlalchemy import inspect as sa_inspect
-
-    try:
-        rel = sa_inspect(instance).mapper.relationships[field_name]
-    except Exception:
-        return (
-            f"Return a Select from the parent resolver via orm.field() and use "
-            f"orm.schema() so the optimizer eager-loads {model_name}.{field_name}."
-        )
-
-    loader = "selectinload" if rel.uselist else "joinedload"
-    return (
-        f"Return a Select (not materialized rows) from the parent field via orm.field(); "
-        f"orm.schema() will apply {loader}({model_name}.{field_name}). "
-        f"Manual fix: select({model_name}).options({loader}({model_name}.{field_name}))."
-    )
-
-
-def _tortoise_relation_hint(instance: Any, field_name: str, model_name: str) -> str:
-    return (
-        f"Return a Tortoise queryset from the parent field via orm.field(); "
-        f"orm.schema() will apply prefetch_related('{field_name}') on {model_name}. "
-        f"Manual fix: {model_name}.all().prefetch_related('{field_name}')."
-    )
-
-
-def _relation_hint(backend: Backend, instance: Any, field_name: str) -> str:
-    model_name = type(instance).__name__
-    backend_name = backend.__class__.__name__
-    if backend_name == "DjangoBackend":
-        return _django_relation_hint(instance, field_name, model_name)
-    if backend_name == "SQLAlchemyBackend":
-        return _sqlalchemy_relation_hint(instance, field_name, model_name)
-    if backend_name == "TortoiseBackend":
-        return _tortoise_relation_hint(instance, field_name, model_name)
-    return (
-        f"Return an unfetched queryset from the parent resolver via orm.field() and "
-        f"use orm.schema() so the optimizer eager-loads {model_name}.{field_name}."
-    )
+def _relation_hint(backend: Backend, instance: Any = None, field_name: str = "") -> str:
+    expected = {
+        "DjangoBackend": "QuerySet",
+        "SQLAlchemyBackend": "Select",
+        "TortoiseBackend": "QuerySet",
+    }.get(backend.__class__.__name__, "queryset")
+    return f"return a {expected} instead of list"
 
 
 @dataclass(frozen=True)
@@ -213,6 +148,19 @@ class _UnoptimizedLoad:
     resolver_type: str
     graphql_field: str
     hint: str
+    path: str = ""
+
+
+@dataclass(frozen=True)
+class _ResolverQueries:
+    """A resolver that issued its own queries instead of reading loaded data."""
+
+    resolver_type: str
+    graphql_field: str
+    model_name: str
+    relations: tuple[str, ...]
+    count: int
+    rows: int = 1
 
 
 def _django_relation_prefetched(instance: Any, field_name: str) -> bool | None:
@@ -288,6 +236,28 @@ def _tortoise_relation_prefetched(instance: Any, field_name: str) -> bool | None
     return isinstance(rel_value, related_model)
 
 
+class QueryProbe:
+    """Counts SQL statements issued while a resolver runs."""
+
+    __slots__ = ("count",)
+
+    def __init__(self) -> None:
+        self.count = 0
+
+
+def unloaded_relations(backend: Backend, instance: Any) -> set[str]:
+    """Return the relations of *instance* that are not loaded yet."""
+    try:
+        names = backend.relation_names(type(instance))
+    except Exception:
+        return set()
+    return {
+        name
+        for name in names
+        if relation_is_prefetched(backend, instance, name) is False
+    }
+
+
 def relation_is_prefetched(
     backend: Backend, instance: Any, field_name: str
 ) -> bool | None:
@@ -302,23 +272,78 @@ def relation_is_prefetched(
     return None
 
 
-def _format_unoptimized_loads(loads: list[_UnoptimizedLoad]) -> str:
+def _format_cause(ancestor: str, loads: list[_UnoptimizedLoad]) -> str:
+    """Describe the field that materialized rows and ended optimization."""
+    relations = sorted({f"{load.model_name}.{load.orm_field}" for load in loads})
+    return (
+        f"  cause: {ancestor} returned rows instead of a query object, so "
+        f"{len(relations)} relation(s) below it could not be eager-loaded\n"
+        f"    fix: return an unexecuted query from {ancestor} "
+        f"(loads: {', '.join(relations)})"
+    )
+
+
+def _format_resolver_queries(entry: _ResolverQueries) -> str:
+    """Describe a resolver that read a relation nobody eager-loaded."""
+    where = f"{entry.resolver_type}.{entry.graphql_field}"
+    read = ", ".join(f"{entry.model_name}.{rel}" for rel in entry.relations)
+    names = ", ".join(f'"{rel}"' for rel in entry.relations)
+    if entry.count:
+        detail = (
+            f"{where} issued {entry.count} query(s) across "
+            f"{entry.rows} row(s) reading {read}"
+        )
+    else:
+        detail = f"{where} lazy-loaded {read} on {entry.rows} row(s)"
+    return f"  - resolver: {detail}\n    fix: @orm.field.computed(using=[{names}])"
+
+
+def _format_unoptimized_loads(
+    loads: list[_UnoptimizedLoad],
+    resolver_queries: list[_ResolverQueries] | None = None,
+    causes: dict[str, list[_UnoptimizedLoad]] | None = None,
+) -> str:
     grouped: Counter[_UnoptimizedLoad] = Counter(loads)
     lines = []
+
+    for ancestor in sorted(causes or {}):
+        lines.append(_format_cause(ancestor, (causes or {})[ancestor]))
+
     for load, count in sorted(
         grouped.items(),
         key=lambda item: (item[0].query_path, item[0].resolver_type, item[0].orm_field),
     ):
         suffix = f" ({count} instances)" if count > 1 else ""
         lines.append(
-            f"  - query path: {load.query_path}\n"
+            f"  - path: {load.query_path}\n"
             f"    resolver: {load.resolver_type}.{load.graphql_field} "
             f"(ORM: {load.model_name}.{load.orm_field}){suffix}\n"
-            f"    {load.hint}"
+            f"    fix: {load.hint}"
         )
 
-    total = len(loads)
-    unique = len(grouped)
+    merged_resolvers: dict[tuple[str, str], _ResolverQueries] = {}
+    for entry in resolver_queries or []:
+        key = (entry.resolver_type, entry.graphql_field)
+        previous = merged_resolvers.get(key)
+        if previous is None:
+            merged_resolvers[key] = entry
+            continue
+        merged_resolvers[key] = _ResolverQueries(
+            resolver_type=entry.resolver_type,
+            graphql_field=entry.graphql_field,
+            model_name=entry.model_name,
+            relations=tuple(sorted(set(previous.relations) | set(entry.relations))),
+            count=previous.count + entry.count,
+            rows=previous.rows + entry.rows,
+        )
+
+    for key in sorted(merged_resolvers):
+        lines.append(_format_resolver_queries(merged_resolvers[key]))
+
+    total = len(loads) + sum(
+        max(entry.count, entry.rows) for entry in merged_resolvers.values()
+    )
+    unique = len(grouped) + len(merged_resolvers)
     header = (
         f"Unoptimized relation loads detected ({total} total, {unique} unique) "
         f"— may waterfall (N+1):"
@@ -335,6 +360,9 @@ class LazyResolutionExtension(SchemaExtension):
     def __init__(self, *, execution_context: Any | None = None) -> None:
         self.execution_context = execution_context  # type: ignore[assignment]
         self._loads: list[_UnoptimizedLoad] = []
+        self._resolver_queries: list[_ResolverQueries] = []
+        self._shapes: dict[str, bool] = {}
+        self._shape_labels: dict[str, str] = {}
 
     @classmethod
     def configure(
@@ -351,6 +379,9 @@ class LazyResolutionExtension(SchemaExtension):
 
     def on_operation(self) -> Iterator[None]:
         self._loads = []
+        self._resolver_queries = []
+        self._shapes = {}
+        self._shape_labels = {}
         yield
         self._flush_loads()
 
@@ -358,18 +389,117 @@ class LazyResolutionExtension(SchemaExtension):
         self, _next: Any, root: Any, info: Any, *args: Any, **kwargs: Any
     ) -> Any:
         self._record_relation_access(root, info)
-        return _next(root, info, *args, **kwargs)
 
-    async def resolve_async(
+        if not self._should_probe(root, info):
+            result = _next(root, info, *args, **kwargs)
+            if isawaitable(result):
+                return self._await_result(result, info)
+            self._record_return_shape(info, result)
+            return result
+
+        # The probe has to stay open across an async resolver's await, so the
+        # context manager is driven by hand rather than with a ``with`` block.
+        before = unloaded_relations(self._backend, root)
+        probe_cm = self._backend.query_probe(info)
+        probe = probe_cm.__enter__()
+        try:
+            result = _next(root, info, *args, **kwargs)
+        except BaseException:
+            probe_cm.__exit__(None, None, None)
+            raise
+
+        if isawaitable(result):
+            return self._await_probed_result(
+                probe_cm, probe, result, root, info, before
+            )
+
+        probe_cm.__exit__(None, None, None)
+        self._record_resolver_queries(root, info, probe, before)
+        self._record_return_shape(info, result)
+        return result
+
+    async def _await_result(self, awaitable: Any, info: Any) -> Any:
+        result = await awaitable
+        self._record_return_shape(info, result)
+        return result
+
+    async def _await_probed_result(
         self,
-        _next: Any,
+        probe_cm: Any,
+        probe: Any,
+        awaitable: Any,
         root: Any,
         info: Any,
-        *args: Any,
-        **kwargs: Any,
+        before: set[str],
     ) -> Any:
-        self._record_relation_access(root, info)
-        return await _next(root, info, *args, **kwargs)
+        try:
+            result = await awaitable
+        finally:
+            probe_cm.__exit__(None, None, None)
+        self._record_resolver_queries(root, info, probe, before)
+        self._record_return_shape(info, result)
+        return result
+
+    def _should_probe(self, root: Any, info: Any) -> bool:
+        """Probe resolvers on ORM types whose field is not itself a relation.
+
+        Relation fields are already covered by :meth:`_record_relation_access`;
+        what this catches is a computed field whose body reads a relation.
+        """
+        if self._mode == "off" or self._backend is None or root is None:
+            return False
+        field_name = _field_name_from_info(info)
+        if not field_name:
+            return False
+        if relation_is_prefetched(self._backend, root, field_name) is not None:
+            return False
+        return self._backend._type_name_for_model(type(root)) is not None
+
+    def _record_return_shape(self, info: Any, result: Any) -> None:
+        """Remember whether each field handed back a still-optimizable query."""
+        if self._mode == "off" or self._backend is None:
+            return
+        path = ".".join(_path_field_names(info))
+        if not path or path in self._shapes:
+            return
+        if isawaitable(result):
+            return
+        self._shapes[path] = self._backend.is_query_object(result)
+        self._shape_labels[path] = (
+            f"{_parent_graphql_type(info)}.{_graphql_field_name(info)}"
+        )
+
+    def _materializing_ancestor(self, path: str) -> str | None:
+        """Nearest ancestor of *path* that returned rows instead of a query."""
+        parts = path.split(".")
+        for depth in range(len(parts) - 1, 0, -1):
+            ancestor = ".".join(parts[:depth])
+            if self._shapes.get(ancestor) is False:
+                return ancestor
+        return None
+
+    def _record_resolver_queries(
+        self,
+        root: Any,
+        info: Any,
+        probe: Any,
+        before: set[str],
+    ) -> None:
+        # Only a relation that flipped from unloaded to loaded during this
+        # resolver is safely attributable; sibling fields resolve concurrently,
+        # so the raw statement count alone would over-attribute.
+        newly_loaded = tuple(sorted(before - unloaded_relations(self._backend, root)))
+        if not newly_loaded:
+            return
+        self._resolver_queries.append(
+            _ResolverQueries(
+                resolver_type=_parent_graphql_type(info),
+                graphql_field=_graphql_field_name(info),
+                model_name=type(root).__name__,
+                relations=newly_loaded,
+                count=probe.count,
+            )
+        )
 
     def _record_relation_access(self, root: Any, info: Any) -> None:
         if self._mode == "off" or self._backend is None or root is None:
@@ -392,14 +522,22 @@ class LazyResolutionExtension(SchemaExtension):
                 resolver_type=_parent_graphql_type(info),
                 graphql_field=_graphql_field_name(info),
                 hint=_relation_hint(self._backend, root, field_name),
+                path=".".join(_path_field_names(info)),
             )
         )
 
     def _flush_loads(self) -> None:
-        if not self._loads or self._mode == "off":
+        if (not self._loads and not self._resolver_queries) or self._mode == "off":
             return
 
-        message = _format_unoptimized_loads(self._loads)
+        causes: dict[str, list[_UnoptimizedLoad]] = {}
+        for load in self._loads:
+            ancestor = self._materializing_ancestor(load.path)
+            if ancestor is not None:
+                label = self._shape_labels.get(ancestor, ancestor)
+                causes.setdefault(label, []).append(load)
+
+        message = _format_unoptimized_loads(self._loads, self._resolver_queries, causes)
         logger.warning(message)
         if self._mode == "error":
             raise RuntimeError(message)

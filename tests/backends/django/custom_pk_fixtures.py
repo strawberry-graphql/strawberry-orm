@@ -31,7 +31,7 @@ class BookType:
 
 @strawberry.type
 class CustomPkQuery:
-    books: list[BookType] = _custom_pk_orm.field(filters=BookFilter)
+    books: list[BookType] = _custom_pk_orm.field.auto(filters=BookFilter)
 
 
 custom_pk_schema = strawberry.Schema(

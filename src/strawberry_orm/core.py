@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import typing as _typing
 from collections.abc import Callable
-from functools import partial, wraps
+from functools import cached_property, partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
 from typing import Any, Literal
@@ -32,8 +32,12 @@ from strawberry_orm._async import (
     run_orm_work_blocking,
 )
 from strawberry_orm.backends.protocol import Backend
+from strawberry_orm.fields import (
+    check_resolver_signature,
+    check_scope_signature,
+)
 from strawberry_orm.mutations import MutationNamespace
-from strawberry_orm.types import FieldDefinition
+from strawberry_orm.types import FieldDefinition, FieldHints
 
 BackendName = Literal["django", "sqlalchemy", "tortoise"]
 
@@ -125,9 +129,9 @@ def _make_query_resolver(
         ) -> Any:
             query = backend.get_default_queryset(model)
             if filter is not None:
-                query = backend.apply_filters(query, filter, model)
+                query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
-                query = backend.apply_ordering(query, order, model)
+                query = backend.apply_ordering(query, order, model, info=info)
             return query
 
         annotations: dict[str, Any] = {"info": info_type}
@@ -144,9 +148,9 @@ def _make_query_resolver(
         ) -> Any:
             query = backend.get_default_queryset(model)
             if filter is not None:
-                query = backend.apply_filters(query, filter, model)
+                query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
-                query = backend.apply_ordering(query, order, model)
+                query = backend.apply_ordering(query, order, model, info=info)
             return query
 
         resolver.__annotations__ = {
@@ -159,7 +163,7 @@ def _make_query_resolver(
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             query = backend.get_default_queryset(model)
             if filter is not None:
-                query = backend.apply_filters(query, filter, model)
+                query = backend.apply_filters(query, filter, model, info=info)
             return query
 
         resolver.__annotations__ = {
@@ -171,7 +175,7 @@ def _make_query_resolver(
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
             query = backend.get_default_queryset(model)
             if order is not None:
-                query = backend.apply_ordering(query, order, model)
+                query = backend.apply_ordering(query, order, model, info=info)
             return query
 
         resolver.__annotations__ = {
@@ -299,10 +303,16 @@ class _AutoFilterOrderExtension(FieldExtension):
         group_by: Any = None,
         order: Any = None,
     ) -> None:
-        """Stash the filtered (pre-pagination) query and backend on context."""
+        """Stash the filtered (pre-pagination) query and backend on context.
+
+        Aggregates and groups are computed from this query rather than from the
+        rows that were fetched, so the type's row scoping has to be applied
+        here. The optimizer applies it on the read path, which runs later.
+        """
         ctx = info.context
         if ctx is None:
             return
+        base_query = self._backend.apply_type_scope(base_query, self._model, info)
         if isinstance(ctx, dict):
             ctx["_orm_base_query"] = base_query
             ctx["_orm_backend"] = self._backend
@@ -325,12 +335,16 @@ class _AutoFilterOrderExtension(FieldExtension):
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
             if filter is not None:
-                result = self._backend.apply_filters(result, filter, self._model)
+                result = self._backend.apply_filters(
+                    result, filter, self._model, info=info
+                )
 
             self._stash_context(info, result, group_by=group_by, order=order)
 
             if order is not None:
-                result = self._backend.apply_ordering(result, order, self._model)
+                result = self._backend.apply_ordering(
+                    result, order, self._model, info=info
+                )
             if not self._defer_query_materialization(info):
                 result = materialize_result(
                     self._backend,
@@ -362,12 +376,16 @@ class _AutoFilterOrderExtension(FieldExtension):
                 )
 
             if filter is not None:
-                result = self._backend.apply_filters(result, filter, self._model)
+                result = self._backend.apply_filters(
+                    result, filter, self._model, info=info
+                )
 
             self._stash_context(info, result, group_by=group_by, order=order)
 
             if order is not None:
-                result = self._backend.apply_ordering(result, order, self._model)
+                result = self._backend.apply_ordering(
+                    result, order, self._model, info=info
+                )
             if not self._defer_query_materialization(info):
                 result = self._backend.materialize_query(result, info)
 
@@ -424,6 +442,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                         result,
                         kwargs["filter"],
                         self._model,
+                        info=info,
                     )
                 self._stash_context(
                     info,
@@ -436,6 +455,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                         result,
                         kwargs["order"],
                         self._model,
+                        info=info,
                     )
                 if not self._defer_query_materialization(info):
                     result = await materialize(result, info)
@@ -466,6 +486,170 @@ class _AutoFilterOrderExtension(FieldExtension):
         if isawaitable(result):
             result = await await_maybe(result)
         return self._cast_result(result)
+
+
+class FieldFactory:
+    """The four ways to declare a field on an ``@orm.type`` class.
+
+    The name says when your code runs, and therefore what it receives:
+
+    ``auto``      metadata only; the library resolves the field.
+    ``scoped``    ``(qs, info)``, once while the prefetch is built.
+    ``custom``    ``(self, info)``, once per parent row, returning rows.
+    ``computed``  ``(self, info)``, once per parent row, returning a value.
+
+    Calling the factory directly is the pre-namespace spelling and still
+    works: ``orm.field()``, ``orm.field(using=[...])``, bare ``@orm.field``.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+
+    # -- Named forms ---------------------------------------------------------
+
+    def auto(
+        self,
+        *,
+        filters: Any | None = None,
+        order: Any | None = None,
+        using: list[str] | None = None,
+        scope: Callable[..., Any] | None = None,
+        compute: dict[str, Any] | None = None,
+        disable_optimization: bool = False,
+        permission_classes: list[type] | None = None,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        """Declare a field the library resolves, with optional metadata."""
+        if scope is not None:
+            check_scope_signature(scope)
+        if any([using, scope, compute, disable_optimization, permission_classes]):
+            return FieldDefinition(
+                using=using,
+                scope=scope,
+                compute=compute,
+                disable_optimization=disable_optimization,
+                permission_classes=permission_classes,
+                description=description,
+            )
+        return _AutoField(
+            self._backend,
+            description=description,
+            deprecation_reason=deprecation_reason,
+            filters=filters,
+            order=order,
+        )
+
+    def scoped(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        using: list[str] | None = None,
+        description: str | None = None,
+    ) -> Any:
+        """Narrow the rows loaded through a relation.
+
+        The callable receives ``(qs, info)`` and returns a query. It never
+        sees the parent row, which is what lets the optimizer fold it into one
+        prefetch covering every parent.
+        """
+
+        def _build(scope: Callable[..., Any]) -> FieldDefinition:
+            check_scope_signature(scope)
+            return FieldDefinition(
+                using=using,
+                scope=scope,
+                description=description,
+                declared_type=_return_annotation(scope),
+            )
+
+        return _build(fn) if fn is not None else _build
+
+    def custom(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        filters: Any | None = None,
+        order: Any | None = None,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        """Replace the resolver. Runs once per parent row, and receives ``self``."""
+
+        def _build(resolver: Callable[..., Any]) -> Any:
+            check_resolver_signature(resolver, "custom")
+            if filters is not None or order is not None:
+                # _AutoField wraps a supplied resolver with the filter/order
+                # arguments rather than generating one.
+                return _AutoField(
+                    self._backend,
+                    description=description,
+                    deprecation_reason=deprecation_reason,
+                    filters=filters,
+                    order=order,
+                )(resolver)
+            return self._resolver_field(
+                resolver,
+                description=description,
+                deprecation_reason=deprecation_reason,
+            )
+
+        return _build(fn) if fn is not None else _build
+
+    def computed(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        using: list[str] | None = None,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        """Declare a computed value and the relations it reads.
+
+        ``using`` names relations on the field's own model that the resolver
+        touches, so the optimizer eager-loads them alongside the parent query
+        instead of taking a lazy load per row::
+
+            @orm.type(Post)
+            class PostType:
+                @orm.field.computed(using=["author"])
+                def byline(self, info) -> str:
+                    return f"by {self.author.name}"
+        """
+
+        def _build(resolver: Callable[..., Any]) -> Any:
+            field = self._resolver_field(
+                resolver,
+                description=description,
+                deprecation_reason=deprecation_reason,
+            )
+            field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
+                using=list(using) if using else None,
+            )
+            return field
+
+        return _build(fn) if fn is not None else _build
+
+    # -- Shared --------------------------------------------------------------
+
+    def _resolver_field(
+        self,
+        fn: Callable[..., Any],
+        *,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        wrap = getattr(self._backend, "wrap_async_safe", None)
+        return strawberry.field(
+            resolver=wrap(fn) if wrap is not None else fn,
+            description=description,
+            deprecation_reason=deprecation_reason,
+        )
+
+
+def _return_annotation(fn: Callable[..., Any]) -> Any:
+    """The decorated form declares the field type here; the inline form does not."""
+    return getattr(fn, "__annotations__", {}).get("return")
 
 
 class _AutoField:
@@ -903,48 +1087,14 @@ class StrawberryORM:
 
     # -- Fields --------------------------------------------------------------
 
-    def field(
-        self,
-        fn: Callable[..., Any] | None = None,
-        *,
-        filters: Any | None = None,
-        order: Any | None = None,
-        load: list[Any] | Callable[..., Any] | None = None,
-        only: list[str] | None = None,
-        compute: dict[str, Any] | None = None,
-        disable_optimization: bool = False,
-        description: str | None = None,
-        deprecation_reason: str | None = None,
-    ) -> Any:
-        if fn is not None:
-            wrap = getattr(self._backend, "wrap_async_safe", None)
-            resolver = wrap(fn) if wrap is not None else fn
-            return strawberry.field(resolver=resolver)
+    @cached_property
+    def field(self) -> FieldFactory:
+        """Field declarations: ``auto``, ``scoped``, ``custom``, ``computed``.
 
-        if filters is not None or order is not None:
-            return _AutoField(
-                self._backend,
-                description=description,
-                deprecation_reason=deprecation_reason,
-                filters=filters,
-                order=order,
-            )
-
-        has_hints = any([load, only, compute, disable_optimization])
-        if has_hints:
-            return FieldDefinition(
-                load=load,
-                only=only,
-                compute=compute,
-                disable_optimization=disable_optimization,
-                description=description,
-            )
-
-        return _AutoField(
-            self._backend,
-            description=description,
-            deprecation_reason=deprecation_reason,
-        )
+        Callable itself for backwards compatibility, so ``orm.field()``,
+        ``orm.field(...)`` and bare ``@orm.field`` keep working.
+        """
+        return FieldFactory(self._backend)
 
     def node(self, **kwargs: Any) -> Any:
         return self._backend.node(**kwargs)
@@ -965,11 +1115,15 @@ class StrawberryORM:
 
     # -- Query application ----------------------------------------------------
 
-    def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
-        return self._backend.apply_filters(query, filter_input, model)
+    def apply_filters(
+        self, query: Any, filter_input: Any, model: type, info: Any = None
+    ) -> Any:
+        return self._backend.apply_filters(query, filter_input, model, info=info)
 
-    def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
-        return self._backend.apply_ordering(query, order_input, model)
+    def apply_ordering(
+        self, query: Any, order_input: Any, model: type, info: Any = None
+    ) -> Any:
+        return self._backend.apply_ordering(query, order_input, model, info=info)
 
     # -- Related list refs ---------------------------------------------------
 
@@ -1043,7 +1197,22 @@ class StrawberryORM:
             insert_at = (optimizer_index + 1) if optimizer_index is not None else 0
             extensions.insert(insert_at, self.lazy_resolution_extension(mode=lazy_mode))
 
+        # Index 0 is the innermost wrapper, so the batcher sees unexecuted
+        # resolver output rather than rows the optimizer already materialized.
+        if getattr(self._backend, "_batch_relations", False) and optimizer:
+            from strawberry_orm.batching import extensions_include_batching
+
+            if not extensions_include_batching(extensions):
+                extensions.insert(0, self.batching_extension())
+
+        self._backend.check_scoped_order_traversal()
+
         return strawberry.Schema(extensions=extensions, **kwargs)
+
+    def batching_extension(self) -> type[SchemaExtension]:
+        from strawberry_orm.batching import BatchingExtension
+
+        return BatchingExtension.configure(self._backend, self._backend._store)
 
     def lazy_resolution_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         from strawberry_orm.lazy_resolution import LazyResolutionExtension
@@ -1068,8 +1237,8 @@ def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:
 
 
 def _create_backend(name: BackendName, **kwargs: Any) -> Backend:
-    if "warn_missing_queryset" not in kwargs and "pytest" in sys.modules:
-        kwargs["warn_missing_queryset"] = False
+    if "warn_missing_scope" not in kwargs and "pytest" in sys.modules:
+        kwargs["warn_missing_scope"] = False
 
     if name == "django":
         from strawberry_orm.backends.django import DjangoBackend

@@ -617,3 +617,27 @@ class TestInternalBackendCoverage:
         ) + [empty_field]
         processed = backend._post_process_strawberry_fields(UserType)
         assert processed is UserType
+
+
+class TestTraversalModelResolution:
+    """Traversal has to follow reverse relations, and give up quietly when a
+    name is not a relation at all."""
+
+    def test_no_model_means_no_relation(self):
+        from strawberry_orm.backends.django import _django_traversal_model
+
+        assert _django_traversal_model(None, "author") is None
+
+    def test_unknown_field_is_not_a_relation(self, User):
+        from strawberry_orm.backends.django import _django_traversal_model
+
+        assert _django_traversal_model(User, "not_a_field") is None
+
+    def test_reverse_relation_resolves(self, Post, User):
+        from strawberry_orm.backends.django import (
+            _django_related_model,
+            _django_traversal_model,
+        )
+
+        assert _django_traversal_model(User, "posts") is Post
+        assert _django_related_model(User, "posts") is None

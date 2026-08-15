@@ -51,18 +51,40 @@ auto = strawberry.auto
 class FieldDefinition:
     """Metadata attached to fields created via orm.field()."""
 
-    load: list[Any] | Callable[..., Any] | None = None
-    only: list[str] | None = None
+    using: list[str] | None = None
+    scope: Callable[..., Any] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False
     permission_classes: list[type] | None = None
     description: str | None = None
+    declared_type: Any = None
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Publish the field's type when it came from a decorated function.
+
+        ``@orm.field.scoped`` decorates the scope, not the resolver, so the
+        GraphQL type lives on the function's return annotation rather than on
+        a class annotation. This runs while the class is being created, which
+        is before ``@orm.type`` reads annotations.
+        """
+        annotations = owner.__dict__.get("__annotations__")
+        if self.declared_type is not None:
+            if annotations is None:
+                annotations = {}
+                owner.__annotations__ = annotations
+            annotations.setdefault(name, self.declared_type)
+        elif self.scope is not None and name not in (annotations or {}):
+            raise TypeError(
+                f"{owner.__name__}.{name} has no type. Annotate the attribute "
+                f"({name}: list[SomeType] = orm.field.scoped(...)), or give the "
+                f"decorated function a return annotation."
+            )
 
     def to_hints(self) -> FieldHints:
         """Return the optimizer-relevant subset as a :class:`FieldHints`."""
         return FieldHints(
-            load=self.load,
-            only=self.only,
+            using=self.using,
+            scope=self.scope,
             compute=self.compute,
             disable_optimization=self.disable_optimization,
         )
@@ -70,10 +92,15 @@ class FieldDefinition:
 
 @dataclass
 class FieldHints:
-    """Optimization hints for a single field (subset of FieldDefinition)."""
+    """Optimization hints for a single field (subset of FieldDefinition).
 
-    load: list[Any] | Callable[..., Any] | None = None
-    only: list[str] | None = None
+    ``using`` names the relations this field is served with - they are
+    eager-loaded alongside the parent query. ``scope`` narrows the rows loaded
+    through this relation edge.
+    """
+
+    using: list[str] | None = None
+    scope: Callable[..., Any] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 import datetime
 import importlib
 import re
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -15,6 +16,7 @@ from strawberry.extensions import SchemaExtension
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
+from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 
@@ -51,7 +53,19 @@ _MANY_REL_TYPES = frozenset(
     }
 )
 
-_QUERY_ORDERINGS: dict[int, list[tuple[str, bool, bool | None, bool | None]]] = {}
+_REL_FIELD_TYPES = _MANY_REL_TYPES | {
+    "ForeignKeyFieldInstance",
+    "OneToOneFieldInstance",
+}
+
+_Ordering = tuple[str, bool, bool | None, bool | None]
+
+# Tortoise querysets use ``__slots__`` without ``__weakref__``, so python-side
+# orderings cannot be attached to the query or tracked with a WeakKeyDictionary.
+# The entry therefore keeps the query alive (which pins its id) and is verified
+# by identity on read: a recycled id must never inherit another query's order.
+_QUERY_ORDERINGS: OrderedDict[int, tuple[Any, list[_Ordering]]] = OrderedDict()
+_MAX_REMEMBERED_ORDERINGS = 1024
 
 
 def _primary_key(value: Any) -> Any:
@@ -60,15 +74,21 @@ def _primary_key(value: Any) -> Any:
 
 def _remember_query_ordering(
     query: Any,
-    orderings: list[tuple[str, bool, bool | None, bool | None]],
+    orderings: list[_Ordering],
 ) -> None:
-    _QUERY_ORDERINGS[id(query)] = orderings
+    _QUERY_ORDERINGS[id(query)] = (query, orderings)
+    _QUERY_ORDERINGS.move_to_end(id(query))
+    while len(_QUERY_ORDERINGS) > _MAX_REMEMBERED_ORDERINGS:
+        _QUERY_ORDERINGS.popitem(last=False)
 
 
 def _query_orderings(
     query: Any,
-) -> list[tuple[str, bool, bool | None, bool | None]] | None:
-    return _QUERY_ORDERINGS.get(id(query))
+) -> list[_Ordering] | None:
+    entry = _QUERY_ORDERINGS.get(id(query))
+    if entry is None or entry[0] is not query:
+        return None
+    return entry[1]
 
 
 def _coalesce_tortoise_prefetch_paths(model: type, paths: list[str]) -> list[Any]:
@@ -109,6 +129,16 @@ def _coalesce_tortoise_prefetch_paths(model: type, paths: list[str]) -> list[Any
         if root not in used_roots and root in meta.fields_map:
             result.append(root)
     return result
+
+
+def _counting_call(original: Any, probe: Any) -> Any:
+    """Wrap an async client method so each call bumps *probe*."""
+
+    async def _counted(*args: Any, **kwargs: Any) -> Any:
+        probe.count += 1
+        return await original(*args, **kwargs)
+
+    return _counted
 
 
 class _CustomRel:
@@ -354,10 +384,15 @@ class TortoiseBackend(BaseBackend):
 
     # -- Query application ----------------------------------------------------
 
-    def apply_filters(self, query: Any, filter_input: Any, model: type) -> Any:
+    def apply_filters(
+        self, query: Any, filter_input: Any, model: type, info: Any = None
+    ) -> Any:
         q_obj, query = _build_tortoise_filter(
             filter_input,
             query=query,
+            model=model,
+            info=info,
+            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             enable_regex=self._enable_regex_filters,
@@ -367,12 +402,16 @@ class TortoiseBackend(BaseBackend):
             query = query.filter(q_obj)
         return query
 
-    def apply_ordering(self, query: Any, order_input: Any, model: type) -> Any:
+    def apply_ordering(
+        self, query: Any, order_input: Any, model: type, info: Any = None
+    ) -> Any:
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[str] = []
         python_orderings: list[tuple[str, bool, bool | None, bool | None]] = []
         for entry in order_list:
-            entry_orderings, query = _build_tortoise_ordering(entry, query=query)
+            entry_orderings, query = _build_tortoise_ordering(
+                entry, query=query, model=model, info=info, backend=self
+            )
             for (
                 col_name,
                 descending,
@@ -420,8 +459,15 @@ class TortoiseBackend(BaseBackend):
                 if authorize and not authorize("create", rel_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
+                if repo is not None:
+                    data = repo.on_before_create(data, info)
                 _check_auth(repo, "can_create", data, info)
-                obj = await rel_model.create(**data)
+                if repo is not None:
+                    obj = await repo._create_async(rel_model, data, info)
+                else:
+                    obj = await rel_model.create(**data)
+                if repo is not None:
+                    repo.on_after_create(obj, info)
                 to_add.append(obj)
             elif ref_update is not strawberry.UNSET and ref_update is not None:
                 data = input_to_dict(ref_update)
@@ -433,11 +479,19 @@ class TortoiseBackend(BaseBackend):
                 else:
                     obj = await rel_model.filter(pk=pk).first()
                 if obj is not None:
+                    if repo is not None:
+                        data = repo.on_before_update(obj, data, info)
                     _check_auth(repo, "can_update", obj, data, info)
                     _check_auth(repo, "can_link", instance, field, obj, info)
                     if data:
-                        await rel_model.filter(pk=pk).update(**data)
-                        obj = await rel_model.get(pk=pk)
+                        if repo is not None:
+                            for k, v in data.items():
+                                setattr(obj, k, v)
+                            await repo._save_async(obj, info)
+                            repo.on_after_update(obj, info)
+                        else:
+                            await rel_model.filter(pk=pk).update(**data)
+                            obj = await rel_model.get(pk=pk)
                     to_add.append(obj)
             elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
                 if authorize and not authorize(
@@ -462,6 +516,8 @@ class TortoiseBackend(BaseBackend):
                     obj = await rel_model.filter(pk=ref_delete.id).first()
                 if obj is not None:
                     _check_auth(repo, "can_delete", obj, info)
+                    if repo is not None:
+                        repo.on_before_delete(obj, info)
                     to_delete_ids.append(ref_delete.id)
 
         if to_add:
@@ -617,6 +673,49 @@ class TortoiseBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    def _relation_target_model(self, model: type, relation: str) -> type | None:
+        field = model._meta.fields_map.get(relation)  # type: ignore[attr-defined]
+        return getattr(field, "related_model", None) if field is not None else None
+
+    def relation_names(self, model: type) -> set[str]:
+        # ``related_model`` is only populated once Tortoise is initialised, so
+        # fall back to the field class for schemas built before init.
+        fields_map = model._meta.fields_map  # type: ignore[attr-defined]
+        return {
+            name
+            for name, field in fields_map.items()
+            if getattr(field, "related_model", None) is not None
+            or type(field).__name__ in _REL_FIELD_TYPES
+        }
+
+    @contextmanager
+    def query_probe(self, info: Any) -> Any:
+        """Count statements by wrapping the client's execute methods."""
+        from strawberry_orm.lazy_resolution import QueryProbe
+
+        probe = QueryProbe()
+        try:
+            # Importing ``connections`` needs an active Tortoise context.
+            from tortoise import connections
+
+            client = connections.get("default")
+        except Exception:
+            yield probe
+            return
+
+        originals = {}
+        for name in ("execute_query", "execute_query_dict"):
+            original = getattr(client, name, None)
+            if original is None:
+                continue  # pragma: no cover
+            originals[name] = original
+            setattr(client, name, _counting_call(original, probe))
+        try:
+            yield probe
+        finally:
+            for name, original in originals.items():
+                setattr(client, name, original)
+
     async def count_query(self, query: Any, info: Any) -> int:
         return await query.count()
 
@@ -647,8 +746,8 @@ class TortoiseBackend(BaseBackend):
         type_name = self._type_name_for_model(parent_model)
         if type_name:
             hints = self._store.get(type_name, field_name)
-            if hints and callable(hints.load):
-                qs = hints.load(qs)
+            if hints and hints.scope is not None:
+                qs = call_scope(hints.scope, qs, info)
 
         return qs
 
@@ -697,8 +796,8 @@ class TortoiseBackend(BaseBackend):
             load_fn = None
             if type_name and store:
                 hints = store.get(type_name, field_name)
-                if hints and callable(hints.load):
-                    load_fn = hints.load
+                if hints and hints.scope is not None:
+                    load_fn = hints.scope
             if nested_get_qs is None and load_fn is None:
                 return None
 
@@ -706,7 +805,7 @@ class TortoiseBackend(BaseBackend):
                 if nested_get_qs is not None:
                     qs = nested_get_qs(qs, info)
                 if load_fn is not None:
-                    qs = load_fn(qs)
+                    qs = call_scope(load_fn, qs, info)
                 return qs
 
             return combined
@@ -716,6 +815,19 @@ class TortoiseBackend(BaseBackend):
                 if full_path.startswith(cp + "__"):
                     return cp
             return None
+
+        def _hint_paths(current_model: type, field_name: str, prefix: str) -> list[str]:
+            """Relation paths declared via ``using=`` for *field_name*."""
+            type_name = self._type_name_for_model(current_model)
+            hints = store.get(type_name, field_name) if type_name and store else None
+            if not hints or hints.disable_optimization or not hints.using:
+                return []
+            fields_map = current_model._meta.fields_map  # type: ignore[attr-defined]
+            return [
+                f"{prefix}__{rel_name}" if prefix else rel_name
+                for rel_name in hints.using
+                if rel_name in fields_map
+            ]
 
         def _walk_selections(
             selection_set: Any,
@@ -729,8 +841,19 @@ class TortoiseBackend(BaseBackend):
                 field_name = _to_snake(node.name.value)
                 full_path = f"{prefix}__{field_name}" if prefix else field_name
 
+                # Declared against the field name, so these also apply to computed
+                # fields that are not ORM fields themselves.
+                for rel_path in _hint_paths(current_model, field_name, prefix):
+                    hint_ancestor = _find_custom_ancestor(rel_path)
+                    if hint_ancestor is not None:
+                        custom_sub_prefetches[hint_ancestor].append(
+                            rel_path[len(hint_ancestor) + 2 :]
+                        )
+                    else:
+                        prefetch_paths.append(rel_path)
+
                 if field_name not in meta.fields_map:
-                    continue  # pragma: no cover
+                    continue
                 field_obj = meta.fields_map[field_name]
                 field_cls = type(field_obj).__name__
 
@@ -797,42 +920,13 @@ class TortoiseBackend(BaseBackend):
                         full_path,
                     )
 
-                type_name = self._type_name_for_model(current_model)
-                if type_name and store:
-                    hints = store.get(type_name, field_name)
-                    if (
-                        hints
-                        and not hints.disable_optimization
-                        and hints.load
-                        and not callable(hints.load)
-                    ):
-                        for rel_name in hints.load:
-                            if rel_name in meta.fields_map:
-                                rel_path = (
-                                    f"{prefix}__{rel_name}" if prefix else rel_name
-                                )
-                                prefetch_paths.append(rel_path)
-
         for field_node in field_nodes_from_info(info):
             _walk_selections(field_node.selection_set, model)
-
-        only_fields: list[str] = []
-        type_name_root = self._type_name_for_model(model)
-        if type_name_root and store:
-            for field_node in field_nodes_from_info(info):
-                if field_node.selection_set:
-                    for sel in iter_field_nodes(field_node.selection_set, fragments):
-                        fname = _to_snake(sel.name.value)
-                        hints = store.get(type_name_root, fname)
-                        if hints and hints.only:
-                            only_fields.extend(hints.only)
 
         if prefetch_paths:
             query = query.prefetch_related(
                 *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
             )
-        if only_fields:
-            query = query.only(*only_fields)
         if orderings:
             _remember_query_ordering(query, orderings)
 
@@ -849,7 +943,7 @@ class TortoiseBackend(BaseBackend):
         custom_rels: list[_CustomRel],
     ) -> None:
         """Execute batch queries for relationships that need custom querysets
-        (load callable or nested get_queryset) and assign results to parents."""
+        (load callable or nested scope_rows) and assign results to parents."""
         if not parents:
             return
 
@@ -964,9 +1058,9 @@ def _make_tortoise_rel_resolver(
         ) -> Any:
             qs = _build_qs(self, info)
             if filter is not None:
-                qs = backend.apply_filters(qs, filter, rel_model)
+                qs = backend.apply_filters(qs, filter, rel_model, info=info)
             if order is not None:
-                qs = backend.apply_ordering(qs, order, rel_model)
+                qs = backend.apply_ordering(qs, order, rel_model, info=info)
             return _apply_python_ordering(
                 list(await qs),
                 _query_orderings(qs),
@@ -982,7 +1076,7 @@ def _make_tortoise_rel_resolver(
         async def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             qs = _build_qs(self, info)
             if filter is not None:
-                qs = backend.apply_filters(qs, filter, rel_model)
+                qs = backend.apply_filters(qs, filter, rel_model, info=info)
             return _apply_python_ordering(
                 list(await qs),
                 _query_orderings(qs),
@@ -997,7 +1091,7 @@ def _make_tortoise_rel_resolver(
         async def resolver(self: Any, info: Any, order: Any = None) -> Any:
             qs = _build_qs(self, info)
             if order is not None:
-                qs = backend.apply_ordering(qs, order, rel_model)
+                qs = backend.apply_ordering(qs, order, rel_model, info=info)
             return _apply_python_ordering(
                 list(await qs),
                 _query_orderings(qs),
@@ -1031,11 +1125,34 @@ _LOOKUP_TO_TORTOISE: dict[str, str] = {
 }
 
 
+def _tortoise_relation_scope_q(
+    backend: Any, model: type | None, relation: str, info: Any, prefix: str
+) -> Any | None:
+    """``Q`` restricting *relation* to the rows its scoping allows.
+
+    Covers both the related type's ``scope_rows`` and any ``scope=`` on this
+    edge, so a filter cannot reach rows the read path hides.
+    """
+    if backend is None or model is None:
+        return None
+    get_qs = backend.relation_scope(model, relation, info)
+    if get_qs is None:
+        return None
+    from tortoise.expressions import Q, Subquery
+
+    related = backend._relation_target_model(model, relation)
+    pk_attr = related._meta.pk_attr
+    scoped = get_qs(related.all(), info)
+    return Q(**{f"{prefix}{relation}__{pk_attr}__in": Subquery(scoped.values(pk_attr))})
+
+
 def _build_tortoise_filter(
     filter_input: Any,
     *,
     query: Any = None,
+    model: type | None = None,
     info: Any = None,
+    backend: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
     enable_regex: bool = False,
@@ -1056,7 +1173,9 @@ def _build_tortoise_filter(
     custom_filter_keys = frozenset(custom_filters.keys())
     recurse_kw = dict(
         query=query,
+        model=model,
         info=info,
+        backend=backend,
         max_depth=max_depth,
         max_branches=max_branches,
         enable_regex=enable_regex,
@@ -1095,6 +1214,16 @@ def _build_tortoise_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
+                # Traversal joins straight to the related table, so the related
+                # type's row scoping has to be re-applied or it is bypassed.
+                scope_q = _tortoise_relation_scope_q(
+                    backend, model, rel_name, info, _prefix
+                )
+                if scope_q is not None:
+                    is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
+                    if is_null_val is not strawberry.UNSET and is_null_val is not None:
+                        # "Has no related row" has to mean "none the caller can see".
+                        return (~scope_q if is_null_val else scope_q), query
                 fk_col = f"{rel_name}_id"
                 fk_prefix = f"{_prefix}{fk_col}"
                 fk_clause = build_reference_object_filter_clause(
@@ -1107,11 +1236,19 @@ def _build_tortoise_filter(
                     max_in_list_size=max_in_list_size,
                 )
                 if fk_clause is not None:
+                    if scope_q is not None:
+                        fk_clause = fk_clause & scope_q
                     return fk_clause, query
-                return _build_tortoise_filter(
+                nested_clause, query = _build_tortoise_filter(
                     nested_filter,
                     query=query,
+                    model=(
+                        backend._relation_target_model(model, rel_name)
+                        if backend is not None and model is not None
+                        else None
+                    ),
                     info=info,
+                    backend=backend,
                     max_depth=max_depth,
                     max_branches=max_branches,
                     enable_regex=enable_regex,
@@ -1119,6 +1256,9 @@ def _build_tortoise_filter(
                     _depth=_depth + 1,
                     _prefix=f"{_prefix}{rel_name}__",
                 )
+                if nested_clause is not None and scope_q is not None:
+                    nested_clause = nested_clause & scope_q
+                return nested_clause, query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -1400,6 +1540,8 @@ def _build_tortoise_ordering(
     *,
     query: Any = None,
     info: Any = None,
+    model: type | None = None,
+    backend: Any = None,
 ) -> tuple[list[tuple[str, bool, bool | None, bool | None]], Any]:
     """Return ``(ordering_tuples, query)``."""
     clauses: list[tuple[str, bool, bool | None, bool | None]] = []
@@ -1419,11 +1561,21 @@ def _build_tortoise_ordering(
                 nested = getattr(val, rel_name)
                 if nested is strawberry.UNSET or nested is None:
                     continue
+                if backend is not None and model is not None:
+                    backend.reject_scoped_order_traversal(
+                        model, rel_name, type(order_input)
+                    )
                 sub_clauses, query = _build_tortoise_ordering(
                     nested,
                     _prefix=f"{_prefix}{rel_name}__",
                     query=query,
                     info=info,
+                    model=(
+                        backend._relation_target_model(model, rel_name)
+                        if backend is not None and model is not None
+                        else None
+                    ),
+                    backend=backend,
                 )
                 clauses.extend(sub_clauses)
         elif key in custom_orders:

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import await_maybe
+from strawberry_orm.batching import stash_parents
 
 if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
@@ -53,6 +54,33 @@ def get_configured_optimizer(info: Any) -> tuple[Backend | None, OptimizerStore 
         getattr(extension, "_backend", None),
         getattr(extension, "_store", None),
     )
+
+
+def returns_single_orm_object(backend: Backend, info: Any) -> bool:
+    """Return True when the field yields one ORM object rather than a list.
+
+    Backends materialize query objects into lists, so a field annotated
+    ``PostType | None`` needs the single row lifted back out. Connections and
+    other wrapper types are left alone: their named type is not a registered
+    ORM type.
+    """
+    from graphql import GraphQLList, GraphQLNonNull
+
+    return_type = getattr(info, "return_type", None)
+    while isinstance(return_type, GraphQLNonNull):
+        return_type = return_type.of_type
+    if return_type is None or isinstance(return_type, GraphQLList):
+        return False
+
+    name = getattr(return_type, "name", None)
+    registry = getattr(backend, "_type_registry", {})
+    return name is not None and name in registry
+
+
+def _unwrap_single(result: Any, singular: bool) -> Any:
+    if not singular or not isinstance(result, list):
+        return result
+    return result[0] if result else None
 
 
 def optimize_query_nodes(nodes: Any, info: Any) -> Any:
@@ -102,19 +130,24 @@ class OptimizerExtension(SchemaExtension):
     ) -> Any:
         result = _next(root, info, *args, **kwargs)
         backend = self._backend
+        singular = False
         if (
             backend is not None
             and self._store is not None
             and backend.is_query_object(result)
         ):
+            singular = returns_single_orm_object(backend, info)
             result = backend.apply_optimizer_hints(self._store, result, info)
 
         if isawaitable(result):
-            return self._resolve_async(result, info)
+            return self._resolve_async(result, info, singular)
 
-        return result
+        stash_parents(getattr(self, "execution_context", None), info, result)
+        return _unwrap_single(result, singular)
 
-    async def _resolve_async(self, result: Any, info: Any) -> Any:
+    async def _resolve_async(
+        self, result: Any, info: Any, singular: bool = False
+    ) -> Any:
         result = await await_maybe(result)
 
         backend = self._backend
@@ -123,8 +156,10 @@ class OptimizerExtension(SchemaExtension):
             and self._store is not None
             and backend.is_query_object(result)
         ):
+            singular = returns_single_orm_object(backend, info)
             result = await await_maybe(
                 backend.apply_optimizer_hints(self._store, result, info)
             )
 
-        return result
+        stash_parents(getattr(self, "execution_context", None), info, result)
+        return _unwrap_single(result, singular)

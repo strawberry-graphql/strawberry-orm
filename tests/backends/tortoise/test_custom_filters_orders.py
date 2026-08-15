@@ -38,7 +38,7 @@ class TestCustomFilterType:
 
         @strawberry.type
         class Query:
-            @orm.field()
+            @orm.field.auto()
             async def users(self) -> list[UserType]:
                 return orm.get_default_queryset(TortUser)
 
@@ -120,7 +120,7 @@ class TestCustomOrderType:
 
         @strawberry.type
         class Query:
-            @orm.field()
+            @orm.field.auto()
             async def users(self) -> list[UserType]:
                 return orm.get_default_queryset(TortUser)
 

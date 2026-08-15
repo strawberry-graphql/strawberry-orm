@@ -19,6 +19,9 @@ EXCLUDED_FILES = {
     "test_query_async_session.py",
     "test_internal_sqlalchemy_extra_coverage.py",
     "test_internal_backend_coverage.py",
+    # Backend-specific query reflection; the shared behaviour is asserted by
+    # test_batching_differential.py and test_batching_security.py.
+    "test_batching_internals.py",
     "test_grouping.py",
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
@@ -91,7 +94,7 @@ TORT_EXCLUDED_FILES = {
     "test_query_nested_resolution.py",
     "test_query_self_is_model.py",
     "test_query_multiple_types.py",
-    "test_query_get_queryset.py",
+    "test_query_scope_rows.py",
     "test_query_error_handling.py",
     "test_mutation_crud.py",
     "test_query_field_hints.py",

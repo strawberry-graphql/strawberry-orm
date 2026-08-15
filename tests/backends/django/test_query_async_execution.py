@@ -91,7 +91,7 @@ class TestAsyncExecution:
 
         @strawberry.type
         class Query:
-            posts: list[PostType] = orm.field()
+            posts: list[PostType] = orm.field.auto()
 
         schema = strawberry.Schema(
             query=Query,
@@ -111,7 +111,7 @@ class TestAsyncExecution:
 
         @strawberry.type
         class Query:
-            @orm.field
+            @orm.field.custom
             def users(self) -> list[UserType]:
                 return list(DjUser.objects.order_by("id"))  # type: ignore[return-value]
 
@@ -197,7 +197,7 @@ class TestAsyncExecution:
 
         @strawberry.type
         class Query:
-            @orm.field
+            @orm.field.custom
             def posts(self) -> list[PostNode]:
                 return list(DjPost.objects.order_by("id"))  # type: ignore[return-value]
 

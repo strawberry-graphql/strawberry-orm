@@ -114,9 +114,9 @@ TagRef = _main_orm.ref(
 
 @strawberry.type
 class _MainQuery:
-    users: list[UserType] = _main_orm.field()
-    posts: list[PostType] = _main_orm.field()
-    comments: list[CommentType] = _main_orm.field()
+    users: list[UserType] = _main_orm.field.auto()
+    posts: list[PostType] = _main_orm.field.auto()
+    comments: list[CommentType] = _main_orm.field.auto()
 
     @strawberry.field
     def user(self, id: int) -> UserType | None:
@@ -283,27 +283,34 @@ def _selected_root_key(input_obj: object) -> str:
 
 _CreateNodeInput = _node_orm.mutations.create_node_input(name="CreateNodeInput")
 _UpdateNodeInput = _node_orm.mutations.update_node_input(name="UpdateNodeInput")
+_ProjectedCreateNodeInput = _node_orm.mutations.create_node_input(
+    project=_node_project, name="ProjectedCreateNodeInput"
+)
+_ProjectedUpdateNodeInput = _node_orm.mutations.update_node_input(
+    project=_node_project, name="ProjectedUpdateNodeInput"
+)
 
 
 @strawberry.type(name="Mutation")
 class _NodeMutation:
-    create_node = _node_orm.mutations.create_node(input_name="CreateNodeInput")
-    update_node = _node_orm.mutations.update_node(input_name="UpdateNodeInput")
-    projected_create_node = _node_orm.mutations.create_node(
-        project=_node_project,
-        input_name="ProjectedCreateNodeInput",
-    )
-    projected_update_node = _node_orm.mutations.update_node(
-        project=_node_project,
-        input_name="ProjectedUpdateNodeInput",
-    )
-
     @strawberry.field
     def inspect_create_node_input(self, input: _CreateNodeInput) -> str:
         return _selected_root_key(input)
 
     @strawberry.field
     def inspect_update_node_input(self, input: _UpdateNodeInput) -> str:
+        return _selected_root_key(input)
+
+    @strawberry.field
+    def inspect_projected_create_node_input(
+        self, input: _ProjectedCreateNodeInput
+    ) -> str:
+        return _selected_root_key(input)
+
+    @strawberry.field
+    def inspect_projected_update_node_input(
+        self, input: _ProjectedUpdateNodeInput
+    ) -> str:
         return _selected_root_key(input)
 
 
@@ -381,7 +388,7 @@ class PublishedPostType:
     is_published: auto
 
     @classmethod
-    def get_queryset(cls, qs, info):
+    def scope_rows(cls, qs, info):
         return qs.filter(is_published=True)
 
 
@@ -402,7 +409,7 @@ class _GetQuerysetQuery:
         return DjUser.objects.all()  # type: ignore[return-value]
 
 
-get_queryset_schema = _qs_orm.schema(
+scope_rows_schema = _qs_orm.schema(
     query=_GetQuerysetQuery,
 )
 
@@ -453,6 +460,17 @@ multi_type_schema = _multi_orm.schema(
 @pytest.fixture
 def orm():
     return StrawberryORM.for_django(lazy_resolution="off")
+
+
+@pytest.fixture
+def orm_factory():
+    """Build ORMs with custom kwargs (strict_hints, batch_relations, ...)."""
+
+    def _make(**kwargs):
+        kwargs.setdefault("lazy_resolution", "off")
+        return StrawberryORM.for_django(**kwargs)
+
+    return _make
 
 
 # -- Model class fixtures ----------------------------------------------------
@@ -635,8 +653,8 @@ def self_model_execute(seed):
 
 
 @pytest.fixture
-def get_queryset_execute(seed):
-    return _make_executor(get_queryset_schema)
+def scope_rows_execute(seed):
+    return _make_executor(scope_rows_schema)
 
 
 @pytest.fixture

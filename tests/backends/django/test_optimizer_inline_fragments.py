@@ -88,7 +88,7 @@ class TestOptimizerInlineFragments(AbstractTestOptimizerInlineFragmentsSync):
         @orm.type(User)
         class UsersUnionType:
             id: auto
-            posts: list[PostUnion] = orm.field()
+            posts: list[PostUnion] = orm.field.auto()
 
         @strawberry.type
         class UnionListQuery:
