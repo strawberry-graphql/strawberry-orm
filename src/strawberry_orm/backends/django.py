@@ -242,33 +242,45 @@ class DjangoBackend(BaseBackend):
                         )
                     else:
 
-                        def _make_resolver(fname: str, return_ann: Any) -> Any:
-                            def resolver(self: Any) -> Any:
-                                return list(getattr(self, fname).all())
+                        def _make_resolver(
+                            fname: str, return_ann: Any, backend: Any
+                        ) -> Any:
+                            def resolver(self: Any, info: Any) -> Any:
+                                return list(
+                                    _scoped_related_queryset(backend, self, fname, info)
+                                )
 
                             resolver.__name__ = fname
-                            resolver.__annotations__ = {"return": return_ann}
-                            if self._django_async_safe:
+                            resolver.__annotations__ = {
+                                "info": strawberry.types.Info,
+                                "return": return_ann,
+                            }
+                            if backend._django_async_safe:
                                 resolver = async_safe_resolver(resolver)
                             return strawberry.field(resolver=resolver)
 
-                        setattr(cls, field_name, _make_resolver(field_name, ann))
+                        setattr(cls, field_name, _make_resolver(field_name, ann, self))
                 elif kind in ("fk", "one"):
 
-                    def _make_fk_resolver(fname: str, return_ann: Any) -> Any:
-                        def resolver(self: Any) -> Any:
-                            return getattr(self, fname)
+                    def _make_fk_resolver(
+                        fname: str, return_ann: Any, backend: Any
+                    ) -> Any:
+                        def resolver(self: Any, info: Any) -> Any:
+                            return _scoped_related_instance(backend, self, fname, info)
 
                         resolver.__name__ = fname
-                        resolver.__annotations__ = {"return": return_ann}
-                        if self._django_async_safe:
+                        resolver.__annotations__ = {
+                            "info": strawberry.types.Info,
+                            "return": return_ann,
+                        }
+                        if backend._django_async_safe:
                             resolver = async_safe_resolver(
                                 resolver,
                                 materialize=False,
                             )
                         return strawberry.field(resolver=resolver)
 
-                    setattr(cls, field_name, _make_fk_resolver(field_name, ann))
+                    setattr(cls, field_name, _make_fk_resolver(field_name, ann, self))
 
             annotations = getattr(cls, "__annotations__", {})
             self._check_lazy_relation_fields(cls, model, annotations)
@@ -571,6 +583,11 @@ class DjangoBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    def is_model_instance(self, value: Any) -> bool:
+        from django.db.models import Model
+
+        return isinstance(value, Model)
+
     def relation_names(self, model: type) -> set[str]:
         return {
             f.name
@@ -719,7 +736,14 @@ class DjangoBackend(BaseBackend):
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
 
-    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+    def _relation_lookups(
+        self, store: Any, model: type, info: Any
+    ) -> tuple[list[str], list[Any]]:
+        """Return the lookups the current selection needs for *model*.
+
+        Shared by query optimization and by loading relations onto instances
+        the caller already holds, so both apply the same row scoping.
+        """
         import re
 
         from strawberry_orm.optimizer.selections import (
@@ -728,17 +752,7 @@ class DjangoBackend(BaseBackend):
             iter_field_nodes,
         )
 
-        def optimize() -> Any:
-            try:
-                model = query.model
-            except AttributeError:
-                return query
-
-            optimized_query = query
-            get_qs = self._type_querysets.get(model)
-            if get_qs is not None:
-                optimized_query = get_qs(optimized_query, info)
-
+        def compute() -> tuple[list[str], list[Any]]:
             select_related: list[str] = []
             prefetch_related: list[Any] = []
             fragments = fragments_from_info(info)
@@ -924,6 +938,25 @@ class DjangoBackend(BaseBackend):
             for field_node in field_nodes_from_info(info):
                 _walk_selections(field_node.selection_set, model)
 
+            return select_related, prefetch_related
+
+        return compute()
+
+    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+        def optimize() -> Any:
+            try:
+                model = query.model
+            except AttributeError:
+                return query
+
+            optimized_query = query
+            get_qs = self._type_querysets.get(model)
+            if get_qs is not None:
+                optimized_query = get_qs(optimized_query, info)
+
+            select_related, prefetch_related = self._relation_lookups(
+                store, model, info
+            )
             if select_related:
                 optimized_query = optimized_query.select_related(*select_related)
             if prefetch_related:
@@ -933,10 +966,119 @@ class DjangoBackend(BaseBackend):
 
         return run_sync(optimize, thread_sensitive=True)
 
+    def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
+        """Eager-load the selected relations onto instances already in memory.
+
+        ``prefetch_related_objects`` fills the relation caches in place, so
+        scalar values the caller is holding - which may be fresher than the
+        database, straight out of a mutation - are never overwritten.
+        """
+
+        def load() -> list[Any]:
+            from django.db.models import prefetch_related_objects
+
+            by_model: dict[type, list[Any]] = {}
+            for instance in instances:
+                by_model.setdefault(type(instance), []).append(instance)
+
+            for model, rows in by_model.items():
+                select_related, prefetch_related = self._relation_lookups(
+                    store, model, info
+                )
+                lookups = _dedupe_lookups([*select_related, *prefetch_related])
+                if lookups:
+                    prefetch_related_objects(rows, *lookups)
+            return instances
+
+        return run_sync(load, thread_sensitive=True)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _scoped_related_queryset(
+    backend: Any, instance: Any, field_name: str, info: Any
+) -> Any:
+    """Return the related rows for *field_name*, with row scoping applied.
+
+    The optimizer scopes relations when it builds the prefetch, but a resolver
+    that returns materialized rows never gives it a query to work on. Reading
+    the relation off the instance would then skip the related type's
+    ``scope_rows`` entirely and hand back rows the caller may not read, so the
+    scope is applied here instead.
+
+    A prefetched relation was already scoped on the way in; re-filtering it
+    would throw the cache away and issue the query this path exists to avoid.
+    """
+    from strawberry_orm.lazy_resolution import _django_relation_prefetched
+
+    manager = getattr(instance, field_name)
+    if _django_relation_prefetched(instance, field_name):
+        return manager.all()
+
+    restrict = backend.relation_scope(type(instance), field_name, info)
+    queryset = manager.all()
+    return queryset if restrict is None else restrict(queryset, info)
+
+
+def _scoped_related_instance(
+    backend: Any, instance: Any, field_name: str, info: Any
+) -> Any:
+    """Return the related row for a to-one *field_name*, with scoping applied.
+
+    A scoped-out row reads as absent, matching what the optimizer produces
+    when its scoped load finds nothing on the other end.
+    """
+    from strawberry_orm.lazy_resolution import _django_relation_prefetched
+
+    restrict = backend.relation_scope(type(instance), field_name, info)
+    if restrict is None:
+        return getattr(instance, field_name)
+
+    # With a scope in play a removed row has to read as absent. The scoped
+    # eager load leaves the cache empty, and Django's forward descriptor
+    # raises rather than returning None for a non-nullable column.
+    if _django_relation_prefetched(instance, field_name):
+        return getattr(instance, field_name, None)
+
+    related = getattr(instance, field_name, None)
+    if related is None:
+        return None
+    queryset = type(related)._default_manager.filter(pk=related.pk)
+    return restrict(queryset, info).first()
+
+
+def _dedupe_lookups(lookups: list[Any]) -> list[Any]:
+    """Collapse repeated lookups for one path, keeping the scoped one.
+
+    The same relation can be reached twice - two aliases of one field, or a
+    field both selected and named in ``using=`` - and Django rejects a repeated
+    path when either occurrence carries a queryset. Which duplicate survives
+    matters: only the ``Prefetch`` carries the row scope, so a bare path must
+    never be allowed to shadow it.
+    """
+    position: dict[str, int] = {}
+    unique: list[Any] = []
+    for lookup in lookups:
+        path = (
+            lookup if isinstance(lookup, str) else getattr(lookup, "prefetch_to", None)
+        )
+        if path is None:
+            unique.append(lookup)
+            continue
+        if path not in position:
+            position[path] = len(unique)
+            unique.append(lookup)
+            continue
+        kept = unique[position[path]]
+        if (
+            getattr(kept, "queryset", None) is None
+            and getattr(lookup, "queryset", None) is not None
+        ):
+            unique[position[path]] = lookup
+    return unique
 
 
 def _is_parent_predicate(
@@ -990,7 +1132,15 @@ def _make_dj_rel_resolver(
         filter: Any = None,
         order: Any = None,
     ) -> list[Any]:
+        if filter is None and order is None:
+            return list(_scoped_related_queryset(backend, self, fname, info))
+
+        # Filtering or ordering re-runs the query, so a prefetched result
+        # cannot carry the scope through - it has to be reapplied here.
+        restrict = backend.relation_scope(type(self), fname, info)
         qs = getattr(self, fname).all()
+        if restrict is not None:
+            qs = restrict(qs, info)
         if filter is not None:
             qs = backend.apply_filters(qs, filter, rel_model, info=info)
         if order is not None:

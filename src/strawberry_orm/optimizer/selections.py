@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from graphql.language.ast import FieldNode, FragmentSpreadNode, InlineFragmentNode
@@ -48,6 +48,72 @@ def field_nodes_from_info(info: Any) -> list[FieldNode]:
     if raw_info is not None:
         return list(raw_info.field_nodes)
     return list(getattr(info, "field_nodes", ()) or ())
+
+
+class _AttributeOverride:
+    """Read-through proxy that replaces a single attribute on *wrapped*."""
+
+    def __init__(self, wrapped: Any, **overrides: Any) -> None:
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_overrides", overrides)
+
+    def __getattr__(self, name: str) -> Any:
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        return getattr(object.__getattribute__(self, "_wrapped"), name)
+
+
+def _named_children(
+    nodes: list[FieldNode], name: str, fragments: dict[str, Any]
+) -> list[FieldNode]:
+    """Return the selections named *name* directly under *nodes*."""
+    snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+
+    def _walk(selection_set: Any) -> Iterator[FieldNode]:
+        if selection_set is None:
+            return
+        for node in selection_set.selections:
+            if isinstance(node, FieldNode):
+                candidate = node.name.value
+                if candidate == name or (
+                    re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", candidate).lower() == snake
+                ):
+                    yield node
+            elif isinstance(node, InlineFragmentNode):
+                yield from _walk(node.selection_set)
+            elif isinstance(node, FragmentSpreadNode):
+                fragment = fragments.get(node.name.value)
+                if fragment is not None:
+                    yield from _walk(fragment.selection_set)
+
+    found: list[FieldNode] = []
+    for node in nodes:
+        found.extend(_walk(node.selection_set))
+    return found
+
+
+def narrow_info(info: Any, path: str | Sequence[str]) -> Any:
+    """Return an ``info`` whose selection set is re-rooted at *path*.
+
+    The optimizer reads the selection from the field currently being resolved.
+    When the rows live further down - under a payload's ``data``, say - it has
+    to be pointed at that node instead, or it will look for relations among
+    ``data`` and ``errors`` and find nothing.
+    """
+    names = [path] if isinstance(path, str) else list(path)
+    raw_info = graphql_resolve_info(info)
+    fragments = fragments_from_info(info) or {}
+
+    nodes = field_nodes_from_info(info)
+    for name in names:
+        nodes = _named_children(nodes, name, fragments)
+        if not nodes:
+            break
+
+    return _AttributeOverride(
+        info, _raw_info=_AttributeOverride(raw_info, field_nodes=nodes)
+    )
 
 
 def _relay_passthrough_field(name: str) -> bool:

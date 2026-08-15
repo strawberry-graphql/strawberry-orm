@@ -188,3 +188,32 @@ class AbstractTestSecurityVulnerabilities:
         """Traversal is scoped at query time (see ``filter_traversal_scoping``),
         so exposing it is no longer something to warn about."""
         assert self.build_traversal_schema(orm_factory()) == []
+
+    def test_materialized_parents_do_not_bypass_relation_scoping(
+        self, seed, run_materialized_parents
+    ):
+        """A resolver returning rows must not disable scoping below it.
+
+        The optimizer scopes a relation while building the eager load, which it
+        can only do when a resolver hands it a query object. Returning
+        ``list(qs)`` instead used to skip that, and the relation was read
+        straight off each parent with no scope applied - so a single call to
+        ``list()`` quietly turned off row-level access control for everything
+        underneath it.
+        """
+        materialized = run_materialized_parents(materialize=True)
+        lazy = run_materialized_parents(materialize=False)
+        assert materialized == lazy, (
+            "scoping depends on whether the resolver materialized its rows"
+        )
+
+    def test_materialized_parents_do_not_bypass_to_one_scoping(
+        self, seed, run_materialized_to_one
+    ):
+        """The same leak on the other side of the relation.
+
+        A scoped-out parent has to read as absent, not as the row itself.
+        """
+        materialized = run_materialized_to_one(materialize=True)
+        lazy = run_materialized_to_one(materialize=False)
+        assert materialized == lazy

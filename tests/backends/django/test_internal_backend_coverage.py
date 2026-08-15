@@ -641,3 +641,70 @@ class TestTraversalModelResolution:
 
         assert _django_traversal_model(User, "posts") is Post
         assert _django_related_model(User, "posts") is None
+
+
+class TestScopedRelationHelpers:
+    """Branches of the resolve-time scoping helpers that the schema tests miss."""
+
+    def test_a_null_to_one_relation_stays_null(self):
+        """A nullable relation with nothing on the other end needs no query."""
+        from strawberry_orm.backends.django import _scoped_related_instance
+
+        class Holder:
+            author = None
+
+        class ScopingBackend:
+            @staticmethod
+            def relation_scope(model, field_name, info):
+                return lambda queryset, info: queryset
+
+        assert (
+            _scoped_related_instance(ScopingBackend(), Holder(), "author", None) is None
+        )
+
+    def test_repeated_lookups_are_collapsed(self):
+        """Two aliases of one relation must not become two prefetches.
+
+        Django rejects a repeated path when either occurrence carries a
+        queryset, so the same field selected twice would raise.
+        """
+        from django.db.models import Prefetch
+
+        from strawberry_orm.backends.django import _dedupe_lookups
+
+        first = Prefetch("posts")
+        collapsed = _dedupe_lookups(["author", "posts", "author", first, "posts"])
+
+        assert collapsed == ["author", "posts"]
+
+    def test_a_scoped_lookup_outranks_a_bare_one(self, Post):
+        """The scope lives on the ``Prefetch``, so it must survive deduping.
+
+        A relation can be reached both by name - from ``using=`` - and as a
+        scoped prefetch. Keeping the bare path would drop the scope and load
+        rows the caller may not read.
+        """
+        from django.db.models import Prefetch
+
+        from strawberry_orm.backends.django import _dedupe_lookups
+
+        scoped = Prefetch("posts", queryset=Post.objects.filter(is_published=True))
+
+        assert _dedupe_lookups(["posts", scoped]) == [scoped]
+        assert _dedupe_lookups([scoped, "posts"]) == [scoped]
+
+    def test_the_first_scoped_lookup_wins_over_a_later_one(self, Post):
+        from django.db.models import Prefetch
+
+        from strawberry_orm.backends.django import _dedupe_lookups
+
+        first = Prefetch("posts", queryset=Post.objects.filter(is_published=True))
+        second = Prefetch("posts", queryset=Post.objects.all())
+
+        assert _dedupe_lookups([first, second]) == [first]
+
+    def test_lookups_without_a_path_are_kept(self):
+        from strawberry_orm.backends.django import _dedupe_lookups
+
+        opaque = object()
+        assert _dedupe_lookups([opaque, opaque]) == [opaque, opaque]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import importlib
+import inspect
 import re
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -315,13 +316,23 @@ class TortoiseBackend(BaseBackend):
                 if field_name in vars(cls):
                     continue  # pragma: no cover
                 ann = annotations[field_name]
+                rel_model = rel_fields[field_name]["model"]
                 el_type = extract_element_type(ann)
                 if el_type is None:
+                    # A to-one relation. No arguments to generate, but it
+                    # still needs a resolver so the scope is applied when the
+                    # parent arrives already materialized.
+                    setattr(
+                        cls,
+                        field_name,
+                        _make_tortoise_to_one_resolver(
+                            self, field_name, rel_model, ann
+                        ),
+                    )
                     continue
 
                 f_type = getattr(el_type, "__orm_filter__", None)
                 o_type = getattr(el_type, "__orm_order__", None)
-                rel_model = rel_fields[field_name]["model"]
 
                 if f_type or o_type:
                     setattr(
@@ -344,7 +355,15 @@ class TortoiseBackend(BaseBackend):
                         backend: Any,
                     ) -> Any:
                         async def resolver(self: Any, info: Any) -> Any:
+                            from strawberry_orm.lazy_resolution import (
+                                _tortoise_relation_prefetched,
+                            )
+
                             rel_value = getattr(self, fname)
+                            # A prefetched relation was already scoped on the
+                            # way in; re-querying it would discard that work.
+                            if _tortoise_relation_prefetched(self, fname):
+                                return list(rel_value)
                             qs = (
                                 rel_value.all()
                                 if hasattr(rel_value, "all")
@@ -552,7 +571,12 @@ class TortoiseBackend(BaseBackend):
         if not agg_kwargs:
             return aggregate_meta.aggregates_type(count=0)
 
-        result = await query.annotate(**agg_kwargs).values(*agg_kwargs.keys())
+        # Tortoise folds ordering columns into the GROUP BY of an aggregate
+        # query, which silently turns a total into a per-row count. Ordering
+        # means nothing to a single aggregate row, so drop it.
+        result = (
+            await query.order_by().annotate(**agg_kwargs).values(*agg_kwargs.keys())
+        )
         if result:
             row = type("Row", (), result[0])()
         else:
@@ -588,8 +612,12 @@ class TortoiseBackend(BaseBackend):
             for fname in requested.get(func_name, []):
                 agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
 
+        # Any ordering inherited from the base query would join the GROUP BY
+        # and split the groups; the explicit clauses below are the only
+        # ordering that should apply.
         qs = (
-            query.annotate(**agg_kwargs)
+            query.order_by()
+            .annotate(**agg_kwargs)
             .group_by(*group_fields)
             .values(*group_fields, *agg_kwargs.keys())
         )
@@ -673,6 +701,11 @@ class TortoiseBackend(BaseBackend):
 
         return isinstance(value, QuerySet)
 
+    def is_model_instance(self, value: Any) -> bool:
+        from tortoise.models import Model
+
+        return isinstance(value, Model)
+
     def _relation_target_model(self, model: type, relation: str) -> type | None:
         field = model._meta.fields_map.get(relation)  # type: ignore[attr-defined]
         return getattr(field, "related_model", None) if field is not None else None
@@ -751,32 +784,21 @@ class TortoiseBackend(BaseBackend):
 
         return qs
 
-    async def apply_optimizer_hints(
-        self,
-        store: Any,
-        query: Any,
-        info: Any,
-    ) -> Any:
+    def _relation_prefetches(
+        self, store: Any, model: type, info: Any
+    ) -> tuple[list[str], list[_CustomRel]]:
+        """Return the prefetch paths and scoped relations the selection needs.
+
+        Shared by query optimization and by loading relations onto instances
+        the caller already holds, so both apply the same row scoping.
+        """
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
             fragments_from_info,
             iter_field_nodes,
         )
 
-        orderings = _query_orderings(query)
         fragments = fragments_from_info(info)
-
-        try:
-            model = query.model
-        except AttributeError:
-            return _apply_python_ordering(
-                list(await query),
-                orderings,
-            )
-
-        get_qs = self._type_querysets.get(model)
-        if get_qs is not None:
-            query = get_qs(query, info)
 
         prefetch_paths: list[str] = []
         custom_rels: list[_CustomRel] = []
@@ -923,6 +945,27 @@ class TortoiseBackend(BaseBackend):
         for field_node in field_nodes_from_info(info):
             _walk_selections(field_node.selection_set, model)
 
+        return prefetch_paths, custom_rels
+
+    async def apply_optimizer_hints(
+        self,
+        store: Any,
+        query: Any,
+        info: Any,
+    ) -> Any:
+        orderings = _query_orderings(query)
+
+        try:
+            model = query.model
+        except AttributeError:
+            return _apply_python_ordering(list(await query), orderings)
+
+        get_qs = self._type_querysets.get(model)
+        if get_qs is not None:
+            query = get_qs(query, info)
+
+        prefetch_paths, custom_rels = self._relation_prefetches(store, model, info)
+
         if prefetch_paths:
             query = query.prefetch_related(
                 *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
@@ -936,6 +979,30 @@ class TortoiseBackend(BaseBackend):
             await self._apply_custom_prefetch(results, custom_rels)
 
         return results
+
+    async def load_relations(
+        self, store: Any, instances: list[Any], info: Any
+    ) -> list[Any]:
+        """Eager-load the selected relations onto instances already in memory.
+
+        ``fetch_for_list`` fills the relation caches in place, so scalar values
+        the caller is holding - which may be fresher than the database,
+        straight out of a mutation - are never overwritten.
+        """
+        by_model: dict[type, list[Any]] = {}
+        for instance in instances:
+            by_model.setdefault(type(instance), []).append(instance)
+
+        for model, rows in by_model.items():
+            prefetch_paths, custom_rels = self._relation_prefetches(store, model, info)
+            if prefetch_paths:
+                await model.fetch_for_list(
+                    rows, *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
+                )
+            if custom_rels:
+                await self._apply_custom_prefetch(rows, custom_rels)
+
+        return instances
 
     async def _apply_custom_prefetch(
         self,
@@ -1029,6 +1096,43 @@ def _get_reverse_fk_field(
         ):
             return getattr(field_obj, "source_field", f"{name}_id")
     return f"{field_name}_id"
+
+
+def _make_tortoise_to_one_resolver(
+    backend: Any,
+    fname: str,
+    rel_model: type,
+    return_ann: Any,
+) -> Any:
+    """Create a field for a to-one relation, scoped at resolve time.
+
+    A scoped-out row reads as absent, matching what the optimizer produces
+    when its scoped load finds nothing on the other end.
+    """
+
+    async def resolver(self: Any, info: Any) -> Any:
+        from strawberry_orm.lazy_resolution import _tortoise_relation_prefetched
+
+        restrict = backend.relation_scope(type(self), fname, info)
+        if restrict is None:
+            related = getattr(self, fname, None)
+            return await related if inspect.isawaitable(related) else related
+
+        if _tortoise_relation_prefetched(self, fname):
+            related = getattr(self, fname, None)
+            return await related if inspect.isawaitable(related) else related
+
+        related_id = getattr(self, f"{fname}_id", None)
+        if related_id is None:
+            return None
+        return await restrict(rel_model.filter(pk=related_id), info).first()
+
+    resolver.__name__ = fname
+    resolver.__annotations__ = {
+        "info": strawberry.types.Info,
+        "return": return_ann,
+    }
+    return strawberry.field(resolver=resolver)
 
 
 def _make_tortoise_rel_resolver(

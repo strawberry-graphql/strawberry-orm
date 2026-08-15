@@ -537,6 +537,20 @@ class TestPageAggregates:
 
 
 class TestGrouping:
+    def test_groups_without_a_group_by_argument_are_empty(self, execute):
+        """Selecting ``groups`` with no ``groupBy`` yields null, not an error."""
+        data = execute("""
+            query {
+                orders(first: 5) {
+                    groups {
+                        key { status }
+                        aggregates { count }
+                    }
+                }
+            }
+        """)
+        assert data["orders"]["groups"] is None
+
     def test_single_field_grouping(self, execute):
         data = execute("""
             query {

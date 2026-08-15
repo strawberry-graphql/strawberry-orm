@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import typing as _typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import cached_property, partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
@@ -724,10 +724,13 @@ class _AutoConnection:
         self,
         backend: Backend,
         graphql_type: Any | None,
+        *,
+        resolver: Callable[..., Any] | None = None,
         **kwargs: Any,
     ) -> None:
         self._backend = backend
         self._graphql_type = graphql_type
+        self._resolver = resolver
         self._kwargs = kwargs
 
     def __set_name__(self, owner: type, name: str) -> None:
@@ -736,16 +739,38 @@ class _AutoConnection:
         )
         if graphql_type is None:
             return
+        field = self._build_field(graphql_type, self._resolver)
+        if field is None:
+            return
+        field._orm_auto_field = True  # type: ignore[attr-defined]
+        setattr(owner, name, field)
 
+    def __call__(self, resolver: Callable[..., Any]) -> Any:
+        """Decorator form: you return the rows, the library builds the field."""
+        return self._build_field(self._graphql_type, resolver)
+
+    def _build_field(
+        self, graphql_type: Any, resolver: Callable[..., Any] | None
+    ) -> Any:
+        """Assemble the connection field, generating a resolver only if none given.
+
+        Both entry points come through here so a supplied resolver still gets
+        the generated arguments and the grouped connection type.
+        """
         model, filter_type, order_type, group_type, aggregate_type = (
             _resolve_orm_metadata(graphql_type)
+            if graphql_type is not None
+            else (None,) * 5
         )
-        if model is None:
-            return
+        # Nothing to generate from and nothing supplied: leave the attribute be.
+        if model is None and resolver is None:
+            return None
 
-        node_type = _extract_connection_node(graphql_type)
+        node_type = (
+            _extract_connection_node(graphql_type) if graphql_type is not None else None
+        )
 
-        if group_type is not None:
+        if group_type is not None and model is not None:
             graphql_type = _build_grouped_connection(
                 self._backend,
                 graphql_type,
@@ -759,58 +784,25 @@ class _AutoConnection:
 
             graphql_type = connection_type_for_node(node_type)
 
-        base_resolver = _make_query_resolver(
-            self._backend, model, filter_type, order_type, group_type
-        )
-        if iscoroutinefunction(getattr(self._backend, "materialize_query", None)):
-
-            @wraps(base_resolver)
-            async def resolver(*args: Any, **kwargs: Any) -> Any:
-                return base_resolver(*args, **kwargs)
-
-        else:
-            resolver = base_resolver
-        if node_type is not None:
-            resolver.__annotations__["return"] = list[node_type]
-        extensions = list(self._kwargs.get("extensions") or [])
-        extensions.append(
-            _AutoFilterOrderExtension(
-                self._backend,
-                filters=filter_type,
-                order=order_type,
-                group=group_type,
+        if resolver is None and model is not None:
+            resolver = _make_query_resolver(
+                self._backend, model, filter_type, order_type, group_type
             )
-        )
-        field = relay.connection(
-            graphql_type,
-            resolver=resolver,
-            name=self._kwargs.get("name"),
-            description=self._kwargs.get("description"),
-            deprecation_reason=self._kwargs.get("deprecation_reason"),
-            extensions=extensions,
-            max_results=self._kwargs.get("max_results"),
-        )
-        from strawberry_orm.relay.connection import _use_orm_connection_extension
+            if node_type is not None:
+                resolver.__annotations__["return"] = list[node_type]
 
-        _use_orm_connection_extension(field)
-        field._orm_auto_field = True  # type: ignore[attr-defined]
-        field._orm_connection = True  # type: ignore[attr-defined]
-        setattr(owner, name, field)
+        # On a backend that materializes asynchronously the field has to be
+        # async, or the connection machinery takes its sync path and ends up
+        # holding un-awaited coroutines. Supplied resolvers get the same
+        # treatment as generated ones so both reach the same code path.
+        if iscoroutinefunction(
+            getattr(self._backend, "materialize_query", None)
+        ) and not iscoroutinefunction(resolver):
+            sync_resolver = resolver
 
-    def __call__(self, resolver: Callable[..., Any]) -> Any:
-        graphql_type = self._graphql_type
-        node_type = (
-            _extract_connection_node(graphql_type) if graphql_type is not None else None
-        )
-        model, filter_type, order_type, group_type, _aggregate_type = (
-            _resolve_orm_metadata(graphql_type)
-            if graphql_type is not None
-            else (None,) * 5
-        )
-        if node_type is not None:
-            from strawberry_orm.relay.connection import connection_type_for_node
-
-            graphql_type = connection_type_for_node(node_type)
+            @wraps(sync_resolver)
+            async def resolver(*args: Any, **kwargs: Any) -> Any:  # noqa: F811
+                return sync_resolver(*args, **kwargs)
 
         extensions = list(self._kwargs.get("extensions") or [])
         extensions.append(
@@ -1099,8 +1091,21 @@ class StrawberryORM:
     def node(self, **kwargs: Any) -> Any:
         return self._backend.node(**kwargs)
 
-    def connection(self, graphql_type: Any | None = None, **kwargs: Any) -> Any:
-        return _AutoConnection(self._backend, graphql_type, **kwargs)
+    def connection(
+        self,
+        graphql_type: Any | None = None,
+        *,
+        resolver: Callable[..., Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """A Relay connection over a model.
+
+        With no ``resolver`` the library builds the query. Supply one - by
+        keyword, or by applying this as a decorator - to return the rows
+        yourself and still get the generated ``filter``/``order``/``groupBy``
+        arguments, the grouped connection type, and optimizer integration.
+        """
+        return _AutoConnection(self._backend, graphql_type, resolver=resolver, **kwargs)
 
     # -- Mutations -----------------------------------------------------------
 
@@ -1166,6 +1171,67 @@ class StrawberryORM:
         return self._backend.get_default_queryset(model)
 
     # -- Optimizer -----------------------------------------------------------
+
+    def optimize(
+        self, data: Any, info: Any, *, at: str | Sequence[str] | None = None
+    ) -> Any:
+        """Eager-load what the current selection needs from *data*.
+
+        The optimizer normally runs on query objects returned straight from a
+        resolver. Use this when that hand-off does not happen: when a resolver
+        has already materialized its rows, or when the rows sit below the
+        resolved field. ``data`` may be a query object, a model instance, a
+        list, or anything else - values it does not recognise are returned
+        untouched, so it is safe to wrap a whole payload in it.
+
+        ``at`` re-roots the selection. A resolver returning
+        ``Payload(data=post)`` passes ``at="data"``, because the relations to
+        load are named under ``data``, not beside it.
+
+        Relations are loaded onto the instances given, so scalar values held in
+        memory - which may be fresher than the database, straight out of a
+        mutation - are preserved. On an async backend the result is awaitable.
+        """
+        from strawberry_orm.optimizer.selections import narrow_info
+
+        if data is None or info is None:
+            return data
+
+        # This ORM's own store, not the schema's: the field hints and scopes
+        # are registered here at type-declaration time, so they apply whether
+        # or not the schema was built with an optimizer extension.
+        store = self._backend._store
+        if at is not None:
+            info = narrow_info(info, at)
+
+        if self._backend.is_query_object(data):
+            return self._backend.apply_optimizer_hints(store, data, info)
+
+        if self._backend.is_model_instance(data):
+            loaded = self._backend.load_relations(store, [data], info)
+            if isawaitable(loaded):
+
+                async def _one() -> Any:
+                    return (await loaded)[0]
+
+                return _one()
+            return loaded[0]
+
+        if isinstance(data, list):
+            instances = [item for item in data if self._backend.is_model_instance(item)]
+            if not instances:
+                return data
+            loaded = self._backend.load_relations(store, instances, info)
+            if isawaitable(loaded):
+
+                async def _many() -> Any:
+                    await loaded
+                    return data
+
+                return _many()
+            return data
+
+        return data
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)

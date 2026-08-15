@@ -132,7 +132,7 @@ class TestScopingHookOrder:
         messages = scope_messages(calls)
         assert_scope_rows_before_load(messages)
 
-    def test_without_optimizer_skips_scoping_hooks(
+    def test_relation_scoping_runs_without_the_optimizer(
         self,
         monkeypatch,
         orm,
@@ -141,6 +141,13 @@ class TestScopingHookOrder:
         Post,
         User,
     ):
+        """Turning the optimizer off must not turn row scoping off.
+
+        Without it there is no prefetch to scope, so the relation is read
+        straight off each parent. ``scope_rows`` still has to run there - it is
+        access control, not an optimization - and it runs per parent rather
+        than once.
+        """
         calls = _install_print_tracker(monkeypatch)
         schema = _build_schema_scope_rows_only(
             orm,
@@ -150,4 +157,4 @@ class TestScopingHookOrder:
         )
         result = schema_execute(schema, self.USERS_POSTS_QUERY)
         assert result.errors is None
-        assert scope_messages(calls) == []
+        assert scope_messages(calls).count(f"{SCOPE_PREFIX}PostType.scope_rows") >= 1

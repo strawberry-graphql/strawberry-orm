@@ -162,17 +162,37 @@ class SQLAlchemyBackend(BaseBackend):
             for field_name, ann in cls.__annotations__.items():
                 if field_name in vars(cls):
                     continue
+                if field_name not in rel_names:
+                    continue
+                rel = mapper.relationships[field_name]
+                rel_model = rel.mapper.class_
                 el_type = extract_element_type(ann)
                 if el_type is None:
+                    # A to-one relation. Nothing to generate arguments from,
+                    # but it still needs a resolver so the scope is applied.
+                    setattr(
+                        cls,
+                        field_name,
+                        _make_sa_plain_rel_resolver(
+                            self, field_name, model, rel_model, ann, uselist=False
+                        ),
+                    )
                     continue
                 f_type = getattr(el_type, "__orm_filter__", None)
                 o_type = getattr(el_type, "__orm_order__", None)
                 if f_type is None and o_type is None:
+                    # No arguments to generate, but the relation still needs a
+                    # resolver: the default attribute read would emit an
+                    # unscoped lazy SELECT whenever the parents arrive already
+                    # materialized.
+                    setattr(
+                        cls,
+                        field_name,
+                        _make_sa_plain_rel_resolver(
+                            self, field_name, model, rel_model, ann
+                        ),
+                    )
                     continue
-                if field_name not in rel_names:
-                    continue  # pragma: no cover
-                rel = mapper.relationships[field_name]
-                rel_model = rel.mapper.class_
                 setattr(
                     cls,
                     field_name,
@@ -507,6 +527,14 @@ class SQLAlchemyBackend(BaseBackend):
 
         return isinstance(value, Select)
 
+    def is_model_instance(self, value: Any) -> bool:
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy.orm.state import InstanceState
+
+        if isinstance(value, type):
+            return False
+        return isinstance(sa_inspect(value, raiseerr=False), InstanceState)
+
     def relation_names(self, model: type) -> set[str]:
         from sqlalchemy import inspect as sa_inspect
 
@@ -661,7 +689,14 @@ class SQLAlchemyBackend(BaseBackend):
 
         return stmt
 
-    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+    def _apply_relation_loads(
+        self, store: Any, query: Any, entity: type, info: Any
+    ) -> Any:
+        """Attach eager-load options for the current selection to *query*.
+
+        Shared by query optimization and by loading relations onto instances
+        the caller already holds, so both apply the same row scoping.
+        """
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy.orm import joinedload, selectinload
 
@@ -672,17 +707,7 @@ class SQLAlchemyBackend(BaseBackend):
         )
 
         fragments = fragments_from_info(info)
-
-        try:
-            entity = query.column_descriptions[0]["entity"]
-        except (AttributeError, IndexError, KeyError):
-            return query
-
         mapper = sa_inspect(entity)
-
-        get_qs = self._type_querysets.get(entity)
-        if get_qs is not None:
-            query = get_qs(query, info)
 
         def _get_field_name(node: Any) -> str:
             """Extract field name from a GraphQL FieldNode, converting camelCase
@@ -859,7 +884,50 @@ class SQLAlchemyBackend(BaseBackend):
 
         for field_node in field_nodes_from_info(info):
             query = _apply_loads(query, field_node.selection_set, mapper)
-        return self._execute_stmt(query, info)
+        return query
+
+    def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+        try:
+            entity = query.column_descriptions[0]["entity"]
+        except (AttributeError, IndexError, KeyError):
+            return query
+
+        get_qs = self._type_querysets.get(entity)
+        if get_qs is not None:
+            query = get_qs(query, info)
+
+        return self._execute_stmt(
+            self._apply_relation_loads(store, query, entity, info), info
+        )
+
+    def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
+        """Eager-load the selected relations onto instances already in memory.
+
+        Re-selecting the same primary keys populates the relations through the
+        session's identity map, which hands back the very objects the caller
+        passed in. Scalars already loaded on them are left alone, so values
+        fresher than the database survive.
+        """
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import select as sa_select
+
+        session = self._get_session(info)
+
+        by_model: dict[type, list[Any]] = {}
+        for instance in instances:
+            by_model.setdefault(type(instance), []).append(instance)
+
+        for model, rows in by_model.items():
+            mapper = sa_inspect(model)
+            pk_column = mapper.primary_key[0]
+            pk_name = mapper.get_property_by_column(pk_column).key
+            stmt = sa_select(model).where(
+                pk_column.in_([getattr(row, pk_name) for row in rows])
+            )
+            stmt = self._apply_relation_loads(store, stmt, model, info)
+            session.execute(stmt).unique().scalars().all()
+
+        return instances
 
     # -- Helpers -------------------------------------------------------------
 
@@ -1123,6 +1191,69 @@ class SQLAlchemyBackend(BaseBackend):
 # ---------------------------------------------------------------------------
 
 
+def _scoped_sa_relation(
+    backend: Any,
+    instance: Any,
+    parent_model: type,
+    fname: str,
+    rel_model: type,
+    info: Any,
+    *,
+    uselist: bool = True,
+) -> Any:
+    """Return the related rows for *fname*, with row scoping applied.
+
+    The optimizer scopes relations when it builds the eager load, but a
+    resolver that returns materialized rows never gives it a statement to work
+    on. Reading the attribute would then emit an unscoped lazy SELECT and hand
+    back rows the caller may not read, so the scope is applied here instead.
+
+    An already-loaded collection was scoped on the way in; re-querying it would
+    both waste a round trip and discard the optimizer's work.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import with_parent
+
+    from strawberry_orm.lazy_resolution import _sqlalchemy_relation_prefetched
+
+    if _sqlalchemy_relation_prefetched(instance, fname):
+        return getattr(instance, fname)
+
+    restrict = backend.relation_scope(parent_model, fname, info)
+    if restrict is None:
+        return getattr(instance, fname)
+
+    stmt = select(rel_model).where(with_parent(instance, getattr(parent_model, fname)))
+    rows = backend._execute_stmt(restrict(stmt, info), info)
+    if uselist:
+        return rows
+    return rows[0] if rows else None
+
+
+def _make_sa_plain_rel_resolver(
+    backend: Any,
+    fname: str,
+    parent_model: type,
+    rel_model: type,
+    return_ann: Any,
+    *,
+    uselist: bool = True,
+) -> Any:
+    """Create a field for a relation that takes no generated arguments."""
+
+    def resolver(self: Any, info: Any) -> Any:
+        return _scoped_sa_relation(
+            backend, self, parent_model, fname, rel_model, info, uselist=uselist
+        )
+
+    resolver.__name__ = fname
+    resolver.__annotations__ = {
+        "info": strawberry.types.Info,
+        "return": return_ann,
+    }
+    return strawberry.field(resolver=resolver)
+
+
 def _make_sa_rel_resolver(
     backend: Any,
     fname: str,
@@ -1161,7 +1292,9 @@ def _make_sa_rel_resolver(
             self: Any, info: Any, filter: Any = None, order: Any = None
         ) -> Any:
             if filter is None and order is None:
-                return getattr(self, fname)
+                return _scoped_sa_relation(
+                    backend, self, parent_model, fname, rel_model, info
+                )
             stmt = _build_stmt(self, info)
             if filter is not None:
                 stmt = backend.apply_filters(stmt, filter, rel_model, info=info)
@@ -1178,7 +1311,9 @@ def _make_sa_rel_resolver(
 
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
             if filter is None:
-                return getattr(self, fname)
+                return _scoped_sa_relation(
+                    backend, self, parent_model, fname, rel_model, info
+                )
             stmt = _build_stmt(self, info)
             stmt = backend.apply_filters(stmt, filter, rel_model, info=info)
             return _execute(stmt, info)
@@ -1191,7 +1326,9 @@ def _make_sa_rel_resolver(
 
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
             if order is None:
-                return getattr(self, fname)
+                return _scoped_sa_relation(
+                    backend, self, parent_model, fname, rel_model, info
+                )
             stmt = _build_stmt(self, info)
             stmt = backend.apply_ordering(stmt, order, rel_model, info=info)
             return _execute(stmt, info)

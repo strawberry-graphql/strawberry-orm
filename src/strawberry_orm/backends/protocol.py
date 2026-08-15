@@ -201,6 +201,16 @@ class Backend(Protocol):
         """Return ``True`` if *value* is a query object the optimizer can handle."""
         ...
 
+    def is_model_instance(self, value: Any) -> bool:
+        """Return ``True`` if *value* is a persisted model instance."""
+        ...
+
+    def load_relations(
+        self, store: Any, instances: list[Any], info: Any
+    ) -> AwaitableOrValue[list[Any]]:
+        """Eager-load the selected relations onto *instances*, in place."""
+        ...
+
     def relation_names(self, model: type) -> set[str]:
         """Return the names of *model*'s relations, for hint validation."""
         ...

@@ -418,70 +418,120 @@ class ORMListConnection(ORMConnection[NodeType]):
             agg = backend.apply_aggregation(base_query, info, meta)
             connection.aggregates = agg
 
-        if _selection_requests(info, "groups"):
-            ctx = info.context
-            group_by = (
-                ctx.get("_orm_group_by")
-                if isinstance(ctx, dict)
-                else getattr(ctx, "_orm_group_by", None)
-            )
-            order_input = (
-                ctx.get("_orm_order")
-                if isinstance(ctx, dict)
-                else getattr(ctx, "_orm_order", None)
-            )
-            if group_by is not None:
-                groups = backend.apply_grouping(
-                    base_query,
-                    group_by,
-                    info,
-                    meta,
-                    order_input=order_input,
+        grouping = cls._collect_groups(backend, base_query, info, meta)
+
+        if inspect.isawaitable(grouping):
+
+            async def _await_grouping() -> Any:
+                groups, items_by_key = await grouping
+                cls._attach_groups(
+                    connection, groups, items_by_key, backend, base_query, meta
                 )
-                _assign_edge_indices(groups, connection.edges, meta.group_key_fields)
+                cls._attach_page_aggregates(connection, info, meta)
+                return connection
 
-                if _selection_requests(info, "groups", "items"):
-                    first = _extract_items_first(info)
-                    after_cursor = _extract_items_after(info)
-                    items_order = _extract_items_order(info)
-                    offset = _decode_cursor_offset(after_cursor) if after_cursor else 0
-                    limit = (first or 10) + offset + 1
-                    items_by_key = backend.batch_group_items(
-                        base_query,
-                        meta.group_key_fields,
-                        info,
-                        meta.model,
-                        per_group_limit=limit,
-                        order_input=items_order,
-                    )
-                    for grp in groups:
-                        key_tuple = tuple(
-                            getattr(grp.key, k) for k in meta.group_key_fields
-                        )
-                        grp._items_nodes = items_by_key.get(key_tuple, [])
+            return _await_grouping()
 
-                for grp in groups:
-                    grp._orm_base_query = base_query
-                    grp._orm_backend = backend
-                    grp._orm_model = meta.model
+        if grouping is not None:
+            groups, items_by_key = grouping
+            cls._attach_groups(
+                connection, groups, items_by_key, backend, base_query, meta
+            )
 
-                connection.groups = groups
+        cls._attach_page_aggregates(connection, info, meta)
+        return connection
 
+    @classmethod
+    def _collect_groups(cls, backend, base_query, info, meta):
+        """Fetch the groups and their items.
+
+        Returns ``(groups, items_by_key)``, ``None`` when groups were not
+        asked for, or a coroutine yielding the pair on async backends.
+        """
+        if not _selection_requests(info, "groups"):
+            return None
+
+        ctx = info.context
+        group_by = (
+            ctx.get("_orm_group_by")
+            if isinstance(ctx, dict)
+            else getattr(ctx, "_orm_group_by", None)
+        )
+        if group_by is None:
+            return None
+        order_input = (
+            ctx.get("_orm_order")
+            if isinstance(ctx, dict)
+            else getattr(ctx, "_orm_order", None)
+        )
+
+        groups = backend.apply_grouping(
+            base_query,
+            group_by,
+            info,
+            meta,
+            order_input=order_input,
+        )
+
+        items_by_key = None
+        if _selection_requests(info, "groups", "items"):
+            after_cursor = _extract_items_after(info)
+            offset = _decode_cursor_offset(after_cursor) if after_cursor else 0
+            items_by_key = backend.batch_group_items(
+                base_query,
+                meta.group_key_fields,
+                info,
+                meta.model,
+                per_group_limit=(_extract_items_first(info) or 10) + offset + 1,
+                order_input=_extract_items_order(info),
+            )
+
+        if inspect.isawaitable(groups) or inspect.isawaitable(items_by_key):
+
+            async def _resolve() -> Any:
+                return (
+                    await groups if inspect.isawaitable(groups) else groups,
+                    await items_by_key
+                    if inspect.isawaitable(items_by_key)
+                    else items_by_key,
+                )
+
+            return _resolve()
+
+        return groups, items_by_key
+
+    @classmethod
+    def _attach_groups(
+        cls, connection, groups, items_by_key, backend, base_query, meta
+    ):
+        _assign_edge_indices(groups, connection.edges, meta.group_key_fields)
+
+        for grp in groups:
+            if items_by_key is not None:
+                key_tuple = tuple(getattr(grp.key, k) for k in meta.group_key_fields)
+                grp._items_nodes = items_by_key.get(key_tuple, [])
+            grp._orm_base_query = base_query
+            grp._orm_backend = backend
+            grp._orm_model = meta.model
+
+        connection.groups = groups
+
+    @classmethod
+    def _attach_page_aggregates(cls, connection, info, meta):
         page_info_type = getattr(cls, "_page_info_type", None)
-        if page_info_type is not None and _selection_requests(
+        if page_info_type is None or not _selection_requests(
             info, "pageInfo", "aggregates"
         ):
-            page_agg = _compute_page_aggregates(connection.edges, meta)
-            pi = connection.page_info
-            connection.page_info = page_info_type(
-                start_cursor=pi.start_cursor,
-                end_cursor=pi.end_cursor,
-                has_previous_page=pi.has_previous_page,
-                has_next_page=pi.has_next_page,
-                aggregates=page_agg,
-            )
+            return
 
-        return connection
+        pi = connection.page_info
+        connection.page_info = page_info_type(
+            start_cursor=pi.start_cursor,
+            end_cursor=pi.end_cursor,
+            has_previous_page=pi.has_previous_page,
+            has_next_page=pi.has_next_page,
+            aggregates=_compute_page_aggregates(connection.edges, meta),
+        )
 
 
 def _get_items_arg(info: Any, arg_name: str) -> Any:

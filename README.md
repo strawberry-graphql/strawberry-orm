@@ -335,13 +335,13 @@ How a field is written decides what scoping it gets.
 | `@orm.field.custom` returning a query object | Optimizer + that type's `scope_rows` — see [Root custom query](#root-custom-query) |
 | `@orm.field.custom` returning `self.author` | As written; scoping only via prefetch |
 | `@strawberry.field`, fully custom | You own scoping and auth |
-| A resolver returning instances | Optimizer skipped; nested relations may be unscoped |
+| A resolver returning instances | Nested relations still scoped, one query each — see [`orm.optimize`](#ormoptimize) |
 
 The first four rows are all `orm.field`, which has four named forms that run at different times and take different arguments — see [The four kinds of field](#the-four-kinds-of-field).
 
-Type-level and field-level scopes compose in that order — `scope_rows` first, then `scope=` — and both run **before SQL executes**, while the prefetch is being built. `using=` is not a filter; it only adds eager-load paths.
+Type-level and field-level scopes compose in that order — `scope_rows` first, then `scope=` — and both run **before SQL executes**.
 
-Scoping hooks do **not** run when you build with `strawberry.Schema(query=Query)` instead of `orm.schema()` on Django or SQLAlchemy, or when a resolver returns materialized instances.
+Relation scoping does not depend on the optimizer. When the optimizer runs it applies the scope once while building the eager load; when it does not, the scope is applied again as each parent's relation is read. Either way the rows are scoped — the difference is how many queries it takes. The **root** field is the exception: `scope_rows` on a root query object is applied by the optimizer, so build with `orm.schema()`.
 
 ### Root custom query
 
@@ -358,6 +358,31 @@ class Query:
 ```
 
 Use `scope_rows` when the same rule applies everywhere the model loads, and a custom root resolver when the criteria belong to that one entry point. See [List Fields](#list-fields) for a comparison.
+
+### `orm.optimize`
+
+Sometimes a resolver cannot return a query object — it has just written the rows, or it returns them inside a wrapper. The rows are still scoped when their relations are read, but each relation costs a query per parent. `orm.optimize` puts them back on the eager-loaded path:
+
+```python
+# Django
+@strawberry.field
+def create_post(self, info: strawberry.Info, ...) -> PostType:
+    post = Post.objects.create(...)
+    return orm.optimize(post, info)
+```
+
+It takes a query object, a model instance, or a list, and returns anything else untouched — so it is safe to wrap a whole payload. Relations are loaded **onto the instances you pass in**, so values you have just set in memory are never overwritten by a re-read of the database. On an async backend the result is awaitable.
+
+When the rows sit below the field being resolved, point it at them with `at`. The optimizer reads the selection set from the current field, and for a payload the relations to load are named under `data`, not beside it:
+
+```python
+# Django
+@strawberry.field
+def recent_posts(self, info: strawberry.Info) -> Payload:
+    return Payload(data=orm.optimize(rows, info, at="data"), errors=None)
+```
+
+`at` also takes a sequence for a deeper path, and matches either `camelCase` or `snake_case`. Getting it wrong is not an error — nothing is eager-loaded and the rows come back as they would have anyway.
 
 ### `orm.schema()`
 
@@ -466,17 +491,15 @@ posts: list[PostType] = orm.field.scoped(
 )
 ```
 
-For `{ users { name posts { title } } }` the order is always `PostType.scope_rows` then `UserType.posts.load`. With a plain annotation and no `scope=`, only the first line appears. Neither hook runs again as GraphQL reads each `user.posts`. The repo asserts this by patching `print` — see `tests/backends/*/test_query_scoping_hook_order.py`.
+For `{ users { name posts { title } } }` the order is always `PostType.scope_rows` then `UserType.posts.load`. With a plain annotation and no `scope=`, only the first line appears. When the relation was eager-loaded, the hooks run once for the whole batch; when it was not, they run again for each parent as the relation is read. Either way they run. The repo asserts this by patching `print` — see `tests/backends/*/test_query_scoping_hook_order.py`.
 
 **Fragments.** The optimizer walks inline fragments (`... on PostType`) and named fragment spreads, so relations inside them are prefetched normally.
-
-**Tortoise.** Annotation-only list relations also apply `_apply_nested_queryset` at resolve time when prefetch did not run. The `scope_rows` then `scope=` order is the same there.
 
 **Field permissions.** `orm.field.auto(permission_classes=[...])` — see [Declaring fields](#declaring-fields).
 
 </details>
 
-> If nested rows come back unscoped, check three things in order: that the schema was built with `orm.schema()`, that root resolvers return query objects, and that `scope_rows` exists on every exposed type. See [Security](#security).
+> If nested rows come back unscoped, check that `scope_rows` exists on every exposed type. Scoping does not depend on the optimizer: a resolver returning a list is slower than one returning a query object, but it is not less scoped. See [Security](#security).
 
 ---
 
@@ -1522,6 +1545,22 @@ This gives you:
 Filters and ordering are applied *before* pagination, so the connection always slices from a correctly filtered and sorted result set.
 
 `orm.connection()` accepts the same keyword arguments as `relay.connection()` — `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`.
+
+### Supplying the queryset yourself
+
+The decorator above is one way to give `orm.connection()` a resolver. You can also pass one by keyword, which is what you want when the connection is a field on a type you are assembling rather than a method you are writing:
+
+```python
+# Django
+def recent_users(info: strawberry.types.Info) -> Iterable[UserNode]:
+    return User.objects.order_by("-created_at")
+
+@strawberry.type
+class Query:
+    users = orm.connection(ORMListConnection[UserNode], resolver=recent_users)
+```
+
+Either way the library still builds everything around your rows: the generated `filter`, `order`, and `groupBy` arguments, the grouped connection type when the node declares a group-by, `totalCount`, and optimizer integration. Your resolver does not need to accept `filter` or `order` — they are applied to the query object you return. Arguments of your own are passed through and appear on the field.
 
 ### Node mutations
 

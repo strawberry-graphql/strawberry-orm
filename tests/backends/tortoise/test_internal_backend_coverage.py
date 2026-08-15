@@ -295,6 +295,13 @@ class TestInternalBackendCoverage:
                 return _run().__await__()
 
         class FakeQuery:
+            def __init__(self):
+                self.ordering_cleared = False
+
+            def order_by(self, *args):
+                self.ordering_cleared = not args
+                return self
+
             def annotate(self, **_kwargs):
                 return self
 
@@ -316,6 +323,9 @@ class TestInternalBackendCoverage:
         )
         assert len(groups) == 1
         assert groups[0].key.author_id == "1"
+        assert fake.ordering_cleared, (
+            "inherited ordering would join the GROUP BY and split the groups"
+        )
 
     @pytest.mark.asyncio
     async def test_apply_ref_list_respects_authorize(self, seed, Post, Tag):
