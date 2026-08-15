@@ -300,3 +300,21 @@ class TestSelectionSetFormatting:
         from strawberry_orm.lazy_resolution import _format_selection_set
 
         assert _format_selection_set(None) == ""
+
+
+class TestForwardReferencedConnectionNode:
+    """A module can declare a connection above the type it names."""
+
+    def test_the_connection_type_is_named_from_the_reference(self):
+        """``__name__`` does not exist on a reference; the name it holds does."""
+        from typing import ForwardRef
+
+        from strawberry_orm.relay.connection import connection_type_for_node
+
+        built = connection_type_for_node(ForwardRef("PostType"))
+        assert built.__name__ == "PostTypeConnection"
+
+    def test_a_bare_string_reference_works_too(self):
+        from strawberry_orm.relay.connection import connection_type_for_node
+
+        assert connection_type_for_node("PostType").__name__ == "PostTypeConnection"

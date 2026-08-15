@@ -717,6 +717,18 @@ class _AutoField:
         )
 
 
+def _is_forward_reference(node_type: Any) -> bool:
+    """True when the node type is still a name rather than a class.
+
+    A module that declares a connection above the type it names can only refer
+    to it by name, and a concrete connection subclass cannot be built around a
+    name. The parameterized annotation is left for Strawberry to resolve once
+    the module finishes; that connection has no generated ``totalCount``, so
+    name the class directly when you need one.
+    """
+    return isinstance(node_type, str) or hasattr(node_type, "__forward_arg__")
+
+
 class _AutoConnection:
     _orm_auto_field = True
 
@@ -779,7 +791,7 @@ class _AutoConnection:
                 order_type,
                 aggregate_type=aggregate_type,
             )
-        elif node_type is not None:
+        elif node_type is not None and not _is_forward_reference(node_type):
             from strawberry_orm.relay.connection import connection_type_for_node
 
             graphql_type = connection_type_for_node(node_type)

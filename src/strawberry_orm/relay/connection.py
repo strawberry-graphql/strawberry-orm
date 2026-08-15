@@ -303,10 +303,22 @@ class ORMConnection(ListConnection[NodeType]):
 
 
 def connection_type_for_node(node_type: type) -> Any:
-    """Return a concrete Strawberry connection type for *node_type* with ``totalCount``."""
+    """Return a concrete Strawberry connection type for *node_type* with ``totalCount``.
+
+    *node_type* may still be a forward reference, which is the normal case for
+    a module that declares its connections above the types they name. The
+    subclass is built around the reference and Strawberry resolves it when the
+    schema is assembled, so a deferred node type keeps ``totalCount`` rather
+    than falling back to a bare connection.
+    """
     import types as _types_mod
 
-    type_name = f"{node_type.__name__}Connection"
+    name = getattr(node_type, "__name__", None) or getattr(
+        node_type, "__forward_arg__", None
+    )
+    if name is None:
+        name = str(node_type)
+    type_name = f"{name}Connection"
 
     def _exec_body(ns: dict[str, Any]) -> None:
         ns["__annotations__"] = {"total_count": int | None}
