@@ -494,7 +494,7 @@ class FieldFactory:
     The name says when your code runs, and therefore what it receives:
 
     ``auto``      metadata only; the library resolves the field.
-    ``scoped``    ``(qs, info)``, once while the prefetch is built.
+    ``scoped``    ``(query, info)``, once while the prefetch is built.
     ``custom``    ``(self, info)``, once per parent row, returning rows.
     ``computed``  ``(self, info)``, once per parent row, returning a value.
 
@@ -549,7 +549,7 @@ class FieldFactory:
     ) -> Any:
         """Narrow the rows loaded through a relation.
 
-        The callable receives ``(qs, info)`` and returns a query. It never
+        The callable receives ``(query, info)`` and returns a query. It never
         sees the parent row, which is what lets the optimizer fold it into one
         prefetch covering every parent.
         """

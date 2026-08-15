@@ -38,6 +38,7 @@ Requires Python `>=3.12` and `strawberry-graphql>=0.311.0`.
 Minimal blog API: users with published posts only. Assumes SQLAlchemy models `User` and `Post` where `Post.is_published` is a boolean. See [Choose a backend](#choose-a-backend) to wire session context.
 
 ```python
+# SQLAlchemy
 import strawberry
 from strawberry_orm import StrawberryORM, auto
 
@@ -82,6 +83,7 @@ Drafts are hidden because `PostType.scope_rows` runs wherever Post rows load —
 **On a type** — every field on an `@orm.type` class is one of these:
 
 ```python
+# SQLAlchemy — see "Reading the examples" for the Django / Tortoise spelling
 @orm.type(Post)
 class PostType:
     # --- declared: the library resolves it, you describe it ---------------------
@@ -97,10 +99,10 @@ class PostType:
         using=["author"],                           # also load Post.author
     )                                               # also: compute=, disable_optimization=
 
-    # --- scoped: (qs, info), once while the prefetch is built -------------------
+    # --- scoped: (query, info), once while the prefetch is built ----------------
     @orm.field.scoped                               # named for the relation
-    def comments(qs, info) -> list[CommentType]:    # it narrows
-        return qs.filter(is_public=True)
+    def comments(select, info) -> list[CommentType]:            # it narrows
+        return select.where(Comment.is_public.is_(True))
 
     # --- written: (self, info), once per parent row -----------------------------
     @orm.field.custom                               # returns rows: hand back the
@@ -123,7 +125,7 @@ class PostType:
 @orm.type(User)
 class UserType:
     posts: list[PostType] = orm.field.scoped(       # the inline spelling of
-        lambda qs, info: qs.filter(is_published=True)   # @orm.field.scoped
+        lambda select, info: select.where(Post.is_published.is_(True))
     )
 ```
 
@@ -132,6 +134,7 @@ There is one scope per relation, and it carries that relation's name — `commen
 **On the query root** — the same forms, minus a parent row:
 
 ```python
+# SQLAlchemy
 @strawberry.type
 class Query:
     posts: list[PostType] = orm.field.auto()                      # generated resolver
@@ -161,6 +164,22 @@ Every backend generates the same schema; they differ in how the session reaches 
 Sync and async execution both work on Django; a custom async resolver that touches the ORM directly still needs `sync_to_async(...)`.
 
 Every constructor takes the same tuning options — limits, warnings, optimizer switches. They are listed under [Backend options](#backend-options); the defaults are safe to start with.
+
+### Reading the examples
+
+Everything `strawberry-orm` generates — types, filters, ordering, grouping, mutations — is identical across the three backends. What differs is the query object your own callables receive and return, in exactly one place: whenever you write a `scope_rows`, a `scope=`, or a resolver that returns rows.
+
+| | Django | Tortoise | SQLAlchemy |
+| --- | --- | --- | --- |
+| What you receive | `QuerySet` | `QuerySet` | `Select` |
+| Idiomatic parameter name | `queryset` | `queryset` | `select` |
+| Narrow rows | `queryset.filter(is_published=True)` | `queryset.filter(is_published=True)` | `select.where(Post.is_published.is_(True))` |
+| Exclude rows | `queryset.exclude(title="x")` | `queryset.exclude(title="x")` | `select.where(Post.title != "x")` |
+| Order | `queryset.order_by("name")` | `queryset.order_by("name")` | `select.order_by(Tag.name)` |
+| Rows for one parent | `Post.objects.filter(author=self)` | `Post.filter(author_id=self.id)` | `select(Post).where(Post.author_id == self.id)` |
+| Everything for a model | `orm.get_default_queryset(Post)` | `orm.get_default_queryset(Post)` | `orm.get_default_queryset(Post)` |
+
+Each code block below says which backend it is written in. Where only the query expression differs, translate it with this table rather than expecting a different API.
 
 ---
 
@@ -243,6 +262,7 @@ This is the mistake that bites hardest, so it is worth one careful example.
 `users { posts { … } }` looks like a single tree, but the ORM loads it in two steps: User rows first, then Post rows. A filter on the parent type restricts *which parents come back*. It does not restrict the children — **even when that filter joins the child table.**
 
 ```python
+# Django
 @orm.type(User)
 class UserType:
     id: auto
@@ -283,6 +303,7 @@ Bob is gone, because the parent filter asked *does this user have a published po
 The fix is to scope the model wherever it loads:
 
 ```python
+# Django
 @orm.type(Post)
 class PostType:
     id: auto
@@ -327,6 +348,7 @@ Scoping hooks do **not** run when you build with `strawberry.Schema(query=Query)
 A root `Query` field returns rows directly rather than through a relation. With `orm.schema()`, returning an *unexecuted* select or queryset still engages the optimizer: your filter composes with `UserType.scope_rows`, and nested fields still get their own type's hook at prefetch time.
 
 ```python
+# SQLAlchemy
 @strawberry.type
 class Query:
     @orm.field.custom
@@ -384,6 +406,7 @@ See [Declaring fields](#declaring-fields) for the full set of forms and argument
 A resolver on a relation field runs once per parent row, so `{ users { posts { … } } }` over 250 users is 251 statements. When the resolver returns an unexecuted query, the optimizer rewrites that into one statement per *query shape*:
 
 ```python
+# Django
 @orm.type(User)
 class UserType:
     name: auto
@@ -402,6 +425,7 @@ class UserType:
 Parents are already in memory and building a queryset touches no database, so the resolver runs for every sibling parent up front, the parent predicate is reflected out of each query, and the remainders are grouped. Branching therefore costs one statement per branch rather than one per row:
 
 ```python
+# Django
 if self.is_admin:
     return Post.objects.filter(author=self)
 return Post.objects.filter(author=self, is_published=True)
@@ -429,6 +453,7 @@ A resolver embedding a per-parent literal such as `created_at__gte=self.joined_a
 **Tracing hook order.** Add `print(..., flush=True)` inside your hooks:
 
 ```python
+# Django
 @classmethod
 def scope_rows(cls, queryset, info):
     print("SCOPE:PostType.scope_rows", flush=True)
@@ -538,17 +563,18 @@ Each one links to the mechanics.
 | `@orm.type` exposing secrets through `auto` | Output types do not hide sensitive columns for you | [Defining Types](#defining-types) |
 
 ```python
-return list(self.posts.all())               # ✗ materialized: no scope_rows, no optimizer
-return self.posts.all()                     # ✓ scoped, and batched into one statement
+# Django; translate the query expressions with "Reading the examples"
+return list(self.posts.all())            # ✗ materialized: no scope_rows, no optimizer
+return self.posts.all()                  # ✓ scoped, and batched into one statement
 
-schema = strawberry.Schema(query=Query)     # ✗ nested hooks never run
-schema = orm.schema(query=Query)            # ✓ optimizer and scoping active
+schema = strawberry.Schema(query=Query)  # ✗ nested hooks never run
+schema = orm.schema(query=Query)         # ✓ optimizer and scoping active
 
-return session.scalars(select(User)).all()  # ✗ optimizer skipped for everything below
-return orm.get_default_queryset(User)       # ✓ still a query object
+return list(User.objects.all())          # ✗ optimizer skipped for everything below
+return orm.get_default_queryset(User)    # ✓ still a query object
 
-return qs.filter(tenant_id=1)                                # ✗ same tenant every request
-return qs.filter(tenant_id=info.context["tenant_id"])        # ✓ per-request scope
+return queryset.filter(tenant_id=1)                             # ✗ same tenant always
+return queryset.filter(tenant_id=info.context["tenant_id"])     # ✓ per-request scope
 ```
 
 Better than a filtering resolver is no resolver at all, so the relation stays a single prefetch:
@@ -656,6 +682,7 @@ A field is either **declared** — the library resolves it — or **written** by
 `scoped` gets `info` but never `self`. That absence is the point: with no parent row to look at, the optimizer folds it into a single prefetch covering every parent at once. It also makes a field-level scope symmetric with `scope_rows(cls, qs, info)`.
 
 ```python
+# Django
 @orm.type(User)
 class UserType:
     id: auto
@@ -666,13 +693,13 @@ class UserType:
 
     # you narrow which rows load — named for the relation it narrows
     @orm.field.scoped
-    def posts(qs, info) -> list[PostType]:
-        return qs.filter(is_published=True)
+    def posts(queryset, info) -> list[PostType]:
+        return queryset.filter(is_published=True)
 
     # you write the resolver; it returns rows
     @orm.field.custom
     def recent(self, info: strawberry.Info) -> list[PostType]:
-        return select(Post).where(Post.author_id == self.id)
+        return Post.objects.filter(author_id=self.id)
 
     # you write the resolver; it returns a value
     @orm.field.computed(using=["comments"])
@@ -965,6 +992,7 @@ Registration order matters: define related orders *before* the parent (e.g. `orm
 `orm.filter_type(Model)` is a class decorator. Annotate fields with `auto` for standard lookups (identical to what `orm.filter()` generates). Add methods decorated with `@filter_field` for custom logic:
 
 ```python
+# SQLAlchemy
 from strawberry_orm import StrawberryORM, filter_field, auto
 
 orm = StrawberryORM.for_sqlalchemy(dialect="postgresql", session_getter=...)
@@ -1194,6 +1222,7 @@ class OrderGroupBy:
 Group-by and aggregation are available on Relay connection fields. Register a group-by type for a model and pass it to `orm.type()`:
 
 ```python
+# SQLAlchemy
 from strawberry import relay
 from strawberry_orm import StrawberryORM, auto
 from strawberry_orm.relay import ORMListConnection
@@ -1435,6 +1464,7 @@ Rules:
 Extend `relay.Node` instead of a plain Strawberry type. Use `relay.NodeID` for the id field:
 
 ```python
+# SQLAlchemy
 from strawberry import relay
 from strawberry_orm import StrawberryORM, auto
 
@@ -1594,6 +1624,7 @@ SQLAlchemy-only:
 A blog API with users, posts, tags, and comments — covering types, relations, queryset scoping, optimizer hints, filters, ordering, object traversal, grouping, aggregation, mutations, ref lists, recursive node mutations, and the query optimizer:
 
 ```python
+# SQLAlchemy
 import strawberry
 from strawberry_orm import StrawberryORM, auto
 
@@ -1639,7 +1670,9 @@ class PostType:
     title: auto
     body: auto
     is_published: auto
-    tags: list[TagType] = orm.field.scoped(lambda qs, info: qs.order_by("name"))
+    tags: list[TagType] = orm.field.scoped(
+        lambda select, info: select.order_by(Tag.name)
+    )
     comments: list[CommentType]
 
     @orm.field.custom

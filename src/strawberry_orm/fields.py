@@ -29,13 +29,13 @@ def check_scope_signature(fn: Callable[..., Any]) -> None:
     if names and names[0] == "self":
         raise TypeError(
             f"{getattr(fn, '__name__', 'scope')}(self, ...) is not a scope: a scope "
-            f"receives (qs, info) and never sees the parent row. Use "
+            f"receives (query, info) and never sees the parent row. Use "
             f"orm.field.custom for a resolver that needs self."
         )
     if len(names) != 2:
         raise TypeError(
             f"{getattr(fn, '__name__', 'scope')} takes {len(names)} positional "
-            f"argument(s); a scope receives exactly (qs, info)."
+            f"argument(s); a scope receives exactly (query, info)."
         )
 
 
