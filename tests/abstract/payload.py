@@ -42,7 +42,13 @@ def _on_error(exc):
 
 
 def policy(**overrides):
-    return PayloadPolicy(errors=Errors, on_error=_on_error, **overrides)
+    # ``types`` implies the errors type can be named rather than imported,
+    # which is how a real schema avoids an import cycle.
+    if overrides.get("types"):
+        overrides.setdefault("errors", "Errors")
+    return PayloadPolicy(
+        errors=overrides.pop("errors", Errors), on_error=_on_error, **overrides
+    )
 
 
 ALL_NAMES = ["Alice", "Bob", "Charlie"]
@@ -199,6 +205,19 @@ class AbstractTestPayload:
         assert conn["totalCount"] == len(ALL_NAMES)
         assert [edge["node"]["name"] for edge in conn["edges"]] == ALL_NAMES[:2]
 
+    def test_the_errors_type_can_be_named_too(self, seed, payload, execute):
+        """The module holding the errors type usually imports the ORM itself.
+
+        Naming it is then the only option, since importing it back into the
+        module that builds the ORM would be a cycle.
+        """
+        result = execute(
+            payload("query", by_name=True, fail=Denied("named")),
+            "{ users { data { name } errors { message } } }",
+        )
+        assert result.errors is None, result.errors
+        assert result.data["users"]["errors"] == {"message": "named"}
+
     def test_a_string_annotation_is_resolved_through_the_policy(
         self, seed, payload, execute
     ):
@@ -347,6 +366,14 @@ class AbstractTestPayloadAsync(AbstractTestPayload):
         assert result.errors is None, result.errors
         conn = result.data["users"]["data"]
         assert conn["totalCount"] == len(ALL_NAMES)
+
+    async def test_the_errors_type_can_be_named_too(self, seed, payload, execute):
+        result = await execute(
+            payload("query", by_name=True, fail=Denied("named")),
+            "{ users { data { name } errors { message } } }",
+        )
+        assert result.errors is None, result.errors
+        assert result.data["users"]["errors"] == {"message": "named"}
 
     async def test_a_string_annotation_is_resolved_through_the_policy(
         self, seed, payload, execute

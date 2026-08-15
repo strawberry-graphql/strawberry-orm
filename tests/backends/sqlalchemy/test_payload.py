@@ -8,7 +8,11 @@ from strawberry import relay
 from strawberry_orm import StrawberryORM
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
-from tests.abstract.payload import AbstractTestPayload, policy
+from tests.abstract.payload import (  # noqa: F401 - Errors is resolved by name
+    AbstractTestPayload,
+    Errors,
+    policy,
+)
 from tests.backends.sqlalchemy.models import Post as SAPost
 from tests.backends.sqlalchemy.models import User as SAUser
 
@@ -57,6 +61,8 @@ def payload(sa_session):
             class ByName:
                 @orm.payload.query
                 def users(self) -> list["NamedUserType"]:  # noqa: F821 - resolved via PayloadPolicy.types
+                    if fail is not None:
+                        raise fail
                     return list(sa_session.execute(rows).unique().scalars().all())
 
             return orm.schema(query=ByName)

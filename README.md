@@ -1480,6 +1480,8 @@ PayloadPolicy(
 
 Names in a payload's return annotation are then resolved there before the payload type is built, so a resolver can name any type in that module without importing it.
 
+The `errors` type can be named the same way, which is usually necessary: the module defining it generally imports the ORM, so importing it back would be a cycle.
+
 ### Connection payloads
 
 `orm.payload.connection` puts a Relay connection under `data`, with the generated `filter` / `order` / `groupBy` arguments and pagination hanging off it. Name the node type in the return annotation and the connection follows from it:

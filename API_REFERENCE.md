@@ -235,11 +235,11 @@ PayloadPolicy(
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `errors` | yes | The GraphQL type of the `errors` field. Any `@strawberry.type`. |
+| `errors` | yes | The GraphQL type of the `errors` field. Any `@strawberry.type`, or its name when `types` is set. |
 | `on_error` | yes | Called with the caught exception; returns a value of `errors`. |
 | `handles` | no | Which exception types are caught at all. Default `(Exception,)`. |
 | `suffix` | no | Appended to the resolver name to name the generated type. |
-| `types` | no | Module where a return annotation's named types are looked up, for resolvers that name a type their own module never imported. |
+| `types` | no | Module where `errors` and a return annotation's named types are looked up, for names the resolver's own module never imported. |
 
 ### How a failure becomes `errors`
 

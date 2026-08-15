@@ -10,7 +10,11 @@ from strawberry import relay
 from strawberry_orm import StrawberryORM
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
-from tests.abstract.payload import AbstractTestPayloadAsync, policy
+from tests.abstract.payload import (  # noqa: F401 - Errors is resolved by name
+    AbstractTestPayloadAsync,
+    Errors,
+    policy,
+)
 from tests.backends.tortoise.models import Post as TPost
 from tests.backends.tortoise.models import User as TUser
 
@@ -78,6 +82,8 @@ def payload():
             class ByName:
                 @orm.payload.query
                 async def users(self) -> list["NamedUserType"]:  # noqa: F821 - resolved via PayloadPolicy.types
+                    if fail is not None:
+                        raise fail
                     return list(await TUser.all().order_by("id"))
 
             return orm.schema(query=ByName)

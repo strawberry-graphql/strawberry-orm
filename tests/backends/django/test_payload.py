@@ -9,7 +9,11 @@ from strawberry import relay
 from strawberry_orm import StrawberryORM
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
-from tests.abstract.payload import AbstractTestPayload, policy
+from tests.abstract.payload import (  # noqa: F401 - Errors is resolved by name
+    AbstractTestPayload,
+    Errors,
+    policy,
+)
 from tests.backends.django.models import Post as DjPost
 from tests.backends.django.models import User as DjUser
 
@@ -49,6 +53,8 @@ def payload():
             class ByName:
                 @orm.payload.query
                 def users(self) -> list["NamedUserType"]:  # noqa: F821 - resolved via PayloadPolicy.types
+                    if fail is not None:
+                        raise fail
                     return list(DjUser.objects.order_by("id"))
 
             return orm.schema(query=ByName)

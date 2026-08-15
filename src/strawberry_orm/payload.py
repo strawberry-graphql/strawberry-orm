@@ -41,8 +41,9 @@ class PayloadPolicy:
     and leaves the decision to ``on_error``; naming your own exception types
     instead means an unexpected error keeps its traceback and its status.
 
-    ``types`` is where a resolver's return annotation is looked up when it names
-    a type as a string. A schema that keeps its types in one module can point
+    ``types`` is where ``errors`` and a resolver's return annotation are looked
+    up when they name a type as a string. Naming the errors type is often the
+    only option, since the module holding it usually imports the ORM itself. A schema that keeps its types in one module can point
     here once instead of importing every name into every module that resolves
     one.
     """
@@ -205,6 +206,10 @@ class PayloadFactory:
         self._orm = orm
         self._policy = policy
 
+    def _errors_type(self, policy: PayloadPolicy) -> Any:
+        """The errors type, resolved if it was named rather than imported."""
+        return _resolve_annotation(policy.errors, policy)
+
     def _require_policy(self) -> PayloadPolicy:
         if self._policy is None:
             raise TypeError(
@@ -295,7 +300,7 @@ class PayloadFactory:
                 payload_name,
                 fn.__module__,
                 {
-                    "errors": _PayloadField(policy.errors | None),
+                    "errors": _PayloadField(self._errors_type(policy) | None),
                     "_orm_connection_rows": _PayloadField(strawberry.Private[Any]),
                     "data": _PayloadField(
                         None,
@@ -345,7 +350,7 @@ class PayloadFactory:
                 func.__module__,
                 {
                     "data": _PayloadField(data_type | None),
-                    "errors": _PayloadField(policy.errors | None),
+                    "errors": _PayloadField(self._errors_type(policy) | None),
                 },
             )
 
