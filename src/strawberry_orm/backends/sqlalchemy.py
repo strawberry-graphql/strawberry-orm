@@ -907,16 +907,46 @@ class SQLAlchemyBackend(BaseBackend):
         session's identity map, which hands back the very objects the caller
         passed in. Scalars already loaded on them are left alone, so values
         fresher than the database survive.
+
+        Returns the rows it actually loaded onto, which is empty when the
+        selection named no relations.
+        """
+        plans = self._relation_load_statements(store, instances, info)
+        if not plans:
+            return []
+
+        session = self._get_session(info)
+        loaded = [row for _stmt, rows in plans for row in rows]
+        if self._is_async_session(session):
+
+            async def _load_async() -> list[Any]:
+                for stmt, _rows in plans:
+                    await self._execute_stmt_async(session, stmt)
+                return loaded
+
+            return _load_async()
+
+        for stmt, _rows in plans:
+            self._execute_stmt_sync(session, stmt)
+        return loaded
+
+    def _relation_load_statements(
+        self, store: Any, instances: list[Any], info: Any
+    ) -> list[tuple[Any, list[Any]]]:
+        """Pair each model's re-select with the rows it will load onto.
+
+        A statement is only worth running when the selection asked for
+        relations; ``options()`` returns a new statement, so one that came back
+        unchanged means re-selecting the rows would buy nothing.
         """
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy import select as sa_select
-
-        session = self._get_session(info)
 
         by_model: dict[type, list[Any]] = {}
         for instance in instances:
             by_model.setdefault(type(instance), []).append(instance)
 
+        plans: list[tuple[Any, list[Any]]] = []
         for model, rows in by_model.items():
             mapper = sa_inspect(model)
             pk_column = mapper.primary_key[0]
@@ -924,10 +954,10 @@ class SQLAlchemyBackend(BaseBackend):
             stmt = sa_select(model).where(
                 pk_column.in_([getattr(row, pk_name) for row in rows])
             )
-            stmt = self._apply_relation_loads(store, stmt, model, info)
-            session.execute(stmt).unique().scalars().all()
-
-        return instances
+            with_loads = self._apply_relation_loads(store, stmt, model, info)
+            if with_loads is not stmt:
+                plans.append((with_loads, rows))
+        return plans
 
     # -- Helpers -------------------------------------------------------------
 

@@ -133,6 +133,58 @@ class TestAsyncSessionExecution:
             ]
         }
 
+    async def test_materialized_rows_are_eager_loaded_on_an_async_session(
+        self, async_seed
+    ):
+        """The automatic pass has to await its loads on an AsyncSession.
+
+        A resolver that returns rows gives the optimizer nothing to add loads
+        to, so it re-selects them with the eager load attached - which on an
+        async session is a coroutine, not a result.
+        """
+        from sqlalchemy import select
+
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
+            session_getter=lambda info: info.context["session"],
+            warn_missing_scope=False,
+        )
+
+        @orm.type(SAPost)
+        class PostType:
+            id: auto
+            title: auto
+
+        @orm.type(SAUser)
+        class UserType:
+            id: auto
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            async def users(self, info: strawberry.types.Info) -> list[UserType]:
+                stmt = select(SAUser).order_by(SAUser.id)
+                rows = await info.context["session"].execute(stmt)
+                return list(rows.unique().scalars().all())
+
+        schema = orm.schema(query=Query)
+        result = await schema.execute(
+            "{ users { name posts { title } } }",
+            context_value={"session": async_seed},
+        )
+        assert result.errors is None, result.errors
+        assert [row["name"] for row in result.data["users"]] == [
+            "Alice",
+            "Bob",
+            "Charlie",
+        ]
+        assert [post["title"] for post in result.data["users"][0]["posts"]] == [
+            "Hello World",
+            "GraphQL Guide",
+        ]
+
 
 class TestAsyncSessionMutations:
     @pytest.mark.asyncio

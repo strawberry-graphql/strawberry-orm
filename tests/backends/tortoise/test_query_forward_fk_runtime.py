@@ -113,10 +113,13 @@ class TestQueryForwardFKRuntime:
         }
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(
-        reason="Tortoise custom forward-FK queryset prefetch is still broken",
-    )
     async def test_forward_fk_respects_type_level_scope_rows(self, seed, User, Post):
+        """A scoped forward FK is not batchable, so it is scoped per row.
+
+        Filtering the related model by the column that points back at the
+        parent only works for reverse relations; a forward FK keeps that column
+        on the parent. The relation resolver applies the scope instead.
+        """
         schema = self._build_schema(
             User,
             Post,
@@ -202,14 +205,9 @@ class TestForwardFKScopingOnMaterializedParents:
     async def test_materialized_parents_do_not_bypass_to_one_scoping(
         self, seed, User, Post
     ):
-        """Only the materialized path is compared here.
-
-        The optimizer's own scoped forward-FK prefetch is separately broken on
-        Tortoise - see ``test_forward_fk_respects_type_level_scope_rows``
-        above - so the two paths cannot be compared the way they are for
-        Django and SQLAlchemy.
-        """
         materialized = await self._run(User, Post, materialize=True)
+        lazy = await self._run(User, Post, materialize=False)
+        assert materialized == lazy
         assert [row["author"] for row in materialized] == [
             {"name": "Alice"},
             {"name": "Alice"},

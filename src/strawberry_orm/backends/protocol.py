@@ -208,7 +208,11 @@ class Backend(Protocol):
     def load_relations(
         self, store: Any, instances: list[Any], info: Any
     ) -> AwaitableOrValue[list[Any]]:
-        """Eager-load the selected relations onto *instances*, in place."""
+        """Eager-load the selected relations onto *instances*, in place.
+
+        Returns the rows it loaded onto - empty when the selection named no
+        relations, so callers can tell a real load from a no-op.
+        """
         ...
 
     def relation_names(self, model: type) -> set[str]:

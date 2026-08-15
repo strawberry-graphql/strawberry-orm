@@ -13,9 +13,9 @@ Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.r
 
 **Before you ship:** [Security](#security) · [Production baseline](#production-baseline)
 
-**Feature guide:** [Defining types](#defining-types) · [Declaring fields](#declaring-fields) · [Filters and ordering](#filters-and-ordering) · [Custom filters and ordering](#custom-filters-and-ordering) · [Grouping and aggregation](#grouping-and-aggregation) · [Mutations](#mutations) · [Relay](#relay-integration) · [Async](#async-usage)
+**Feature guide:** [Defining types](#defining-types) · [Declaring fields](#declaring-fields) · [Filters and ordering](#filters-and-ordering) · [Custom filters and ordering](#custom-filters-and-ordering) · [Grouping and aggregation](#grouping-and-aggregation) · [Payloads](#data--errors-payloads) · [Mutations](#mutations) · [Relay](#relay-integration) · [Async](#async-usage)
 
-**Reference:** [Backend options](#backend-options) · [Public exports](#public-exports) · [Full example](#appendix-full-example)
+**Reference:** [API reference](API_REFERENCE.md) · [Backend options](#backend-options) · [Public exports](#public-exports) · [Full example](#appendix-full-example)
 
 ---
 
@@ -335,7 +335,7 @@ How a field is written decides what scoping it gets.
 | `@orm.field.custom` returning a query object | Optimizer + that type's `scope_rows` — see [Root custom query](#root-custom-query) |
 | `@orm.field.custom` returning `self.author` | As written; scoping only via prefetch |
 | `@strawberry.field`, fully custom | You own scoping and auth |
-| A resolver returning instances | Nested relations still scoped, one query each — see [`orm.optimize`](#ormoptimize) |
+| A resolver returning instances | Nested relations scoped and eager-loaded — see [Rows a resolver already fetched](#rows-a-resolver-already-fetched) |
 
 The first four rows are all `orm.field`, which has four named forms that run at different times and take different arguments — see [The four kinds of field](#the-four-kinds-of-field).
 
@@ -359,30 +359,35 @@ class Query:
 
 Use `scope_rows` when the same rule applies everywhere the model loads, and a custom root resolver when the criteria belong to that one entry point. See [List Fields](#list-fields) for a comparison.
 
-### `orm.optimize`
+### Rows a resolver already fetched
 
-Sometimes a resolver cannot return a query object — it has just written the rows, or it returns them inside a wrapper. The rows are still scoped when their relations are read, but each relation costs a query per parent. `orm.optimize` puts them back on the eager-loaded path:
+A resolver that returns rows rather than a query object gives the optimizer nothing to add eager loads to. It handles that case anyway: the rows are all it needs, so it loads their relations onto them.
 
 ```python
 # Django
 @strawberry.field
 def create_post(self, info: strawberry.Info, ...) -> PostType:
-    post = Post.objects.create(...)
-    return orm.optimize(post, info)
+    return Post.objects.create(...)      # relations below still eager-loaded
 ```
 
-It takes a query object, a model instance, or a list, and returns anything else untouched — so it is safe to wrap a whole payload. Relations are loaded **onto the instances you pass in**, so values you have just set in memory are never overwritten by a re-read of the database. On an async backend the result is awaitable.
+This reaches rows nested inside a wrapper too. A payload's `data` is a resolved field in its own right, so the rows arrive with exactly the selection that describes them.
 
-When the rows sit below the field being resolved, point it at them with `at`. The optimizer reads the selection set from the current field, and for a payload the relations to load are named under `data`, not beside it:
+Relations are loaded **onto the rows you returned**, so a value you just set in memory is never overwritten by a re-read of the database — the mutation above reports the title it wrote, not the one in the database.
+
+<details>
+<summary><code>orm.optimize</code> — the manual form</summary>
+
+Rows that never pass through a resolver's return value are out of reach, and for those there is `orm.optimize(data, info)`. It takes a query object, a model instance, or a list, and returns anything else untouched.
 
 ```python
 # Django
-@strawberry.field
-def recent_posts(self, info: strawberry.Info) -> Payload:
-    return Payload(data=orm.optimize(rows, info, at="data"), errors=None)
+rows = list(Post.objects.filter(...))
+orm.optimize(rows, info)
 ```
 
-`at` also takes a sequence for a deeper path, and matches either `camelCase` or `snake_case`. Getting it wrong is not an error — nothing is eager-loaded and the rows come back as they would have anyway.
+Calling it on rows the optimizer already prepared costs nothing. `at="data"` re-roots the selection when the rows sit below the resolved field; `at` also takes a sequence for a deeper path and matches either `camelCase` or `snake_case`. Getting it wrong is not an error — nothing is eager-loaded and the rows come back as they would have anyway.
+
+</details>
 
 ### `orm.schema()`
 
@@ -1370,6 +1375,125 @@ class OrderAggregation:
 
 ---
 
+## Data / errors payloads
+
+A GraphQL error aborts the field and hands the client an `errors` array detached from the shape it asked for. If you would rather answer with a typed payload — `data` when the work succeeded, `errors` when it did not — `orm.payload` builds it.
+
+Configure it once with the error type and how to convert an exception:
+
+```python
+# Django
+from strawberry_orm import PayloadPolicy, StrawberryORM
+
+orm = StrawberryORM.for_django(
+    payload=PayloadPolicy(
+        errors=ErrorsObject,
+        on_error=ErrorsObject.from_exception,
+    ),
+)
+```
+
+Then the resolver says what it returns, and the payload type is generated from it:
+
+```python
+# Django
+@strawberry.type
+class Query:
+    @orm.payload.query
+    def recent_users(self) -> list[UserType]:
+        return User.objects.order_by("-created_at")
+
+@strawberry.type
+class Mutation:
+    @orm.payload.mutation
+    def rename_user(self, identifier: str, name: str) -> UserType:
+        ...
+```
+
+`recentUsers` returns a `RecentUsersPayload` with `data` and `errors`. The name comes from the resolver; pass `name=` to choose your own. `orm.payload.mutation` also takes `input_mutation=True` to collapse the arguments into a generated `input` argument.
+
+Three things happen for you. Exceptions become `errors` and leave `data` null. Sync ORM work is moved off the event loop under async, decided per call so the same resolver is correct in tests and under an ASGI server. And rows returned through `data` are eager-loaded, because `data` is a resolved field like any other — the payload machinery itself does no optimization.
+
+### How an exception becomes `errors`
+
+`on_error` is the whole translation step. It receives the exception and returns a value of your `errors` type:
+
+```python
+# Django
+@strawberry.type
+class ErrorsObject:
+    message: str
+    field: str | None = None
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "ErrorsObject":
+        if isinstance(exc, ValidationError):
+            return cls(message=str(exc), field=exc.field)
+        if isinstance(exc, AuthorizationError):
+            return cls(message="Not allowed")
+        raise exc          # anything unrecognised stays a GraphQL error
+```
+
+Given `raise ValidationError("Title is required", field="title")`, a client asking for
+
+```graphql
+{ createPost(title: "") { data { id title } errors { message field } } }
+```
+
+gets its answer in the shape it asked for, with `data` null:
+
+```json
+{ "data": { "createPost": { "data": null,
+                            "errors": { "message": "Title is required",
+                                        "field": "title" } } } }
+```
+
+Exactly one of `data` and `errors` is ever set.
+
+That final `raise` matters: a converter that only recognises some of your errors needs a way to let the rest through. Anything `on_error` re-raises fails the field normally, so `createPost` comes back null with a top-level GraphQL error — a bug stays a bug rather than being flattened into a message.
+
+`handles` is the other way to draw that line. It decides what is caught in the first place, so an unlisted exception never reaches the converter and keeps its own traceback instead of being chained through one:
+
+```python
+# Django
+PayloadPolicy(
+    errors=ErrorsObject,
+    on_error=ErrorsObject.from_exception,
+    handles=(ValidationError, AuthorizationError),
+)
+```
+
+The default is `(Exception,)`, which catches broadly and leaves the decision to `on_error`. Which you prefer is a question of where the list of known errors should live: next to the policy, or inside the converter.
+
+### Connection payloads
+
+`orm.payload.connection` puts a Relay connection under `data`, with the generated `filter` / `order` / `groupBy` arguments and pagination hanging off it:
+
+```python
+# Django
+@strawberry.type
+class Query:
+    @orm.payload.connection(ORMListConnection[UserNode])
+    def users(self):
+        return User.objects.order_by("id")
+```
+
+```graphql
+{
+  users {
+    errors { message }
+    data(first: 10, filter: { field: { name: { contains: "a" } } }) {
+      totalCount
+      edges { node { name } }
+    }
+  }
+}
+```
+
+On failure `data` is an empty connection rather than null, so a client renders the same shape either way.
+
+---
+
 ## Mutations
 
 Write plain `@strawberry.mutation` resolvers and use `strawberry-orm` for generated input types. Authorization and row-level checks are your responsibility — see [Security](#security).
@@ -1654,7 +1778,9 @@ SQLAlchemy-only:
 
 ## Public exports
 
-`StrawberryORM`, `auto`, `make_ref_type`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
+Every name below is documented with its signature in the [API reference](API_REFERENCE.md).
+
+`StrawberryORM`, `auto`, `make_ref_type`, `PayloadPolicy`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
 
 ---
 

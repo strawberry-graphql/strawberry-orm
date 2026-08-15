@@ -996,6 +996,7 @@ class StrawberryORM:
         self._backend_name = backend
         repos: dict[type, type[AbstractRepo]] | None = kwargs.pop("repos", None)  # type: ignore[type-arg]
         policy = kwargs.pop("policy", None)
+        self._payload_policy = kwargs.pop("payload", None)
         self._backend: Backend = _create_backend(backend, **kwargs)
         self._backend._repos = repos or {}  # type: ignore[attr-defined]
 
@@ -1090,6 +1091,17 @@ class StrawberryORM:
 
     def node(self, **kwargs: Any) -> Any:
         return self._backend.node(**kwargs)
+
+    @cached_property
+    def payload(self) -> Any:
+        """Resolvers that answer with ``data`` and ``errors``.
+
+        Needs ``payload=PayloadPolicy(...)`` on the ORM; see
+        :mod:`strawberry_orm.payload`.
+        """
+        from strawberry_orm.payload import PayloadFactory
+
+        return PayloadFactory(self, self._payload_policy)
 
     def connection(
         self,
@@ -1192,6 +1204,7 @@ class StrawberryORM:
         memory - which may be fresher than the database, straight out of a
         mutation - are preserved. On an async backend the result is awaitable.
         """
+        from strawberry_orm.optimizer.extension import _mark_prepared
         from strawberry_orm.optimizer.selections import narrow_info
 
         if data is None or info is None:
@@ -1205,32 +1218,39 @@ class StrawberryORM:
             info = narrow_info(info, at)
 
         if self._backend.is_query_object(data):
-            return self._backend.apply_optimizer_hints(store, data, info)
+            rows = self._backend.apply_optimizer_hints(store, data, info)
+            if isawaitable(rows):
+
+                async def _await_rows() -> Any:
+                    resolved = await rows
+                    _mark_prepared(resolved)
+                    return resolved
+
+                return _await_rows()
+            _mark_prepared(rows)
+            return rows
 
         if self._backend.is_model_instance(data):
-            loaded = self._backend.load_relations(store, [data], info)
-            if isawaitable(loaded):
-
-                async def _one() -> Any:
-                    return (await loaded)[0]
-
-                return _one()
-            return loaded[0]
-
-        if isinstance(data, list):
+            instances = [data]
+        elif isinstance(data, list):
             instances = [item for item in data if self._backend.is_model_instance(item)]
             if not instances:
                 return data
-            loaded = self._backend.load_relations(store, instances, info)
-            if isawaitable(loaded):
-
-                async def _many() -> Any:
-                    await loaded
-                    return data
-
-                return _many()
+        else:
             return data
 
+        loaded = self._backend.load_relations(store, instances, info)
+        if isawaitable(loaded):
+
+            async def _await_loaded() -> Any:
+                # Only what was loaded is marked, so the optimizer's automatic
+                # pass does not repeat the work - and, when this call turned
+                # out to be a no-op, is not suppressed by it either.
+                _mark_prepared(await loaded)
+                return data
+
+            return _await_loaded()
+        _mark_prepared(loaded)
         return data
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:

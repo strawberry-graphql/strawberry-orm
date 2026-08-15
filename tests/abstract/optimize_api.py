@@ -91,6 +91,11 @@ class AbstractTestOptimizeAPI:
     (``"query"``), and returns ``(data, query_count)``.
     """
 
+    #: Backends differ in how they load onto rows already in memory. Django and
+    #: Tortoise fill the relation caches in place, so the rows plus one relation
+    #: is two queries; SQLAlchemy re-selects the rows to attach the eager load.
+    max_eager_queries = 2
+
     # -- the three shapes orm.optimize accepts -------------------------------
 
     def test_a_single_instance_is_optimized(self, seed, run_payload):
@@ -100,9 +105,11 @@ class AbstractTestOptimizeAPI:
     def test_a_query_object_is_optimized_and_materialized(self, seed, run_payload):
         """A query object still goes through the ordinary optimizer path."""
         optimized, optimized_queries = run_payload(optimize=True, shape="query")
-        plain, _ = run_payload(optimize=False, shape="query")
+        plain, plain_queries = run_payload(optimize=False, shape="query")
         assert optimized == plain == ALL_POSTS
-        assert optimized_queries <= 2
+        assert optimized_queries == plain_queries, (
+            "optimizing a query object twice should not cost an extra query"
+        )
 
     # -- values it must not touch --------------------------------------------
 
@@ -129,13 +136,38 @@ class AbstractTestOptimizeAPI:
         plain, _ = run_payload(optimize=False)
         assert optimized == plain == ALL_POSTS
 
-    def test_optimize_collapses_the_per_row_queries(self, seed, run_payload):
+    def test_rows_are_eager_loaded_without_an_explicit_call(self, seed, run_payload):
+        """The optimizer reaches materialized rows on its own.
+
+        ``data`` is a resolved field like any other, so the rows arrive at the
+        optimizer with exactly the selection that describes them - no call
+        needed. Two queries: the rows, then their relation.
+        """
+        _, plain_queries = run_payload(optimize=False)
+        assert plain_queries <= self.max_eager_queries, (
+            f"{plain_queries} queries for 3 rows and one relation suggests "
+            f"the automatic pass did not run"
+        )
+
+    def test_an_explicit_call_costs_nothing_extra(self, seed, run_payload):
+        """``orm.optimize`` on rows the optimizer already prepared is a no-op."""
         _, optimized_queries = run_payload(optimize=True)
         _, plain_queries = run_payload(optimize=False)
-        assert optimized_queries < plain_queries, (
-            f"optimize() issued {optimized_queries} queries, "
-            f"no better than the {plain_queries} without it"
-        )
+        assert optimized_queries == plain_queries
+
+    def test_a_call_that_loads_nothing_does_not_suppress_the_automatic_pass(
+        self, seed, run_payload
+    ):
+        """A wrong ``at`` must be no worse than never calling it.
+
+        The rows sit under ``data``; pointed at the payload instead, the call
+        finds no relations and loads nothing. Marking them regardless would
+        skip the automatic pass on ``data`` and reinstate the per-row queries
+        the call was meant to avoid.
+        """
+        _, misdirected = run_payload(optimize=True, at=None)
+        _, plain = run_payload(optimize=False)
+        assert misdirected == plain
 
     def test_relation_scoping_still_applies(self, seed, run_payload):
         """``scope_rows`` on the related type must survive this path.
@@ -194,22 +226,35 @@ class AbstractTestOptimizeAPIAsync(AbstractTestOptimizeAPI):
         self, seed, run_payload
     ):
         optimized, optimized_queries = await run_payload(optimize=True, shape="query")
-        plain, _ = await run_payload(optimize=False, shape="query")
+        plain, plain_queries = await run_payload(optimize=False, shape="query")
         assert optimized == plain == ALL_POSTS
-        assert optimized_queries <= 2
+        assert optimized_queries == plain_queries
 
     async def test_optimized_and_unoptimized_agree(self, seed, run_payload):
         optimized, _ = await run_payload(optimize=True)
         plain, _ = await run_payload(optimize=False)
         assert optimized == plain == ALL_POSTS
 
-    async def test_optimize_collapses_the_per_row_queries(self, seed, run_payload):
+    async def test_rows_are_eager_loaded_without_an_explicit_call(
+        self, seed, run_payload
+    ):
+        _, plain_queries = await run_payload(optimize=False)
+        assert plain_queries <= self.max_eager_queries, (
+            f"{plain_queries} queries for 3 rows and one relation suggests "
+            f"the automatic pass did not run"
+        )
+
+    async def test_an_explicit_call_costs_nothing_extra(self, seed, run_payload):
         _, optimized_queries = await run_payload(optimize=True)
         _, plain_queries = await run_payload(optimize=False)
-        assert optimized_queries < plain_queries, (
-            f"optimize() issued {optimized_queries} queries, "
-            f"no better than the {plain_queries} without it"
-        )
+        assert optimized_queries == plain_queries
+
+    async def test_a_call_that_loads_nothing_does_not_suppress_the_automatic_pass(
+        self, seed, run_payload
+    ):
+        _, misdirected = await run_payload(optimize=True, at=None)
+        _, plain = await run_payload(optimize=False)
+        assert misdirected == plain
 
     async def test_relation_scoping_still_applies(self, seed, run_payload):
         scoped, _ = await run_payload(optimize=True, scoped=True)

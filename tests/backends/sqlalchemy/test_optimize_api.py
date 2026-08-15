@@ -131,4 +131,6 @@ def run_dirty_scalar(sa_session):
 
 
 class TestOptimizeAPI(AbstractTestOptimizeAPI):
-    pass
+    # Loading onto rows already in memory means re-selecting them by primary
+    # key so the eager load has something to hang off, then the selectin.
+    max_eager_queries = 3

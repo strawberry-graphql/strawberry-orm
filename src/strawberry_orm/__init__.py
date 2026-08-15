@@ -20,6 +20,7 @@ from strawberry_orm.filters import (
 from strawberry_orm.lazy_resolution import LazyResolutionExtension
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import FieldHints, OptimizerExtension, OptimizerStore
+from strawberry_orm.payload import PayloadPolicy
 from strawberry_orm.policy import MutationPolicy
 from strawberry_orm.repo import AbstractRepo
 from strawberry_orm.types import (
@@ -52,6 +53,7 @@ __all__ = [
     "LazyResolutionExtension",
     "OptimizerExtension",
     "OptimizerStore",
+    "PayloadPolicy",
     "Ordering",
     "StrawberryORM",
     "StringLookup",

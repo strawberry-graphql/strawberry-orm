@@ -197,6 +197,44 @@ class TestForwardFKScopingOnMaterializedParents:
             None,
         ]
 
+    def test_a_scoped_to_one_is_reapplied_per_row_without_the_optimizer(
+        self, seed, User, Post
+    ):
+        """With no eager load to scope, the scope runs as each row is read."""
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(User)
+        class AuthorType:
+            id: auto
+            name: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(name="Alice")
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+            author: AuthorType | None
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                return list(Post.objects.order_by("id"))
+
+        result = orm.schema(query=Query, optimizer=False).execute_sync(
+            "{ posts { title author { name } } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        assert [row["author"] for row in result.data["posts"]] == [
+            {"name": "Alice"},
+            {"name": "Alice"},
+            None,
+            None,
+        ]
+
     def test_an_unscoped_to_one_reads_straight_through(self, seed, User, Post):
         """With no scope there is nothing to reapply, so the row is returned."""
         orm = StrawberryORM.for_django(warn_missing_scope=False)

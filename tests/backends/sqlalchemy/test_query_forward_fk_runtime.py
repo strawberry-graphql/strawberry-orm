@@ -213,6 +213,53 @@ class TestForwardFKScopingOnMaterializedParents:
             None,
         ]
 
+    def test_a_scoped_to_one_is_reapplied_per_row_without_the_optimizer(
+        self, sa_session, seed, User, Post
+    ):
+        """With no eager load to scope, the scope runs as each row is read."""
+        from sqlalchemy import select
+
+        sa_session.expunge_all()
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
+            session_getter=lambda info: info.context["session"],
+            warn_missing_scope=False,
+        )
+
+        @orm.type(User)
+        class AuthorType:
+            id: auto
+            name: auto
+
+            @classmethod
+            def scope_rows(cls, select_stmt, info):
+                return select_stmt.where(User.name == "Alice")
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+            author: AuthorType | None
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                stmt = select(Post).order_by(Post.id)
+                return list(sa_session.execute(stmt).unique().scalars().all())
+
+        result = orm.schema(query=Query, optimizer=False).execute_sync(
+            "{ posts { title author { name } } }",
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None, result.errors
+        assert [row["author"] for row in result.data["posts"]] == [
+            {"name": "Alice"},
+            {"name": "Alice"},
+            None,
+            None,
+        ]
+
     def test_an_unscoped_to_one_reads_straight_through(
         self, sa_session, seed, User, Post
     ):

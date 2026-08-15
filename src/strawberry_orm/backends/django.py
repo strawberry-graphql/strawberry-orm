@@ -972,6 +972,9 @@ class DjangoBackend(BaseBackend):
         ``prefetch_related_objects`` fills the relation caches in place, so
         scalar values the caller is holding - which may be fresher than the
         database, straight out of a mutation - are never overwritten.
+
+        Returns the rows it actually loaded onto, which is empty when the
+        selection named no relations.
         """
 
         def load() -> list[Any]:
@@ -981,6 +984,7 @@ class DjangoBackend(BaseBackend):
             for instance in instances:
                 by_model.setdefault(type(instance), []).append(instance)
 
+            loaded: list[Any] = []
             for model, rows in by_model.items():
                 select_related, prefetch_related = self._relation_lookups(
                     store, model, info
@@ -988,7 +992,8 @@ class DjangoBackend(BaseBackend):
                 lookups = _dedupe_lookups([*select_related, *prefetch_related])
                 if lookups:
                     prefetch_related_objects(rows, *lookups)
-            return instances
+                    loaded.extend(rows)
+            return loaded
 
         return run_sync(load, thread_sensitive=True)
 

@@ -945,6 +945,17 @@ class TortoiseBackend(BaseBackend):
         for field_node in field_nodes_from_info(info):
             _walk_selections(field_node.selection_set, model)
 
+        # Batching a scoped relation filters the related model by the column
+        # that points back at the parent. A forward FK has no such column - it
+        # lives on the parent - so there is nothing to batch on. Those edges are
+        # scoped per row by the relation resolver instead: slower, but correct,
+        # where attempting the batch raises on an unknown filter param.
+        custom_rels = [
+            crel
+            for crel in custom_rels
+            if crel.fk_col is None or crel.fk_col in crel.related_model._meta.fields_map
+        ]
+
         return prefetch_paths, custom_rels
 
     async def apply_optimizer_hints(
@@ -988,21 +999,28 @@ class TortoiseBackend(BaseBackend):
         ``fetch_for_list`` fills the relation caches in place, so scalar values
         the caller is holding - which may be fresher than the database,
         straight out of a mutation - are never overwritten.
+
+        Returns the rows it actually loaded onto, which is empty when the
+        selection named no relations.
         """
         by_model: dict[type, list[Any]] = {}
         for instance in instances:
             by_model.setdefault(type(instance), []).append(instance)
 
+        loaded: list[Any] = []
         for model, rows in by_model.items():
             prefetch_paths, custom_rels = self._relation_prefetches(store, model, info)
             if prefetch_paths:
-                await model.fetch_for_list(
-                    rows, *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
-                )
+                # Paths go in raw here: ``fetch_for_list`` splits ``a__b``
+                # itself, and rejects the ``Prefetch`` objects the queryset
+                # path needs.
+                await model.fetch_for_list(rows, *prefetch_paths)
             if custom_rels:
                 await self._apply_custom_prefetch(rows, custom_rels)
+            if prefetch_paths or custom_rels:
+                loaded.extend(rows)
 
-        return instances
+        return loaded
 
     async def _apply_custom_prefetch(
         self,

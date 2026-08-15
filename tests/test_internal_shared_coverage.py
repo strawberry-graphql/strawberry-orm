@@ -269,3 +269,34 @@ class TestRelationScopeLookup:
 
         backend = _minimal_backend(target=Related)
         assert backend.relation_scope(object, "rel", info=None) is None
+
+
+class TestSelectionSetFormatting:
+    """The N+1 report quotes the selection that asked for the relation."""
+
+    @staticmethod
+    def _selection_set(query: str):
+        from graphql import parse
+
+        return parse(query).definitions[0].selection_set
+
+    def test_a_flat_selection_reads_as_field_names(self):
+        from strawberry_orm.lazy_resolution import _format_selection_set
+
+        assert _format_selection_set(self._selection_set("{ title body }")) == (
+            "title body"
+        )
+
+    def test_a_nested_selection_keeps_its_braces(self):
+        """Without recursion the report would name a relation and stop."""
+        from strawberry_orm.lazy_resolution import _format_selection_set
+
+        formatted = _format_selection_set(
+            self._selection_set("{ title tags { name colour } }")
+        )
+        assert formatted == "title tags { name colour }"
+
+    def test_an_empty_selection_set_is_blank(self):
+        from strawberry_orm.lazy_resolution import _format_selection_set
+
+        assert _format_selection_set(None) == ""
