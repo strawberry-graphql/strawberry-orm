@@ -318,3 +318,96 @@ class TestForwardReferencedConnectionNode:
         from strawberry_orm.relay.connection import connection_type_for_node
 
         assert connection_type_for_node("PostType").__name__ == "PostTypeConnection"
+
+
+class TestPayloadAnnotationResolution:
+    """``PayloadPolicy.types`` decides where a named type is looked up."""
+
+    @staticmethod
+    def _policy(types=None):
+        from strawberry_orm import PayloadPolicy
+
+        return PayloadPolicy(errors=object, on_error=lambda exc: None, types=types)
+
+    def test_without_a_types_module_the_annotation_is_left_alone(self):
+        from strawberry_orm.payload import _resolve_annotation
+
+        assert _resolve_annotation("Whatever", self._policy()) == "Whatever"
+
+    def test_a_bare_string_is_resolved(self):
+        from strawberry_orm.payload import _resolve_annotation
+
+        resolved = _resolve_annotation("PayloadPolicy", self._policy("strawberry_orm"))
+        from strawberry_orm import PayloadPolicy
+
+        assert resolved is PayloadPolicy
+
+    def test_a_dotted_string_uses_its_last_segment(self):
+        from strawberry_orm import PayloadPolicy
+        from strawberry_orm.payload import _resolve_annotation
+
+        resolved = _resolve_annotation(
+            "somewhere.PayloadPolicy", self._policy("strawberry_orm")
+        )
+        assert resolved is PayloadPolicy
+
+    def test_a_name_the_module_does_not_have_is_left_alone(self):
+        from strawberry_orm.payload import _resolve_annotation
+
+        assert (
+            _resolve_annotation("NoSuchType", self._policy("strawberry_orm"))
+            == "NoSuchType"
+        )
+
+    def test_a_nested_reference_is_resolved_inside_its_container(self):
+        from strawberry_orm import PayloadPolicy
+        from strawberry_orm.payload import _resolve_annotation
+
+        resolved = _resolve_annotation(
+            list["PayloadPolicy"], self._policy("strawberry_orm")
+        )
+        import typing
+
+        assert typing.get_args(resolved) == (PayloadPolicy,)
+
+    def test_an_explicit_forward_reference_is_resolved(self):
+        """``ForwardRef`` is what an annotation string becomes once evaluated."""
+        from typing import ForwardRef
+
+        from strawberry_orm import PayloadPolicy
+        from strawberry_orm.payload import _resolve_annotation
+
+        resolved = _resolve_annotation(
+            ForwardRef("PayloadPolicy"), self._policy("strawberry_orm")
+        )
+        assert resolved is PayloadPolicy
+
+    def test_an_annotation_with_nothing_to_resolve_is_returned_as_is(self):
+        from strawberry_orm.payload import _resolve_annotation
+
+        assert (
+            _resolve_annotation(list[int], self._policy("strawberry_orm"))
+            == (list[int])
+        )
+
+
+class TestPayloadElementType:
+    def test_a_list_yields_its_item_type(self):
+        from strawberry_orm.payload import _element_type
+
+        assert _element_type(list[int]) is int
+
+    def test_an_optional_skips_none(self):
+        from strawberry_orm.payload import _element_type
+
+        assert _element_type(int | None) is int
+
+    def test_a_plain_type_is_its_own_element(self):
+        from strawberry_orm.payload import _element_type
+
+        assert _element_type(int) is int
+
+    def test_no_annotation_yields_nothing(self):
+        from strawberry_orm.payload import _element_type
+
+        assert _element_type(None) is None

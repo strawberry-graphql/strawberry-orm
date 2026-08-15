@@ -186,6 +186,34 @@ class AbstractTestPayload:
         assert result.data["users"]["errors"] == {"message": "nope"}
         assert result.data["users"]["data"]["edges"] == []
 
+    def test_a_connection_type_is_derived_from_the_annotation(
+        self, seed, payload, execute
+    ):
+        """Naming the node type is enough; the connection follows from it."""
+        result = execute(
+            payload("connection", derive=True),
+            "{ users { data(first: 2) { totalCount edges { node { name } } } } }",
+        )
+        assert result.errors is None, result.errors
+        conn = result.data["users"]["data"]
+        assert conn["totalCount"] == len(ALL_NAMES)
+        assert [edge["node"]["name"] for edge in conn["edges"]] == ALL_NAMES[:2]
+
+    def test_a_string_annotation_is_resolved_through_the_policy(
+        self, seed, payload, execute
+    ):
+        """``PayloadPolicy.types`` says where a named type lives.
+
+        A resolver can then name a type its own module never imported, which
+        is what a schema with one types module and many resolver modules needs.
+        """
+        result = execute(
+            payload("query", by_name=True),
+            "{ users { data { name } errors { message } } }",
+        )
+        assert result.errors is None, result.errors
+        assert [row["name"] for row in result.data["users"]["data"]] == ALL_NAMES
+
     # -- misuse --------------------------------------------------------------
 
     def test_the_payload_name_can_be_overridden(self, orm_with_policy):
@@ -216,6 +244,14 @@ class AbstractTestPayload:
             @orm_with_policy.payload.query
             def users(self):  # no annotation to build the payload from
                 return []
+
+    def test_a_connection_without_a_node_type_is_rejected(self, orm_with_policy):
+        """With no connection type and no annotation there is nothing to build."""
+        with pytest.raises(TypeError, match="needs a return annotation naming"):
+
+            @orm_with_policy.payload.connection()
+            def users(self):
+                return []  # pragma: no cover - never built
 
     def test_using_payload_without_a_policy_is_rejected(self, orm):
         with pytest.raises(TypeError, match="needs a PayloadPolicy"):
@@ -300,6 +336,27 @@ class AbstractTestPayloadAsync(AbstractTestPayload):
             "data": None,
             "errors": {"message": "read only"},
         }
+
+    async def test_a_connection_type_is_derived_from_the_annotation(
+        self, seed, payload, execute
+    ):
+        result = await execute(
+            payload("connection", derive=True),
+            "{ users { data(first: 2) { totalCount edges { node { name } } } } }",
+        )
+        assert result.errors is None, result.errors
+        conn = result.data["users"]["data"]
+        assert conn["totalCount"] == len(ALL_NAMES)
+
+    async def test_a_string_annotation_is_resolved_through_the_policy(
+        self, seed, payload, execute
+    ):
+        result = await execute(
+            payload("query", by_name=True),
+            "{ users { data { name } errors { message } } }",
+        )
+        assert result.errors is None, result.errors
+        assert [row["name"] for row in result.data["users"]["data"]] == ALL_NAMES
 
     async def test_a_connection_payload_paginates(self, seed, payload, execute):
         result = await execute(

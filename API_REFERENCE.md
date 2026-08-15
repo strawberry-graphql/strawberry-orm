@@ -229,6 +229,7 @@ PayloadPolicy(
     on_error: Callable[[BaseException], Any],
     handles: tuple[type[BaseException], ...] = (Exception,),
     suffix: str = "Payload",
+    types: str | None = None,
 )
 ```
 
@@ -238,6 +239,7 @@ PayloadPolicy(
 | `on_error` | yes | Called with the caught exception; returns a value of `errors`. |
 | `handles` | no | Which exception types are caught at all. Default `(Exception,)`. |
 | `suffix` | no | Appended to the resolver name to name the generated type. |
+| `types` | no | Module where a return annotation's named types are looked up, for resolvers that name a type their own module never imported. |
 
 ### How a failure becomes `errors`
 
@@ -305,12 +307,14 @@ An exception outside `handles`, or one `on_error` re-raises, produces the ordina
 ```python
 orm.payload.query(fn=None, *, name=None, permission_classes=None)
 orm.payload.mutation(fn=None, *, name=None, permission_classes=None, input_mutation=False)
-orm.payload.connection(graphql_type, *, name=None, permission_classes=None)
+orm.payload.connection(graphql_type=None, *, name=None, permission_classes=None)
 ```
 
 The payload type is generated from the resolver's return annotation and named after the resolver (`recent_users` → `RecentUsersPayload`), overridable with `name=`. `input_mutation=True` collapses the arguments into a generated `input` argument.
 
-`orm.payload.connection` differs on failure: `data` is an **empty connection** rather than null, so a client renders the same shape whether or not the call succeeded.
+`orm.payload.connection` takes the connection type, or derives it from the resolver's return annotation when omitted. It differs on failure: `data` is an **empty connection** rather than null, so a client renders the same shape whether or not the call succeeded.
+
+Rows placed under `data` are eager-loaded for the payload's own selection.
 
 Sync resolvers are moved off the event loop under async, decided per call, so the same resolver is correct under `execute_sync` and under an ASGI server. Async resolvers are awaited directly.
 

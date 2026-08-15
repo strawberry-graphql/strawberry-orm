@@ -13,12 +13,15 @@ from tests.backends.sqlalchemy.models import Post as SAPost
 from tests.backends.sqlalchemy.models import User as SAUser
 
 
-def _orm(handles=None):
+def _orm(handles=None, by_name=False):
     return StrawberryORM.for_sqlalchemy(
         dialect="sqlite",
         session_getter=lambda info: info.context["session"],
         warn_missing_scope=False,
-        payload=policy(**({"handles": handles} if handles else {})),
+        payload=policy(
+            types=__name__ if by_name else None,
+            **({"handles": handles} if handles else {}),
+        ),
     )
 
 
@@ -29,9 +32,9 @@ def orm_with_policy():
 
 @pytest.fixture
 def payload(sa_session):
-    def _build(kind, *, fail=None, handles=None):
+    def _build(kind, *, fail=None, handles=None, derive=False, by_name=False):
         sa_session.expunge_all()
-        orm = _orm(handles)
+        orm = _orm(handles, by_name)
 
         @orm.type(SAPost)
         class PostType:
@@ -45,6 +48,18 @@ def payload(sa_session):
             posts: list[PostType]
 
         rows = select(SAUser).order_by(SAUser.id)
+
+        globals()["NamedUserType"] = UserType
+
+        if kind == "query" and by_name:
+
+            @strawberry.type
+            class ByName:
+                @orm.payload.query
+                def users(self) -> list["NamedUserType"]:  # noqa: F821 - resolved via PayloadPolicy.types
+                    return list(sa_session.execute(rows).unique().scalars().all())
+
+            return orm.schema(query=ByName)
 
         if kind == "query":
 
@@ -75,6 +90,17 @@ def payload(sa_session):
                     return user
 
             return orm.schema(query=Empty, mutation=Mutate)
+
+        if derive:
+
+            @strawberry.type
+            class DerivedConn:
+                # No connection type: it follows from the annotation.
+                @orm.payload.connection()
+                def users(self) -> list[UserType]:
+                    return rows
+
+            return orm.schema(query=DerivedConn)
 
         @strawberry.type
         class ConnRoot:

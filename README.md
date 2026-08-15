@@ -1465,18 +1465,35 @@ PayloadPolicy(
 
 The default is `(Exception,)`, which catches broadly and leaves the decision to `on_error`. Which you prefer is a question of where the list of known errors should live: next to the policy, or inside the converter.
 
+### Naming types from another module
+
+A schema that keeps its types in one module and its resolvers in several hits a wall: `-> list["UserType"]` is resolved against the module that wrote it, which may never have imported the name. `types` says where to look instead:
+
+```python
+# Django
+PayloadPolicy(
+    errors=ErrorsObject,
+    on_error=ErrorsObject.from_exception,
+    types="app.api.graphql.objects",
+)
+```
+
+Names in a payload's return annotation are then resolved there before the payload type is built, so a resolver can name any type in that module without importing it.
+
 ### Connection payloads
 
-`orm.payload.connection` puts a Relay connection under `data`, with the generated `filter` / `order` / `groupBy` arguments and pagination hanging off it:
+`orm.payload.connection` puts a Relay connection under `data`, with the generated `filter` / `order` / `groupBy` arguments and pagination hanging off it. Name the node type in the return annotation and the connection follows from it:
 
 ```python
 # Django
 @strawberry.type
 class Query:
-    @orm.payload.connection(ORMListConnection[UserNode])
-    def users(self):
+    @orm.payload.connection()
+    def users(self) -> list[UserNode]:
         return User.objects.order_by("id")
 ```
+
+Pass `ORMListConnection[UserNode]` explicitly instead when you want a connection type of your own.
 
 ```graphql
 {
