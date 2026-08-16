@@ -13,6 +13,7 @@ from strawberry_orm.batching import (
     _CONNECTION_KEY,
     _UNBATCHABLE,
     RelationConnectionExtension,
+    _already_loaded,
     _Bail,
     extensions_include_relation_connections,
     page_attr,
@@ -186,3 +187,9 @@ def test_the_pass_is_installed_only_once():
 
 def test_the_page_is_left_where_the_resolver_looks_for_it():
     assert page_attr("posts").endswith("posts")
+
+
+def test_a_field_with_no_discoverable_name_is_not_treated_as_loaded():
+    """Without a name there is nothing to probe, so nothing is assumed."""
+    nameless = types.SimpleNamespace(path=None, python_name=None)
+    assert _already_loaded(object(), nameless) is False

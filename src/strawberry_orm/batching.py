@@ -90,6 +90,36 @@ def stash_parents(execution_context: Any, info: Any, rows: Any) -> None:
     store[path_key(info)] = rows
 
 
+def _already_loaded(root: Any, info: Any) -> bool:
+    """True when this field's rows were loaded with the parent.
+
+    A prefetched relation hands back the rows it already holds, which is not a
+    query object and so looks to the rewrite like a resolver that ran its own.
+    Nothing ran, and nothing is owed a report.
+    """
+    from strawberry_orm.lazy_resolution import (
+        _django_relation_prefetched,
+        _sqlalchemy_relation_prefetched,
+        _tortoise_relation_prefetched,
+    )
+
+    name = getattr(info, "python_name", None) or _path_field_names(info)[-1:]
+    field_name = name if isinstance(name, str) else (name[0] if name else None)
+    if field_name is None:
+        return False
+    for probe in (
+        _sqlalchemy_relation_prefetched,
+        _django_relation_prefetched,
+        _tortoise_relation_prefetched,
+    ):
+        try:
+            if probe(root, field_name) is True:
+                return True
+        except Exception:  # pragma: no cover - probes are best effort
+            continue
+    return False
+
+
 def record_bail(execution_context: Any, path: str, reason: str) -> None:
     """Note that *path* fell back to one query per parent, and why.
 
@@ -168,14 +198,15 @@ class BatchingExtension(SchemaExtension):
         first = _next(root, info, *args, **kwargs)
         if isawaitable(first) or not backend.is_query_object(first):
             results[key] = _UNBATCHABLE
-            record_bail(
-                execution_context,
-                key,
-                "the resolver answers asynchronously, so there is no query to "
-                "rewrite before it runs"
-                if isawaitable(first)
-                else "the resolver ran its own query, leaving nothing to rewrite",
-            )
+            if not _already_loaded(root, info):
+                record_bail(
+                    execution_context,
+                    key,
+                    "the resolver answers asynchronously, so there is no query "
+                    "to rewrite before it runs"
+                    if isawaitable(first)
+                    else "the resolver ran its own query, leaving nothing to rewrite",
+                )
             return first
 
         try:
