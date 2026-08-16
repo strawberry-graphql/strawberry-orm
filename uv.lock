@@ -502,7 +502,7 @@ wheels = [
 
 [[package]]
 name = "strawberry-orm"
-version = "0.19.3"
+version = "0.19.4"
 source = { editable = "." }
 dependencies = [
     { name = "strawberry-graphql" },

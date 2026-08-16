@@ -17,6 +17,7 @@ implementations for the conditions.
 
 from __future__ import annotations
 
+import re
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
@@ -90,6 +91,11 @@ def stash_parents(execution_context: Any, info: Any, rows: Any) -> None:
     store[path_key(info)] = rows
 
 
+def _to_snake(name: str) -> str:
+    """GraphQL camelCase to the model's attribute spelling."""
+    return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+
+
 def _already_loaded(root: Any, info: Any) -> bool:
     """True when this field's rows were loaded with the parent.
 
@@ -103,8 +109,12 @@ def _already_loaded(root: Any, info: Any) -> bool:
         _tortoise_relation_prefetched,
     )
 
-    name = getattr(info, "python_name", None) or _path_field_names(info)[-1:]
-    field_name = name if isinstance(name, str) else (name[0] if name else None)
+    field_name = getattr(info, "python_name", None)
+    if field_name is None:
+        # A raw resolve info knows only the GraphQL name, which is camelCase
+        # while the model attribute is not.
+        path = _path_field_names(info)
+        field_name = _to_snake(path[-1]) if path else None
     if field_name is None:
         return False
     for probe in (
