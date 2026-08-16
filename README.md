@@ -648,6 +648,8 @@ class PostOrder:
 
 `allow_scoped_ordering` only lifts the ordering restriction for the relations you name, on that one order input. `scope_rows` keeps scoping reads and filter traversal exactly as before, and another order input over the same model is unaffected. Naming a relation the order input cannot sort through is an error, so typos fail loudly.
 
+Pass `allow_scoped_ordering=True` to allow every relation that order input can sort through. Naming them one by one is the better habit — it keeps the decision visible per relation — but the names only exist once the type is built, so a schema generating its order inputs in a loop cannot list them. Reach for it when you have decided the rule holds across the model: every readable parent implies a readable child.
+
 If you build with `strawberry.Schema` directly instead of `orm.schema()`, the build-time check does not run; the offending query is rejected at execution instead.
 
 ### Common mistakes

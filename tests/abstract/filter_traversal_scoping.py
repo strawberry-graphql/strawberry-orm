@@ -189,6 +189,15 @@ class AbstractTestScopedOrderTraversal:
         schema = self.build(allow=["author"])
         assert titles(self.execute(schema, NESTED_HIDDEN)) == []
 
+    def test_true_allows_every_relation_the_type_can_order_through(self):
+        """The names only exist once the type is built, so a schema that has
+        decided its parents imply readable children cannot list them itself."""
+        assert self.build(allow=True) is not None
+
+    def test_true_still_keeps_reads_scoped(self):
+        schema = self.build(allow=True)
+        assert titles(self.execute(schema, NESTED_HIDDEN)) == []
+
     def test_override_must_name_a_relation_that_can_be_ordered_through(self):
         with pytest.raises(ValueError, match="allow_scoped_ordering"):
             self.build(allow=["not_a_relation"])

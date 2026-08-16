@@ -66,10 +66,20 @@ def _set_scoped_ordering_allowance(order_type: type, model: type, allowed: Any) 
 
     Kept on the order type rather than keyed by model, so one order input
     opting in cannot widen another order input over the same model.
+
+    ``True`` allows every relation this order type can traverse. Naming them
+    individually is the safer habit, but it cannot be done without first
+    knowing the set, which only exists once the type is built - so a schema
+    that has decided its parents always imply readable children would
+    otherwise have to list them by hand.
     """
+    traversable = set(getattr(order_type, "_relation_models", {}))
+    if allowed is True:
+        order_type._scoped_ordering_allowed = frozenset(traversable)  # type: ignore[attr-defined]
+        return
     names = frozenset(allowed or ())
     order_type._scoped_ordering_allowed = names  # type: ignore[attr-defined]
-    unknown = names - set(getattr(order_type, "_relation_models", {}))
+    unknown = names - traversable
     if unknown:
         raise ValueError(
             f"allow_scoped_ordering names {sorted(unknown)} on "
@@ -878,7 +888,11 @@ class BaseBackend:
         *,
         include: list[str] | tuple[str, ...] | set[str] | None = None,
         exclude: list[str] | tuple[str, ...] | set[str] | None = None,
-        allow_scoped_ordering: list[str] | tuple[str, ...] | set[str] | None = None,
+        allow_scoped_ordering: list[str]
+        | tuple[str, ...]
+        | set[str]
+        | bool
+        | None = None,
     ) -> Callable[[type], type]:
         """Decorator that builds a ``@oneOf`` order input from a user class.
 

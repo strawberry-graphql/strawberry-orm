@@ -150,7 +150,7 @@ A field you resolve yourself: your callable receives `self` and runs once per pa
 
 ```python
 orm.filter(model_or_type, *, name=None, include=None, exclude=None)
-orm.order(model_or_type, *, name=None, include=None, exclude=None, allow_scoped_ordering=None)
+orm.order(model_or_type, *, name=None, include=None, exclude=None, allow_scoped_ordering=None  # names, or True for all)
 orm.group(model_or_type, *, name=None, include=None, exclude=None)
 orm.aggregate(model_or_type, *, name=None, include=None, exclude=None)
 ```
