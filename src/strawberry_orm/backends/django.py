@@ -1048,10 +1048,18 @@ class DjangoBackend(BaseBackend):
             select_related, prefetch_related = self._relation_lookups(
                 store, model, info
             )
+            # One relation can be reached twice - two aliases, or the same
+            # field under sibling fragments of an interface - and each pass
+            # builds its own queryset. Django compares those by identity, so
+            # duplicates have to be collapsed before they reach it.
             if select_related:
-                optimized_query = optimized_query.select_related(*select_related)
+                optimized_query = optimized_query.select_related(
+                    *_dedupe_lookups(select_related)
+                )
             if prefetch_related:
-                optimized_query = optimized_query.prefetch_related(*prefetch_related)
+                optimized_query = optimized_query.prefetch_related(
+                    *_dedupe_lookups(prefetch_related)
+                )
 
             return list(optimized_query)
 

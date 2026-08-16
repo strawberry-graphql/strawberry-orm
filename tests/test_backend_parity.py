@@ -98,8 +98,10 @@ TORT_EXCLUDED_FILES = {
     # that rather than the behaviour the other two share.
     "test_relation_connection.py",
     # on= is refused on Tortoise, so its test_on.py asserts that rather than
-    # the behaviour the other two share.
+    # the behaviour the other two share, and the duplicate-lookup case it
+    # brings cannot arise there at all.
     "test_on.py",
+    "test_on_duplicate_lookups.py",
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
     "test_query_async_session.py",
