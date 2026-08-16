@@ -55,6 +55,7 @@ class FieldDefinition:
     scope: Callable[..., Any] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False
+    on: str | None = None
     permission_classes: list[type] | None = None
     description: str | None = None
     declared_type: Any = None
@@ -87,6 +88,7 @@ class FieldDefinition:
             scope=self.scope,
             compute=self.compute,
             disable_optimization=self.disable_optimization,
+            on=self.on,
         )
 
 
@@ -96,13 +98,15 @@ class FieldHints:
 
     ``using`` names the relations this field is served with - they are
     eager-loaded alongside the parent query. ``scope`` narrows the rows loaded
-    through this relation edge.
+    through this relation edge. ``on`` names the relation the field is served
+    from, for when the GraphQL field is called something else.
     """
 
     using: list[str] | None = None
     scope: Callable[..., Any] | None = None
     compute: dict[str, Any] | None = None
     disable_optimization: bool = False
+    on: str | None = None
 
 
 UNSET = strawberry.UNSET

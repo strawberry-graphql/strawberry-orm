@@ -9,9 +9,9 @@ This is a lookup table, not a guide. For what the pieces are *for* and how they 
 - [Constructing an ORM](#constructing-an-orm) — `for_django`, `for_sqlalchemy`, `for_tortoise`, options
 - [Building the schema](#building-the-schema) — `orm.schema()`, extensions
 - [Types and inputs](#types-and-inputs) — `orm.type`, `orm.input`, `orm.partial`, `orm.ref`
-- [Declaring fields](#declaring-fields) — `orm.field.auto` / `.scoped` / `.custom` / `.computed`
+- [Declaring fields](#declaring-fields) — `orm.field.eager` / `.lazy`
 - [Filters, ordering, grouping](#filters-ordering-and-grouping) — generators and custom-field decorators
-- [Relay](#relay) — `orm.connection`, `orm.node`, connection types
+- [Relay](#relay) — `orm.connection.eager` / `.lazy`, `orm.node`, connection types
 - [Payloads](#payloads) — `orm.payload`, `PayloadPolicy`
 - [Mutations](#mutations) — `orm.create` / `update` / `delete`, node inputs, `AbstractRepo`
 - [Query helpers](#query-helpers) — `orm.optimize`, `apply_filters`, `apply_ordering`
@@ -114,43 +114,35 @@ Build a reference input for writing related lists. `make_ref_type` is the standa
 
 ## Declaring fields
 
-`orm.field` is a namespace of four forms that run at different times. See [The four kinds of field](README.md#the-four-kinds-of-field).
+`orm.field` is a namespace of two forms, told apart by whether your callable receives the parent row. See [The two kinds of field](README.md#the-two-kinds-of-field).
 
 ```python
-orm.field.auto(*, filters=None, order=None, using=None, scope=None, compute=None,
-               disable_optimization=False, permission_classes=None,
+orm.field.eager(fn=None, *, scope=None, filters=None, order=None, compute=None,
+                disable_optimization=False, permission_classes=None,
+                description=None, deprecation_reason=None)
+```
+
+A field the library resolves: one query for the whole result set. Bare, it writes the query itself; assign it to an annotated attribute. Handed a `(query, info)` callable — as `scope=`, or as a decorator — that callable narrows which rows load, running while the eager load is built and composing **after** the related type's `scope_rows`.
+
+Nothing here sees a parent row, and passing a callable that takes `self` raises. There is deliberately no `using=`: that hint discloses relations the optimizer cannot see being read, and an eager field hides nothing from it.
+
+```python
+orm.field.lazy(fn=None, *, using=None, filters=None, order=None,
                description=None, deprecation_reason=None)
 ```
 
-The library resolves the field. Assign it to an annotated attribute.
-
-```python
-orm.field.scoped(fn=None, *, using=None, description=None)
-```
-
-Narrow the rows loaded through a relation. The callable receives `(query, info)` and returns a query; it runs while the eager load is built, composing **after** the related type's `scope_rows`.
-
-```python
-orm.field.custom(fn=None, *, filters=None, order=None,
-                 description=None, deprecation_reason=None)
-```
-
-Replace the resolver. Runs once per parent row and receives `self`. Sync ORM work is moved off the event loop automatically.
-
-```python
-orm.field.computed(fn=None, *, using=None, description=None, deprecation_reason=None)
-```
-
-A computed value plus the relations it reads, so `using=` can eager-load them instead of taking a lazy load per row.
+A field you resolve yourself: your callable receives `self` and runs once per parent row. Sync ORM work is moved off the event loop automatically. Name the relations it reads with `using=[...]` and they load alongside the parent, so those reads cost no extra query.
 
 | Parameter | Applies to | Meaning |
 | --- | --- | --- |
-| `using` | all | Relation names this field is served with; they are eager-loaded alongside the parent. |
-| `scope` | `auto` | Narrow rows through this relation edge (same shape as `orm.field.scoped`). |
-| `compute` | `auto` | Backend expressions annotated onto the query. |
-| `filters` / `order` | `auto`, `custom` | Attach generated `filter` / `order` arguments to this field. |
-| `disable_optimization` | `auto` | Skip the optimizer for this field, and silence its lazy-load warning. |
-| `permission_classes` | `auto` | Strawberry permission classes. |
+| `scope` | `eager` | Narrow rows through this relation edge; the keyword spelling of handing `eager` a `(query, info)` callable. |
+| `using` | `lazy` | Relation names the resolver reads; they are eager-loaded alongside the parent. |
+| `compute` | `eager` | Backend expressions annotated onto the query. |
+| `filters` / `order` | both | Attach generated `filter` / `order` arguments to this field. |
+| `disable_optimization` | `eager` | Skip the optimizer for this field, and silence its lazy-load warning. |
+| `permission_classes` | `eager` | Strawberry permission classes. |
+
+`auto`, `scoped`, `custom`, and `computed` remain as aliases: `auto` and `scoped` for `eager`, `custom` and `computed` for `lazy`.
 
 ---
 
@@ -196,10 +188,19 @@ Generated per column type, and exported so you can reference them in custom filt
 ## Relay
 
 ```python
-orm.connection(graphql_type=None, *, resolver=None, **kwargs)
+orm.connection.eager(graphql_type=None, *, scope=None, **kwargs)
+orm.connection.lazy(graphql_type=None, *, resolver=None, **kwargs)
 ```
 
-A Relay connection over a model, usable as a decorator or assigned to an annotated attribute. Without `resolver` the library builds the query; supply one to return the rows yourself and still get the generated `filter` / `order` / `groupBy` arguments, the grouped connection type, `totalCount`, and optimizer integration. Also takes `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`. See [Connection fields](README.md#connection-fields).
+A Relay connection over a model, split on the same question as fields: does your callable need the parent row?
+
+`eager` has the library build the query, optionally narrowed by a `(query, info)` scope. The scope applies to `totalCount` and `aggregates` as well as `edges`, since those are computed from the query rather than the returned rows.
+
+On an `@orm.type` an eager connection is served by the parent's relation, and every parent's page is taken in one query using `ROW_NUMBER() OVER (PARTITION BY ...)`, with a second grouped query for the per-parent `totalCount`. That needs a window function and a column on the related rows identifying the parent, so it is refused when the type is defined on Tortoise and for many-to-many relations, both of which point at `lazy`.
+
+`lazy` takes a resolver receiving `self` that returns the rows, and runs once per parent row.
+
+Either way you still get the generated `filter` / `order` / `groupBy` arguments, the grouped connection type, `totalCount`, and optimizer integration. Both also accept `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`; any other keyword raises rather than being ignored. Calling `orm.connection(...)` directly still works. See [Connection fields](README.md#connection-fields).
 
 ```python
 orm.node(**kwargs)
@@ -418,7 +419,7 @@ Strawberry's Relay node resolution hook.
 | `Ordering` | `ASC`, `DESC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST` |
 | `DateGroupByInterval` | `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR` |
 | `DateGroupByOption` | Input pairing a date column with an interval. |
-| `FieldDefinition` | What `orm.field.*` returns: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`. |
+| `FieldDefinition` | What `orm.field.eager` returns for a scope or metadata: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`. |
 | `FieldHints` | The optimizer-relevant subset: `using`, `scope`, `compute`, `disable_optimization`. |
 | `OperationInfo` | `messages: list[OperationMessage]` |
 | `OperationMessage` | `kind`, `field`, `message` |

@@ -688,6 +688,15 @@ class DjangoBackend(BaseBackend):
             return list(query)
         return run_sync(list, query, thread_sensitive=True)
 
+    _supports_on_prefetch = True
+    _supports_relation_batching = True
+    _supports_windowed_pages = True
+
+    def _make_on_resolver(
+        self, model: type, field_name: str, relation: str, return_ann: Any
+    ) -> Any:
+        return _make_on_resolver(self, field_name, relation, return_ann)
+
     def _post_process_strawberry_fields(self, graphql_type: type) -> type:
         if not self._django_async_safe:
             return graphql_type
@@ -732,6 +741,61 @@ class DjangoBackend(BaseBackend):
         return graphql_type
 
     # -- Optimizer -----------------------------------------------------------
+
+    def _make_relation_query_resolver(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        backend = self
+
+        def resolver(self: Any, info: Any) -> Any:
+            from strawberry_orm.batching import page_attr
+
+            page = getattr(self, page_attr(field_name), None)
+            if page is not None:
+                return page
+            restrict = backend.relation_scope(model, field_name, info, on=relation)
+            queryset = getattr(self, relation).all()
+            return queryset if restrict is None else restrict(queryset, info)
+
+        resolver.__name__ = field_name
+        return resolver
+
+    def group_counts(self, query: Any, key_field: str, info: Any) -> dict[Any, int]:
+        """Only reached once the windowed page came back synchronously."""
+        from django.db.models import Count
+
+        rows = query.values(key_field).annotate(_n=Count("pk"))
+        return {row[key_field]: row["_n"] for row in rows}
+
+    def _relation_connection_spec(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        from strawberry_orm.backends._base import RelationConnectionSpec
+
+        # The relation was checked before this is reached.
+        rel = model._meta.get_field(relation)
+        # Only a reverse FK carries the parent key on the related row; a
+        # many-to-many keeps it in the join table, where a window cannot
+        # partition by it.
+        fk = getattr(rel, "field", None)
+        if type(rel).__name__ != "ManyToOneRel" or fk is None:
+            return None
+        return RelationConnectionSpec(
+            model=model,
+            field_name=field_name,
+            relation=relation,
+            related_model=rel.related_model,
+            key_field=fk.attname,
+        )
+
+    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+        queryset = spec.related_model._default_manager.filter(
+            **{f"{spec.key_field}__in": pks}
+        )
+        restrict = self.relation_scope(
+            spec.model, spec.field_name, info, on=spec.relation
+        )
+        return queryset if restrict is None else restrict(queryset, info)
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
@@ -824,8 +888,22 @@ class DjangoBackend(BaseBackend):
                                 else:
                                     prefetch_related.append(rel_path)
 
+                    # A on= field is served by a relation under another name,
+                    # so ask the model about the relation, not the field.
+                    on = None
+                    if type_name and store:
+                        on_hints = store.get(type_name, field_name)
+                        on = getattr(on_hints, "on", None) if on_hints else None
+                    relation_name = on or field_name
+                    on_path = f"{prefix}__{relation_name}" if prefix else relation_name
+
+                    # A field that answers for itself will ignore whatever the
+                    # prefetch loads, so do not pay for it.
+                    if on is None and self.resolves_itself(type_name, field_name):
+                        continue
+
                     try:
-                        field_obj = meta.get_field(field_name)
+                        field_obj = meta.get_field(relation_name)
                     except Exception:
                         continue
 
@@ -919,7 +997,20 @@ class DjangoBackend(BaseBackend):
                         custom_qs = _get_nested_queryset(
                             current_model, field_name, related_model
                         )
-                        if custom_qs is not None:
+                        if on is not None:
+                            # to_attr keeps the two views apart: without it the
+                            # second Prefetch of the same relation collides.
+                            from django.db.models import Prefetch
+
+                            queryset = (
+                                custom_qs
+                                if custom_qs is not None
+                                else related_model._default_manager.all()
+                            )
+                            prefetch_related.append(
+                                Prefetch(on_path, queryset=queryset, to_attr=field_name)
+                            )
+                        elif custom_qs is not None:
                             from django.db.models import Prefetch
 
                             prefetch_related.append(
@@ -927,7 +1018,7 @@ class DjangoBackend(BaseBackend):
                             )
                         else:
                             prefetch_related.append(full_path)
-                        if node.selection_set:
+                        if node.selection_set and on is None:
                             _walk_selections(
                                 node.selection_set,
                                 related_model,
@@ -1001,6 +1092,35 @@ class DjangoBackend(BaseBackend):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_on_resolver(
+    backend: Any, field_name: str, relation: str, return_ann: Any
+) -> Any:
+    """Serve a field whose rows come from a differently named relation.
+
+    The optimizer loads those rows under ``field_name`` on ``to_attr``, so
+    they are read from there when present. Without the optimizer there is no
+    such attribute, and the relation is queried directly - scoped here, because
+    that is the only place left to apply it.
+    """
+
+    def resolver(self: Any, info: Any) -> Any:
+        prefetched = self.__dict__.get(field_name)
+        if prefetched is not None:
+            return prefetched
+        restrict = backend.relation_scope(type(self), field_name, info, on=relation)
+        queryset = getattr(self, relation).all()
+        return queryset if restrict is None else restrict(queryset, info)
+
+    resolver.__name__ = field_name
+    resolver.__annotations__ = {
+        "info": strawberry.types.Info,
+        "return": return_ann,
+    }
+    if backend._django_async_safe:
+        resolver = async_safe_resolver(resolver)
+    return resolver
 
 
 def _scoped_related_queryset(

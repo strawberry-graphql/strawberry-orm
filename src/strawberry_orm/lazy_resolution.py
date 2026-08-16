@@ -302,6 +302,7 @@ def _format_unoptimized_loads(
     loads: list[_UnoptimizedLoad],
     resolver_queries: list[_ResolverQueries] | None = None,
     causes: dict[str, list[_UnoptimizedLoad]] | None = None,
+    bails: dict[str, str] | None = None,
 ) -> str:
     grouped: Counter[_UnoptimizedLoad] = Counter(loads)
     lines = []
@@ -340,10 +341,20 @@ def _format_unoptimized_loads(
     for key in sorted(merged_resolvers):
         lines.append(_format_resolver_queries(merged_resolvers[key]))
 
-    total = len(loads) + sum(
-        max(entry.count, entry.rows) for entry in merged_resolvers.values()
+    for path in sorted(bails or {}):
+        lines.append(
+            f"  - path: {path}\n"
+            f"    fell back to one query per parent: {(bails or {})[path]}\n"
+            f"    fix: narrow it with a scope on orm.field.eager, which cannot "
+            f"vary per parent and so never needs rewriting"
+        )
+
+    total = (
+        len(loads)
+        + sum(max(entry.count, entry.rows) for entry in merged_resolvers.values())
+        + len(bails or {})
     )
-    unique = len(grouped) + len(merged_resolvers)
+    unique = len(grouped) + len(merged_resolvers) + len(bails or {})
     header = (
         f"Unoptimized relation loads detected ({total} total, {unique} unique) "
         f"— may waterfall (N+1):"
@@ -527,7 +538,12 @@ class LazyResolutionExtension(SchemaExtension):
         )
 
     def _flush_loads(self) -> None:
-        if (not self._loads and not self._resolver_queries) or self._mode == "off":
+        from strawberry_orm.batching import recorded_bails
+
+        bails = recorded_bails(getattr(self, "execution_context", None))
+        if (
+            not self._loads and not self._resolver_queries and not bails
+        ) or self._mode == "off":
             return
 
         causes: dict[str, list[_UnoptimizedLoad]] = {}
@@ -537,7 +553,9 @@ class LazyResolutionExtension(SchemaExtension):
                 label = self._shape_labels.get(ancestor, ancestor)
                 causes.setdefault(label, []).append(load)
 
-        message = _format_unoptimized_loads(self._loads, self._resolver_queries, causes)
+        message = _format_unoptimized_loads(
+            self._loads, self._resolver_queries, causes, bails
+        )
         logger.warning(message)
         if self._mode == "error":
             raise RuntimeError(message)

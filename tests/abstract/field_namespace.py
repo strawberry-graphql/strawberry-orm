@@ -1,9 +1,14 @@
-"""The four ways to declare a field, and the errors that keep them apart.
+"""The two ways to declare a field, and the errors that keep them apart.
 
-``orm.field.auto`` / ``scoped`` / ``custom`` / ``computed`` differ in when they
-run and therefore in what they receive. The name is the contract, so the
-library checks the callable against it at decoration time rather than letting a
-wrong shape surface as a failure deep inside a prefetch.
+``orm.field.eager`` is anything the optimizer can plan into one query for the
+whole result set, whether the library writes it, a scope narrows it, or a
+resolver names what it reads. ``orm.field.lazy`` is the rest: your code, once
+per parent row. The name is the contract, so the library checks the callable
+against it at decoration time rather than letting a wrong shape surface as a
+failure deep inside a prefetch.
+
+``auto`` / ``scoped`` / ``custom`` / ``computed`` remain as aliases and are
+still covered here, since existing schemas are written in them.
 """
 
 import pytest
@@ -25,6 +30,30 @@ class AbstractTestFieldNamespace:
 
     def test_computed_eager_loads_what_it_uses(self):
         assert self.run_computed() == "by Alice"
+
+    def test_eager_bare_lets_the_library_resolve_it(self):
+        assert self.run_eager_bare() == ["python"]
+
+    def test_eager_folds_a_scope_into_the_prefetch(self):
+        assert self.run_eager_scope() == ["Nice post!"]
+
+    def test_lazy_preloads_what_it_declares(self):
+        """Still one call per row, but the relation it reads costs no query."""
+        assert self.run_lazy_using() == "by Alice"
+
+    def test_lazy_receives_the_parent_row(self):
+        assert self.run_lazy() == "HELLO WORLD"
+
+    def test_eager_carries_metadata_without_a_callable(self):
+        assert self.run_eager_metadata_only() == ["python"]
+
+    def test_lazy_takes_filter_arguments(self):
+        assert self.run_lazy_with_filters() == ["Nice post!"]
+
+    def test_eager_refuses_a_callable_that_takes_self(self):
+        """One name, one contract: a parent row means it cannot be eager."""
+        with pytest.raises(TypeError, match="is not a scope"):
+            self.declare_eager_taking_self()
 
     def test_scoped_rejects_a_resolver_signature(self):
         with pytest.raises(TypeError, match="never sees the parent row"):
@@ -61,6 +90,30 @@ class AbstractTestFieldNamespaceAsync:
 
     async def test_computed_eager_loads_what_it_uses(self):
         assert await self.run_computed() == "by Alice"
+
+    async def test_eager_bare_lets_the_library_resolve_it(self):
+        assert await self.run_eager_bare() == ["python"]
+
+    async def test_eager_folds_a_scope_into_the_prefetch(self):
+        assert await self.run_eager_scope() == ["Nice post!"]
+
+    async def test_lazy_preloads_what_it_declares(self):
+        """Still one call per row, but the relation it reads costs no query."""
+        assert await self.run_lazy_using() == "by Alice"
+
+    async def test_lazy_receives_the_parent_row(self):
+        assert await self.run_lazy() == "HELLO WORLD"
+
+    async def test_eager_carries_metadata_without_a_callable(self):
+        assert await self.run_eager_metadata_only() == ["python"]
+
+    async def test_lazy_takes_filter_arguments(self):
+        assert await self.run_lazy_with_filters() == ["Nice post!"]
+
+    async def test_eager_refuses_a_callable_that_takes_self(self):
+        """One name, one contract: a parent row means it cannot be eager."""
+        with pytest.raises(TypeError, match="is not a scope"):
+            self.declare_eager_taking_self()
 
     async def test_scoped_rejects_a_resolver_signature(self):
         with pytest.raises(TypeError, match="never sees the parent row"):

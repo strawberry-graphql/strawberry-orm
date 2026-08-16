@@ -125,7 +125,7 @@ class SQLAlchemyBackend(BaseBackend):
 
             rel_names = {rel.key for rel in mapper.relationships}
 
-            # PEP 563: resolve string annotations via get_type_hints
+            # PEP 563: resolve string annotations on get_type_hints
             annotations = getattr(cls, "__annotations__", {}).copy()
             try:
                 import typing as _t
@@ -665,6 +665,81 @@ class SQLAlchemyBackend(BaseBackend):
 
     # -- Optimizer -----------------------------------------------------------
 
+    _supports_relation_batching = True
+    _supports_windowed_pages = True
+
+    def _make_on_resolver(
+        self, model: type, field_name: str, relation: str, return_ann: Any
+    ) -> Any:
+        return _make_sa_on_resolver(self, model, field_name, relation, return_ann)
+
+    def _make_relation_query_resolver(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        from sqlalchemy import inspect as sa_inspect
+
+        backend = self
+        rel = sa_inspect(model).relationships[relation]
+        rel_model = self._relation_target_model(model, relation)
+        pairs = list(rel.local_remote_pairs or ())
+
+        def resolver(self: Any, info: Any) -> Any:
+            from strawberry_orm.batching import page_attr
+
+            page = getattr(self, page_attr(field_name), None)
+            if page is not None:
+                return page
+            from sqlalchemy import select
+
+            stmt = select(rel_model).where(pairs[0][1] == backend.instance_pk(self))
+            restrict = backend.relation_scope(model, field_name, info, on=relation)
+            return stmt if restrict is None else restrict(stmt, info)
+
+        resolver.__name__ = field_name
+        return resolver
+
+    def group_counts(self, query: Any, key_field: str, info: Any) -> Any:
+        from sqlalchemy import func, select
+
+        subq = query.subquery()
+        key_col = subq.c[key_field]
+        stmt = select(key_col, func.count()).select_from(subq).group_by(key_col)
+        # Only reached once the windowed page came back synchronously.
+        return dict(self._get_session(info).execute(stmt).all())
+
+    def _relation_connection_spec(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        from sqlalchemy import inspect as sa_inspect
+
+        from strawberry_orm.backends._base import RelationConnectionSpec
+
+        rel = sa_inspect(model).relationships[relation]
+        pairs = list(rel.local_remote_pairs or ())
+        # An association table keeps the parent key off the related row, so
+        # there is nothing for a window to partition by.
+        if rel.secondary is not None or len(pairs) != 1:
+            return None
+        return RelationConnectionSpec(
+            model=model,
+            field_name=field_name,
+            relation=relation,
+            related_model=self._relation_target_model(model, relation),
+            key_field=pairs[0][1].key,
+        )
+
+    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import select
+
+        rel = sa_inspect(spec.model).relationships[spec.relation]
+        fk_column = list(rel.local_remote_pairs)[0][1]
+        stmt = select(spec.related_model).where(fk_column.in_(pks))
+        restrict = self.relation_scope(
+            spec.model, spec.field_name, info, on=spec.relation
+        )
+        return stmt if restrict is None else restrict(stmt, info)
+
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
 
@@ -779,7 +854,7 @@ class SQLAlchemyBackend(BaseBackend):
                 return parent_loader.joinedload(rel_attr)
 
         def _hint_relations(current_mapper: Any, field_name: str) -> list[str]:
-            """Relation names declared via ``using=`` for *field_name*.
+            """Relation names declared on ``using=`` for *field_name*.
 
             Keyed on the field name alone, so computed fields that are not mapped
             attributes can still declare the relations their resolver reads.
@@ -797,6 +872,13 @@ class SQLAlchemyBackend(BaseBackend):
                 return stmt
             for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
+
+                # A field that answers for itself will ignore whatever this
+                # loads, so do not pay for it.
+                if self.resolves_itself(
+                    self._type_name_for_model(current_mapper.entity), field_name
+                ):
+                    continue
 
                 if field_name in current_mapper.relationships:
                     rel = current_mapper.relationships[field_name]
@@ -1260,6 +1342,51 @@ def _scoped_sa_relation(
     return rows[0] if rows else None
 
 
+def _make_sa_on_resolver(
+    backend: Any, parent_model: type, field_name: str, relation: str, return_ann: Any
+) -> Any:
+    """Serve a ``on=`` field on SQLAlchemy.
+
+    Loader options populate the mapped attribute, so there is nowhere to put a
+    second view of the same relation. The statement is therefore built per
+    parent and left for the batcher to collapse, which is why one of these
+    cannot be declared with batching turned off.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    rel = sa_inspect(parent_model).relationships[relation]
+    pairs = list(rel.local_remote_pairs or ())
+    if rel.secondary is not None or len(pairs) != 1:
+        raise ValueError(
+            f"{parent_model.__name__}.{field_name}: on={relation!r} goes through "
+            f"an association table, so the rows carry no column tying them to one "
+            f"parent and the batcher cannot collapse the per-parent queries. The "
+            f"field would cost a query per parent row; write it as "
+            f"orm.field.lazy instead."
+        )
+
+    # The batcher collapses these by rewriting ``fk = <pk>`` into
+    # ``fk IN (...)``, and only recognises that predicate with the column on
+    # the left. with_parent() emits it the other way round, which reads
+    # identically in SQL but silently costs a query per parent.
+    fk_column = pairs[0][1]
+    rel_model = backend._relation_target_model(parent_model, relation)
+
+    def resolver(self: Any, info: Any) -> Any:
+        from sqlalchemy import select
+
+        stmt = select(rel_model).where(fk_column == backend.instance_pk(self))
+        restrict = backend.relation_scope(parent_model, field_name, info, on=relation)
+        return stmt if restrict is None else restrict(stmt, info)
+
+    resolver.__name__ = field_name
+    resolver.__annotations__ = {
+        "info": strawberry.types.Info,
+        "return": return_ann,
+    }
+    return resolver
+
+
 def _make_sa_plain_rel_resolver(
     backend: Any,
     fname: str,
@@ -1295,7 +1422,7 @@ def _make_sa_rel_resolver(
     """Create a Strawberry field for an SA relationship with filter/order.
 
     When no filter/order is provided by the caller, falls back to the
-    eagerly-loaded attribute.  Otherwise issues a fresh query via
+    eagerly-loaded attribute.  Otherwise issues a fresh query on
     ``with_parent`` so the database handles the filtering/ordering.
     """
     info_type = strawberry.types.Info

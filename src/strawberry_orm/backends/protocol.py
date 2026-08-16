@@ -191,6 +191,16 @@ class Backend(Protocol):
         """
         ...
 
+    def group_counts(
+        self, query: Any, key_field: str, info: Any
+    ) -> AwaitableOrValue[dict[Any, int]]:
+        """Count *query*'s rows per distinct value of *key_field*, in one query.
+
+        A windowed page cannot report ``totalCount``, having kept only the
+        page, so the totals come from here instead.
+        """
+        ...
+
     # -- Queryset overrides --------------------------------------------------
 
     def get_default_queryset(self, model: type) -> Any:

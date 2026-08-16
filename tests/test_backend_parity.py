@@ -29,6 +29,27 @@ EXCLUDED_FILES = {
 }
 
 EXCLUDED_METHODS = {
+    # Django prefetches a many-to-many view with to_attr like any other, so
+    # there is nothing for it to refuse.
+    (
+        "test_on.py",
+        "TestVia",
+        "test_on_through_an_association_table_is_refused",
+    ),
+    # Django is the only backend with a usable no-optimizer path: SQLAlchemy
+    # leaves even a root field unmaterialized without it.
+    (
+        "test_on.py",
+        "TestVia",
+        "test_the_scope_holds_without_the_optimizer",
+    ),
+    # Django prefetches a second view with to_attr, so batching is irrelevant
+    # there and there is nothing to refuse.
+    (
+        "test_on.py",
+        "TestVia",
+        "test_on_with_batching_off_is_refused",
+    ),
     (
         "test_query_error_handling.py",
         "TestQueryErrorHandling",
@@ -73,6 +94,12 @@ EXCLUDED_METHODS = {
 
 
 TORT_EXCLUDED_FILES = {
+    # A connection over a relation is refused on Tortoise, so its file asserts
+    # that rather than the behaviour the other two share.
+    "test_relation_connection.py",
+    # on= is refused on Tortoise, so its test_on.py asserts that rather than
+    # the behaviour the other two share.
+    "test_on.py",
     "test_query_session_resolution.py",
     "test_query_queryset_detection.py",
     "test_query_async_session.py",

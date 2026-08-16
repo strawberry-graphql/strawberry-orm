@@ -262,6 +262,19 @@ def input_to_dict(obj: Any) -> dict[str, Any]:
     return result
 
 
+@dataclass
+class RelationConnectionSpec:
+    """What a connection field needs in order to be read one window at a time."""
+
+    model: type
+    field_name: str
+    relation: str
+    related_model: type
+    #: Column on the related rows holding the parent key, so a window can
+    #: partition by it and a grouped count can total by it.
+    key_field: str
+
+
 class BaseBackend:
     """Shared foundation for Django, SQLAlchemy, and Tortoise backends.
 
@@ -275,6 +288,7 @@ class BaseBackend:
 
     def __init__(self, **kwargs: Any) -> None:
         self._store = OptimizerStore()
+        self._relation_connections: dict[tuple[str, str], Any] = {}
         self._repos: dict[type, type] = {}
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
         self._type_registry: dict[str, type] = {}
@@ -1387,7 +1401,9 @@ class BaseBackend:
         hints = self._store.get(type_name, relation)
         return getattr(hints, "scope", None) if hints else None
 
-    def relation_scope(self, model: type, relation: str, info: Any) -> Any | None:
+    def relation_scope(
+        self, model: type, relation: str, info: Any, *, on: str | None = None
+    ) -> Any | None:
         """Everything that restricts the far side of *relation*, or ``None``.
 
         Filtering reaches the related table directly, which would otherwise
@@ -1395,8 +1411,12 @@ class BaseBackend:
         count: the related type's ``scope_rows`` and any ``scope=`` on this
         edge. They are composed in that order, the same order the read path
         uses.
+
+        A ``on=`` field is not a relation, so the far side is found through
+        the relation it names while the edge's own scope stays keyed to the
+        field. Without that split the scope silently resolves to nothing.
         """
-        related = self._relation_target_model(model, relation)
+        related = self._relation_target_model(model, on or relation)
         if related is None:
             return None
         get_qs = self._type_querysets.get(related)
@@ -1657,18 +1677,29 @@ class BaseBackend:
         field_name: str,
         hints: Any,
     ) -> None:
-        """A scope narrows a relation, so the field has to be one."""
-        if hints.scope is None or not self._strict_hints:
+        """A scope narrows a relation, so the field has to name one.
+
+        ``on=`` supplies that name when the field is called something else,
+        which is also the only way one relation can back more than one field.
+        """
+        if (hints.scope is None and hints.on is None) or not self._strict_hints:
             return
         names = self.relation_names(model)
-        if field_name in names:
+        relation = hints.on or field_name
+        if relation in names:
             return
-        suggestion = get_close_matches(field_name, sorted(names), n=1)
+        suggestion = get_close_matches(relation, sorted(names), n=1)
         hint_text = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+        if hints.on is not None:
+            raise ValueError(
+                f"{type_name}.{field_name}: on={relation!r} names the relation "
+                f"this field is served from, but {model.__name__} has no relation "
+                f"{relation!r}.{hint_text}"
+            )
         raise ValueError(
             f"{type_name}.{field_name}: scope= narrows the rows loaded through a "
             f"relation, but {model.__name__} has no relation {field_name!r}."
-            f"{hint_text}"
+            f"{hint_text} Pass on= if the relation is named something else."
         )
 
     def _validate_hints(
@@ -1865,9 +1896,165 @@ class BaseBackend:
                 )
                 self._store.register(type_name, attr_name, val._orm_computed_hints)
             elif getattr(val, "_orm_auto_field", False):
+                pending = getattr(val, "_orm_pending_connection", None)
+                if pending is not None:
+                    self._rebuild_relation_connection(
+                        cls, model, type_name, attr_name, pending
+                    )
+                    continue
                 delattr(cls, attr_name)
 
         return type_name
+
+    def _register_relation_connection(
+        self, model: type, type_name: str, field_name: str, relation: str
+    ) -> None:
+        """Record what a connection field is served by, for the windowed read."""
+        spec = self._relation_connection_spec(model, field_name, relation)
+        if spec is None:
+            raise ValueError(
+                f"{type_name}.{field_name}: a connection over {relation!r} cannot "
+                f"take each parent's page in one query, because those rows carry "
+                f"no column tying them to a parent for a window to partition by. "
+                f"Give it a resolver with @orm.connection.lazy instead."
+            )
+        # Resolution hands the extension a raw graphql-core info, which knows
+        # the camelCase field name and not the Python one, so register both.
+        head, *rest = field_name.split("_")
+        camel = head + "".join(part.title() for part in rest)
+        self._relation_connections[(type_name, field_name)] = spec
+        self._relation_connections[(type_name, camel)] = spec
+
+    def relation_connection_spec(self, info: Any) -> Any:
+        """The spec for the connection being resolved, if this field is one."""
+        type_name = getattr(getattr(info, "parent_type", None), "name", None)
+        for attr in ("python_name", "field_name"):
+            field_name = getattr(info, attr, None)
+            if field_name is None:
+                continue
+            spec = self._relation_connections.get((type_name, field_name))
+            if spec is not None:
+                return spec
+        return None
+
+    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+        """Every parent's related rows in one scoped query, ready to window."""
+        raise NotImplementedError
+
+    def _rebuild_relation_connection(
+        self, cls: type, model: type, type_name: str, attr_name: str, pending: Any
+    ) -> None:
+        """Point a connection declared on a type at the parent's relation.
+
+        Built from the annotation alone it queries the whole table, because
+        ``__set_name__`` runs before ``@orm.type`` knows what the parent is.
+        Here the model is known, so the field is rebuilt around a resolver that
+        follows the relation of the same name.
+        """
+        hints = self._store.get(type_name, attr_name)
+        relation = getattr(hints, "on", None) if hints else None
+        relation = relation or attr_name
+        if relation not in self.relation_names(model):
+            raise ValueError(
+                f"{type_name}.{attr_name}: a connection on a type is served by "
+                f"the parent's relation, but {model.__name__} has no relation "
+                f"{relation!r}. Name it with on=, or give the connection a "
+                f"resolver with @orm.connection.lazy."
+            )
+        if not self._supports_windowed_pages:
+            raise ValueError(
+                f"{type_name}.{attr_name}: a connection over a relation needs a "
+                f"window function to take each parent's page in one query, which "
+                f"this backend does not have - every parent would cost its own "
+                f"query. Give it a resolver with @orm.connection.lazy, which says "
+                f"that plainly."
+            )
+        resolver = self._make_relation_query_resolver(model, attr_name, relation)
+        setattr(cls, attr_name, pending.rebuild_for_relation(resolver))
+        self._register_relation_connection(model, type_name, attr_name, relation)
+
+    def _make_relation_query_resolver(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        """Backend hook: a resolver returning the parent's rows as a query.
+
+        A connection paginates and counts what it is given, so this always
+        returns an unexecuted query rather than rows.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot serve a connection over a relation."
+        )
+
+    def resolves_itself(self, type_name: str | None, field_name: str) -> bool:
+        """True when *field_name* answers without the prefetch the walk would add.
+
+        Only a relation connection qualifies today. It is served from a
+        windowed page covering every parent, so the prefetch the walk would
+        otherwise add for a field sharing a relation's name is read by nobody.
+
+        Having a resolver is not evidence of this: the backends install one for
+        ordinary relation fields as well, and those do read the prefetch.
+        """
+        return (type_name, field_name) in self._relation_connections
+
+    # -- on= fields ---------------------------------------------------------
+
+    #: True when the backend can load one relation into an attribute of our
+    #: choosing, so several views of it can be prefetched side by side.
+    _supports_on_prefetch: bool = False
+
+    #: True when the backend implements ``split_parent_predicate``, without
+    #: which the batcher cannot collapse per-parent relation queries.
+    _supports_relation_batching: bool = False
+
+    #: True when ``batch_group_items`` really windows rather than looping per
+    #: group, which is what lets a connection take every parent's page at once.
+    _supports_windowed_pages: bool = False
+
+    def _install_on_resolvers(
+        self, graphql_type: type, model: type, type_name: str
+    ) -> None:
+        """Serve every ``on=`` field, which has no attribute of its own."""
+        from strawberry.types.field import UNRESOLVED
+        from strawberry.types.fields.resolver import StrawberryResolver
+
+        for field in graphql_type.__strawberry_definition__.fields:
+            field_name = field.python_name
+            if not field_name or field.base_resolver is not None:
+                continue
+            hints = self._store.get(type_name, field_name)
+            relation = getattr(hints, "on", None) if hints else None
+            if relation is None:
+                continue
+            if not self._supports_on_prefetch:
+                # Nothing here can prefetch a second view of a relation, so the
+                # batcher is the only thing keeping this field's promise of one
+                # query per view rather than one per parent row.
+                if not self._supports_relation_batching:
+                    raise ValueError(
+                        f"{type_name}.{field_name}: on= cannot be eager on this "
+                        f"backend. It can neither load a second view of "
+                        f"{relation!r} alongside the first nor batch the "
+                        f"per-parent queries, so the field would cost one query "
+                        f"per parent row. Write it as orm.field.lazy, which says "
+                        f"that plainly."
+                    )
+                if not self._batch_relations:
+                    # Batching is on unless it was turned off deliberately, and
+                    # quietly turning it back on would override that choice.
+                    raise ValueError(
+                        f"{type_name}.{field_name}: on= needs batch_relations on "
+                        f"this backend, which cannot load a second view of "
+                        f"{relation!r} alongside the first. With batching off the "
+                        f"field would cost a query per parent row. Enable "
+                        f"batching, or write it as orm.field.lazy instead."
+                    )
+
+            return_ann = getattr(graphql_type, "__annotations__", {})[field_name]
+            field.base_resolver = StrawberryResolver(
+                self._make_on_resolver(model, field_name, relation, return_ann),
+                type_override=field.type if field.type is not UNRESOLVED else None,
+            )
 
     def _finalize_type(
         self,
@@ -1880,4 +2067,5 @@ class BaseBackend:
         result = strawberry.type(cls, name=name if name else None)
         self._type_registry[type_name] = model
         self._graphql_type_registry[model] = result
+        self._install_on_resolvers(result, model, type_name)
         return result

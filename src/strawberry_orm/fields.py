@@ -30,7 +30,7 @@ def check_scope_signature(fn: Callable[..., Any]) -> None:
         raise TypeError(
             f"{getattr(fn, '__name__', 'scope')}(self, ...) is not a scope: a scope "
             f"receives (query, info) and never sees the parent row. Use "
-            f"orm.field.custom for a resolver that needs self."
+            f"orm.field.lazy for a resolver that needs self."
         )
     if len(names) != 2:
         raise TypeError(
@@ -45,6 +45,6 @@ def check_resolver_signature(fn: Callable[..., Any], kind: str) -> None:
     if not names or names[0] != "self":
         raise TypeError(
             f"{getattr(fn, '__name__', kind)} must take self as its first argument; "
-            f"orm.field.{kind} runs once per parent row. Use orm.field.scoped for a "
+            f"orm.field.{kind} runs once per parent row. Use orm.field.eager for a "
             f"callable that narrows the query instead."
         )

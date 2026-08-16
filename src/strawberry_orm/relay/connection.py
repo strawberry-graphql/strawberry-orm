@@ -61,8 +61,26 @@ def _orm_backend_from_info(info: Any) -> Any | None:
     return backend
 
 
+class PreslicedRows(list):
+    """One parent's page, already cut to size by a windowed query.
+
+    ``totalCount`` cannot be read off these rows: the window kept only the
+    page, so counting them would report the page size as the total. The real
+    figure is carried alongside, from a grouped count over the same query.
+    """
+
+    __slots__ = ("orm_total_count",)
+
+    def __init__(self, rows: Any, total_count: int) -> None:
+        super().__init__(rows)
+        self.orm_total_count = total_count
+
+
 def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
     """Count connection nodes before Relay pagination is applied."""
+    carried = getattr(nodes, "orm_total_count", None)
+    if carried is not None:
+        return carried
     backend = _orm_backend_from_info(info)
     if backend is not None and backend.is_query_object(nodes):
         return backend.count_query(nodes, info)

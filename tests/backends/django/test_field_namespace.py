@@ -150,6 +150,106 @@ class TestFieldNamespace(AbstractTestFieldNamespace):
         post = self._execute(orm, PostType, "{ posts { tags { name } } }")
         return [t["name"] for t in post["tags"]]
 
+    def run_eager_bare(self):
+        orm = self._orm()
+        _, TagType, _ = self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+            tags: list[TagType] = orm.field.eager()
+
+        post = self._execute(orm, PostType, "{ posts { tags { name } } }")
+        return [t["name"] for t in post["tags"]]
+
+    def run_eager_scope(self):
+        orm = self._orm()
+        CommentType, _, _ = self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+
+            @orm.field.eager
+            def comments(qs, info) -> list[CommentType]:
+                return qs.filter(body__startswith="Nice")
+
+        post = self._execute(orm, PostType, "{ posts { comments { body } } }")
+        return [c["body"] for c in post["comments"]]
+
+    def run_lazy_using(self):
+        orm = self._orm()
+        _, _, UserType = self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+            author: UserType
+
+            @orm.field.lazy(using=["author"])
+            def byline(self, info: strawberry.Info) -> str:
+                return f"by {self.author.name}"
+
+        return self._execute(orm, PostType, "{ posts { byline } }")["byline"]
+
+    def run_lazy(self):
+        orm = self._orm()
+        self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+
+            @orm.field.lazy
+            def title_upper(self, info: strawberry.Info) -> str:
+                return self.title.upper()
+
+        return self._execute(orm, PostType, "{ posts { titleUpper } }")["titleUpper"]
+
+    def declare_eager_taking_self(self):
+        orm = self._orm()
+
+        @orm.field.eager
+        def byline(self, info) -> str: ...
+
+    def run_eager_metadata_only(self):
+        orm = self._orm()
+        _, TagType, _ = self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+            tags: list[TagType] = orm.field.eager(disable_optimization=True)
+
+        post = self._execute(orm, PostType, "{ posts { tags { name } } }")
+        return [t["name"] for t in post["tags"]]
+
+    def run_lazy_with_filters(self):
+        orm = self._orm()
+        CommentType, _, _ = self._leaves(orm)
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+
+            @orm.field.lazy(filters=orm.filter(DjComment))
+            def searchable(self, info: strawberry.Info) -> list[CommentType]:
+                return DjComment.objects.filter(post_id=self.id)
+
+        post = self._execute(
+            orm,
+            PostType,
+            "{ posts { searchable(filter: { field: { body: "
+            '{ startsWith: "Nice" } } }) { body } } }',
+        )
+        return [c["body"] for c in post["searchable"]]
+
     # -- rejected shapes -----------------------------------------------------
 
     def declare_scoped_taking_self(self):

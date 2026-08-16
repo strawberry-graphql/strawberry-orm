@@ -33,6 +33,7 @@ from strawberry_orm._async import (
 )
 from strawberry_orm.backends.protocol import Backend
 from strawberry_orm.fields import (
+    call_scope,
     check_resolver_signature,
     check_scope_signature,
 )
@@ -395,7 +396,15 @@ class _AutoFilterOrderExtension(FieldExtension):
         if self._output_type is None:
             return result
         if isinstance(result, (list, tuple)):
-            return [strawberry_cast(self._output_type, item) for item in result]
+            cast = [strawberry_cast(self._output_type, item) for item in result]
+            # A windowed page carries its parent's real total, which counting
+            # the page cannot recover: the window kept only the page.
+            carried = getattr(result, "orm_total_count", None)
+            if carried is not None:
+                from strawberry_orm.relay.connection import PreslicedRows
+
+                return PreslicedRows(cast, carried)
+            return cast
         return result
 
     async def _resolve_awaitable_result(self, result: Any) -> Any:
@@ -507,6 +516,106 @@ class FieldFactory:
 
     # -- Named forms ---------------------------------------------------------
 
+    def eager(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        on: str | None = None,
+        scope: Callable[..., Any] | None = None,
+        filters: Any | None = None,
+        order: Any | None = None,
+        compute: dict[str, Any] | None = None,
+        disable_optimization: bool = False,
+        permission_classes: list[type] | None = None,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        """A field the library resolves: one query for the whole result set.
+
+        Bare, it writes the query itself. Handed a ``(query, info)`` callable -
+        by keyword as ``scope=``, or as a decorator - that callable narrows
+        which rows load. Either way nothing here sees a parent row, which is
+        exactly what lets one query serve every parent.
+
+        By default the field is served by the relation of the same name. Pass
+        ``on=`` to serve it from a differently named one, which is also how a
+        relation gets more than one view of itself:
+
+            recent: list[PostType] = orm.field.eager(on="posts", scope=...)
+
+        There is no ``using=`` here. That hint exists to disclose relations the
+        optimizer cannot see being read, and nothing about an eager field is
+        hidden from it: the query is either written by the library from the
+        selection set, or returned by your scope for the ORM to read. A
+        resolver needing ``self`` belongs on :meth:`lazy`, which does take it.
+        """
+        supplied = fn if fn is not None else scope
+        if supplied is not None:
+            check_scope_signature(supplied)
+            return FieldDefinition(
+                scope=supplied,
+                on=on,
+                description=description,
+                declared_type=_return_annotation(supplied),
+            )
+        if any([on, compute, disable_optimization, permission_classes]):
+            return FieldDefinition(
+                scope=None,
+                on=on,
+                compute=compute,
+                disable_optimization=disable_optimization,
+                permission_classes=permission_classes,
+                description=description,
+            )
+        return _AutoField(
+            self._backend,
+            description=description,
+            deprecation_reason=deprecation_reason,
+            filters=filters,
+            order=order,
+        )
+
+    def lazy(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        using: list[str] | None = None,
+        filters: Any | None = None,
+        order: Any | None = None,
+        description: str | None = None,
+        deprecation_reason: str | None = None,
+    ) -> Any:
+        """A field you resolve yourself, once per parent row, receiving ``self``.
+
+        The optimizer cannot see inside your resolver, so name the relations it
+        reads with ``using=[...]`` and they are loaded alongside the parent
+        instead of one round trip per row.
+        """
+
+        def _build(resolver: Callable[..., Any]) -> Any:
+            check_resolver_signature(resolver, "lazy")
+            if filters is not None or order is not None:
+                field = _AutoField(
+                    self._backend,
+                    description=description,
+                    deprecation_reason=deprecation_reason,
+                    filters=filters,
+                    order=order,
+                )(resolver)
+            else:
+                field = self._resolver_field(
+                    resolver,
+                    description=description,
+                    deprecation_reason=deprecation_reason,
+                )
+            if using:
+                field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
+                    using=list(using),
+                )
+            return field
+
+        return _build(fn) if fn is not None else _build
+
     def auto(
         self,
         *,
@@ -520,7 +629,7 @@ class FieldFactory:
         description: str | None = None,
         deprecation_reason: str | None = None,
     ) -> Any:
-        """Declare a field the library resolves, with optional metadata."""
+        """Deprecated alias for :meth:`eager`."""
         if scope is not None:
             check_scope_signature(scope)
         if any([using, scope, compute, disable_optimization, permission_classes]):
@@ -547,12 +656,7 @@ class FieldFactory:
         using: list[str] | None = None,
         description: str | None = None,
     ) -> Any:
-        """Narrow the rows loaded through a relation.
-
-        The callable receives ``(query, info)`` and returns a query. It never
-        sees the parent row, which is what lets the optimizer fold it into one
-        prefetch covering every parent.
-        """
+        """Deprecated alias for :meth:`eager` given a ``(query, info)`` callable."""
 
         def _build(scope: Callable[..., Any]) -> FieldDefinition:
             check_scope_signature(scope)
@@ -574,7 +678,7 @@ class FieldFactory:
         description: str | None = None,
         deprecation_reason: str | None = None,
     ) -> Any:
-        """Replace the resolver. Runs once per parent row, and receives ``self``."""
+        """Deprecated alias for :meth:`lazy`."""
 
         def _build(resolver: Callable[..., Any]) -> Any:
             check_resolver_signature(resolver, "custom")
@@ -655,7 +759,7 @@ def _return_annotation(fn: Callable[..., Any]) -> Any:
 class _AutoField:
     """Descriptor returned by ``orm.field()`` that auto-detects ``filter``
     and ``order`` from the return-type's ``__orm_filter__`` /
-    ``__orm_order__`` attributes at class-creation time via
+    ``__orm_order__`` attributes at class-creation time on
     ``__set_name__``.
 
     This mirrors the strawberry-django pattern where filters declared on
@@ -732,6 +836,17 @@ def _is_forward_reference(node_type: Any) -> bool:
 class _AutoConnection:
     _orm_auto_field = True
 
+    _KWARGS = frozenset(
+        {
+            "name",
+            "description",
+            "deprecation_reason",
+            "extensions",
+            "max_results",
+            "scope",
+        }
+    )
+
     def __init__(
         self,
         backend: Backend,
@@ -740,6 +855,16 @@ class _AutoConnection:
         resolver: Callable[..., Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        unknown = sorted(set(kwargs) - self._KWARGS)
+        if unknown:
+            raise TypeError(
+                f"orm.connection() got unexpected keyword argument(s) "
+                f"{', '.join(unknown)}. Accepted: "
+                f"{', '.join(sorted(self._KWARGS))}."
+            )
+        scope = kwargs.get("scope")
+        if scope is not None:
+            check_scope_signature(scope)
         self._backend = backend
         self._graphql_type = graphql_type
         self._resolver = resolver
@@ -751,15 +876,35 @@ class _AutoConnection:
         )
         if graphql_type is None:
             return
+        self._resolved_type = graphql_type
         field = self._build_field(graphql_type, self._resolver)
         if field is None:
             return
         field._orm_auto_field = True  # type: ignore[attr-defined]
+        if self._resolver is None:
+            # __set_name__ runs before @orm.type knows the model, so a
+            # connection over a relation cannot be built yet. Carry the
+            # declaration through for the type loop to finish.
+            field._orm_pending_connection = self  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
         """Decorator form: you return the rows, the library builds the field."""
         return self._build_field(self._graphql_type, resolver)
+
+    def rebuild_for_relation(self, resolver: Callable[..., Any]) -> Any:
+        """Rebuild this connection around a resolver that follows the parent."""
+        graphql_type = getattr(self, "_resolved_type", None) or self._graphql_type
+        node_type = (
+            _extract_connection_node(graphql_type) if graphql_type is not None else None
+        )
+        # Relay checks the resolver's annotation rather than the field's, so it
+        # has to say it returns the nodes.
+        resolver.__annotations__ = {
+            "info": strawberry.types.Info,
+            "return": list[node_type] if node_type is not None else Any,
+        }
+        return self._build_field(graphql_type, resolver)
 
     def _build_field(
         self, graphql_type: Any, resolver: Callable[..., Any] | None
@@ -800,6 +945,17 @@ class _AutoConnection:
             resolver = _make_query_resolver(
                 self._backend, model, filter_type, order_type, group_type
             )
+            scope = self._kwargs.get("scope")
+            if scope is not None:
+                generated = resolver
+
+                @wraps(generated)
+                def resolver(*args: Any, **kw: Any) -> Any:  # noqa: F811
+                    info = kw.get("info") or next(
+                        (a for a in args if hasattr(a, "context")), None
+                    )
+                    return call_scope(scope, generated(*args, **kw), info)
+
             if node_type is not None:
                 resolver.__annotations__["return"] = list[node_type]
 
@@ -839,6 +995,69 @@ class _AutoConnection:
         _use_orm_connection_extension(field)
         field._orm_connection = True  # type: ignore[attr-defined]
         return field
+
+
+class ConnectionFactory:
+    """Relay connections, split the same way fields are.
+
+    The dividing line is whether your callable receives the parent row. One
+    that does not leaves the library free to cover every parent in a single
+    query; one that does forecloses that, however capable the backend is.
+
+    Calling the factory directly is the pre-namespace spelling and still
+    works: ``orm.connection()``, ``orm.connection(SomeConnection)``.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+
+    def __call__(
+        self,
+        graphql_type: Any | None = None,
+        *,
+        resolver: Callable[..., Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return _AutoConnection(self._backend, graphql_type, resolver=resolver, **kwargs)
+
+    def eager(
+        self,
+        graphql_type: Any | None = None,
+        *,
+        scope: Callable[..., Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """A connection the library builds, optionally narrowed by a scope.
+
+        The scope takes ``(query, info)`` and never sees a parent row, which is
+        what lets one query serve every parent. As with ``orm.field.eager``
+        there is no ``using=``: nothing here is opaque to the optimizer.
+        """
+        return _AutoConnection(
+            self._backend,
+            graphql_type,
+            resolver=None,
+            scope=scope,
+            **kwargs,
+        )
+
+    def lazy(
+        self,
+        graphql_type: Any | None = None,
+        *,
+        resolver: Callable[..., Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """A connection you resolve yourself, once per parent row.
+
+        Your resolver receives ``self`` and returns a query; the library still
+        supplies the generated arguments, the connection type, and pagination.
+        """
+        if resolver is not None:
+            check_resolver_signature(resolver, "connection.lazy")
+        conn = _AutoConnection(self._backend, graphql_type, resolver=resolver, **kwargs)
+        conn._require_resolver = True
+        return conn
 
 
 def _build_grouped_connection(
@@ -1115,21 +1334,14 @@ class StrawberryORM:
 
         return PayloadFactory(self, self._payload_policy)
 
-    def connection(
-        self,
-        graphql_type: Any | None = None,
-        *,
-        resolver: Callable[..., Any] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        """A Relay connection over a model.
+    @cached_property
+    def connection(self) -> ConnectionFactory:
+        """Relay connections: ``eager`` and ``lazy``.
 
-        With no ``resolver`` the library builds the query. Supply one - by
-        keyword, or by applying this as a decorator - to return the rows
-        yourself and still get the generated ``filter``/``order``/``groupBy``
-        arguments, the grouped connection type, and optimizer integration.
+        Callable itself for backwards compatibility, so ``orm.connection()``
+        and ``orm.connection(SomeConnection)`` keep working.
         """
-        return _AutoConnection(self._backend, graphql_type, resolver=resolver, **kwargs)
+        return ConnectionFactory(self._backend)
 
     # -- Mutations -----------------------------------------------------------
 
@@ -1303,6 +1515,16 @@ class StrawberryORM:
             if not extensions_include_batching(extensions):
                 extensions.insert(0, self.batching_extension())
 
+        # A connection cannot go through the batcher, which has no way to
+        # express a per-parent limit, so it gets its own windowed pass.
+        if optimizer and self._backend._relation_connections:
+            from strawberry_orm.batching import (
+                extensions_include_relation_connections,
+            )
+
+            if not extensions_include_relation_connections(extensions):
+                extensions.insert(0, self.relation_connection_extension())
+
         self._backend.check_scoped_order_traversal()
 
         return strawberry.Schema(extensions=extensions, **kwargs)
@@ -1311,6 +1533,13 @@ class StrawberryORM:
         from strawberry_orm.batching import BatchingExtension
 
         return BatchingExtension.configure(self._backend, self._backend._store)
+
+    def relation_connection_extension(self) -> type[SchemaExtension]:
+        from strawberry_orm.batching import RelationConnectionExtension
+
+        return RelationConnectionExtension.configure(
+            self._backend, self._backend._store
+        )
 
     def lazy_resolution_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         from strawberry_orm.lazy_resolution import LazyResolutionExtension
@@ -1322,7 +1551,7 @@ class StrawberryORM:
 
 
 def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:
-    """Extract the ORM model class from filter/order types via ``__orm_model__``."""
+    """Extract the ORM model class from filter/order types on ``__orm_model__``."""
     for source in (filters, order):
         if source is not None:
             model = getattr(source, "__orm_model__", None)
