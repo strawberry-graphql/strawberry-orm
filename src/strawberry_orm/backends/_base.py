@@ -55,6 +55,9 @@ def _annotate_filter_relation_presence(FilterCls: type) -> None:
 
 
 _ROW_SCOPE_HOOK = "scope_rows"
+#: What the hook was called before 0.15. Left in place it is simply not read,
+#: so the rows it was written to hide come back instead.
+_LEGACY_ROW_SCOPE_HOOK = "get_queryset"
 
 
 _KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
@@ -1883,6 +1886,18 @@ class BaseBackend:
 
         if isinstance(vars(cls).get(_ROW_SCOPE_HOOK), classmethod):
             self._register_type_scope(cls, model, type_name)
+        elif isinstance(vars(cls).get(_LEGACY_ROW_SCOPE_HOOK), classmethod):
+            # Refused rather than warned about: the class reads as scoped and
+            # is not, so every row it meant to hide is being returned. That is
+            # a widening of what a caller can read, and it happens on upgrade
+            # without anything in the schema changing shape.
+            raise ValueError(
+                f"{type_name} defines {_LEGACY_ROW_SCOPE_HOOK}, which was "
+                f"renamed to {_ROW_SCOPE_HOOK} in 0.15 and is no longer read. "
+                f"Left as it is, {model.__name__} rows load unscoped and the "
+                f"rows it was written to hide are returned. Rename it to "
+                f"{_ROW_SCOPE_HOOK}."
+            )
 
         self._check_missing_scope(cls, model, type_name)
 

@@ -27,6 +27,7 @@ from strawberry_orm._async import (
     await_maybe,
     await_maybe_blocking,
     in_async_context,
+    keep_annotations,
     materialize_result,
     run_orm_work,
     run_orm_work_blocking,
@@ -956,8 +957,21 @@ class _AutoConnection:
                     )
                     return call_scope(scope, generated(*args, **kw), info)
 
+                keep_annotations(resolver, generated)
+
             if node_type is not None:
-                resolver.__annotations__["return"] = list[node_type]
+                # inspect.signature follows __wrapped__, so every function in
+                # the chain has to carry the return type, not just the outermost.
+                # Assign rather than mutate: from 3.14 a wrapper and the
+                # function it wraps no longer share one annotations dict.
+                return_ann = list[node_type]
+                target: Any = resolver
+                while target is not None:
+                    target.__annotations__ = {
+                        **target.__annotations__,
+                        "return": return_ann,
+                    }
+                    target = getattr(target, "__wrapped__", None)
 
         # On a backend that materializes asynchronously the field has to be
         # async, or the connection machinery takes its sync path and ends up
@@ -971,6 +985,8 @@ class _AutoConnection:
             @wraps(sync_resolver)
             async def resolver(*args: Any, **kwargs: Any) -> Any:  # noqa: F811
                 return sync_resolver(*args, **kwargs)
+
+            keep_annotations(resolver, sync_resolver)
 
         extensions = list(self._kwargs.get("extensions") or [])
         extensions.append(

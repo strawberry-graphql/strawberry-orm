@@ -47,6 +47,34 @@ class OperationInfo:
 auto = strawberry.auto
 
 
+def _own_annotations(owner: type) -> dict[str, Any] | None:
+    """The annotations declared on *owner* itself, or ``None`` if it has none.
+
+    From 3.14 annotations are lazy (PEP 649), so a class that has them may
+    carry ``__annotate__`` and no ``__annotations__`` entry yet. Reading
+    ``__dict__`` alone reports nothing in that case, and writing a fresh dict
+    back would drop every annotation the class declared.
+    """
+    existing = owner.__dict__.get("__annotations__")
+    if existing is not None:
+        return existing
+    try:
+        import annotationlib
+    except ImportError:  # pragma: no cover - Python < 3.14
+        return None
+
+    # Mid-class-creation the annotations are reachable through neither
+    # ``__annotations__`` nor ``__annotate__``, so ask for them directly.
+    # FORWARDREF so a reference to a type defined later resolves to a
+    # ForwardRef rather than raising, which is normal in these schemas.
+    # Exercised on 3.14 runs; the coverage gate runs on 3.12, where the import
+    # above has already returned.
+    return (  # pragma: no cover
+        annotationlib.get_annotations(owner, format=annotationlib.Format.FORWARDREF)
+        or None
+    )
+
+
 @dataclass
 class FieldDefinition:
     """Metadata attached to fields created via orm.field()."""
@@ -68,12 +96,15 @@ class FieldDefinition:
         a class annotation. This runs while the class is being created, which
         is before ``@orm.type`` reads annotations.
         """
-        annotations = owner.__dict__.get("__annotations__")
+        annotations = _own_annotations(owner)
         if self.declared_type is not None:
             if annotations is None:
                 annotations = {}
-                owner.__annotations__ = annotations
             annotations.setdefault(name, self.declared_type)
+            # Assign rather than mutate: the dict may have been materialised
+            # from a lazy annotation function, in which case nothing is
+            # watching it.
+            owner.__annotations__ = annotations
         elif self.scope is not None and name not in (annotations or {}):
             raise TypeError(
                 f"{owner.__name__}.{name} has no type. Annotate the attribute "

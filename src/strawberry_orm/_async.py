@@ -14,6 +14,19 @@ T = TypeVar("T")
 AwaitableOrValue = T | Awaitable[T]
 
 
+def keep_annotations(wrapper: Any, wrapped: Any) -> Any:
+    """Give *wrapper* the annotations *wrapped* declares.
+
+    From 3.14 ``functools.wraps`` carries over the lazy annotation function
+    rather than the computed annotations, and assigning ``__annotations__``
+    clears that function - so wrapping a resolver whose annotations were set
+    explicitly leaves the wrapper with none at all. Strawberry reads a field's
+    arguments and return type from there.
+    """
+    wrapper.__annotations__ = dict(getattr(wrapped, "__annotations__", {}))
+    return wrapper
+
+
 def in_async_context() -> bool:
     """Return ``True`` when called from a running event loop."""
     try:

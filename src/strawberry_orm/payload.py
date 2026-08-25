@@ -26,7 +26,7 @@ from typing import Any
 
 import strawberry
 
-from strawberry_orm._async import in_async_context, run_sync
+from strawberry_orm._async import in_async_context, keep_annotations, run_sync
 
 
 @dataclass(frozen=True)
@@ -196,7 +196,7 @@ def _guarded(
 
         return _offloaded()
 
-    return resolver
+    return keep_annotations(resolver, fn)
 
 
 class PayloadFactory:
