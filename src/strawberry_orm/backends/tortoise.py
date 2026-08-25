@@ -30,6 +30,13 @@ from ._base import (
     requested_aggregates,
 )
 
+#: Where the window puts each row's number within its group. Dropped again
+#: before the row is turned back into a model, which knows no such column.
+_ROW_NUMBER_ALIAS = "_orm_rn"
+
+#: Where the grouped count puts each group's total.
+_COUNT_ALIAS = "_orm_count"
+
 _TORTOISE_FIELD_MAP: dict[str, type] = {
     "IntField": int,
     "SmallIntField": int,
@@ -669,24 +676,45 @@ class TortoiseBackend(BaseBackend):
         per_group_limit: int,
         order_input: Any | None = None,
     ) -> dict[tuple, list[Any]]:
-        """Per-group fallback since Tortoise has limited window function support."""
-        groups_qs = await query.group_by(*group_key_fields).values(*group_key_fields)
-        items_by_key: dict[tuple, list[Any]] = {}
+        """Every group's first rows in one windowed query.
 
-        for group_dict in groups_qs:
+        Tortoise has no window expression, so the query it built is wrapped in
+        SQL that numbers rows within each group and keeps the low numbers. The
+        wrapping keeps the placeholders and values Tortoise produced, so filter
+        values are still bound rather than pasted into the statement.
+        """
+        order_clauses = (
+            _build_tortoise_order_from_input(order_input) if order_input else []
+        )
+        sql, values = _windowed_sql(
+            query, model, group_key_fields, order_clauses, per_group_limit
+        )
+        rows = await query._db.execute_query_dict(sql, values)
+
+        items_by_key: dict[tuple, list[Any]] = defaultdict(list)
+        for row in rows:
             key = tuple(
-                str(group_dict[k]) if group_dict[k] is not None else None
+                str(row[k]) if row.get(k) is not None else None
                 for k in group_key_fields
             )
-            scoped = query.filter(**{k: group_dict[k] for k in group_key_fields})
-            if order_input:
-                order_clauses = _build_tortoise_order_from_input(order_input)
-                if order_clauses:
-                    scoped = scoped.order_by(*order_clauses)
-            items = await scoped.limit(per_group_limit)
-            items_by_key[key] = list(items)
+            row.pop(_ROW_NUMBER_ALIAS, None)
+            items_by_key[key].append(model._init_from_db(**row))
+        return dict(items_by_key)
 
-        return items_by_key
+    async def group_counts(
+        self, query: Any, key_field: str, info: Any
+    ) -> dict[Any, int]:
+        """Each group's real total, which the windowed page cannot report."""
+        from tortoise.functions import Count
+
+        # Inherited ordering would drag non-grouped columns into the statement.
+        counted = (
+            query.order_by()
+            .group_by(key_field)
+            .annotate(**{_COUNT_ALIAS: Count(query.model._meta.pk_attr)})
+            .values(key_field, _COUNT_ALIAS)
+        )
+        return {row[key_field]: row[_COUNT_ALIAS] for row in await counted}
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -760,8 +788,63 @@ class TortoiseBackend(BaseBackend):
 
     # -- Optimizer -----------------------------------------------------------
 
+    _supports_windowed_pages = True
+
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return OptimizerExtension.configure(backend=self, store=self._store)
+
+    def instance_pk(self, instance: Any) -> Any:
+        return getattr(instance, "pk", None)
+
+    def _relation_connection_spec(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        from tortoise.fields.relational import BackwardFKRelation
+
+        from strawberry_orm.backends._base import RelationConnectionSpec
+
+        field = model._meta.fields_map.get(relation)  # type: ignore[attr-defined]
+        key_field = getattr(field, "relation_field", None)
+        # Only a reverse foreign key keeps the parent's key on the related row.
+        # A many-to-many hides it in the through table, leaving the window
+        # nothing to partition by.
+        if not isinstance(field, BackwardFKRelation) or key_field is None:
+            return None
+        return RelationConnectionSpec(
+            model=model,
+            field_name=field_name,
+            relation=relation,
+            related_model=self._relation_target_model(model, relation),
+            key_field=key_field,
+        )
+
+    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+        qs = spec.related_model.filter(**{f"{spec.key_field}__in": pks})
+        restrict = self.relation_scope(
+            spec.model, spec.field_name, info, on=spec.relation
+        )
+        return qs if restrict is None else restrict(qs, info)
+
+    def _make_relation_query_resolver(
+        self, model: type, field_name: str, relation: str
+    ) -> Any:
+        backend = self
+        spec = self._relation_connection_spec(model, field_name, relation)
+
+        def resolver(self: Any, info: Any) -> Any:
+            from strawberry_orm.batching import page_attr
+
+            page = getattr(self, page_attr(field_name), None)
+            if page is not None:
+                return page
+            qs = spec.related_model.filter(
+                **{spec.key_field: backend.instance_pk(self)}
+            )
+            restrict = backend.relation_scope(model, field_name, info, on=relation)
+            return qs if restrict is None else restrict(qs, info)
+
+        resolver.__name__ = field_name
+        return resolver
 
     def _apply_nested_queryset(
         self,
@@ -884,6 +967,13 @@ class TortoiseBackend(BaseBackend):
                     or field_cls in _MANY_REL_TYPES
                 )
                 if not is_rel:
+                    continue
+
+                # A field that answers for itself will ignore whatever the
+                # prefetch loads, so do not pay for it.
+                if self.resolves_itself(
+                    self._type_name_for_model(current_model), field_name
+                ):
                     continue
 
                 related_model = field_obj.related_model
@@ -1793,6 +1883,84 @@ def _extract_tortoise_overlapping_order(
                 clauses.append(col_name)
 
     return clauses
+
+
+def _db_columns(model: type) -> dict[str, str]:
+    """Field name to column name, for every column the model really has."""
+    return dict(model._meta.fields_db_projection)  # type: ignore[attr-defined]
+
+
+def _quote_ident(name: str, model: type, quote_char: str) -> str:
+    """Quote *name* for the dialect, having checked the model owns it.
+
+    Only ever called with names the caller derived from the model, so an
+    unknown one means a bug rather than user input; refusing it anyway keeps
+    the window's SQL from being assembled out of anything but real columns.
+    """
+    columns = set(_db_columns(model).values())
+    if name not in columns:
+        raise ValueError(
+            f"{model.__name__} has no column {name!r} to build a window from."
+        )
+    return f"{quote_char}{name}{quote_char}"
+
+
+def _window_ordering(
+    model: type, order_clauses: list[str], quote_char: str
+) -> list[str]:
+    """Render the window's ORDER BY, falling back to the primary key."""
+    meta = model._meta  # type: ignore[attr-defined]
+    projection = _db_columns(model)
+    rendered: list[str] = []
+    for clause in order_clauses:
+        descending = clause.startswith("-")
+        field = clause[1:] if descending else clause
+        column = projection.get(field, field)
+        direction = " DESC" if descending else " ASC"
+        rendered.append(_quote_ident(column, model, quote_char) + direction)
+    if not rendered:
+        pk_column = projection.get(meta.pk_attr, meta.db_pk_column)
+        rendered.append(_quote_ident(pk_column, model, quote_char) + " ASC")
+    return rendered
+
+
+def _windowed_sql(
+    query: Any,
+    model: type,
+    group_key_fields: list[str],
+    order_clauses: list[str],
+    per_group_limit: int,
+) -> tuple[str, list[Any]]:
+    """Wrap *query* in SQL keeping the first rows of every group.
+
+    Returns the statement and the values its placeholders still expect, so the
+    caller binds them rather than embedding them.
+    """
+    query._choose_db_if_not_chosen()
+    query._make_query()
+    inner, values = query.query.get_parameterized_sql()
+
+    quote_char = query._db.query_class.SQL_CONTEXT.quote_char
+    projection = _db_columns(model)
+    partition = ", ".join(
+        _quote_ident(projection.get(field, field), model, quote_char)
+        for field in group_key_fields
+    )
+    ordering = ", ".join(_window_ordering(model, order_clauses, quote_char))
+    alias = f"{quote_char}{_ROW_NUMBER_ALIAS}{quote_char}"
+
+    sql = (
+        f"SELECT * FROM ("
+        f"SELECT _orm_inner.*, ROW_NUMBER() OVER ("
+        f"PARTITION BY {partition} ORDER BY {ordering}"
+        f") AS {alias} FROM ({inner}) _orm_inner"
+        f") _orm_windowed WHERE {alias} <= {int(per_group_limit)} "
+        # Ordered by the row number so each group comes back in the order the
+        # window put it in; without it the rows arrive however the database
+        # found them and the requested order is lost.
+        f"ORDER BY {alias}"
+    )
+    return sql, values
 
 
 def _build_tortoise_order_from_input(order_input: Any) -> list[str]:

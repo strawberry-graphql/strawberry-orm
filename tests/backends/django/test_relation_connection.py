@@ -131,6 +131,72 @@ class TestRelationConnection:
             self._by_user(schema, query)
         return len(ctx.captured_queries)
 
+    def _counts(self, schema, query):
+        result = schema.execute_sync(query, context_value={})
+        assert result.errors is None, result.errors
+        return {
+            u["name"]: (
+                u["posts"]["totalCount"],
+                [e["node"]["title"] for e in u["posts"]["edges"]],
+            )
+            for u in result.data["users"]
+        }
+
+    def test_a_filter_narrows_each_parents_page(self, seed, User, Post):
+        """The page is cut before the resolver runs, so the filter must reach it."""
+        counts = self._counts(
+            self._schema(_orm(), User, Post),
+            "{ users { name posts(first: 5, "
+            'filter: {field: {title: {contains: "Hello"}}}) '
+            "{ totalCount edges { node { title } } } } }",
+        )
+        assert counts["Alice"] == (1, ["Hello World"])
+        assert counts["Bob"] == (0, [])
+
+    def test_a_filter_narrows_each_parents_total(self, seed, User, Post):
+        """A total counted without the filter reports rows the caller excluded."""
+        counts = self._counts(
+            self._schema(_orm(), User, Post),
+            "{ users { name posts(first: 1, "
+            'filter: {field: {title: {contains: "Hello"}}}) '
+            "{ totalCount edges { node { title } } } } }",
+        )
+        assert counts["Alice"][0] == 1, "the total ignored the filter"
+
+    def test_an_order_applies_within_each_parents_page(self, seed, User, Post):
+        by_desc = self._by_user(
+            self._schema(_orm(), User, Post),
+            "{ users { name posts(first: 5, order: {field: {title: DESC}}) "
+            "{ edges { node { title } } } } }",
+        )
+        by_asc = self._by_user(
+            self._schema(_orm(), User, Post),
+            "{ users { name posts(first: 5, order: {field: {title: ASC}}) "
+            "{ edges { node { title } } } } }",
+        )
+        assert by_desc["Alice"] == ["Hello World", "GraphQL Guide"]
+        assert by_asc["Alice"] == ["GraphQL Guide", "Hello World"]
+
+    def test_an_order_decides_which_rows_the_page_keeps(self, seed, User, Post):
+        """Ordering has to reach the window, not just the rows it returned."""
+        by_user = self._by_user(
+            self._schema(_orm(), User, Post),
+            "{ users { name posts(first: 1, order: {field: {title: ASC}}) "
+            "{ edges { node { title } } } } }",
+        )
+        assert by_user["Alice"] == ["GraphQL Guide"]
+
+    def test_a_filter_still_costs_one_query_per_shape(self, seed, User, Post):
+        assert (
+            self._count(
+                self._schema(_orm(), User, Post),
+                "{ users { name posts(first: 1, "
+                'filter: {field: {title: {contains: "o"}}}) '
+                "{ totalCount edges { node { title } } } } }",
+            )
+            == 3
+        )
+
     PAGE = "{ users { name posts(first: 1) { edges { node { title } } } } }"
 
     def test_a_page_costs_the_same_whether_or_not_it_is_scoped(self, seed, User, Post):

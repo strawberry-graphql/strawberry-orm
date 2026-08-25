@@ -197,7 +197,9 @@ class UserNode(relay.Node):
 
 `totalCount` is each parent's own total, counted separately rather than read off the page — the page was truncated, so counting it would report the page size.
 
-This needs a window function and a column on the related rows tying them to a parent, so it is refused when the type is defined if either is missing: on Tortoise, whose query builder has no window functions, and for a many-to-many, whose rows carry the parent key in the association table. Both point you at `orm.connection.lazy`, which is the honest spelling for one query per parent.
+This works on all three backends. Tortoise has no window expression of its own, so that backend wraps the query it built in SQL that does the numbering; the values you filtered on stay bound rather than pasted into the statement.
+
+What it does need is a column on the related rows tying them to a parent, so a many-to-many is refused when the type is defined — those rows keep the parent key in the association table, leaving the window nothing to partition by. The error points you at `orm.connection.lazy`, which is the honest spelling for one query per parent.
 
 Note that a connection on a plain `@strawberry.type` is a *root* connection wherever it appears — it queries the whole table, because nothing about it knows a parent exists. Put connections over relations on an `@orm.type`.
 

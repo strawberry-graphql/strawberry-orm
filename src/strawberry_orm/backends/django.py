@@ -551,13 +551,20 @@ class DjangoBackend(BaseBackend):
             ordering = [F("pk")]
 
         def _run():
-            qs = query.annotate(
-                _rn=Window(
-                    expression=RowNumber(),
-                    partition_by=partition,
-                    order_by=ordering,
+            qs = (
+                query.annotate(
+                    _rn=Window(
+                        expression=RowNumber(),
+                        partition_by=partition,
+                        order_by=ordering,
+                    )
                 )
-            ).filter(_rn__lte=per_group_limit)
+                .filter(_rn__lte=per_group_limit)
+                # Ordered by the row number so each group comes back in the
+                # order the window put it in; without it the rows arrive
+                # however the database found them and the order is lost.
+                .order_by("_rn")
+            )
             rows = list(qs)
             items_by_key: dict[tuple, list[Any]] = defaultdict(list)
             for row in rows:

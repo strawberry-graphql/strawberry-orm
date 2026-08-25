@@ -11,8 +11,15 @@ permissions:
 
 jobs:
   test:
-    name: Test (Python 3.12)
+    name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version here is advertised in the pyproject classifiers; keep
+        # the two lists in step so a claim of support is always backed by a run.
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Check out repository
@@ -21,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -30,15 +37,15 @@ jobs:
 
       - name: Install dependencies
         run: >-
-          uv sync --group dev
+          uv sync --group dev --python ${{ matrix.python-version }}
           --extra django --extra sqlalchemy --extra tortoise
 
       - name: Run tests with coverage
-        run: uv run pytest
+        run: uv run --python ${{ matrix.python-version }} pytest
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
-        if: always()
+        if: always() && matrix.python-version == '3.12'
         with:
           files: coverage.xml
           fail_ci_if_error: false

@@ -476,7 +476,10 @@ class SQLAlchemyBackend(BaseBackend):
 
         subq = query.add_columns(rn).subquery()
         ranked_stmt = select(model).from_statement(
-            select(subq).where(subq.c._rn <= per_group_limit)
+            # Ordered by the row number so each group comes back in the order
+            # the window put it in; without it the rows arrive however the
+            # database found them and the requested order is lost.
+            select(subq).where(subq.c._rn <= per_group_limit).order_by(subq.c._rn)
         )
 
         session = self._get_session(info)

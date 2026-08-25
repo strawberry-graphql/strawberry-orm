@@ -18,11 +18,13 @@ implementations for the conditions.
 from __future__ import annotations
 
 import re
+from asyncio import ensure_future
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import AwaitableOrValue
 from strawberry_orm.lazy_resolution import _path_field_names
 
 if TYPE_CHECKING:
@@ -347,6 +349,39 @@ def page_attr(field_name: str) -> str:
     return f"_orm_connection_page_{field_name}"
 
 
+def _connection_inputs(
+    execution_context: Any, info: Any, kwargs: dict[str, Any]
+) -> tuple[Any, Any]:
+    """The field's own ``filter`` and ``order``, as the backends expect them.
+
+    A schema extension runs before Strawberry converts arguments, so these
+    arrive as plain dictionaries while the backends build their clauses out of
+    input instances. Converting here is what keeps a windowed page honest: the
+    page is cut before the field's own resolver is reached, so a filter applied
+    any later would be applied to rows that were already chosen without it.
+    """
+    schema = getattr(execution_context, "schema", None)
+    fields = getattr(getattr(info, "parent_type", None), "fields", None) or {}
+    gql_field = fields.get(getattr(info, "field_name", None))
+    field = (
+        gql_field.extensions.get("strawberry-definition")
+        if gql_field is not None
+        else None
+    )
+    if schema is None or field is None:
+        return None, None
+
+    from strawberry.types.arguments import convert_arguments
+
+    converted = convert_arguments(
+        kwargs,
+        field.arguments,
+        schema.schema_converter.scalar_registry,
+        schema.config,
+    )
+    return converted.get("filter"), converted.get("order")
+
+
 class RelationConnectionExtension(SchemaExtension):
     """Resolve every parent's page of a relation connection in one query.
 
@@ -356,6 +391,10 @@ class RelationConnectionExtension(SchemaExtension):
     cut with a window function instead, numbering rows within each parent and
     keeping the low numbers, which needs one query for every parent's page and
     one more for their totals.
+
+    Both reads are shared across the sibling parents. On an async backend they
+    resolve concurrently, so what is shared is the in-flight read rather than
+    its result; see :meth:`resolve`.
     """
 
     _backend: Backend | None = None
@@ -397,20 +436,74 @@ class RelationConnectionExtension(SchemaExtension):
             if parents is None:
                 return _next(root, info, *args, **kwargs)
             try:
-                cached = self._fetch_pages(backend, spec, parents, info)
+                cached = self._fetch_pages(backend, spec, parents, info, kwargs=kwargs)
             except _Bail as exc:
                 pages[key] = _UNBATCHABLE
                 record_bail(execution_context, key, str(exc) or "not windowable")
                 return _next(root, info, *args, **kwargs)
+            if isawaitable(cached):
+                # Siblings reach this concurrently, before any result exists to
+                # cache, so what gets cached is the read itself. It has to be a
+                # task rather than the bare coroutine: a coroutine is awaitable
+                # once, which would leave every other sibling to start a read of
+                # its own - the N+1 this exists to collapse.
+                cached = ensure_future(cached)
             pages[key] = cached
 
-        # Relay builds the connection inside ``_next``, so the page is handed
-        # to the resolver rather than returned here - returning rows would
-        # replace the connection itself.
-        page = cached.get(id(root))
+        if isawaitable(cached):
+            return self._resolve_async(
+                cached, _next, root, info, spec, execution_context, key, args, kwargs
+            )
+        return self._with_page(cached, _next, root, info, spec, args, kwargs)
+
+    def _with_page(
+        self,
+        pages_by_parent: dict[int, Any],
+        _next: Any,
+        root: Any,
+        info: Any,
+        spec: Any,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Hand this parent its page, then let the field build the connection.
+
+        Relay builds the connection inside ``_next``, so the page is handed to
+        the resolver rather than returned here - returning rows would replace
+        the connection itself.
+        """
+        page = pages_by_parent.get(id(root))
         if page is not None:
             setattr(root, page_attr(spec.field_name), page)
         return _next(root, info, *args, **kwargs)
+
+    async def _resolve_async(
+        self,
+        pending: Any,
+        _next: Any,
+        root: Any,
+        info: Any,
+        spec: Any,
+        execution_context: Any,
+        key: str,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        """Await the shared read, then resolve this parent from it.
+
+        Nothing bails here: every condition that falls back to per-parent reads
+        is decided before the query is issued, so a failure this late is a bug
+        in the backend rather than a shape it cannot window.
+        """
+        from strawberry_orm._async import await_maybe
+
+        fetched = await pending
+        pages = _operation_store(execution_context, _CONNECTION_KEY)
+        if pages is not None:
+            pages[key] = fetched
+        return await await_maybe(
+            self._with_page(fetched, _next, root, info, spec, args, kwargs)
+        )
 
     def _siblings(
         self, execution_context: Any, root: Any, key: str
@@ -429,13 +522,15 @@ class RelationConnectionExtension(SchemaExtension):
         return parents
 
     def _fetch_pages(
-        self, backend: Backend, spec: Any, parents: list[Any], info: Any
-    ) -> dict[int, Any]:
+        self,
+        backend: Backend,
+        spec: Any,
+        parents: list[Any],
+        info: Any,
+        kwargs: dict[str, Any] | None = None,
+    ) -> AwaitableOrValue[dict[int, Any]]:
         """One windowed query for the pages, one grouped query for the totals."""
-        from strawberry_orm.relay.connection import (
-            PreslicedRows,
-            _decode_cursor_offset,
-        )
+        from strawberry_orm.relay.connection import _decode_cursor_offset
 
         pks = [backend.instance_pk(parent) for parent in parents]
         if any(pk is None for pk in pks):
@@ -449,7 +544,14 @@ class RelationConnectionExtension(SchemaExtension):
             # plain batched read is already the whole answer.
             raise _Bail("no page size, so there is nothing to window")
 
+        filter_input, order_input = _connection_inputs(
+            getattr(self, "execution_context", None), info, kwargs or {}
+        )
         base = backend.relation_base_query(spec, pks, info)
+        if filter_input is not None:
+            base = backend.apply_filters(
+                base, filter_input, spec.related_model, info=info
+            )
         rows_by_key = backend.batch_group_items(
             base,
             [spec.key_field],
@@ -458,19 +560,50 @@ class RelationConnectionExtension(SchemaExtension):
             # Relay slices this itself, so hand it the page plus the row that
             # tells it whether another page exists.
             per_group_limit=first + offset + 1,
+            order_input=order_input,
         )
         if isawaitable(rows_by_key):
-            raise _Bail("this backend windows asynchronously")
+            return self._fetch_pages_async(
+                backend, spec, parents, pks, info, base, rows_by_key
+            )
         totals = backend.group_counts(base, spec.key_field, info)
+        return self._assemble(parents, pks, rows_by_key, totals)
 
-        # Both backends stringify their group keys, so the parent key has to be
+    async def _fetch_pages_async(
+        self,
+        backend: Backend,
+        spec: Any,
+        parents: list[Any],
+        pks: list[Any],
+        info: Any,
+        base: Any,
+        rows_by_key: Any,
+    ) -> dict[int, Any]:
+        """The same two reads, for a backend that only answers asynchronously."""
+        from strawberry_orm._async import await_maybe
+
+        rows = await rows_by_key
+        totals = await await_maybe(backend.group_counts(base, spec.key_field, info))
+        return self._assemble(parents, pks, rows, totals)
+
+    @staticmethod
+    def _assemble(
+        parents: list[Any],
+        pks: list[Any],
+        rows_by_key: dict[tuple, list[Any]],
+        totals: dict[Any, int],
+    ) -> dict[int, Any]:
+        """Pair every parent with its own page and that page's real total."""
+        from strawberry_orm.relay.connection import PreslicedRows
+
+        # Every backend stringifies its group keys, so the parent key has to be
         # compared in the same form.
-        pages: dict[int, Any] = {}
-        for parent, pk in zip(parents, pks, strict=True):
-            pages[id(parent)] = PreslicedRows(
+        return {
+            id(parent): PreslicedRows(
                 rows_by_key.get((str(pk),), []), totals.get(pk, 0)
             )
-        return pages
+            for parent, pk in zip(parents, pks, strict=True)
+        }
 
 
 def extensions_include_relation_connections(extensions: list[Any]) -> bool:

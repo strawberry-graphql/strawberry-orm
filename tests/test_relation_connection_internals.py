@@ -119,14 +119,46 @@ class TestFetchGuards:
         with pytest.raises(_Bail):
             ext._fetch_pages(ext._backend, object(), [_Parent(1)], _info())
 
-    def test_an_awaitable_page_falls_back(self):
-        """Async backends resolve per parent rather than block here."""
-        backend = _Backend(awaitable=True)
+    async def test_an_awaitable_page_is_awaited_not_refused(self):
+        """An async backend windows too; the reads are just awaited."""
+        backend = _Backend(awaitable=True, rows={("1",): ["row"]}, totals={1: 4})
         ext = _extension(backend)
         spec = types.SimpleNamespace(key_field="author_id", related_model=object)
         info = _info(args=[_arg("first", 1)])
-        with pytest.raises(_Bail):
-            ext._fetch_pages(backend, spec, [_Parent(1)], info)
+
+        pending = ext._fetch_pages(backend, spec, [_Parent(1)], info)
+        pages = await pending
+        assert list(pages.values())[0].orm_total_count == 4
+
+    async def test_siblings_share_one_read_rather_than_one_each(self):
+        """Cache the coroutine and each sibling starts the N+1 this collapses."""
+        reads = {"n": 0}
+
+        class _Counting(_Backend):
+            def batch_group_items(self, *a, **kw):
+                async def _later():
+                    reads["n"] += 1
+                    return {("1",): ["row"], ("2",): ["row"]}
+
+                return _later()
+
+        import asyncio
+
+        backend = _Counting(totals={1: 1, 2: 1})
+        backend.relation_connection_spec = lambda info: types.SimpleNamespace(
+            key_field="author_id", related_model=object, field_name="posts"
+        )
+        ext = _extension(backend)
+        parents = [_Parent(1), _Parent(2)]
+        ext.execution_context._orm_batch_parents = {"users": parents}
+        info = _info(args=[_arg("first", 1)])
+
+        async def _next(root, info, *a, **k):
+            return root
+
+        await asyncio.gather(*(ext.resolve(_next, p, info) for p in parents))
+        assert reads["n"] == 1, "each sibling started its own read"
+        assert all(getattr(p, page_attr("posts"), None) is not None for p in parents)
 
     def test_a_cursor_widens_the_window(self):
         """after= is applied by Relay, so the window has to reach past it."""

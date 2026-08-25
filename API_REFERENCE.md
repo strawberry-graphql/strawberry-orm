@@ -196,7 +196,7 @@ A Relay connection over a model, split on the same question as fields: does your
 
 `eager` has the library build the query, optionally narrowed by a `(query, info)` scope. The scope applies to `totalCount` and `aggregates` as well as `edges`, since those are computed from the query rather than the returned rows.
 
-On an `@orm.type` an eager connection is served by the parent's relation, and every parent's page is taken in one query using `ROW_NUMBER() OVER (PARTITION BY ...)`, with a second grouped query for the per-parent `totalCount`. That needs a window function and a column on the related rows identifying the parent, so it is refused when the type is defined on Tortoise and for many-to-many relations, both of which point at `lazy`.
+On an `@orm.type` an eager connection is served by the parent's relation, and every parent's page is taken in one query using `ROW_NUMBER() OVER (PARTITION BY ...)`, with a second grouped query for the per-parent `totalCount`. All three backends support this; Tortoise, which has no window expression, wraps its own parameterized SQL to do the numbering. It does need a column on the related rows identifying the parent, so a many-to-many is refused when the type is defined and pointed at `lazy`.
 
 `lazy` takes a resolver receiving `self` that returns the rows, and runs once per parent row.
 
