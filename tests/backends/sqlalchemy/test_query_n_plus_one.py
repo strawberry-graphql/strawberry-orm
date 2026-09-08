@@ -299,6 +299,54 @@ class TestQueryLoadHintNoNPlusOne:
         assert result.data is not None
         assert len(query_counter) <= 5
 
+    def test_load_hint_applies_to_each_type_of_a_shared_model(
+        self, orm, sa_session, seed, query_counter, User
+    ):
+        """using= is honoured on the second of two types registered for one model.
+
+        A model-keyed hint lookup can only find the first registration, which
+        silently drops the eager load and reintroduces one query per row.
+        """
+
+        @orm.type(User)
+        class UserPlain:
+            id: auto
+            name: auto
+
+        @orm.type(User)
+        class UserWithPosts:
+            id: auto
+            name: auto
+
+            @orm.field.computed(using=["posts"])
+            def post_count(self) -> int:
+                return len(self.posts)
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users_plain(self, info: strawberry.types.Info) -> list[UserPlain]:
+                return select(User)  # type: ignore[return-value]
+
+            @strawberry.field
+            def users(self, info: strawberry.types.Info) -> list[UserWithPosts]:
+                return select(User)  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = schema.execute_sync(
+            "{ users { name postCount } }",
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "postCount": 2},
+                {"name": "Bob", "postCount": 1},
+                {"name": "Charlie", "postCount": 1},
+            ]
+        }
+        assert len(query_counter) <= 2
+
 
 class TestQueryLoadCallable:
     def test_load_callable_filters_nested_relation(

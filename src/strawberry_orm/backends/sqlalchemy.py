@@ -759,7 +759,7 @@ class SQLAlchemyBackend(BaseBackend):
         if get_qs is not None:
             stmt = get_qs(stmt, info)
 
-        type_name = self._type_name_for_model(parent_entity)
+        type_name = self._resolved_type_name(parent_entity, info)
         if type_name:
             hints = self._store.get(type_name, field_name)
             if hints and hints.scope is not None:
@@ -796,7 +796,7 @@ class SQLAlchemyBackend(BaseBackend):
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
         def _get_nested_criteria(
-            parent_entity: type,
+            type_name: str | None,
             field_name: str,
             related_entity: type,
         ) -> Any:
@@ -811,7 +811,6 @@ class SQLAlchemyBackend(BaseBackend):
                 if temp_stmt.whereclause is not None:
                     criteria_parts.append(temp_stmt.whereclause)
 
-            type_name = self._type_name_for_model(parent_entity)
             if type_name and store:
                 hints = store.get(type_name, field_name)
                 if hints and hints.scope is not None:
@@ -856,13 +855,14 @@ class SQLAlchemyBackend(BaseBackend):
                     return parent_loader.joinedload(rel_attr.and_(criteria))
                 return parent_loader.joinedload(rel_attr)
 
-        def _hint_relations(current_mapper: Any, field_name: str) -> list[str]:
+        def _hint_relations(
+            type_name: str | None, current_mapper: Any, field_name: str
+        ) -> list[str]:
             """Relation names declared on ``using=`` for *field_name*.
 
             Keyed on the field name alone, so computed fields that are not mapped
             attributes can still declare the relations their resolver reads.
             """
-            type_name = self._type_name_for_model(current_mapper.entity)
             hints = store.get(type_name, field_name) if type_name and store else None
             if not hints or hints.disable_optimization or not hints.using:
                 return []
@@ -870,7 +870,12 @@ class SQLAlchemyBackend(BaseBackend):
                 name for name in hints.using if name in current_mapper.relationships
             ]
 
-        def _apply_loads(stmt: Any, selection_set: Any, current_mapper: Any) -> Any:
+        def _apply_loads(
+            stmt: Any,
+            selection_set: Any,
+            current_mapper: Any,
+            type_name: str | None,
+        ) -> Any:
             if selection_set is None:
                 return stmt
             for node in iter_field_nodes(selection_set, fragments):
@@ -878,16 +883,14 @@ class SQLAlchemyBackend(BaseBackend):
 
                 # A field that answers for itself will ignore whatever this
                 # loads, so do not pay for it.
-                if self.resolves_itself(
-                    self._type_name_for_model(current_mapper.entity), field_name
-                ):
+                if self.resolves_itself(type_name, field_name):
                     continue
 
                 if field_name in current_mapper.relationships:
                     rel = current_mapper.relationships[field_name]
                     rel_attr = getattr(current_mapper.entity, field_name)
                     criteria = _get_nested_criteria(
-                        current_mapper.entity,
+                        type_name,
                         field_name,
                         rel.mapper.class_,
                     )
@@ -895,15 +898,18 @@ class SQLAlchemyBackend(BaseBackend):
 
                     if node.selection_set:
                         child_mapper = sa_inspect(rel.mapper.class_)
+                        child_type = self._child_type_name(
+                            type_name, node.name.value, rel.mapper.class_, info
+                        )
                         nested = _collect_nested_loaders(
-                            base_loader, node.selection_set, child_mapper
+                            base_loader, node.selection_set, child_mapper, child_type
                         )
                         for nl in nested:
                             stmt = stmt.options(nl)
                     else:
                         stmt = stmt.options(base_loader)
 
-                for rel_name in _hint_relations(current_mapper, field_name):
+                for rel_name in _hint_relations(type_name, current_mapper, field_name):
                     extra_rel = current_mapper.relationships[rel_name]
                     extra_attr = getattr(current_mapper.entity, rel_name)
                     if extra_rel.uselist:
@@ -914,7 +920,10 @@ class SQLAlchemyBackend(BaseBackend):
             return stmt
 
         def _collect_nested_loaders(
-            parent_loader: Any, selection_set: Any, child_mapper: Any
+            parent_loader: Any,
+            selection_set: Any,
+            child_mapper: Any,
+            type_name: str | None,
         ) -> list[Any]:
             """Collect all nested relationship loader chains from a selection set.
 
@@ -928,7 +937,7 @@ class SQLAlchemyBackend(BaseBackend):
             for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
 
-                for rel_name in _hint_relations(child_mapper, field_name):
+                for rel_name in _hint_relations(type_name, child_mapper, field_name):
                     has_child_rels = True
                     hint_rel = child_mapper.relationships[rel_name]
                     loaders.append(
@@ -945,7 +954,7 @@ class SQLAlchemyBackend(BaseBackend):
                     rel = child_mapper.relationships[field_name]
                     rel_attr = getattr(child_mapper.entity, field_name)
                     criteria = _get_nested_criteria(
-                        child_mapper.entity,
+                        type_name,
                         field_name,
                         rel.mapper.class_,
                     )
@@ -957,8 +966,11 @@ class SQLAlchemyBackend(BaseBackend):
                     )
                     if node.selection_set:
                         nested_mapper = sa_inspect(rel.mapper.class_)
+                        nested_type = self._child_type_name(
+                            type_name, node.name.value, rel.mapper.class_, info
+                        )
                         nested = _collect_nested_loaders(
-                            child_loader, node.selection_set, nested_mapper
+                            child_loader, node.selection_set, nested_mapper, nested_type
                         )
                         loaders.extend(nested)
                     else:
@@ -967,8 +979,11 @@ class SQLAlchemyBackend(BaseBackend):
                 loaders.append(parent_loader)
             return loaders
 
+        root_type_name = self._selection_type_name(entity, info)
         for field_node in field_nodes_from_info(info):
-            query = _apply_loads(query, field_node.selection_set, mapper)
+            query = _apply_loads(
+                query, field_node.selection_set, mapper, root_type_name
+            )
         return query
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:

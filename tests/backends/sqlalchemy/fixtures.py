@@ -454,10 +454,24 @@ scope_rows_schema = _qs_orm.schema(
 _multi_orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
 
 
+def _multi_published_only(stmt, info):
+    return stmt.where(SAPost.is_published)
+
+
+@_multi_orm.type(SAPost)
+class MultiPostType:
+    id: auto
+    title: auto
+
+
+# UserBrief is registered first, so a model-keyed hint lookup would resolve
+# every SAUser selection to it - which is exactly what the multi-type hint
+# tests guard against.
 @_multi_orm.type(SAUser)
 class UserBrief:
     id: auto
     name: auto
+    posts: list[MultiPostType]
 
 
 @_multi_orm.type(SAUser)
@@ -465,6 +479,7 @@ class UserFull:
     id: auto
     name: auto
     email: auto
+    posts: list[MultiPostType] = _multi_orm.field.auto(scope=_multi_published_only)
 
 
 @strawberry.type

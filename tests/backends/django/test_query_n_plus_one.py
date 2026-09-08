@@ -285,6 +285,50 @@ class TestQueryLoadHintNoNPlusOne:
         assert result.data is not None
         assert len(ctx) <= 7
 
+    def test_load_hint_applies_to_each_type_of_a_shared_model(self, orm, seed, User):
+        """using= is honoured on the second of two types registered for one model.
+
+        A model-keyed hint lookup can only find the first registration, which
+        silently drops the prefetch and reintroduces one query per row.
+        """
+
+        @orm.type(User)
+        class UserPlain:
+            id: auto
+            name: auto
+
+        @orm.type(User)
+        class UserWithPosts:
+            id: auto
+            name: auto
+
+            @orm.field.computed(using=["posts"])
+            def post_count(self) -> int:
+                return len(self.posts.all())
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users_plain(self) -> list[UserPlain]:
+                return User.objects.all()  # type: ignore[return-value]
+
+            @strawberry.field
+            def users(self) -> list[UserWithPosts]:
+                return User.objects.all()  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        with CaptureQueriesContext(connection) as ctx:
+            result = schema.execute_sync("{ users { name postCount } }")
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "postCount": 2},
+                {"name": "Bob", "postCount": 1},
+                {"name": "Charlie", "postCount": 1},
+            ]
+        }
+        assert len(ctx) <= 2
+
 
 class TestQueryLoadCallable:
     def test_load_callable_filters_nested_relation(self, seed, Post, User):

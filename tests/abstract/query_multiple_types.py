@@ -45,3 +45,36 @@ class AbstractTestQueryMultipleTypes:
                 {"name": "Charlie", "email": "charlie@test.org"},
             ],
         }
+
+    def test_scope_on_the_queried_type_applies(self, multi_type_execute):
+        """The scope declared on UserFull.posts filters UserFull's rows.
+
+        UserFull is the *second* type registered for the user model, so a
+        model-keyed hint lookup would find UserBrief's (absent) hints instead
+        and let the draft post through.
+        """
+        data = multi_type_execute("{ usersFull { name posts { title } } }")
+        assert data == {
+            "usersFull": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": []},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ]
+        }
+
+    def test_sibling_type_of_the_same_model_stays_unscoped(self, multi_type_execute):
+        """UserBrief.posts declares no scope, so UserFull's must not leak onto it."""
+        data = multi_type_execute("{ usersBrief { name posts { title } } }")
+        assert data == {
+            "usersBrief": [
+                {
+                    "name": "Alice",
+                    "posts": [{"title": "Hello World"}, {"title": "GraphQL Guide"}],
+                },
+                {"name": "Bob", "posts": [{"title": "Draft Post"}]},
+                {"name": "Charlie", "posts": [{"title": "Rust Adventures"}]},
+            ]
+        }

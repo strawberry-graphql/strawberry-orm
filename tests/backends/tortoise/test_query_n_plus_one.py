@@ -354,6 +354,51 @@ class TestQueryLoadHintNoNPlusOne:
         assert result.errors is None
         assert result.data is not None
 
+    @pytest.mark.asyncio
+    async def test_load_hint_applies_to_each_type_of_a_shared_model(self, seed, User):
+        """using= is honoured on the second of two types registered for one model.
+
+        A model-keyed hint lookup can only find the first registration, which
+        silently drops the prefetch - and reading the unfetched relation below
+        raises NoValuesFetched, so the assertion on errors catches it.
+        """
+        orm = StrawberryORM.for_tortoise()
+
+        @orm.type(User)
+        class UserPlain:
+            id: auto
+            name: auto
+
+        @orm.type(User)
+        class UserWithPosts:
+            id: auto
+            name: auto
+
+            @orm.field.computed(using=["posts"])
+            def post_count(self) -> int:
+                return len(list(self.posts))
+
+        @strawberry.type
+        class Q:
+            @strawberry.field
+            def users_plain(self) -> list[UserPlain]:
+                return User.all()  # type: ignore[return-value]
+
+            @strawberry.field
+            def users(self) -> list[UserWithPosts]:
+                return User.all()  # type: ignore[return-value]
+
+        schema = strawberry.Schema(query=Q, extensions=[orm.optimizer_extension()])
+        result = await schema.execute("{ users { name postCount } }")
+        assert result.errors is None
+        assert result.data == {
+            "users": [
+                {"name": "Alice", "postCount": 2},
+                {"name": "Bob", "postCount": 1},
+                {"name": "Charlie", "postCount": 1},
+            ]
+        }
+
 
 class TestQueryLoadCallable:
     @pytest.mark.asyncio

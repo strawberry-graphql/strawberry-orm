@@ -1410,9 +1410,9 @@ class BaseBackend:
 
     # -- Scoping across relation traversal -----------------------------------
 
-    def _field_scope(self, model: type, relation: str) -> Any | None:
+    def _field_scope(self, model: type, relation: str, info: Any = None) -> Any | None:
         """The ``scope=`` declared on *model*'s own ``relation`` field, if any."""
-        type_name = self._type_name_for_model(model)
+        type_name = self._resolved_type_name(model, info)
         if type_name is None:
             return None
         hints = self._store.get(type_name, relation)
@@ -1437,7 +1437,7 @@ class BaseBackend:
         if related is None:
             return None
         get_qs = self._type_querysets.get(related)
-        field_scope = self._field_scope(model, relation)
+        field_scope = self._field_scope(model, relation, info)
         if get_qs is None and field_scope is None:
             return None
         if info is None:
@@ -1751,6 +1751,57 @@ class BaseBackend:
             if m is model:
                 return type_name
         return None
+
+    # One model can be registered as several GraphQL types, each with its own
+    # field hints, so ``_type_name_for_model`` - which can only ever return the
+    # first registration - must not decide which hints apply. The three lookups
+    # below read the type out of the request instead, and fall back to the
+    # registration-order name only when the request does not carry one (a test
+    # double without a schema, a wrapper referencing two types of one model).
+
+    def _selection_type_name(self, model: type, info: Any) -> str | None:
+        """Name of *model*'s type whose selection the optimizer is walking."""
+        from strawberry_orm.optimizer.selections import (
+            graphql_resolve_info,
+            registered_type_name,
+        )
+
+        return_type = getattr(graphql_resolve_info(info), "return_type", None)
+        name = registered_type_name(return_type, model, self._type_registry)
+        return name if name is not None else self._type_name_for_model(model)
+
+    def _child_type_name(
+        self,
+        parent_type_name: str | None,
+        field_name: str,
+        model: type,
+        info: Any,
+    ) -> str | None:
+        """Name of *model*'s type that *field_name* under *parent_type_name* yields."""
+        from strawberry_orm.optimizer.selections import (
+            child_field_type,
+            graphql_resolve_info,
+            registered_type_name,
+        )
+
+        schema = getattr(graphql_resolve_info(info), "schema", None)
+        field_type = child_field_type(schema, parent_type_name, field_name)
+        name = registered_type_name(field_type, model, self._type_registry)
+        return name if name is not None else self._type_name_for_model(model)
+
+    def _resolved_type_name(self, model: type, info: Any) -> str | None:
+        """Name of *model*'s type that the current field is being resolved on."""
+        from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+        parent_type = (
+            getattr(graphql_resolve_info(info), "parent_type", None)
+            if info is not None
+            else None
+        )
+        name = getattr(parent_type, "name", None)
+        if name is not None and self._type_registry.get(name) is model:
+            return name
+        return self._type_name_for_model(model)
 
     def _relation_type_from_annotation(self, ann: Any) -> Any | None:
         import typing as _typing

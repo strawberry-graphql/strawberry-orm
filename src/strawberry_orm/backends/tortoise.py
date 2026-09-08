@@ -859,7 +859,7 @@ class TortoiseBackend(BaseBackend):
         if get_qs is not None:
             qs = get_qs(qs, info)
 
-        type_name = self._type_name_for_model(parent_model)
+        type_name = self._resolved_type_name(parent_model, info)
         if type_name:
             hints = self._store.get(type_name, field_name)
             if hints and hints.scope is not None:
@@ -891,13 +891,12 @@ class TortoiseBackend(BaseBackend):
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
         def _get_custom_qs(
-            parent_model: type,
+            type_name: str | None,
             field_name: str,
             related_model: type,
         ) -> Any:
             """Return a load callable or None."""
             nested_get_qs = self._type_querysets.get(related_model)
-            type_name = self._type_name_for_model(parent_model)
             load_fn = None
             if type_name and store:
                 hints = store.get(type_name, field_name)
@@ -921,9 +920,10 @@ class TortoiseBackend(BaseBackend):
                     return cp
             return None
 
-        def _hint_paths(current_model: type, field_name: str, prefix: str) -> list[str]:
+        def _hint_paths(
+            type_name: str | None, current_model: type, field_name: str, prefix: str
+        ) -> list[str]:
             """Relation paths declared via ``using=`` for *field_name*."""
-            type_name = self._type_name_for_model(current_model)
             hints = store.get(type_name, field_name) if type_name and store else None
             if not hints or hints.disable_optimization or not hints.using:
                 return []
@@ -938,6 +938,7 @@ class TortoiseBackend(BaseBackend):
             selection_set: Any,
             current_model: type,
             prefix: str = "",
+            type_name: str | None = None,
         ) -> None:
             if selection_set is None:
                 return  # pragma: no cover
@@ -948,7 +949,9 @@ class TortoiseBackend(BaseBackend):
 
                 # Declared against the field name, so these also apply to computed
                 # fields that are not ORM fields themselves.
-                for rel_path in _hint_paths(current_model, field_name, prefix):
+                for rel_path in _hint_paths(
+                    type_name, current_model, field_name, prefix
+                ):
                     hint_ancestor = _find_custom_ancestor(rel_path)
                     if hint_ancestor is not None:
                         custom_sub_prefetches[hint_ancestor].append(
@@ -971,12 +974,13 @@ class TortoiseBackend(BaseBackend):
 
                 # A field that answers for itself will ignore whatever the
                 # prefetch loads, so do not pay for it.
-                if self.resolves_itself(
-                    self._type_name_for_model(current_model), field_name
-                ):
+                if self.resolves_itself(type_name, field_name):
                     continue
 
                 related_model = field_obj.related_model
+                child_type = self._child_type_name(
+                    type_name, node.name.value, related_model, info
+                )
 
                 ancestor = _find_custom_ancestor(full_path)
                 if ancestor is not None:
@@ -987,11 +991,12 @@ class TortoiseBackend(BaseBackend):
                             node.selection_set,
                             related_model,
                             full_path,
+                            type_name=child_type,
                         )
                     continue
 
                 custom = _get_custom_qs(
-                    current_model,
+                    type_name,
                     field_name,
                     related_model,
                 )
@@ -1030,10 +1035,12 @@ class TortoiseBackend(BaseBackend):
                         node.selection_set,
                         related_model,
                         full_path,
+                        type_name=child_type,
                     )
 
+        root_type_name = self._selection_type_name(model, info)
         for field_node in field_nodes_from_info(info):
-            _walk_selections(field_node.selection_set, model)
+            _walk_selections(field_node.selection_set, model, type_name=root_type_name)
 
         # Batching a scoped relation filters the related model by the column
         # that points back at the parent. A forward FK has no such column - it

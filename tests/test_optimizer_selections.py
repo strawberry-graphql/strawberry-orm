@@ -1,11 +1,21 @@
 """Unit tests for optimizer GraphQL selection walking."""
 
-from graphql import parse
+from graphql import (
+    GraphQLField,
+    GraphQLList,
+    GraphQLNonNull,
+    GraphQLObjectType,
+    GraphQLSchema,
+    GraphQLString,
+    parse,
+)
 
 from strawberry_orm.optimizer.selections import (
+    child_field_type,
     field_nodes_from_info,
     fragments_from_info,
     iter_field_nodes,
+    registered_type_name,
 )
 
 
@@ -197,3 +207,84 @@ class TestFieldNodesFromInfo:
 
     def test_returns_empty_when_missing(self):
         assert field_nodes_from_info(type("Info", (), {})()) == []
+
+
+class _UserModel:
+    pass
+
+
+def _object_type(name: str, **field_types) -> GraphQLObjectType:
+    return GraphQLObjectType(
+        name, {key: GraphQLField(value) for key, value in field_types.items()}
+    )
+
+
+_USER_TYPE = _object_type("UserType", id=GraphQLString)
+_REGISTRY = {"UserType": _UserModel}
+
+
+class TestRegisteredTypeName:
+    def test_matches_the_named_type_through_wrappers(self):
+        wrapped = GraphQLNonNull(GraphQLList(GraphQLNonNull(_USER_TYPE)))
+        assert registered_type_name(wrapped, _UserModel, _REGISTRY) == "UserType"
+
+    def test_finds_the_type_inside_a_payload(self):
+        payload = _object_type(
+            "UserPayload", data=GraphQLList(_USER_TYPE), errors=GraphQLString
+        )
+        assert registered_type_name(payload, _UserModel, _REGISTRY) == "UserType"
+
+    def test_finds_the_type_inside_a_connection(self):
+        edge = _object_type("UserEdge", cursor=GraphQLString, node=_USER_TYPE)
+        connection = _object_type("UserConnection", edges=GraphQLList(edge))
+        assert registered_type_name(connection, _UserModel, _REGISTRY) == "UserType"
+
+    def test_two_registered_names_at_one_depth_is_ambiguous(self):
+        brief = _object_type("UserBrief", id=GraphQLString)
+        full = _object_type("UserFull", id=GraphQLString)
+        registry = {"UserBrief": _UserModel, "UserFull": _UserModel}
+        wrapper = _object_type("Pair", brief=brief, full=full)
+        assert registered_type_name(wrapper, _UserModel, registry) is None
+
+    def test_none_type_returns_none(self):
+        assert registered_type_name(None, _UserModel, _REGISTRY) is None
+
+    def test_no_match_anywhere_returns_none(self):
+        scalar_only = _object_type("Totals", count=GraphQLString)
+        assert registered_type_name(scalar_only, _UserModel, _REGISTRY) is None
+
+    def test_repeated_types_are_visited_once(self):
+        # Both fields point at the same wrapper, which itself has no match.
+        inner = _object_type("Inner", value=GraphQLString)
+        outer = _object_type("Outer", first=inner, second=inner)
+        assert registered_type_name(outer, _UserModel, _REGISTRY) is None
+
+    def test_search_depth_is_bounded(self):
+        nested = _object_type("Level4", user=_USER_TYPE)
+        for level in (3, 2, 1, 0):
+            nested = _object_type(f"Level{level}", below=nested)
+        assert registered_type_name(nested, _UserModel, _REGISTRY) is None
+
+
+class TestChildFieldType:
+    def _schema(self) -> GraphQLSchema:
+        query = _object_type("Query", user=_USER_TYPE, title=GraphQLString)
+        return GraphQLSchema(query=query)
+
+    def test_resolves_the_field_type(self):
+        assert child_field_type(self._schema(), "Query", "user") is _USER_TYPE
+
+    def test_none_schema_returns_none(self):
+        assert child_field_type(None, "Query", "user") is None
+
+    def test_none_parent_returns_none(self):
+        assert child_field_type(self._schema(), None, "user") is None
+
+    def test_unknown_parent_returns_none(self):
+        assert child_field_type(self._schema(), "Missing", "user") is None
+
+    def test_scalar_parent_returns_none(self):
+        assert child_field_type(self._schema(), "String", "user") is None
+
+    def test_unknown_field_returns_none(self):
+        assert child_field_type(self._schema(), "Query", "missing") is None

@@ -832,7 +832,7 @@ class DjangoBackend(BaseBackend):
                 return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
             def _get_nested_queryset(
-                parent_model: type,
+                type_name: str | None,
                 field_name: str,
                 related_model: type,
             ) -> Any:
@@ -840,7 +840,6 @@ class DjangoBackend(BaseBackend):
                 the related model's type defines scope_rows."""
                 get_qs = self._type_querysets.get(related_model)
 
-                type_name = self._type_name_for_model(parent_model)
                 load_fn = None
                 if type_name and store:
                     hints = store.get(type_name, field_name)
@@ -862,6 +861,7 @@ class DjangoBackend(BaseBackend):
                 current_model: type,
                 prefix: str = "",
                 in_prefetch: bool = False,
+                type_name: str | None = None,
             ) -> None:
                 if selection_set is None:
                     return
@@ -872,7 +872,6 @@ class DjangoBackend(BaseBackend):
 
                     # Eager-load hints are declared against the field name, so they
                     # apply to computed fields that are not ORM fields themselves.
-                    type_name = self._type_name_for_model(current_model)
                     if type_name and store:
                         hints = store.get(type_name, field_name)
                         if hints and not hints.disable_optimization and hints.using:
@@ -925,8 +924,11 @@ class DjangoBackend(BaseBackend):
                         ):
                             continue
                         related_model = field_obj.related_model
+                        child_type = self._child_type_name(
+                            type_name, node.name.value, related_model, info
+                        )
                         custom_qs = _get_nested_queryset(
-                            current_model, field_name, related_model
+                            type_name, field_name, related_model
                         )
                         if custom_qs is not None:
                             from django.db.models import Prefetch
@@ -940,6 +942,7 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch=True,
+                                    type_name=child_type,
                                 )
                         elif in_prefetch:
                             prefetch_related.append(full_path)
@@ -949,6 +952,7 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch,
+                                    type_name=child_type,
                                 )
                         else:
                             select_related.append(full_path)
@@ -958,11 +962,15 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch,
+                                    type_name=child_type,
                                 )
                     elif field_class_name == "OneToOneRel":
                         related_model = field_obj.related_model
+                        child_type = self._child_type_name(
+                            type_name, node.name.value, related_model, info
+                        )
                         custom_qs = _get_nested_queryset(
-                            current_model, field_name, related_model
+                            type_name, field_name, related_model
                         )
                         if custom_qs is not None:
                             from django.db.models import Prefetch
@@ -976,6 +984,7 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch=True,
+                                    type_name=child_type,
                                 )
                         elif in_prefetch:
                             prefetch_related.append(full_path)
@@ -985,6 +994,7 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch,
+                                    type_name=child_type,
                                 )
                         else:
                             select_related.append(full_path)
@@ -994,6 +1004,7 @@ class DjangoBackend(BaseBackend):
                                     related_model,
                                     full_path,
                                     in_prefetch,
+                                    type_name=child_type,
                                 )
                     elif field_class_name in (
                         "ManyToManyField",
@@ -1001,8 +1012,11 @@ class DjangoBackend(BaseBackend):
                         "ManyToOneRel",
                     ):
                         related_model = field_obj.related_model
+                        child_type = self._child_type_name(
+                            type_name, node.name.value, related_model, info
+                        )
                         custom_qs = _get_nested_queryset(
-                            current_model, field_name, related_model
+                            type_name, field_name, related_model
                         )
                         if on is not None:
                             # to_attr keeps the two views apart: without it the
@@ -1031,10 +1045,14 @@ class DjangoBackend(BaseBackend):
                                 related_model,
                                 full_path,
                                 in_prefetch=True,
+                                type_name=child_type,
                             )
 
+            root_type_name = self._selection_type_name(model, info)
             for field_node in field_nodes_from_info(info):
-                _walk_selections(field_node.selection_set, model)
+                _walk_selections(
+                    field_node.selection_set, model, type_name=root_type_name
+                )
 
             return select_related, prefetch_related
 

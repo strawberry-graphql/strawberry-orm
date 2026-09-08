@@ -398,13 +398,29 @@ scope_rows_schema = _qs_orm.schema(
 # Multiple-types schema
 # =========================================================================
 
-_multi_orm = StrawberryORM.for_tortoise()
+# strict_hints needs the reverse relations Tortoise only wires at init(),
+# which runs long after this module is imported.
+_multi_orm = StrawberryORM.for_tortoise(strict_hints=False)
 
 
+def _multi_published_only(qs, info):
+    return qs.filter(is_published=True)
+
+
+@_multi_orm.type(TortPost)
+class MultiPostType:
+    id: auto
+    title: auto
+
+
+# UserBrief is registered first, so a model-keyed hint lookup would resolve
+# every TortUser selection to it - which is exactly what the multi-type hint
+# tests guard against.
 @_multi_orm.type(TortUser)
 class UserBrief:
     id: auto
     name: auto
+    posts: list[MultiPostType]
 
 
 @_multi_orm.type(TortUser)
@@ -412,6 +428,7 @@ class UserFull:
     id: auto
     name: auto
     email: auto
+    posts: list[MultiPostType] = _multi_orm.field.auto(scope=_multi_published_only)
 
 
 @strawberry.type

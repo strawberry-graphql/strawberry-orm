@@ -116,6 +116,73 @@ def narrow_info(info: Any, path: str | Sequence[str]) -> Any:
     )
 
 
+def _unwrap_named_type(graphql_type: Any) -> Any:
+    """Strip NonNull/List wrappers from *graphql_type* down to the named type."""
+    while (
+        graphql_type is not None and getattr(graphql_type, "of_type", None) is not None
+    ):
+        graphql_type = graphql_type.of_type
+    return graphql_type
+
+
+def registered_type_name(
+    graphql_type: Any, model: type, registry: dict[str, type]
+) -> str | None:
+    """Name under which *model* is registered, at or under *graphql_type*.
+
+    One model can be registered as several GraphQL types, each with its own
+    field hints, so hints must be resolved from the type the selection actually
+    names - a model-keyed lookup can only ever find one of them.
+
+    The rows often sit inside a wrapper - a connection's ``edges { node }``, a
+    payload's ``data`` - so the wrapper's fields are searched breadth-first.
+    Finding two different registered names for *model* at the same depth means
+    the wrapper alone cannot say which one applies; that returns ``None`` and
+    the caller falls back to the registration-order lookup.
+    """
+    current = _unwrap_named_type(graphql_type)
+    if current is None:
+        return None
+    frontier = [current]
+    seen = {current}
+    for _ in range(4):
+        matches = {
+            named.name
+            for named in frontier
+            if getattr(named, "name", None) is not None
+            and registry.get(named.name) is model
+        }
+        if matches:
+            return matches.pop() if len(matches) == 1 else None
+        next_frontier: list[Any] = []
+        for named in frontier:
+            for field in (getattr(named, "fields", None) or {}).values():
+                child = _unwrap_named_type(field.type)
+                if child is not None and child not in seen:
+                    seen.add(child)
+                    next_frontier.append(child)
+        if not next_frontier:
+            return None
+        frontier = next_frontier
+    return None
+
+
+def child_field_type(schema: Any, parent_type_name: str | None, field_name: str) -> Any:
+    """Schema type that *field_name* on the type named *parent_type_name* yields.
+
+    ``field_name`` is the name as it appears in the query AST, which is the
+    schema spelling. ``None`` when any hop is unknown - a test double without a
+    schema, a fragment field belonging to a sibling type - and the caller falls
+    back.
+    """
+    type_map = getattr(schema, "type_map", None)
+    if type_map is None or parent_type_name is None:
+        return None
+    fields = getattr(type_map.get(parent_type_name), "fields", None) or {}
+    field = fields.get(field_name)
+    return field.type if field is not None else None
+
+
 def _relay_passthrough_field(name: str) -> bool:
     if name in _RELAY_PASSTHROUGH_FIELDS:
         return True

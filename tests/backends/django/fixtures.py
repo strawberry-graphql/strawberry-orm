@@ -421,10 +421,24 @@ scope_rows_schema = _qs_orm.schema(
 _multi_orm = StrawberryORM.for_django(lazy_resolution="off")
 
 
+def _multi_published_only(qs, info):
+    return qs.filter(is_published=True)
+
+
+@_multi_orm.type(DjPost)
+class MultiPostType:
+    id: auto
+    title: auto
+
+
+# UserBrief is registered first, so a model-keyed hint lookup would resolve
+# every DjUser selection to it - which is exactly what the multi-type hint
+# tests guard against.
 @_multi_orm.type(DjUser)
 class UserBrief:
     id: auto
     name: auto
+    posts: list[MultiPostType]
 
 
 @_multi_orm.type(DjUser)
@@ -432,6 +446,7 @@ class UserFull:
     id: auto
     name: auto
     email: auto
+    posts: list[MultiPostType] = _multi_orm.field.auto(scope=_multi_published_only)
 
 
 @strawberry.type
