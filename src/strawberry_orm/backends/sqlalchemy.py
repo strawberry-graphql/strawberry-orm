@@ -9,6 +9,9 @@ from decimal import Decimal
 from typing import Any
 
 import strawberry
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.orm.state import InstanceState
+from sqlalchemy.sql import Select
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm.backends._base import (
@@ -27,6 +30,9 @@ from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
 from strawberry_orm.optimizer import OptimizerExtension
 from strawberry_orm.types import DateGroupByInterval
+
+#: Relation-name sets by model class; see :meth:`SQLAlchemyBackend.relation_names`.
+_RELATION_NAMES: dict[type, set[str]] = {}
 
 
 def _primary_key(value: Any) -> Any:
@@ -526,22 +532,21 @@ class SQLAlchemyBackend(BaseBackend):
         return stmt
 
     def is_query_object(self, value: Any) -> bool:
-        from sqlalchemy.sql import Select
-
         return isinstance(value, Select)
 
     def is_model_instance(self, value: Any) -> bool:
-        from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy.orm.state import InstanceState
-
         if isinstance(value, type):
             return False
         return isinstance(sa_inspect(value, raiseerr=False), InstanceState)
 
     def relation_names(self, model: type) -> set[str]:
-        from sqlalchemy import inspect as sa_inspect
-
-        return set(sa_inspect(model).relationships.keys())
+        # Called once per field per row while resolving, so the set is cached
+        # per model class. Relationships are fixed once mappers configure.
+        names = _RELATION_NAMES.get(model)
+        if names is None:
+            names = set(sa_inspect(model).relationships.keys())
+            _RELATION_NAMES[model] = names
+        return names
 
     def _relation_target_model(self, model: type, relation: str) -> type | None:
         from sqlalchemy import inspect as sa_inspect

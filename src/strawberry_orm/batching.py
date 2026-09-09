@@ -22,6 +22,7 @@ from asyncio import ensure_future
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
+from graphql import GraphQLList, GraphQLNonNull
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import AwaitableOrValue
@@ -43,8 +44,6 @@ class _Bail(Exception):
 
 def returns_orm_list(backend: Backend, info: Any) -> bool:
     """True when the field returns a list of a registered ORM type."""
-    from graphql import GraphQLList, GraphQLNonNull
-
     return_type = getattr(info, "return_type", None)
     while isinstance(return_type, GraphQLNonNull):
         return_type = return_type.of_type
@@ -174,6 +173,13 @@ class BatchingExtension(SchemaExtension):
             {"_backend": backend, "_store": store},
         )
 
+    #: Per-execution ``id(return_type) -> returns_orm_list`` verdicts. Set
+    #: lazily on the instance (extensions are instantiated per operation), so
+    #: entries never outlive the return-type objects they key on. The verdict
+    #: is asked once per field per row; a page of rows repeats a handful of
+    #: return types thousands of times.
+    _orm_list_verdicts: dict[int, bool] | None = None
+
     def resolve(
         self, _next: Any, root: Any, info: Any, *args: Any, **kwargs: Any
     ) -> Any:
@@ -181,7 +187,15 @@ class BatchingExtension(SchemaExtension):
         if backend is None or root is None:
             return _next(root, info, *args, **kwargs)
 
-        if not returns_orm_list(backend, info):
+        verdicts = self._orm_list_verdicts
+        if verdicts is None:
+            verdicts = self._orm_list_verdicts = {}
+        type_key = id(info.return_type)
+        verdict = verdicts.get(type_key)
+        if verdict is None:
+            verdict = returns_orm_list(backend, info)
+            verdicts[type_key] = verdict
+        if not verdict:
             return _next(root, info, *args, **kwargs)
 
         key = path_key(info)

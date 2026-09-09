@@ -7,6 +7,7 @@ from contextlib import suppress
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
+from graphql import GraphQLList, GraphQLNonNull
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import await_maybe
@@ -66,8 +67,6 @@ def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     other wrapper types are left alone: their named type is not a registered
     ORM type.
     """
-    from graphql import GraphQLList, GraphQLNonNull
-
     return_type = getattr(info, "return_type", None)
     while isinstance(return_type, GraphQLNonNull):
         return_type = return_type.of_type
@@ -79,6 +78,13 @@ def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     return name is not None and name in registry
 
 
+#: Cached ``(model class, field name) -> reads a relation`` verdicts. The
+#: verdict depends only on the model's relation names, which are fixed by the
+#: time rows are being resolved, so it is computed once rather than once per
+#: field per row (the regex below is measurably hot on large pages).
+_RELATION_VERDICTS: dict[tuple[type, str], bool] = {}
+
+
 def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> bool:
     """True when this field is a relation hanging off an in-memory parent row."""
     if root is None or not backend.is_model_instance(root):
@@ -87,12 +93,17 @@ def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> b
     name = getattr(info, "python_name", None) or getattr(info, "field_name", "")
     if not name:
         return False  # pragma: no cover - Info always carries one of the two
-    snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
-    try:
-        return snake in backend.relation_names(type(root))
-    except Exception:  # pragma: no cover - defensive; unmapped roots
-        return False
+    key = (type(root), name)
+    verdict = _RELATION_VERDICTS.get(key)
+    if verdict is None:
+        snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+        try:
+            verdict = snake in backend.relation_names(type(root))
+        except Exception:  # pragma: no cover - defensive; unmapped roots
+            return False
+        _RELATION_VERDICTS[key] = verdict
+    return verdict
 
 
 def _unwrap_single(result: Any, singular: bool) -> Any:
@@ -110,6 +121,13 @@ def _unwrap_single(result: Any, singular: bool) -> Any:
 # from the first, so the second falls back to loading relations as it reads
 # them. That is slower, not wrong: the lazy path applies the same row scoping.
 _PREPARED = "_strawberry_orm_relations_loaded"
+
+#: Exact types a resolved value can have that no branch below ``resolve``
+#: touches: not a query object, not a model instance, not a list, and never
+#: awaitable. A page of 500 rows resolves thousands of such leaves, so they
+#: skip the machinery entirely. Exact-type matching keeps subclasses (enums,
+#: bool-like wrappers) on the full path.
+_SCALAR_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
 
 
 def _mark_prepared(rows: Any) -> None:
@@ -179,6 +197,9 @@ class OptimizerExtension(SchemaExtension):
         **kwargs: Any,
     ) -> Any:
         result = _next(root, info, *args, **kwargs)
+        if type(result) in _SCALAR_LEAF_TYPES:
+            # Scalar leaves fall through every branch below unchanged.
+            return result
         backend = self._backend
         singular = False
         optimized = False

@@ -13,6 +13,8 @@ from typing import Any
 
 import strawberry
 from strawberry.extensions import SchemaExtension
+from tortoise.models import Model
+from tortoise.queryset import QuerySet
 
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
@@ -725,13 +727,9 @@ class TortoiseBackend(BaseBackend):
         return qs
 
     def is_query_object(self, value: Any) -> bool:
-        from tortoise.queryset import QuerySet
-
         return isinstance(value, QuerySet)
 
     def is_model_instance(self, value: Any) -> bool:
-        from tortoise.models import Model
-
         return isinstance(value, Model)
 
     def _relation_target_model(self, model: type, relation: str) -> type | None:

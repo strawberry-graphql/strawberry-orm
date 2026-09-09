@@ -9,6 +9,7 @@ from inspect import iscoroutinefunction
 from typing import Any
 
 import strawberry
+from django.db.models import Model, QuerySet
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
@@ -27,6 +28,9 @@ from ._base import (
     invoke_custom_callback,
     requested_aggregates,
 )
+
+#: Relation-name sets by model class; see :meth:`DjangoBackend.relation_names`.
+_RELATION_NAMES: dict[type, set[str]] = {}
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
     "AutoField": int,
@@ -586,21 +590,23 @@ class DjangoBackend(BaseBackend):
         return qs
 
     def is_query_object(self, value: Any) -> bool:
-        from django.db.models import QuerySet
-
         return isinstance(value, QuerySet)
 
     def is_model_instance(self, value: Any) -> bool:
-        from django.db.models import Model
-
         return isinstance(value, Model)
 
     def relation_names(self, model: type) -> set[str]:
-        return {
-            f.name
-            for f in model._meta.get_fields()  # type: ignore[attr-defined]
-            if getattr(f, "is_relation", False)
-        }
+        # Called once per field per row while resolving, so the set is cached
+        # per model class. Django's field list is fixed once apps are loaded.
+        names = _RELATION_NAMES.get(model)
+        if names is None:
+            names = {
+                f.name
+                for f in model._meta.get_fields()  # type: ignore[attr-defined]
+                if getattr(f, "is_relation", False)
+            }
+            _RELATION_NAMES[model] = names
+        return names
 
     def _relation_target_model(self, model: type, relation: str) -> type | None:
         try:
