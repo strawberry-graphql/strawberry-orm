@@ -1,6 +1,7 @@
 """Comprehensive tests for grouping, aggregation, and related features."""
 
 import datetime
+from decimal import Decimal
 
 import pytest
 import strawberry
@@ -8,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    Numeric,
     String,
     case,
     create_engine,
@@ -46,6 +48,13 @@ class Order(GroupBase):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime)
 
 
+class Invoice(GroupBase):
+    __tablename__ = "invoices"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    total: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+
+
 # ---------------------------------------------------------------------------
 # ORM setup
 # ---------------------------------------------------------------------------
@@ -67,9 +76,21 @@ class OrderType(relay.Node):
     created_at: auto
 
 
+InvoiceFilter = orm.filter(Invoice)
+InvoiceOrder = orm.order(Invoice)
+InvoiceGroupBy = orm.group(Invoice)
+
+
+@orm.type(Invoice, filters=InvoiceFilter, order=InvoiceOrder, group=InvoiceGroupBy)
+class InvoiceType(relay.Node):
+    id: relay.NodeID[int]
+    total: auto
+
+
 @strawberry.type
 class Query:
     orders: ORMListConnection[OrderType] = orm.connection()
+    invoices: ORMListConnection[InvoiceType] = orm.connection()
 
 
 schema = strawberry.Schema(
@@ -348,6 +369,21 @@ class TestTypeGeneration:
         assert "amount" in sum_fields
         assert "quantity" in sum_fields
 
+    def test_decimal_fields_are_numeric_for_aggregates(self):
+        meta = orm.backend._build_aggregate_types(Invoice)
+        numeric_names = [f[0] for f in meta.numeric_fields]
+        comparable_names = [f[0] for f in meta.comparable_fields]
+        assert "total" in numeric_names
+        assert "total" in comparable_names
+        assert meta.sum_type is not None
+        assert meta.avg_type is not None
+        assert meta.min_type is not None
+        assert meta.max_type is not None
+        assert "total" in meta.sum_type.__dataclass_fields__
+        assert "total" in meta.avg_type.__dataclass_fields__
+        assert "total" in meta.min_type.__dataclass_fields__
+        assert "total" in meta.max_type.__dataclass_fields__
+
     def test_group_key_type_has_all_groupable_fields(self):
         meta = orm.backend._build_aggregate_types(Order)
         key_fields = meta.group_key_type.__dataclass_fields__
@@ -404,6 +440,39 @@ class TestAggregation:
         assert agg["avg"]["amount"] > 0
         assert agg["min"]["amount"] == 15.0
         assert agg["max"]["amount"] == 200.0
+
+    def test_decimal_fields_can_be_aggregated(self, session):
+        session.add_all(
+            [
+                Invoice(id=1, total=Decimal("10.50")),
+                Invoice(id=2, total=Decimal("20.25")),
+            ]
+        )
+        session.commit()
+
+        result = schema.execute_sync(
+            """
+            query {
+                invoices(first: 10) {
+                    aggregates {
+                        count
+                        sum { total }
+                        avg { total }
+                        min { total }
+                        max { total }
+                    }
+                }
+            }
+            """,
+            context_value={"session": session},
+        )
+        assert result.errors is None, f"GraphQL errors: {result.errors}"
+        agg = result.data["invoices"]["aggregates"]
+        assert agg["count"] == 2
+        assert agg["sum"]["total"] == pytest.approx(30.75)
+        assert agg["avg"]["total"] == pytest.approx(15.375)
+        assert agg["min"]["total"] == pytest.approx(10.50)
+        assert agg["max"]["total"] == pytest.approx(20.25)
 
     def test_aggregates_with_filter(self, execute):
         data = execute("""

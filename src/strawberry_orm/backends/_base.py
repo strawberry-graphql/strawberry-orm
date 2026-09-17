@@ -11,6 +11,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from decimal import Decimal
 from difflib import get_close_matches
 from typing import Any, Literal
 
@@ -1022,10 +1023,11 @@ class BaseBackend:
 
     # -- Group-by type generation --------------------------------------------
 
-    _NUMERIC_TYPES: tuple[type, ...] = (int, float)
+    _NUMERIC_TYPES: tuple[type, ...] = (int, float, Decimal)
     _COMPARABLE_TYPES: tuple[type, ...] = (
         int,
         float,
+        Decimal,
         datetime.date,
         datetime.time,
         datetime.datetime,
