@@ -33,6 +33,7 @@ from strawberry_orm.types import (
     Ordering,
     auto,
 )
+from strawberry_orm.upserts import UpsertNotFoundError, UpsertValidationError
 
 __all__ = [
     "AbstractRepo",
@@ -60,6 +61,8 @@ __all__ = [
     "StringLookupNoRegex",
     "TimeComparisonLookup",
     "UNSET",
+    "UpsertNotFoundError",
+    "UpsertValidationError",
     "aggregate_field",
     "auto",
     "filter_field",

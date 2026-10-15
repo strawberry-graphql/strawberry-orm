@@ -304,9 +304,21 @@ class DjangoBackend(BaseBackend):
         *,
         authorize: Any | None = None,
     ) -> Any:
+        from django.db import transaction
+
         from strawberry_orm.repo import _check_auth
+        from strawberry_orm.upserts import has_upsert
+        from strawberry_orm.upserts import run_sync as run_steps
 
         def apply() -> None:
+            writer = self._ref_list_writer(instance, field, refs, info, authorize)
+            if not any(has_upsert(ref) for ref in refs):
+                apply_items(writer)
+                return
+            with transaction.atomic(using=instance._state.db):
+                apply_items(writer)
+
+        def apply_items(writer: Any) -> None:
             manager = getattr(instance, field)
             rel_model = manager.model
             repo = self.get_repo(rel_model) if not authorize else None
@@ -321,7 +333,10 @@ class DjangoBackend(BaseBackend):
                 ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
                 ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-                if ref_create is not strawberry.UNSET and ref_create is not None:
+                if has_upsert(ref):
+                    spec = self._upsert_relation_spec(type(instance), field)
+                    run_steps(writer.apply_ref_upsert(instance, spec, ref, link=True))
+                elif ref_create is not strawberry.UNSET and ref_create is not None:
                     if authorize and not authorize("create", rel_model, None, info):
                         continue
                     data = input_to_dict(ref_create)
@@ -399,6 +414,47 @@ class DjangoBackend(BaseBackend):
                     rel_model.objects.filter(pk__in=to_delete_ids).delete()
 
         return run_sync(apply, thread_sensitive=True)
+
+    # -- Upserts -------------------------------------------------------------
+
+    def apply_upsert(
+        self, payload: Any, info: Any, *, authorize: Any | None = None
+    ) -> Any:
+        from django.db import router, transaction
+
+        from strawberry_orm.upserts import run_sync as run_steps
+
+        def apply() -> Any:
+            writer = self._upsert_writer(info, authorize)
+            writer.validate_root(payload)
+            model = type(payload).__orm_model__
+            with transaction.atomic(using=router.db_for_write(model)):
+                return run_steps(writer.apply_root(payload))
+
+        return run_sync(apply, thread_sensitive=True)
+
+    def _upsert_ops(self, info: Any) -> Any:
+        return _DjangoUpsertOps(info)
+
+    def _upsert_relation_spec(self, model: type, field: str) -> Any:
+        from strawberry_orm.mutations import _django_relation_specs
+
+        return _django_relation_specs(model)[field]
+
+    def _find_for_upsert(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        rows = repo.scope_query(model._default_manager.all(), info).filter(
+            **self._upsert_lookup_kwargs(query)
+        )
+        return self._single_upsert_match(model, list(rows[:2]))
+
+    async def _find_for_upsert_async(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        return await run_sync(
+            self._find_for_upsert, repo, model, query, info, thread_sensitive=True
+        )
 
     # -- Query application ----------------------------------------------------
 
@@ -1348,6 +1404,103 @@ def _make_dj_rel_resolver(
     if getattr(backend, "_django_async_safe", False):
         resolver = async_safe_resolver(resolver)
     return strawberry.field(resolver=resolver)
+
+
+class _DjangoUpsertOps:
+    """The calls :class:`~strawberry_orm.upserts.UpsertWriter` makes.
+
+    Every call is synchronous; under async the whole write already runs in one
+    ``sync_to_async`` call.
+    """
+
+    def __init__(self, info: Any) -> None:
+        self._info = info
+
+    # -- Repo-backed reads and writes ----------------------------------------
+
+    def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
+        return repo.find_for_upsert(model, query, self._info)
+
+    def get(self, repo: Any, model: type, pk: Any) -> Any:
+        return repo._get(model, pk, self._info)
+
+    def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
+        return repo._create(model, data, self._info)
+
+    def save(self, repo: Any, instance: Any) -> None:
+        repo._save(instance, self._info)
+
+    def delete(self, repo: Any, instance: Any) -> None:
+        repo._delete(instance, self._info)
+
+    # -- Relations -----------------------------------------------------------
+
+    def load_attr(self, instance: Any, name: str) -> Any:
+        return getattr(instance, name)
+
+    def init_collection(self, instance: Any, name: str) -> None:
+        return None
+
+    def link(self, parent: Any, spec: Any, child: Any) -> None:
+        if spec.relation_mode == "reverse_fk" and self._is_child(parent, spec, child):
+            return
+        getattr(parent, spec.name).add(child)
+
+    def unlink(self, parent: Any, spec: Any, child: Any) -> None:
+        getattr(parent, spec.name).remove(child)
+
+    def is_member(self, parent: Any, spec: Any, child: Any) -> bool:
+        if spec.relation_mode == "reverse_fk":
+            return self._is_child(parent, spec, child)
+        return getattr(parent, spec.name).filter(pk=child.pk).exists()
+
+    def back_reference(
+        self, parent_model: type, spec: Any
+    ) -> tuple[str | None, str | None]:
+        """The attribute and foreign key column a nested child points back with."""
+        return spec.remote_attr, self._foreign_key(spec).attname
+
+    def parent_scope(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        foreign_key = self._foreign_key(spec)
+        return {foreign_key.attname: getattr(parent, foreign_key.target_field.attname)}
+
+    def parent_assignment(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        return {spec.remote_attr: parent}
+
+    # -- Keys ----------------------------------------------------------------
+
+    def pk_value(self, instance: Any) -> Any:
+        return instance.pk
+
+    def coerce_pk(self, model: type, value: Any) -> Any:
+        from django.core.exceptions import ValidationError
+
+        from strawberry_orm.upserts import UpsertValidationError
+
+        if not isinstance(value, str):
+            return value
+        try:
+            return model._meta.pk.to_python(value)  # type: ignore[attr-defined]
+        except ValidationError:
+            raise UpsertValidationError(
+                f"{value!r} is not a valid {model.__name__} id"
+            ) from None
+
+    # -- Internals -----------------------------------------------------------
+
+    @staticmethod
+    def _foreign_key(spec: Any) -> Any:
+        return spec.related_model._meta.get_field(spec.remote_attr)
+
+    def _is_child(self, parent: Any, spec: Any, child: Any) -> bool:
+        return all(
+            getattr(child, child_key) == value
+            for child_key, value in self.parent_scope(parent, spec).items()
+        )
 
 
 # ---------------------------------------------------------------------------

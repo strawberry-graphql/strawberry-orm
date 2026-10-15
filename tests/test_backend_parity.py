@@ -26,6 +26,8 @@ EXCLUDED_FILES = {
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
     "test_mutation_meta_ops.py",
+    # Column-only relationships, which only SQLAlchemy has.
+    "test_insert_only_upserts_sqlalchemy.py",
 }
 
 EXCLUDED_METHODS = {

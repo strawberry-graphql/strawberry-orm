@@ -844,6 +844,37 @@ class TestFix10_FilterExclude:
         input_names = set(inp.__dataclass_fields__.keys())
         assert "password_hash" in input_names
 
+    def test_a_projection_field_list_includes_sensitive_fields(self):
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        project = {
+            "_meta": {
+                "name": "ListedAccount",
+                "create": ["username", "api_key"],
+                "upsert": {"where": ["api_key"], "optional": True},
+            }
+        }
+        upsert = orm.mutations.upsert_node_input(model=Account, project=project)
+        fields = {
+            field.python_name: field.type
+            for field in upsert.__strawberry_definition__.fields
+        }
+        create_names = set(fields["create"].of_type.__dataclass_fields__)
+        assert create_names == {"username", "api_key"}
+        assert set(fields["where"].__dataclass_fields__) == {"api_key"}
+
+        unlisted = orm.mutations.upsert_node_input(
+            model=Account,
+            project={
+                "_meta": {
+                    "name": "AnyAccount",
+                    "create": True,
+                    "upsert": {"where": True},
+                }
+            },
+        )
+        create_type = unlisted.__strawberry_definition__.fields[1].type.of_type
+        assert "api_key" not in create_type.__dataclass_fields__
+
     def test_excluded_field_not_in_filter(self):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
         filt = orm.filter(Account, exclude=["password_hash", "api_key"])

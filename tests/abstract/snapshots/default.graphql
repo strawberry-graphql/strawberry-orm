@@ -1,0 +1,65 @@
+directive @oneOf on INPUT_OBJECT
+
+input CreatePostNodeInput4fa1a6dd {
+  title: String
+  body: String
+  isPublished: Boolean
+  createdAt: DateTime
+}
+
+input CreateUserNodeInputD928c35f {
+  name: String
+  email: String
+  createdAt: DateTime
+  posts: [UserPostsRef4fa1a6dd!]
+}
+
+"""Date with time (isoformat)"""
+scalar DateTime
+
+input DefaultUserInput {
+  where: WhereUserNodeInputD928c35f!
+  create: CreateUserNodeInputD928c35f
+  update: UpdatePatchUserNodeInputD928c35f
+}
+
+type Mutation {
+  take0(input: DefaultUserInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}
+
+input UpdatePatchPostNodeInput4fa1a6dd {
+  title: String
+  body: String
+  isPublished: Boolean
+  createdAt: DateTime
+}
+
+input UpdatePatchUserNodeInputD928c35f {
+  name: String
+  email: String
+  createdAt: DateTime
+  posts: [UserPostsRef4fa1a6dd!]
+}
+
+input UpsertPostNodeInput4fa1a6dd {
+  where: WherePostNodeInput4fa1a6dd!
+  create: CreatePostNodeInput4fa1a6dd
+  update: UpdatePatchPostNodeInput4fa1a6dd
+}
+
+input UserPostsRef4fa1a6dd @oneOf {
+  create: CreatePostNodeInput4fa1a6dd
+  upsert: UpsertPostNodeInput4fa1a6dd
+}
+
+input WherePostNodeInput4fa1a6dd {
+  title: String!
+}
+
+input WhereUserNodeInputD928c35f {
+  email: String!
+}

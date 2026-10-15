@@ -190,7 +190,7 @@ class TestInternalSharedCoverage:
 
         assert ns._child_project(_PROJECT_UNBOUNDED, "anything") == _PROJECT_UNBOUNDED
         assert ns._child_project(_PROJECT_SHALLOW, "anything") == _PROJECT_LEAF
-        assert ns._child_project({"relations": {}}, "anything") == _PROJECT_SHALLOW
+        assert ns._child_project({"relations": {"posts": {}}}, "posts") == {}
 
     def test_node_input_allows_explicit_root_type_names(self):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")

@@ -282,6 +282,67 @@ class SQLAlchemyBackend(BaseBackend):
             authorize,
         )
 
+    # -- Upserts -------------------------------------------------------------
+
+    def apply_upsert(
+        self, payload: Any, info: Any, *, authorize: Callable[..., bool] | None = None
+    ) -> Any:
+        from strawberry_orm.upserts import run_sync
+
+        session = self._get_session(info)
+        writer = self._upsert_writer(info, authorize)
+        if self._is_async_session(session):
+            return self._apply_upsert_async(session, writer, payload)
+        writer.validate_root(payload)
+        with session.begin_nested():
+            return run_sync(writer.apply_root(payload))
+
+    async def _apply_upsert_async(self, session: Any, writer: Any, payload: Any) -> Any:
+        from strawberry_orm.upserts import run_async
+
+        writer.validate_root(payload)
+        async with session.begin_nested():
+            return await run_async(writer.apply_root(payload))
+
+    def _upsert_ops(self, info: Any) -> Any:
+        return _SQLAlchemyUpsertOps(self, self._get_session(info), info)
+
+    def _upsert_relation_spec(self, model: type, field: str) -> Any:
+        from strawberry_orm.mutations import _sqlalchemy_relation_specs
+
+        return _sqlalchemy_relation_specs(model)[field]
+
+    def _upsert_lookup(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        from sqlalchemy import select
+
+        from strawberry_orm.repo import _get_sa_pk_column
+
+        pk_column = _get_sa_pk_column(model)
+        conditions = [
+            (pk_column if name == "id" else getattr(model, name)) == value
+            for name, value in query.items()
+        ]
+        stmt = repo.scope_query(select(model).where(*conditions), info)
+        return stmt.limit(2)
+
+    def _find_for_upsert(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._find_for_upsert_async(repo, model, query, info)
+        rows = session.execute(self._upsert_lookup(repo, model, query, info))
+        return self._single_upsert_match(model, list(rows.scalars().all()))
+
+    async def _find_for_upsert_async(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        session = self._get_session(info)
+        rows = await session.execute(self._upsert_lookup(repo, model, query, info))
+        return self._single_upsert_match(model, list(rows.scalars().all()))
+
     # -- Query application ----------------------------------------------------
 
     def apply_filters(
@@ -1135,7 +1196,31 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         authorize: Callable[..., bool] | None,
     ) -> None:
+        from strawberry_orm.upserts import has_upsert
+
+        writer = self._ref_list_writer(instance, field, refs, info, authorize)
+        if any(has_upsert(ref) for ref in refs):
+            with session.begin_nested():
+                self._apply_ref_items_sync(
+                    session, instance, field, refs, info, authorize, writer
+                )
+            return
+        self._apply_ref_items_sync(
+            session, instance, field, refs, info, authorize, writer
+        )
+
+    def _apply_ref_items_sync(
+        self,
+        session: Any,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        authorize: Callable[..., bool] | None,
+        writer: Any,
+    ) -> None:
         from strawberry_orm.repo import _check_auth
+        from strawberry_orm.upserts import has_upsert, run_sync
 
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
@@ -1151,7 +1236,10 @@ class SQLAlchemyBackend(BaseBackend):
             ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_create is not strawberry.UNSET and ref_create is not None:
+            if has_upsert(ref):
+                spec = self._upsert_relation_spec(type(instance), field)
+                to_add.append(run_sync(writer.apply_ref_upsert(instance, spec, ref)))
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
@@ -1232,7 +1320,31 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None,
     ) -> None:
+        from strawberry_orm.upserts import has_upsert
+
+        writer = self._ref_list_writer(instance, field, refs, info, authorize)
+        if any(has_upsert(ref) for ref in refs):
+            async with session.begin_nested():
+                await self._apply_ref_items_async(
+                    session, instance, field, refs, info, authorize, writer
+                )
+            return
+        await self._apply_ref_items_async(
+            session, instance, field, refs, info, authorize, writer
+        )
+
+    async def _apply_ref_items_async(
+        self,
+        session: Any,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        authorize: Callable[..., bool] | None,
+        writer: Any,
+    ) -> None:
         from strawberry_orm.repo import _check_auth
+        from strawberry_orm.upserts import has_upsert, run_async
 
         relationship = getattr(type(instance), field).property
         target_model = relationship.mapper.class_
@@ -1248,7 +1360,12 @@ class SQLAlchemyBackend(BaseBackend):
             ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_create is not strawberry.UNSET and ref_create is not None:
+            if has_upsert(ref):
+                spec = self._upsert_relation_spec(type(instance), field)
+                to_add.append(
+                    await run_async(writer.apply_ref_upsert(instance, spec, ref))
+                )
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", target_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
@@ -1319,6 +1436,162 @@ class SQLAlchemyBackend(BaseBackend):
         setattr(instance, field, merged)
         for obj in to_delete:
             await session.delete(obj)
+
+
+class _SQLAlchemyUpsertOps:
+    """The calls :class:`~strawberry_orm.upserts.UpsertWriter` makes.
+
+    On an async session, a call that may need I/O returns a coroutine for the
+    async driver to await; everything else answers directly.
+    """
+
+    def __init__(self, backend: SQLAlchemyBackend, session: Any, info: Any) -> None:
+        self._session = session
+        self._info = info
+        self._async = backend._is_async_session(session)
+
+    # -- Repo-backed reads and writes ----------------------------------------
+
+    def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
+        if self._async:
+            return repo.find_for_upsert_async(model, query, self._info)
+        return repo.find_for_upsert(model, query, self._info)
+
+    def get(self, repo: Any, model: type, pk: Any) -> Any:
+        if self._async:
+            return repo._get_async(model, pk, self._info)
+        return repo._get(model, pk, self._info)
+
+    def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
+        if self._async:
+            return repo._create_async(model, data, self._info)
+        return repo._create(model, data, self._info)
+
+    def save(self, repo: Any, instance: Any) -> Any:
+        if self._async:
+            return repo._save_async(instance, self._info)
+        return repo._save(instance, self._info)
+
+    def delete(self, repo: Any, instance: Any) -> Any:
+        if self._async:
+            return repo._delete_async(instance, self._info)
+        return repo._delete(instance, self._info)
+
+    # -- Relations -----------------------------------------------------------
+
+    def load_attr(self, instance: Any, name: str) -> Any:
+        return self._with_loaded(instance, name, lambda value: value)
+
+    def init_collection(self, instance: Any, name: str) -> None:
+        """Mark a just-inserted row's collection as loaded and empty."""
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        if name in sa_inspect(instance).unloaded:
+            set_committed_value(instance, name, [])
+
+    def link(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            if not self._is_child(parent, spec, child):
+                for name, value in self.parent_assignment(parent, spec).items():
+                    setattr(child, name, value)
+            return None
+
+        def append(collection: Any) -> None:
+            if child not in collection:
+                collection.append(child)
+
+        return self._with_loaded(parent, spec.name, append)
+
+    def unlink(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            for name in self.parent_assignment(parent, spec):
+                setattr(child, name, None)
+            return None
+        return self._with_loaded(
+            parent, spec.name, lambda collection: collection.remove(child)
+        )
+
+    def is_member(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            return self._is_child(parent, spec, child)
+        return self._with_loaded(
+            parent, spec.name, lambda collection: child in collection
+        )
+
+    def back_reference(
+        self, parent_model: type, spec: Any
+    ) -> tuple[str | None, str | None]:
+        """The attribute and foreign key column a nested child points back with."""
+        return spec.remote_attr, self._key_pairs(parent_model, spec)[0][1]
+
+    def parent_scope(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        return {
+            child_key: getattr(parent, parent_key)
+            for parent_key, child_key in self._key_pairs(type(parent), spec)
+        }
+
+    def parent_assignment(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        if spec.remote_attr is not None:
+            return {spec.remote_attr: parent}
+        return self.parent_scope(parent, spec)
+
+    # -- Keys ----------------------------------------------------------------
+
+    def pk_value(self, instance: Any) -> Any:
+        identity = sa_inspect(instance).identity
+        return identity[0] if len(identity) == 1 else identity
+
+    def coerce_pk(self, model: type, value: Any) -> Any:
+        from strawberry_orm.repo import _get_sa_pk_column
+        from strawberry_orm.upserts import UpsertValidationError
+
+        if not isinstance(value, str):
+            return value
+        try:
+            python_type = _get_sa_pk_column(model).type.python_type
+        except NotImplementedError:
+            return value
+        if python_type is str:
+            return value
+        try:
+            return python_type(value)
+        except (TypeError, ValueError):
+            raise UpsertValidationError(
+                f"{value!r} is not a valid {model.__name__} id"
+            ) from None
+
+    # -- Internals -----------------------------------------------------------
+
+    def _with_loaded(self, instance: Any, name: str, then: Callable[[Any], Any]) -> Any:
+        if self._async and name in sa_inspect(instance).unloaded:
+            return self._with_loaded_async(instance, name, then)
+        return then(getattr(instance, name))
+
+    async def _with_loaded_async(
+        self, instance: Any, name: str, then: Callable[[Any], Any]
+    ) -> Any:
+        await self._session.refresh(instance, [name])
+        return then(getattr(instance, name))
+
+    def _key_pairs(self, parent_model: type, spec: Any) -> list[tuple[str, str]]:
+        prop = sa_inspect(parent_model).relationships[spec.name]
+        return [
+            (
+                prop.parent.get_property_by_column(local).key,
+                prop.mapper.get_property_by_column(remote).key,
+            )
+            for local, remote in prop.local_remote_pairs
+        ]
+
+    def _is_child(self, parent: Any, spec: Any, child: Any) -> bool:
+        return all(
+            getattr(child, child_key) == getattr(parent, parent_key)
+            for parent_key, child_key in self._key_pairs(type(parent), spec)
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,71 @@
+directive @oneOf on INPUT_OBJECT
+
+"""Date (isoformat)"""
+scalar Date
+
+input EditableEventCreate {
+  kind: String
+  occurredOn: Date
+}
+
+input EditableEventPatch {
+  kind: String
+}
+
+input EditableEventUpdate {
+  kind: String
+  id: ID!
+}
+
+input EditableEventUpsert {
+  where: EditableEventWhere!
+  create: EditableEventCreate
+  update: EditableEventPatch
+}
+
+input EditableEventWhere {
+  kind: String!
+  occurredOn: Date!
+}
+
+input MixedPersonCreate {
+  ssn: String
+  dob: Date
+  events: [MixedPersonEventsItem!]
+}
+
+input MixedPersonEventsItem @oneOf {
+  create: EditableEventCreate
+  update: EditableEventUpdate
+  upsert: EditableEventUpsert
+  delete: MixedPersonEventsItemDeleteInput
+}
+
+input MixedPersonEventsItemDeleteInput {
+  id: ID!
+}
+
+input MixedPersonInput {
+  """
+  Fields that find an existing Person. Matched rows are not modified; nested rows are appended.
+  """
+  where: MixedPersonWhere!
+
+  """
+  Creates the Person when nothing matches `where`. Matched rows are not modified; nested rows are appended.
+  """
+  create: MixedPersonCreate
+}
+
+input MixedPersonWhere {
+  ssn: String!
+  dob: Date!
+}
+
+type Mutation {
+  take0(input: MixedPersonInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}

@@ -1,0 +1,61 @@
+directive @oneOf on INPUT_OBJECT
+
+input IgnorePostCreate {
+  title: String
+  body: String
+}
+
+input IgnorePostUpsert {
+  """
+  Fields that find an existing Post. Matched rows are not modified, and nothing nested under them is applied.
+  """
+  where: IgnorePostWhere!
+
+  """
+  Creates the Post when nothing matches `where`. Matched rows are not modified, and nothing nested under them is applied.
+  """
+  create: IgnorePostCreate
+}
+
+input IgnorePostWhere {
+  title: String!
+}
+
+input IgnoreUserCreate {
+  name: String
+  email: String
+  posts: [IgnoreUserPostsItem!]
+}
+
+input IgnoreUserInput {
+  """
+  Fields that find an existing User. Matched rows are not modified, and nothing nested under them is applied.
+  """
+  where: IgnoreUserWhere!
+
+  """
+  Creates the User when nothing matches `where`. Matched rows are not modified, and nothing nested under them is applied.
+  """
+  create: IgnoreUserCreate
+}
+
+input IgnoreUserPostsItem @oneOf {
+  create: IgnorePostCreate
+
+  """
+  Finds the Post by `where`, or creates it from `create`. Matched rows are not modified, and nothing nested under them is applied.
+  """
+  upsert: IgnorePostUpsert
+}
+
+input IgnoreUserWhere {
+  email: String!
+}
+
+type Mutation {
+  take0(input: IgnoreUserInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}

@@ -1,0 +1,61 @@
+directive @oneOf on INPUT_OBJECT
+
+input LoopPostAuthorLink @oneOf {
+  create: LoopUserCreate
+
+  """
+  Finds the User by `where`, or creates it from `create`. Matched rows are not modified; nested rows are appended.
+  """
+  upsert: LoopUserUpsert
+}
+
+input LoopPostCreate {
+  title: String
+  author: LoopPostAuthorLink
+}
+
+input LoopUserCreate {
+  name: String
+  email: String
+  posts: [LoopUserPostsItem!]
+}
+
+input LoopUserInput {
+  """
+  Fields that find an existing User. Matched rows are not modified; nested rows are appended.
+  """
+  where: LoopUserWhere!
+
+  """
+  Creates the User when nothing matches `where`. Matched rows are not modified; nested rows are appended.
+  """
+  create: LoopUserCreate
+}
+
+input LoopUserPostsItem @oneOf {
+  create: LoopPostCreate
+}
+
+input LoopUserUpsert {
+  """
+  Fields that find an existing User. Matched rows are not modified; nested rows are appended.
+  """
+  where: LoopUserWhere!
+
+  """
+  Creates the User when nothing matches `where`. Matched rows are not modified; nested rows are appended.
+  """
+  create: LoopUserCreate
+}
+
+input LoopUserWhere {
+  email: String!
+}
+
+type Mutation {
+  take0(input: LoopUserInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}

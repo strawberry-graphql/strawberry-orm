@@ -7,7 +7,7 @@ from strawberry_orm.types import auto
 from tests.abstract import mutation_node_inputs as sync_cases
 
 
-class AbstractTestNodeMutationInputsAsync:
+class AbstractTestNodeMutationInputsAsync(sync_cases.UpsertNodeInputCases):
     async def test_the_create_input_carries_a_nested_relation(self, node_execute, seed):
         data = await node_execute(sync_cases.CREATE_WITH_NESTED_RELATION)
         assert data == {"inspectCreateNodeInput": "post"}
@@ -28,6 +28,13 @@ class AbstractTestNodeMutationInputsAsync:
         result = await node_execute_result(sync_cases.PROJECTED_TOO_DEEP)
         assert result.errors is not None
         assert "Field 'posts' is not defined by type" in str(result.errors[0])
+
+    async def test_a_projected_input_leaves_out_undeclared_relations(
+        self, node_execute_result, seed
+    ):
+        result = await node_execute_result(sync_cases.PROJECTED_UNDECLARED_RELATION)
+        assert result.errors is not None
+        assert "Field 'post' is not defined by type" in str(result.errors[0])
 
     async def test_a_projected_update_input_selects_its_root(self, node_execute, seed):
         data = await node_execute(sync_cases.PROJECTED_UPDATE)

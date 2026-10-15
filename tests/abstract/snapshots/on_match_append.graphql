@@ -1,0 +1,61 @@
+directive @oneOf on INPUT_OBJECT
+
+input AppendPostCreate {
+  title: String
+  body: String
+}
+
+input AppendPostUpsert {
+  """
+  Fields that find an existing Post. Matched rows are not modified; nested rows are appended.
+  """
+  where: AppendPostWhere!
+
+  """
+  Creates the Post when nothing matches `where`. Matched rows are not modified; nested rows are appended.
+  """
+  create: AppendPostCreate
+}
+
+input AppendPostWhere {
+  title: String!
+}
+
+input AppendUserCreate {
+  name: String
+  email: String
+  posts: [AppendUserPostsItem!]
+}
+
+input AppendUserInput {
+  """
+  Fields that find an existing User. Matched rows are not modified; nested rows are appended.
+  """
+  where: AppendUserWhere!
+
+  """
+  Creates the User when nothing matches `where`. Matched rows are not modified; nested rows are appended.
+  """
+  create: AppendUserCreate
+}
+
+input AppendUserPostsItem @oneOf {
+  create: AppendPostCreate
+
+  """
+  Finds the Post by `where`, or creates it from `create`. Matched rows are not modified; nested rows are appended.
+  """
+  upsert: AppendPostUpsert
+}
+
+input AppendUserWhere {
+  email: String!
+}
+
+type Mutation {
+  take0(input: AppendUserInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}

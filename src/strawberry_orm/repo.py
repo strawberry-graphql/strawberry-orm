@@ -19,6 +19,7 @@ Usage::
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Generic, TypeVar, get_args
 
 try:
@@ -80,6 +81,45 @@ class AbstractRepo(Generic[M]):
         """Called before removing an instance from a relation."""
         return True
 
+    def can_upsert(self, instance: Any, info: Any) -> bool:
+        """Called when an upsert matches *instance*, before :meth:`on_match`.
+
+        A miss that goes on to create is checked by :meth:`can_create` instead.
+        """
+        return True
+
+    # -- Upsert matching -----------------------------------------------------
+
+    def find_for_upsert(self, model: type, query: dict[str, Any], info: Any) -> Any:
+        """Return the row an upsert matches, or ``None``.
+
+        *query* maps the sent ``where`` fields to their values; ``"id"`` is the
+        primary key, already decoded from a Relay global ID. A nested upsert's
+        query also carries the foreign key to the row it is nested under. The
+        default looks the row up under :meth:`scope_query` and requires every
+        field to match.
+        """
+        return self._backend._find_for_upsert(self, model, query, info)
+
+    async def find_for_upsert_async(
+        self, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        """Async variant of :meth:`find_for_upsert`.
+
+        An override of :meth:`find_for_upsert` alone, sync or async, is used
+        here too, so a repo only has to override one of them.
+        """
+        if type(self).find_for_upsert is not AbstractRepo.find_for_upsert:
+            found = self.find_for_upsert(model, query, info)
+            return await found if inspect.isawaitable(found) else found
+        return await self._backend._find_for_upsert_async(self, model, query, info)
+
+    def on_match(self, instance: Any, info: Any) -> Any:
+        """Called once for every row an upsert matches, after authorization.
+
+        May be ``async`` when the session is.
+        """
+
     # -- Query scoping -------------------------------------------------------
 
     def scope_query(self, query: Any, info: Any) -> Any:
@@ -139,6 +179,14 @@ class AbstractRepo(Generic[M]):
 
         if name == "TortoiseBackend":
             return await model.create(**data)
+
+        if name == "SQLAlchemyBackend":
+            session = backend._get_session(info)
+            if backend._is_async_session(session):
+                instance = model(**data)
+                session.add(instance)
+                await session.flush()
+                return instance
 
         return self._create(model, data, info)
 
@@ -218,6 +266,13 @@ class AbstractRepo(Generic[M]):
         if name == "TortoiseBackend":
             await instance.save()
             return
+
+        if name == "SQLAlchemyBackend":
+            session = backend._get_session(info)
+            if backend._is_async_session(session):
+                session.add(instance)
+                await session.flush()
+                return
 
         self._save(instance, info)
 

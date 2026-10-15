@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.21.2"
+version = "0.22.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -97,6 +97,7 @@ markers = [
 
 [tool.coverage.run]
 source = ["strawberry_orm"]
+concurrency = ["greenlet", "thread"]
 omit = [
     "*/backends/protocol.py",
 ]

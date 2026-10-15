@@ -467,7 +467,28 @@ class TortoiseBackend(BaseBackend):
         *,
         authorize: Any | None = None,
     ) -> None:
+        from tortoise.transactions import in_transaction
+
+        from strawberry_orm.upserts import has_upsert
+
+        writer = self._ref_list_writer(instance, field, refs, info, authorize)
+        if not any(has_upsert(ref) for ref in refs):
+            await self._apply_ref_items(instance, field, refs, info, authorize, writer)
+            return
+        async with in_transaction(type(instance)._meta.default_connection):
+            await self._apply_ref_items(instance, field, refs, info, authorize, writer)
+
+    async def _apply_ref_items(
+        self,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        authorize: Any | None,
+        writer: Any,
+    ) -> None:
         from strawberry_orm.repo import _check_auth
+        from strawberry_orm.upserts import has_upsert, run_async
 
         manager = getattr(instance, field)
         rel_model = manager.remote_model
@@ -483,7 +504,10 @@ class TortoiseBackend(BaseBackend):
             ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
             ref_delete = getattr(ref, "delete", strawberry.UNSET)
 
-            if ref_create is not strawberry.UNSET and ref_create is not None:
+            if has_upsert(ref):
+                spec = self._upsert_relation_spec(type(instance), field)
+                await run_async(writer.apply_ref_upsert(instance, spec, ref, link=True))
+            elif ref_create is not strawberry.UNSET and ref_create is not None:
                 if authorize and not authorize("create", rel_model, None, info):
                     continue
                 data = input_to_dict(ref_create)
@@ -557,6 +581,42 @@ class TortoiseBackend(BaseBackend):
             to_remove = await rel_model.filter(pk__in=to_delete_ids)
             await manager.remove(*to_remove)
             await rel_model.filter(pk__in=to_delete_ids).delete()
+
+    # -- Upserts -------------------------------------------------------------
+
+    async def apply_upsert(
+        self, payload: Any, info: Any, *, authorize: Any | None = None
+    ) -> Any:
+        from tortoise.transactions import in_transaction
+
+        from strawberry_orm.upserts import run_async
+
+        writer = self._upsert_writer(info, authorize)
+        writer.validate_root(payload)
+        model = type(payload).__orm_model__
+        async with in_transaction(model._meta.default_connection):
+            return await run_async(writer.apply_root(payload))
+
+    def _upsert_ops(self, info: Any) -> Any:
+        return _TortoiseUpsertOps(info)
+
+    def _upsert_relation_spec(self, model: type, field: str) -> Any:
+        from strawberry_orm.mutations import _tortoise_relation_specs
+
+        return _tortoise_relation_specs(model)[field]
+
+    def _find_for_upsert(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        return self._find_for_upsert_async(repo, model, query, info)
+
+    async def _find_for_upsert_async(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        rows = repo.scope_query(model.all(), info).filter(
+            **self._upsert_lookup_kwargs(query)
+        )
+        return self._single_upsert_match(model, list(await rows.limit(2)))
 
     # -- Grouping / aggregation -----------------------------------------------
 
@@ -1188,6 +1248,107 @@ class TortoiseBackend(BaseBackend):
                             _query_orderings(parent_qs),
                         ),
                     )
+
+
+class _TortoiseUpsertOps:
+    """The calls :class:`~strawberry_orm.upserts.UpsertWriter` makes.
+
+    A call that needs I/O returns an awaitable for the async driver to await.
+    """
+
+    def __init__(self, info: Any) -> None:
+        self._info = info
+
+    # -- Repo-backed reads and writes ----------------------------------------
+
+    def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
+        return repo.find_for_upsert_async(model, query, self._info)
+
+    def get(self, repo: Any, model: type, pk: Any) -> Any:
+        return repo._get_async(model, pk, self._info)
+
+    def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
+        return repo._create_async(model, data, self._info)
+
+    def save(self, repo: Any, instance: Any) -> Any:
+        return repo._save_async(instance, self._info)
+
+    def delete(self, repo: Any, instance: Any) -> Any:
+        return repo._delete_async(instance, self._info)
+
+    # -- Relations -----------------------------------------------------------
+
+    def load_attr(self, instance: Any, name: str) -> Any:
+        return getattr(instance, name)
+
+    def init_collection(self, instance: Any, name: str) -> None:
+        return None
+
+    def link(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            if self._is_child(parent, spec, child):
+                return None
+            setattr(child, spec.remote_attr, parent)
+            return child.save()
+        return getattr(parent, spec.name).add(child)
+
+    def unlink(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            setattr(child, spec.remote_attr, None)
+            return child.save()
+        return getattr(parent, spec.name).remove(child)
+
+    def is_member(self, parent: Any, spec: Any, child: Any) -> Any:
+        if spec.relation_mode == "reverse_fk":
+            return self._is_child(parent, spec, child)
+        return getattr(parent, spec.name).filter(pk=child.pk).exists()
+
+    def back_reference(
+        self, parent_model: type, spec: Any
+    ) -> tuple[str | None, str | None]:
+        """The attribute and foreign key column a nested child points back with."""
+        return spec.remote_attr, self._foreign_key(spec).source_field
+
+    def parent_scope(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        foreign_key = self._foreign_key(spec)
+        target = foreign_key.to_field_instance.model_field_name
+        return {foreign_key.source_field: getattr(parent, target)}
+
+    def parent_assignment(self, parent: Any, spec: Any) -> dict[str, Any]:
+        if spec.relation_mode != "reverse_fk":
+            return {}
+        return {spec.remote_attr: parent}
+
+    # -- Keys ----------------------------------------------------------------
+
+    def pk_value(self, instance: Any) -> Any:
+        return instance.pk
+
+    def coerce_pk(self, model: type, value: Any) -> Any:
+        from strawberry_orm.upserts import UpsertValidationError
+
+        if not isinstance(value, str):
+            return value
+        try:
+            return model._meta.pk.to_python_value(value)  # type: ignore[attr-defined]
+        except (TypeError, ValueError):
+            raise UpsertValidationError(
+                f"{value!r} is not a valid {model.__name__} id"
+            ) from None
+
+    # -- Internals -----------------------------------------------------------
+
+    @staticmethod
+    def _foreign_key(spec: Any) -> Any:
+        return spec.related_model._meta.fields_map[spec.remote_attr]
+
+    def _is_child(self, parent: Any, spec: Any, child: Any) -> bool:
+        return all(
+            getattr(child, child_key) == value
+            for child_key, value in self.parent_scope(parent, spec).items()
+        )
 
 
 # ---------------------------------------------------------------------------

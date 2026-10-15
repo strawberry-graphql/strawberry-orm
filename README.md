@@ -1730,7 +1730,7 @@ mutation {
 
 ### Node mutation inputs
 
-`orm.mutations.create_node_input()` and `orm.mutations.update_node_input()` generate a catch-all `@oneOf` input carrying one branch per registered Relay `Node` type, with recursive nested ref lists. The library deliberately does **not** ship a resolver that executes them — you write the mutation, so the write path (and its scoping) stays yours:
+`orm.mutations.create_node_input()` and `orm.mutations.update_node_input()` generate a catch-all `@oneOf` input carrying one branch per registered Relay `Node` type, with recursive nested ref lists. The library deliberately does **not** ship a resolver that executes them — you write the mutation, so the write path (and its scoping) stays yours. The exception is an upsert input, which `orm.apply_upsert()` can execute for you; see [Applying an upsert](#applying-an-upsert).
 
 ```python
 @orm.type(Post)
@@ -1773,8 +1773,108 @@ Rules:
 
 - Root keys are model names (`post`, `comment`, ...).
 - Nested keys are relation names on that model.
-- `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `onReplace`).
+- `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `unlink`, `delete`, `onReplace`, `immutable`, `maxVisits`, `name`).
 - Relations you do not declare are absent from the input, so the schema rejects them.
+
+#### Upserting with `_meta.upsert`
+
+`_meta.upsert.where` adds an `upsert` arm made of `where`, `create` and `update`. A list of field names makes those fields required, and a row matches only when all of them do. `where: True` exposes every writable scalar plus `id` as optional fields, so the caller chooses which fields to match on and the match uses the ones that were sent:
+
+```python
+project = {
+    "_meta": {"upsert": {"where": ["email"]}},
+    "posts": {
+        "_meta": {"create": True, "upsert": {"where": True}},
+    },
+}
+
+UpsertUserInput = orm.mutations.upsert_node_input(
+    model=User, project=project, name="UpsertUserInput"
+)
+```
+
+`upsert_node_input()` builds the same `{where, create, update}` input as a standalone root for one model; `project` is that model's subtree and must declare `_meta.upsert.where`. Every generated input class carries the model it writes as `__orm_model__`, so a resolver can walk a nested input without looking the relations up again. Fields left unset in an optional `where` are `strawberry.UNSET`.
+
+#### What a match does: `onMatch` and `immutable`
+
+By default a matched row is updated from `update`. `_meta.upsert.onMatch` chooses otherwise, per projection:
+
+| `onMatch`          | A matched row is…                                    | Nested rows under it                 | Generated `upsert` input     |
+| ------------------ | ---------------------------------------------------- | ------------------------------------ | ---------------------------- |
+| `"UPDATE"` (default) | updated from `update`                              | applied from `update`                | `{where!, create, update}`   |
+| `"IGNORE"`         | left alone                                           | not applied                          | `{where!, create}`           |
+| `"APPEND"`         | left alone                                           | applied from `create`, with the matched row as parent | `{where!, create}` |
+
+Leaving `onMatch` unset keeps the existing behaviour. Setting `onMatch: "UPDATE"` explicitly requires `_meta.update`, so the fields a match may change are stated rather than implied. Under `"APPEND"`, each nested to-many item still follows its own projection: an item that is itself an upsert is matched under the parent and applies its own `onMatch`.
+
+`_meta.immutable: True` is shorthand for a row that is written once and never changed. It removes `update`, `unlink`, `delete` and `onReplace` from the projection, and matches with `"APPEND"` unless you set `onMatch: "IGNORE"`. Combining it with any of those keys is an error naming the model and keys, as is `onMatch` without `where`. A projection whose update is disabled generates no `*Patch` or `*Update` types, and a link to an immutable target has no `onReplace`, because the link can never be re-pointed.
+
+The policy belongs to the projection, so a named projection reused recursively (`_meta.name`) applies the same rules everywhere it appears, and one tree can mix immutable and mutable projections. When any of these keys is set, the generated `where`, `create` and `upsert` fields carry a description of what a match does ("Matched rows are not modified; nested rows are appended.").
+
+A single link is written only when its row is created. Sending one for a row that turns out to match is a validation error, because it would silently do nothing; set `_meta.upsert.onMatchLinks: "IGNORE"` (with `onMatch: "APPEND"`) to skip it instead. To link an existing row without ever creating one, send `upsert: {where: {id}}` and no `create`: a match links it without writing to it, and a miss raises `UpsertNotFoundError`. `where.id` accepts a raw primary key or a Relay global ID.
+
+`_meta.maxVisits: N` caps how many times the model may appear on one nesting path, which bounds how deep a recursive projection can be sent. It is checked before anything is written.
+
+An insert-only people schema, where re-sending a person who already exists only adds their new events:
+
+```python
+def immutable(name, where, **meta):
+    return {"_meta": {"name": name, "immutable": True, "create": True,
+                      "upsert": {"where": where}, **meta}}
+
+person = immutable("Person", ["ssn", "dob"])
+person["events"] = immutable("Event", ["kind", "occurred_on"])
+address = immutable("Address", ["line1"])
+address["person"] = immutable("PersonRef", ["ssn", "dob"])
+
+PersonInput = orm.mutations.upsert_node_input(model=Person, project=person, name="PersonInput")
+AddressInput = orm.mutations.upsert_node_input(model=Address, project=address, name="AddressInput")
+```
+
+```graphql
+input PersonInput { where: PersonWhere!  create: PersonCreate }
+input PersonEventsItem @oneOf { create: EventCreate  upsert: EventUpsert }
+input EventUpsert { where: EventWhere!  create: EventCreate }
+input AddressPersonLink @oneOf { create: PersonRefCreate  upsert: PersonRefUpsert }
+```
+
+#### Applying an upsert
+
+`orm.apply_upsert(input, info, *, authorize=None)` executes an input built by `upsert_node_input()` and returns the matched or created row. The upsert arm of `orm.apply_ref_list()` runs through the same code. All three backends implement both. Await the result on an async SQLAlchemy session, in an async Django resolver, and always on Tortoise.
+
+```python
+@strawberry.mutation
+def save_person(self, info: strawberry.Info, input: PersonInput) -> PersonNode:
+    return orm.apply_upsert(input, info)   # await it where the backend is async
+```
+
+For each upsert in the payload:
+
+- The lookup uses the sent `where` fields, scoped to the parent row for a nested item, and runs through the repo's `scope_query`.
+- On a miss with `create`, the row is created from `create` merged with `where` (except `id`), through the normal create path (`on_before_create`, `can_create`, `on_after_create`).
+- On a miss without `create`, `UpsertNotFoundError` is raised.
+- On a match, `onMatch` applies. A matched person with two new events issues no `UPDATE`, only two `INSERT`s.
+
+The whole payload is validated before the first write: operations the projection does not allow, an empty `where`, a nested item that sets the foreign key back to its parent, and `maxVisits`. This holds for payloads built in Python too. The write is one unit, so an error at any depth leaves nothing behind:
+
+| Backend | Unit of work |
+| --- | --- |
+| SQLAlchemy | A savepoint of your session. It does not commit; that stays with your session handling. |
+| Django | `transaction.atomic()` on the model's write database, run through `sync_to_async` in an async context. |
+| Tortoise | `in_transaction()` on the model's connection. |
+
+Django's `atomic()` and Tortoise's `in_transaction()` commit when they are the outermost transaction, and become a savepoint inside one you opened, such as `ATOMIC_REQUESTS`.
+
+Two repo hooks are specific to upserts:
+
+| Hook | Called |
+| --- | --- |
+| `find_for_upsert(model, query, info)` | to find the match; `query` maps the sent `where` fields (plus the parent's foreign key when nested) to values. Override for a custom lookup; on async, an `async def` override, or `find_for_upsert_async`, is awaited. The default returns an awaitable on an async SQLAlchemy session and on Tortoise, so `await` it when calling `super()`. |
+| `can_upsert(instance, info)` / `on_match(instance, info)` | once per matched row, after authorization. `on_match` may be `async` on an async SQLAlchemy session and on Tortoise; Django runs the write synchronously, so its hooks must be sync. |
+
+`authorize(action, model, pk, info)` sees `"upsert"` for a match and `"create"` for a miss, alongside `"update"`, `"unlink"` and `"delete"` for nested items. Unlike a plain `apply_ref_list` item, which is skipped when `authorize` returns `False`, every denial inside an upsert raises `PermissionError`, so a write is never partly applied.
+
+Validation failures raise `UpsertValidationError` (a `ValueError`); a missing row raises `UpsertNotFoundError` (a `LookupError`).
 
 ---
 
@@ -1966,7 +2066,7 @@ SQLAlchemy-only:
 
 Every name below is documented with its signature in the [API reference](API_REFERENCE.md).
 
-`StrawberryORM`, `auto`, `make_ref_type`, `PayloadPolicy`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
+`StrawberryORM`, `auto`, `make_ref_type`, `UpsertValidationError`, `UpsertNotFoundError`, `PayloadPolicy`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
 
 ---
 

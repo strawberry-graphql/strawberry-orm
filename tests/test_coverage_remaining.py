@@ -247,6 +247,23 @@ class TestRepoCoverage:
         repo._delete(tag, info)
         assert not DjTag.objects.filter(pk=tag.pk).exists()
 
+    @pytest.mark.django_db(transaction=True)
+    async def test_django_find_for_upsert_can_be_awaited(self):
+        from asgiref.sync import sync_to_async
+
+        from tests.backends.django.models import User as DjUser
+
+        repo = AbstractRepo.__new__(AbstractRepo)
+        repo._backend = DjangoBackend()
+        info = SimpleNamespace(context={})
+        user = await sync_to_async(DjUser.objects.create, thread_sensitive=True)(
+            name="Ada", email="ada@example.com"
+        )
+
+        found = await repo.find_for_upsert_async(DjUser, {"id": user.pk}, info)
+        assert found == user
+        assert await repo.find_for_upsert_async(DjUser, {"id": 0}, info) is None
+
     @pytest.mark.asyncio
     async def test_sqlalchemy_async_get_and_delete(self, sa_session):
         backend = SQLAlchemyBackend(dialect="sqlite")
@@ -2557,7 +2574,7 @@ class TestMutationMetaOpsCoverage:
     def test_normalize_where_rejects_non_string_container(self, sa_session):
         backend = SQLAlchemyBackend(dialect="sqlite")
         ns = MutationNamespace(backend)
-        with pytest.raises(ValueError, match="must be a string or"):
+        with pytest.raises(ValueError, match="must be True, a string or"):
             ns._normalize_where_fields({"email": True}, model=SAUser)
 
     def test_normalize_where_rejects_non_string_list_entries(self, sa_session):
@@ -2664,6 +2681,23 @@ class TestRepoAndInputInternals:
             .run_until_complete(repo._get_async(SATag, 1, info))
         )
         assert found.name == "python"
+
+    def test_create_and_save_async_fall_back_to_the_sync_writes(self):
+        session, info = self._sa_setup()
+
+        class TagRepo(AbstractRepo[SATag]):
+            pass
+
+        repo = TagRepo(SQLAlchemyBackend(dialect="sqlite"))
+        loop = asyncio.get_event_loop_policy().new_event_loop()
+        tag = loop.run_until_complete(
+            repo._create_async(SATag, {"id": 1, "name": "python"}, info)
+        )
+        tag.name = "rust"
+        loop.run_until_complete(repo._save_async(tag, info))
+        loop.close()
+        session.expire_all()
+        assert session.get(SATag, 1).name == "rust"
 
     def test_a_composite_primary_key_is_rejected(self):
         from sqlalchemy import Column, Integer

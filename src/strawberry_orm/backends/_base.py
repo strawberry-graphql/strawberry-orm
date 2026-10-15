@@ -343,6 +343,83 @@ class BaseBackend:
             repo.model = model
         return repo
 
+    # -- Upserts -------------------------------------------------------------
+
+    def apply_upsert(
+        self, payload: Any, info: Any, *, authorize: Any | None = None
+    ) -> Any:
+        """Apply an input built by ``orm.mutations.upsert_node_input()``."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the upsert operation"
+        )
+
+    def _find_for_upsert(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the upsert operation"
+        )
+
+    async def _find_for_upsert_async(
+        self, repo: Any, model: type, query: dict[str, Any], info: Any
+    ) -> Any:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the upsert operation"
+        )
+
+    def _upsert_ops(self, info: Any) -> Any:
+        """The calls :class:`~strawberry_orm.upserts.UpsertWriter` makes."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the upsert operation"
+        )
+
+    def _upsert_relation_spec(self, model: type, field: str) -> Any:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the upsert operation"
+        )
+
+    def _upsert_writer(self, info: Any, authorize: Any | None) -> Any:
+        from strawberry_orm.upserts import UpsertWriter
+
+        return UpsertWriter(self, self._upsert_ops(info), info, authorize)
+
+    def _ref_list_writer(
+        self,
+        instance: Any,
+        field: str,
+        refs: list[Any],
+        info: Any,
+        authorize: Any | None,
+    ) -> Any:
+        """Validate the generated items in *refs*; ``None`` when there are none."""
+        from strawberry_orm.upserts import has_upsert
+
+        if not any(
+            has_upsert(ref) or hasattr(type(ref), "__relation_policy__") for ref in refs
+        ):
+            return None
+        writer = self._upsert_writer(info, authorize)
+        spec = self._upsert_relation_spec(type(instance), field)
+        writer.validate_refs(type(instance), spec, refs)
+        return writer
+
+    def _single_upsert_match(self, model: type, rows: list[Any]) -> Any:
+        from strawberry_orm.upserts import UpsertValidationError
+
+        if len(rows) > 1:
+            raise UpsertValidationError(
+                f"The upsert where matches more than one {model.__name__}; "
+                f"match on fields that identify a single row"
+            )
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _upsert_lookup_kwargs(query: dict[str, Any]) -> dict[str, Any]:
+        """*query* as ORM keyword lookups, with ``id`` meaning the primary key."""
+        return {
+            ("pk" if name == "id" else name): value for name, value in query.items()
+        }
+
     # -- Abstract / hook methods (override in subclasses) --------------------
 
     def _introspect_model(

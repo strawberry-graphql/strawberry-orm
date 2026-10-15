@@ -1414,6 +1414,24 @@ class StrawberryORM:
             authorize=authorize,
         )
 
+    def apply_upsert(
+        self,
+        input: Any,
+        info: Any,
+        *,
+        authorize: Any | None = None,
+    ) -> Any:
+        """Find or create the row *input* describes, and apply what it nests.
+
+        *input* is built by :meth:`MutationNamespace.upsert_node_input`. Each
+        projection's ``onMatch`` decides what happens to a matched row. The
+        whole write runs in a savepoint of the caller's session, so an error
+        leaves nothing behind. Returns the matched or created row, or an
+        awaitable of it on an async session. Only the SQLAlchemy backend
+        implements this.
+        """
+        return self._backend.apply_upsert(input, info, authorize=authorize)
+
     # -- Queryset overrides --------------------------------------------------
 
     def is_query_object(self, value: Any) -> bool:

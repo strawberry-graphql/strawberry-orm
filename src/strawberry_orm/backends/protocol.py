@@ -116,9 +116,20 @@ class Backend(Protocol):
         """Apply a list of ref operations to *instance*'s *field* relation.
 
         Each ref is a ``@oneOf`` input with exactly one of ``create``,
-        ``update`` (link + optional field updates), ``unlink`` (remove from
-        relation), or ``delete`` (hard-delete the row).
+        ``update`` (link + optional field updates), ``upsert`` (find or
+        create), ``unlink`` (remove from relation), or ``delete`` (hard-delete
+        the row).
         """
+        ...
+
+    def apply_upsert(
+        self,
+        payload: Any,
+        info: Any,
+        *,
+        authorize: Any | None = None,
+    ) -> AwaitableOrValue[Any]:
+        """Apply an input built by ``orm.mutations.upsert_node_input()``."""
         ...
 
     # -- Query application ----------------------------------------------------

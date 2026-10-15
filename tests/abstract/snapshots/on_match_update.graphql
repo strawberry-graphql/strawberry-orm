@@ -1,0 +1,78 @@
+directive @oneOf on INPUT_OBJECT
+
+type Mutation {
+  take0(input: UpdateUserInput!): Boolean!
+}
+
+type Query {
+  ok: Boolean!
+}
+
+input UpdatePostCreate {
+  title: String
+  body: String
+}
+
+input UpdatePostPatch {
+  title: String
+}
+
+input UpdatePostUpdate {
+  title: String
+  id: ID!
+}
+
+input UpdatePostUpsert {
+  """
+  Fields that find an existing Post. A matched row is updated from `update`.
+  """
+  where: UpdatePostWhere!
+
+  """
+  Creates the Post when nothing matches `where`. A matched row is updated from `update`.
+  """
+  create: UpdatePostCreate
+  update: UpdatePostPatch
+}
+
+input UpdatePostWhere {
+  title: String!
+}
+
+input UpdateUserCreate {
+  name: String
+  email: String
+  posts: [UpdateUserPostsItem!]
+}
+
+input UpdateUserInput {
+  """
+  Fields that find an existing User. A matched row is updated from `update`.
+  """
+  where: UpdateUserWhere!
+
+  """
+  Creates the User when nothing matches `where`. A matched row is updated from `update`.
+  """
+  create: UpdateUserCreate
+  update: UpdateUserPatch
+}
+
+input UpdateUserPatch {
+  name: String
+  posts: [UpdateUserPostsItem!]
+}
+
+input UpdateUserPostsItem @oneOf {
+  create: UpdatePostCreate
+  update: UpdatePostUpdate
+
+  """
+  Finds the Post by `where`, or creates it from `create`. A matched row is updated from `update`.
+  """
+  upsert: UpdatePostUpsert
+}
+
+input UpdateUserWhere {
+  email: String!
+}

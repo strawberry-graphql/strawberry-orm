@@ -105,10 +105,10 @@ Generate input types — `partial` makes every field optional for patch-style up
 ```python
 orm.ref(model, *, create=None, update=None, unlink=False, delete=False) -> type
 make_ref_type(model, *, create=None, update=None, upsert=None,
-              unlink=False, delete=False, name=None) -> type
+              unlink=False, delete=False, name=None, descriptions=None) -> type
 ```
 
-Build a reference input for writing related lists. `make_ref_type` is the standalone form and additionally supports `upsert`. See [Related list inputs](README.md#related-list-inputs-ormref).
+Build a reference input for writing related lists. `make_ref_type` is the standalone form and additionally supports `upsert`; `descriptions` maps variant names to GraphQL field descriptions. See [Related list inputs](README.md#related-list-inputs-ormref).
 
 ---
 
@@ -334,9 +334,32 @@ Generated mutation fields. See [Mutations](README.md#mutations).
 ```python
 orm.mutations.create_node_input(*, models=None, project=None, name=None) -> type
 orm.mutations.update_node_input(*, models=None, project=None, name=None) -> type
+orm.mutations.upsert_node_input(*, model, project, name=None) -> type
 ```
 
-Catch-all Relay node mutation *inputs* with recursive nested refs; you write the resolver. See [Node mutation inputs](README.md#node-mutations).
+Catch-all Relay node mutation *inputs* with recursive nested refs; you write the resolver. `upsert_node_input` builds a single-model `{where, create, update}` root from a project that declares `_meta.upsert.where`; the `update` member is present only when matched rows are updated. See [Node mutation inputs](README.md#node-mutations) and [Upserting](README.md#upserting-with-_metaupsert).
+
+`project` `_meta` keys:
+
+| Key | Value |
+| --- | --- |
+| `create`, `update` | `True` or a list of field names |
+| `unlink`, `delete` | `True` (to-many relations only) |
+| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only) |
+| `upsert.where` | a list of field names to match on, or `True` for caller-chosen optional fields |
+| `upsert.onMatch` | `"UPDATE"` (default; requires `update` when set), `"IGNORE"` or `"APPEND"` |
+| `upsert.onMatchLinks` | `"ERROR"` (default) or `"IGNORE"`; only with `onMatch: "APPEND"` |
+| `immutable` | `True`: no `update`, `unlink`, `delete` or `onReplace`; matches `APPEND` unless `onMatch: "IGNORE"` |
+| `maxVisits` | positive integer: how many times the model may appear on one nesting path |
+| `name` | a name for the projection's generated types, which also lets it recurse |
+
+Contradictory keys raise `ValueError` when the input is built. See [What a match does](README.md#what-a-match-does-onmatch-and-immutable).
+
+```python
+orm.apply_upsert(input, info, *, authorize=None) -> instance
+```
+
+Executes an input built by `upsert_node_input()` as one unit of work and returns the matched or created row. The unit is a savepoint of the SQLAlchemy session, `transaction.atomic()` on Django, or `in_transaction()` on Tortoise. Awaitable on an async SQLAlchemy session, in an async Django context, and always on Tortoise. Raises `UpsertValidationError` (a `ValueError`) before writing when the payload breaks its projection, `UpsertNotFoundError` (a `LookupError`) when an upsert without `create` or an `id` names no row, and `PermissionError` on any denial. See [Applying an upsert](README.md#applying-an-upsert).
 
 ### `AbstractRepo`
 
@@ -351,6 +374,10 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | `can_delete` | `(instance, info) -> bool` |
 | `can_link` | `(parent, field, instance, info) -> bool` |
 | `can_unlink` | `(parent, field, instance, info) -> bool` |
+| `can_upsert` | `(instance, info) -> bool`, for a row an upsert matched |
+| `find_for_upsert` | `(model, query, info) -> instance \| None`; may be `async` on an async session |
+| `find_for_upsert_async` | `async (model, query, info) -> instance \| None` |
+| `on_match` | `(instance, info) -> None`, once per matched row; may be `async` on an async session |
 | `on_before_create` | `(data, info) -> data` |
 | `on_after_create` | `(instance, info) -> None` |
 | `on_before_update` | `(instance, data, info) -> data` |
@@ -377,7 +404,7 @@ orm.apply_ordering(query, order_input, model, info=None) -> query
 orm.apply_ref_list(instance, field, refs, info, *, authorize=None)
 ```
 
-`apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input, honouring the model's repo.
+`apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input, honouring the model's repo. Items carrying an `upsert` arm built by `orm.mutations` are validated and applied like [`apply_upsert`](#mutations), in the same unit of work as the rest of the list.
 
 ---
 
@@ -431,7 +458,7 @@ Strawberry's Relay node resolution hook.
 
 Everything in `strawberry_orm.__all__`:
 
-`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TimeComparisonLookup`, `UNSET`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `make_ref_type`, `order_field`
+`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TimeComparisonLookup`, `UNSET`, `UpsertNotFoundError`, `UpsertValidationError`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `make_ref_type`, `order_field`
 
 From `strawberry_orm.relay`:
 
