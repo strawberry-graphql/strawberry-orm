@@ -87,6 +87,8 @@ class FieldDefinition:
     permission_classes: list[type] | None = None
     description: str | None = None
     declared_type: Any = None
+    #: Strawberry field metadata, tags included, for the field this becomes.
+    metadata: dict[Any, Any] | None = None
 
     def __set_name__(self, owner: type, name: str) -> None:
         """Publish the field's type when it came from a decorated function.

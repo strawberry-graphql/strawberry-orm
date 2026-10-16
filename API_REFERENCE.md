@@ -7,7 +7,7 @@ This is a lookup table, not a guide. For what the pieces are *for* and how they 
 ## Contents
 
 - [Constructing an ORM](#constructing-an-orm) — `for_django`, `for_sqlalchemy`, `for_tortoise`, options
-- [Building the schema](#building-the-schema) — `orm.schema()`, extensions
+- [Building the schema](#building-the-schema) — `orm.schema()`, extensions, `tags`
 - [Types and inputs](#types-and-inputs) — `orm.type`, `orm.input`, `orm.partial`, `orm.ref`
 - [Declaring fields](#declaring-fields) — `orm.field.eager` / `.lazy`
 - [Filters, ordering, grouping](#filters-ordering-and-grouping) — generators and custom-field decorators
@@ -69,10 +69,21 @@ See [Backend options](README.md#backend-options).
 ## Building the schema
 
 ```python
-orm.schema(*, optimizer: bool | None = None, **kwargs) -> strawberry.Schema
+orm.schema(*, optimizer: bool | None = None, tags: str | Iterable[str] | None = None,
+           schema_class: type[strawberry.Schema] = strawberry.Schema,
+           **kwargs) -> strawberry.Schema
 ```
 
 Takes everything `strawberry.Schema` takes. The optimizer, lazy-resolution, and batching extensions are mounted for you; `optimizer=False` opts out. See [`orm.schema()`](README.md#ormschema).
+
+`tags` builds the schema for those tags. It keeps every field, argument and input field that is untagged or carries one of them, and the types those still reach. Building fails, naming the field, for a hidden argument or input field without a default, and for a type whose every field is hidden. `schema_class` is the class built. See [Several schemas from one set of types](README.md#several-schemas-from-one-set-of-types-tags).
+
+```python
+tags(*names: str) -> dict
+TAGS_KEY = "strawberry_orm.tags"
+```
+
+`tags()` is the field metadata for something declared with Strawberry itself: `strawberry.field(metadata=tags("internal"))`, and likewise for `strawberry.mutation`, `strawberry.argument` and input fields. The ORM helpers take `tags=` directly.
 
 The extensions are also available individually, for a hand-built `strawberry.Schema`:
 
@@ -119,7 +130,7 @@ Build a reference input for writing related lists. `make_ref_type` is the standa
 ```python
 orm.field.eager(fn=None, *, scope=None, filters=None, order=None, compute=None,
                 disable_optimization=False, permission_classes=None,
-                description=None, deprecation_reason=None)
+                description=None, deprecation_reason=None, tags=None, metadata=None)
 ```
 
 A field the library resolves: one query for the whole result set. Bare, it writes the query itself; assign it to an annotated attribute. Handed a `(query, info)` callable — as `scope=`, or as a decorator — that callable narrows which rows load, running while the eager load is built and composing **after** the related type's `scope_rows`.
@@ -128,7 +139,7 @@ Nothing here sees a parent row, and passing a callable that takes `self` raises.
 
 ```python
 orm.field.lazy(fn=None, *, using=None, filters=None, order=None,
-               description=None, deprecation_reason=None)
+               description=None, deprecation_reason=None, tags=None, metadata=None)
 ```
 
 A field you resolve yourself: your callable receives `self` and runs once per parent row. Sync ORM work is moved off the event loop automatically. Name the relations it reads with `using=[...]` and they load alongside the parent, so those reads cost no extra query.
@@ -141,6 +152,8 @@ A field you resolve yourself: your callable receives `self` and runs once per pa
 | `filters` / `order` | both | Attach generated `filter` / `order` arguments to this field. |
 | `disable_optimization` | `eager` | Skip the optimizer for this field, and silence its lazy-load warning. |
 | `permission_classes` | `eager` | Strawberry permission classes. |
+| `tags` | both | Schemas the field belongs to; see [`orm.schema`](#building-the-schema). Also taken by `orm.field.computed`, `orm.connection.*`, `orm.node` and `orm.payload.*`. |
+| `metadata` | both | Strawberry field metadata. Tags are merged into it. |
 
 `auto`, `scoped`, `custom`, and `computed` remain as aliases: `auto` and `scoped` for `eager`, `custom` and `computed` for `lazy`.
 
@@ -306,9 +319,11 @@ An exception outside `handles`, or one `on_error` re-raises, produces the ordina
 ### Decorators
 
 ```python
-orm.payload.query(fn=None, *, name=None, permission_classes=None)
-orm.payload.mutation(fn=None, *, name=None, permission_classes=None, input_mutation=False)
-orm.payload.connection(graphql_type=None, *, name=None, permission_classes=None)
+orm.payload.query(fn=None, *, name=None, permission_classes=None, tags=None, metadata=None)
+orm.payload.mutation(fn=None, *, name=None, permission_classes=None, input_mutation=False,
+                     tags=None, metadata=None)
+orm.payload.connection(graphql_type=None, *, name=None, permission_classes=None,
+                       tags=None, metadata=None)
 ```
 
 The payload type is generated from the resolver's return annotation and named after the resolver (`recent_users` → `RecentUsersPayload`), overridable with `name=`. `input_mutation=True` collapses the arguments into a generated `input` argument.
@@ -446,7 +461,7 @@ Strawberry's Relay node resolution hook.
 | `Ordering` | `ASC`, `DESC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST` |
 | `DateGroupByInterval` | `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR` |
 | `DateGroupByOption` | Input pairing a date column with an interval. |
-| `FieldDefinition` | What `orm.field.eager` returns for a scope or metadata: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`. |
+| `FieldDefinition` | What `orm.field.eager` returns for a scope or metadata: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`, `metadata`. |
 | `FieldHints` | The optimizer-relevant subset: `using`, `scope`, `compute`, `disable_optimization`. |
 | `OperationInfo` | `messages: list[OperationMessage]` |
 | `OperationMessage` | `kind`, `field`, `message` |
@@ -458,7 +473,7 @@ Strawberry's Relay node resolution hook.
 
 Everything in `strawberry_orm.__all__`:
 
-`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TimeComparisonLookup`, `UNSET`, `UpsertNotFoundError`, `UpsertValidationError`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `make_ref_type`, `order_field`
+`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TAGS_KEY`, `TimeComparisonLookup`, `UNSET`, `UpsertNotFoundError`, `UpsertValidationError`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `make_ref_type`, `order_field`, `tags`
 
 From `strawberry_orm.relay`:
 

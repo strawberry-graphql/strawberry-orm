@@ -474,6 +474,58 @@ schema = orm.schema(query=Query, optimizer=False)              # opt out per sch
 orm = StrawberryORM.for_sqlalchemy(enable_optimizer=False, …)  # or globally
 ```
 
+`schema_class=` builds your own `strawberry.Schema` subclass instead, with the same extensions mounted.
+
+#### Several schemas from one set of types: `tags`
+
+When several GraphQL APIs share types, tag what belongs to only some of them, and build one schema per API from the same classes. A field without tags is in every schema. A tagged field is in each schema built for one of its tags.
+
+```python
+from strawberry_orm import tags
+
+@orm.type(User)
+class UserType:
+    id: auto
+    name: auto                                                   # every schema
+    email: auto = orm.field.eager(tags="internal")
+    posts: list[PostType] = orm.field.eager(tags=["internal", "partner"])
+
+    @orm.field.computed(tags="partner")
+    def handle(self, info: strawberry.Info) -> str: ...
+
+@strawberry.type
+class Query:
+    users: list[UserType] = orm.field.eager()
+    audit_log: ORMListConnection[AuditNode] = orm.connection.eager(tags="internal")
+
+    @strawberry.field(metadata=tags("internal"))
+    def health(self, verbose: Annotated[bool, strawberry.argument(metadata=tags("internal"))] = False) -> str: ...
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation(metadata=tags("internal"))
+    def purge_cache(self) -> bool: ...
+
+public = orm.schema(query=Query, mutation=Mutation, tags="public")
+internal = orm.schema(query=Query, mutation=Mutation, tags="internal")
+partner = orm.schema(query=Query, tags="partner")
+```
+
+Every ORM helper takes `tags=`: `orm.field.eager` / `.lazy` / `.computed`, `orm.connection.*`, `orm.node` and `orm.payload.*`. Anything declared with Strawberry itself takes `metadata=tags(...)`: fields, mutations, arguments and input fields. On an `@orm.type`, a `strawberry.field(metadata=tags(...))` that sets nothing else only tags the attribute. The library still resolves the column or relation underneath.
+
+What a schema built with `tags=` keeps:
+
+- Fields, arguments and input fields that are untagged or carry one of its tags.
+- Only the types something it keeps still reaches. `PostType` above is left out of the public schema.
+- Without `tags=`, `orm.schema()` keeps everything.
+
+Building the schema fails, naming the field, when a tag would leave a schema that cannot work:
+
+- A hidden argument or input field without a default, because no client of that schema could ever supply it. A hidden one with a default takes the default.
+- A type whose every field is hidden. Tag the fields that return it instead.
+
+Tags are field metadata stored under `strawberry_orm.TAGS_KEY`, next to any `metadata=` you pass. Generated inputs (filters, orders, mutation projections) are built field by field by the library, so build a separately named one per schema where they should differ.
+
 #### Telling the optimizer what to load
 
 The optimizer follows the selection set, so a relation the client asks for is prefetched without you saying anything. Two cases it cannot see:
@@ -2066,7 +2118,7 @@ SQLAlchemy-only:
 
 Every name below is documented with its signature in the [API reference](API_REFERENCE.md).
 
-`StrawberryORM`, `auto`, `make_ref_type`, `UpsertValidationError`, `UpsertNotFoundError`, `PayloadPolicy`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
+`StrawberryORM`, `auto`, `make_ref_type`, `UpsertValidationError`, `UpsertNotFoundError`, `PayloadPolicy`, `Ordering`, `DateGroupByInterval`, `DateGroupByOption`, `FieldDefinition`, `FieldHints`, `OptimizerExtension`, `OptimizerStore`, `UNSET`, `tags`, `TAGS_KEY`, `filter_field`, `order_field`, `group_field`, `aggregate_field`, and the built-in lookup input classes from `strawberry_orm.filters`.
 
 ---
 

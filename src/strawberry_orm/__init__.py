@@ -23,6 +23,7 @@ from strawberry_orm.optimizer import FieldHints, OptimizerExtension, OptimizerSt
 from strawberry_orm.payload import PayloadPolicy
 from strawberry_orm.policy import MutationPolicy
 from strawberry_orm.repo import AbstractRepo
+from strawberry_orm.tags import TAGS_KEY, tags
 from strawberry_orm.types import (
     UNSET,
     DateGroupByInterval,
@@ -59,6 +60,7 @@ __all__ = [
     "StrawberryORM",
     "StringLookup",
     "StringLookupNoRegex",
+    "TAGS_KEY",
     "TimeComparisonLookup",
     "UNSET",
     "UpsertNotFoundError",
@@ -69,4 +71,5 @@ __all__ = [
     "group_field",
     "make_ref_type",
     "order_field",
+    "tags",
 ]

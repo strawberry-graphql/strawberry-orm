@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import typing as _typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property, partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction
 from types import UnionType
@@ -39,6 +39,7 @@ from strawberry_orm.fields import (
     check_scope_signature,
 )
 from strawberry_orm.mutations import MutationNamespace
+from strawberry_orm.tags import field_metadata, tagged_schema_class
 from strawberry_orm.types import FieldDefinition, FieldHints
 
 BackendName = Literal["django", "sqlalchemy", "tortoise"]
@@ -499,17 +500,15 @@ class _AutoFilterOrderExtension(FieldExtension):
 
 
 class FieldFactory:
-    """The four ways to declare a field on an ``@orm.type`` class.
+    """The ways to declare a field on an ``@orm.type`` class.
 
     The name says when your code runs, and therefore what it receives:
 
-    ``auto``      metadata only; the library resolves the field.
-    ``scoped``    ``(query, info)``, once while the prefetch is built.
-    ``custom``    ``(self, info)``, once per parent row, returning rows.
+    ``eager``     nothing, or ``(query, info)`` once while the prefetch is built.
+    ``lazy``      ``(self, info)``, once per parent row, returning rows.
     ``computed``  ``(self, info)``, once per parent row, returning a value.
 
-    Calling the factory directly is the pre-namespace spelling and still
-    works: ``orm.field()``, ``orm.field(using=[...])``, bare ``@orm.field``.
+    ``auto``, ``scoped`` and ``custom`` are deprecated aliases.
     """
 
     def __init__(self, backend: Any) -> None:
@@ -530,6 +529,8 @@ class FieldFactory:
         permission_classes: list[type] | None = None,
         description: str | None = None,
         deprecation_reason: str | None = None,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """A field the library resolves: one query for the whole result set.
 
@@ -549,7 +550,12 @@ class FieldFactory:
         hidden from it: the query is either written by the library from the
         selection set, or returned by your scope for the ORM to read. A
         resolver needing ``self`` belongs on :meth:`lazy`, which does take it.
+
+        ``tags`` names the schemas the field belongs to (see
+        :meth:`StrawberryORM.schema`); ``metadata`` is Strawberry field metadata.
+        Every field and connection helper takes both.
         """
+        merged = field_metadata(metadata, tags)
         supplied = fn if fn is not None else scope
         if supplied is not None:
             check_scope_signature(supplied)
@@ -558,6 +564,7 @@ class FieldFactory:
                 on=on,
                 description=description,
                 declared_type=_return_annotation(supplied),
+                metadata=merged,
             )
         if any([on, compute, disable_optimization, permission_classes]):
             return FieldDefinition(
@@ -567,6 +574,7 @@ class FieldFactory:
                 disable_optimization=disable_optimization,
                 permission_classes=permission_classes,
                 description=description,
+                metadata=merged,
             )
         return _AutoField(
             self._backend,
@@ -574,6 +582,7 @@ class FieldFactory:
             deprecation_reason=deprecation_reason,
             filters=filters,
             order=order,
+            metadata=merged,
         )
 
     def lazy(
@@ -585,6 +594,8 @@ class FieldFactory:
         order: Any | None = None,
         description: str | None = None,
         deprecation_reason: str | None = None,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """A field you resolve yourself, once per parent row, receiving ``self``.
 
@@ -592,6 +603,7 @@ class FieldFactory:
         reads with ``using=[...]`` and they are loaded alongside the parent
         instead of one round trip per row.
         """
+        merged = field_metadata(metadata, tags)
 
         def _build(resolver: Callable[..., Any]) -> Any:
             check_resolver_signature(resolver, "lazy")
@@ -602,12 +614,14 @@ class FieldFactory:
                     deprecation_reason=deprecation_reason,
                     filters=filters,
                     order=order,
+                    metadata=merged,
                 )(resolver)
             else:
                 field = self._resolver_field(
                     resolver,
                     description=description,
                     deprecation_reason=deprecation_reason,
+                    metadata=merged,
                 )
             if using:
                 field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
@@ -708,6 +722,8 @@ class FieldFactory:
         using: list[str] | None = None,
         description: str | None = None,
         deprecation_reason: str | None = None,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """Declare a computed value and the relations it reads.
 
@@ -722,11 +738,14 @@ class FieldFactory:
                     return f"by {self.author.name}"
         """
 
+        merged = field_metadata(metadata, tags)
+
         def _build(resolver: Callable[..., Any]) -> Any:
             field = self._resolver_field(
                 resolver,
                 description=description,
                 deprecation_reason=deprecation_reason,
+                metadata=merged,
             )
             field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
                 using=list(using) if using else None,
@@ -743,12 +762,14 @@ class FieldFactory:
         *,
         description: str | None = None,
         deprecation_reason: str | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         wrap = getattr(self._backend, "wrap_async_safe", None)
         return strawberry.field(
             resolver=wrap(fn) if wrap is not None else fn,
             description=description,
             deprecation_reason=deprecation_reason,
+            metadata=metadata,
         )
 
 
@@ -778,12 +799,15 @@ class _AutoField:
         *,
         filters: Any | None = None,
         order: Any | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> None:
         self._backend = backend
         self._description = description
         self._deprecation_reason = deprecation_reason
         self._filters = filters
         self._order = order
+        #: Read by ``@orm.type`` when this stands in for a model attribute.
+        self.metadata = metadata
 
     def __set_name__(self, owner: type, name: str) -> None:
         ann = getattr(owner, "__annotations__", {}).get(name)
@@ -803,6 +827,7 @@ class _AutoField:
             resolver=resolver,
             description=self._description,
             deprecation_reason=self._deprecation_reason,
+            metadata=self.metadata,
         )
         field._orm_auto_field = True  # type: ignore[attr-defined]
         setattr(owner, name, field)
@@ -812,6 +837,7 @@ class _AutoField:
             resolver=resolver,
             description=self._description,
             deprecation_reason=self._deprecation_reason,
+            metadata=self.metadata,
             extensions=[
                 _AutoFilterOrderExtension(
                     self._backend,
@@ -845,6 +871,8 @@ class _AutoConnection:
             "extensions",
             "max_results",
             "scope",
+            "tags",
+            "metadata",
         }
     )
 
@@ -866,6 +894,9 @@ class _AutoConnection:
         scope = kwargs.get("scope")
         if scope is not None:
             check_scope_signature(scope)
+        kwargs["metadata"] = field_metadata(
+            kwargs.pop("metadata", None), kwargs.pop("tags", None)
+        )
         self._backend = backend
         self._graphql_type = graphql_type
         self._resolver = resolver
@@ -1005,6 +1036,7 @@ class _AutoConnection:
             deprecation_reason=self._kwargs.get("deprecation_reason"),
             extensions=extensions,
             max_results=self._kwargs.get("max_results"),
+            metadata=self._kwargs["metadata"],
         )
         from strawberry_orm.relay.connection import _use_orm_connection_extension
 
@@ -1329,14 +1361,15 @@ class StrawberryORM:
 
     @cached_property
     def field(self) -> FieldFactory:
-        """Field declarations: ``auto``, ``scoped``, ``custom``, ``computed``.
-
-        Callable itself for backwards compatibility, so ``orm.field()``,
-        ``orm.field(...)`` and bare ``@orm.field`` keep working.
-        """
+        """Field declarations: ``eager``, ``lazy`` and ``computed``."""
         return FieldFactory(self._backend)
 
     def node(self, **kwargs: Any) -> Any:
+        metadata = field_metadata(
+            kwargs.pop("metadata", None), kwargs.pop("tags", None)
+        )
+        if metadata is not None:
+            kwargs["metadata"] = metadata
         return self._backend.node(**kwargs)
 
     @cached_property
@@ -1425,10 +1458,9 @@ class StrawberryORM:
 
         *input* is built by :meth:`MutationNamespace.upsert_node_input`. Each
         projection's ``onMatch`` decides what happens to a matched row. The
-        whole write runs in a savepoint of the caller's session, so an error
-        leaves nothing behind. Returns the matched or created row, or an
-        awaitable of it on an async session. Only the SQLAlchemy backend
-        implements this.
+        whole write is one unit of work, so an error leaves nothing behind.
+        Returns the matched or created row, or an awaitable of it where the
+        backend is async.
         """
         return self._backend.apply_upsert(input, info, authorize=authorize)
 
@@ -1514,12 +1546,24 @@ class StrawberryORM:
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)
 
-    def schema(self, *, optimizer: bool | None = None, **kwargs: Any) -> Any:
+    def schema(
+        self,
+        *,
+        optimizer: bool | None = None,
+        tags: str | Iterable[str] | None = None,
+        schema_class: type[strawberry.Schema] = strawberry.Schema,
+        **kwargs: Any,
+    ) -> Any:
         """Create a :class:`strawberry.Schema` with the optimizer enabled by default.
 
         Pass ``optimizer=False`` to opt out, or set ``enable_optimizer=False`` when
         constructing the ORM instance. Additional ``extensions`` are merged after
         the optimizer unless an optimizer extension was already provided.
+
+        ``tags`` builds the schema for those tags: it keeps every field,
+        argument and input field that is untagged or carries one of them, and
+        leaves out types nothing kept reaches. ``schema_class`` is the class
+        built, for a ``strawberry.Schema`` subclass of your own.
         """
         from strawberry_orm.lazy_resolution import extensions_include_lazy_resolution
         from strawberry_orm.optimizer.extension import (
@@ -1561,7 +1605,9 @@ class StrawberryORM:
 
         self._backend.check_scoped_order_traversal()
 
-        return strawberry.Schema(extensions=extensions, **kwargs)
+        if tags is not None:
+            schema_class = tagged_schema_class(schema_class, tags)
+        return schema_class(extensions=extensions, **kwargs)
 
     def batching_extension(self) -> type[SchemaExtension]:
         from strawberry_orm.batching import BatchingExtension

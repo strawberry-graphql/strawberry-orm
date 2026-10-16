@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.23.0
+
+### Added
+
+- **Schema tags.** Build several GraphQL schemas from one set of types: tag what belongs to only some of them, then build one per tag with `orm.schema(..., tags="public")`.
+  - `tags=` on `orm.field.eager`, `lazy` and `computed`, `orm.connection.*`, `orm.node` and `orm.payload.*`.
+  - `tags("a", "b")`, for `metadata=` on anything declared with Strawberry itself: fields, mutations, arguments and input fields.
+  - A schema built for some tags keeps what is untagged or carries one of them, and the types that still reach. Building it fails, naming the field, for a hidden argument or input field without a default, and for a type with every field hidden.
+- `metadata=` on the same ORM helpers, passed to the Strawberry field.
+- `orm.schema(schema_class=...)` builds a `strawberry.Schema` subclass of your own, with the library's extensions mounted.
+
+### Changed
+
+- On an `@orm.type`, a `strawberry.field(metadata=...)` that sets nothing else no longer replaces the model attribute's resolution. It used to stop Django and Tortoise from generating the relation's resolver.
+
 ## 0.22.0
 
 ### Added

@@ -17,7 +17,7 @@ describes them.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from functools import wraps
@@ -27,6 +27,7 @@ from typing import Any
 import strawberry
 
 from strawberry_orm._async import in_async_context, keep_annotations, run_sync
+from strawberry_orm.tags import field_metadata
 
 
 @dataclass(frozen=True)
@@ -225,9 +226,16 @@ class PayloadFactory:
         *,
         name: str | None = None,
         permission_classes: list[type] | None = None,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """A query field whose result is wrapped in a payload."""
-        return self._simple(fn, name=name, permissions=permission_classes)
+        return self._simple(
+            fn,
+            name=name,
+            permissions=permission_classes,
+            metadata=field_metadata(metadata, tags),
+        )
 
     def mutation(
         self,
@@ -236,6 +244,8 @@ class PayloadFactory:
         name: str | None = None,
         permission_classes: list[type] | None = None,
         input_mutation: bool = False,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """A mutation whose result is wrapped in a payload.
 
@@ -248,6 +258,7 @@ class PayloadFactory:
             permissions=permission_classes,
             mutation=True,
             input_mutation=input_mutation,
+            metadata=field_metadata(metadata, tags),
         )
 
     def connection(
@@ -256,6 +267,8 @@ class PayloadFactory:
         *,
         name: str | None = None,
         permission_classes: list[type] | None = None,
+        tags: str | Iterable[str] | None = None,
+        metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
         """A payload whose ``data`` is a Relay connection.
 
@@ -319,7 +332,9 @@ class PayloadFactory:
                 ),
             )
             return strawberry.field(
-                resolver=resolver, permission_classes=permission_classes
+                resolver=resolver,
+                permission_classes=permission_classes,
+                metadata=field_metadata(metadata, tags),
             )
 
         return _decorate
@@ -332,6 +347,7 @@ class PayloadFactory:
         permissions: list[type] | None,
         mutation: bool = False,
         input_mutation: bool = False,
+        metadata: dict[Any, Any] | None = None,
     ) -> Any:
         policy = self._require_policy()
 
@@ -378,6 +394,7 @@ class PayloadFactory:
                 resolver=resolver,
                 permission_classes=permissions,
                 extensions=extensions,
+                metadata=metadata,
             )
 
         return _decorate(fn) if fn is not None else _decorate

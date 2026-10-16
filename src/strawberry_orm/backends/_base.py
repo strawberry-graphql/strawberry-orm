@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import hashlib
 import inspect
@@ -13,9 +14,11 @@ from dataclasses import dataclass
 from dataclasses import field as dc_field
 from decimal import Decimal
 from difflib import get_close_matches
+from types import MappingProxyType
 from typing import Any, Literal
 
 import strawberry
+from strawberry.types.field import StrawberryField
 
 from strawberry_orm.filters import (
     _CUSTOM_AGGREGATE_ATTR,
@@ -47,6 +50,27 @@ _SENSITIVE_PATTERNS = re.compile(
     r"superuser|permission|role)",
     re.IGNORECASE,
 )
+
+
+def _metadata_only_field(value: Any) -> bool:
+    """True for ``strawberry.field(metadata=...)`` that sets nothing else.
+
+    On an ``@orm.type`` such a field only tags a model attribute, so the
+    attribute is resolved as if the field were not there.
+    """
+    return (
+        isinstance(value, StrawberryField)
+        and bool(value.metadata)
+        and value.base_resolver is None
+        and value.default is dataclasses.MISSING
+        and value.default_factory is dataclasses.MISSING
+        and value.graphql_name is None
+        and value.description is None
+        and value.deprecation_reason is None
+        and not value.permission_classes
+        and not value.directives
+        and not value.extensions
+    )
 
 
 def _annotate_filter_relation_presence(FilterCls: type) -> None:
@@ -2031,6 +2055,9 @@ class BaseBackend:
 
         self._check_missing_scope(cls, model, type_name)
 
+        # Metadata of the placeholders removed below, so the backend builds
+        # the field as usual; _finalize_type puts it back on that field.
+        removed_metadata: dict[str, Any] = {}
         for attr_name in list(vars(cls)):
             val = getattr(cls, attr_name, None)
             if isinstance(val, FieldDefinition):
@@ -2045,10 +2072,16 @@ class BaseBackend:
                         strawberry.field(
                             permission_classes=val.permission_classes,
                             description=val.description,
+                            metadata=val.metadata,
                         ),
                     )
                 else:
+                    if val.metadata:
+                        removed_metadata[attr_name] = val.metadata
                     delattr(cls, attr_name)
+            elif _metadata_only_field(val) and attr_name in annotations:
+                removed_metadata[attr_name] = dict(val.metadata)
+                delattr(cls, attr_name)
             elif getattr(val, "_orm_computed_hints", None) is not None:
                 self._validate_hints(
                     model, type_name, attr_name, val._orm_computed_hints
@@ -2061,8 +2094,11 @@ class BaseBackend:
                         cls, model, type_name, attr_name, pending
                     )
                     continue
+                if getattr(val, "metadata", None):
+                    removed_metadata[attr_name] = dict(val.metadata)
                 delattr(cls, attr_name)
 
+        cls._orm_removed_metadata = removed_metadata  # type: ignore[attr-defined]
         return type_name
 
     def _register_relation_connection(
@@ -2224,6 +2260,13 @@ class BaseBackend:
     ) -> Any:
         """Call ``strawberry.type()`` and register the model in the type registry."""
         result = strawberry.type(cls, name=name if name else None)
+        removed = vars(cls).get("_orm_removed_metadata")
+        if removed:
+            for field in result.__strawberry_definition__.fields:
+                if field.python_name in removed:
+                    field.metadata = MappingProxyType(
+                        {**field.metadata, **removed[field.python_name]}
+                    )
         self._type_registry[type_name] = model
         self._graphql_type_registry[model] = result
         self._install_on_resolvers(result, model, type_name)
