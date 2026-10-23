@@ -27,6 +27,7 @@ from ._base import (
     AggregateMeta,
     BaseBackend,
     extract_element_type,
+    hint_hops,
     input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
@@ -63,10 +64,9 @@ _MANY_REL_TYPES = frozenset(
     }
 )
 
-_REL_FIELD_TYPES = _MANY_REL_TYPES | {
-    "ForeignKeyFieldInstance",
-    "OneToOneFieldInstance",
-}
+_FORWARD_REL_TYPES = frozenset({"ForeignKeyFieldInstance", "OneToOneFieldInstance"})
+
+_REL_FIELD_TYPES = _MANY_REL_TYPES | _FORWARD_REL_TYPES
 
 _Ordering = tuple[str, bool, bool | None, bool | None]
 
@@ -101,44 +101,94 @@ def _query_orderings(
     return entry[1]
 
 
-def _coalesce_tortoise_prefetch_paths(model: type, paths: list[str]) -> list[Any]:
-    """Merge nested prefetch strings into ``Prefetch`` objects for reverse relations.
+class _PlannedPrefetch:
+    """One relation in a query's load plan, with the relations under it."""
 
-    Tortoise does not always apply nested prefetches such as ``posts__tags`` on
-    reverse FK relations; building an explicit ``Prefetch('posts', Post...tags)``
-    queryset matches what ``fetch_related`` does for direct models.
+    __slots__ = ("related_model", "forward", "many_to_many", "scope", "children")
+
+    def __init__(self, related_model: type, field_cls: str, scope: Any) -> None:
+        self.related_model = related_model
+        self.forward = field_cls in _FORWARD_REL_TYPES
+        self.many_to_many = field_cls == "ManyToManyFieldInstance"
+        self.scope = scope
+        self.children: dict[str, _PlannedPrefetch] = {}
+
+
+def _prefetch_lookups(plan: dict[str, _PlannedPrefetch]) -> list[Any]:
+    """Tortoise lookups for *plan*, nesting each level inside its parent's queryset.
+
+    Nested paths such as ``posts__tags`` are spelled as ``Prefetch`` objects:
+    Tortoise does not always apply the string form on reverse relations.
+    Forward relations stay unscoped here, and a many-to-many relation's
+    children are loaded afterwards, because Tortoise drops ``Prefetch``
+    objects nested under one; see ``_finish_prefetches``.
     """
     from tortoise.query_utils import Prefetch
 
-    nested: dict[str, list[str]] = {}
-    roots: list[str] = []
-    for path in paths:
-        if "__" in path:
-            root, sub = path.split("__", 1)
-            nested.setdefault(root, []).append(sub)
-        else:
-            roots.append(path)
-
-    result: list[Any] = []
-    used_roots: set[str] = set()
-    meta = model._meta  # type: ignore[attr-defined]
-    for root, subs in nested.items():
-        field = meta.fields_map.get(root)
-        related_model = (
-            getattr(field, "related_model", None) if field is not None else None
-        )
-        if related_model is None:
+    lookups: list[Any] = []
+    for name, load in plan.items():
+        children = [] if load.many_to_many else _prefetch_lookups(load.children)
+        scoped = load.scope is not None and not load.forward
+        if not scoped and not children:
+            lookups.append(name)
             continue
-        qs = related_model.all()
-        if subs:
-            qs = qs.prefetch_related(*subs)
-        result.append(Prefetch(root, qs))
-        used_roots.add(root)
+        queryset = load.related_model.all()
+        if scoped:
+            queryset = load.scope(queryset)
+        if children:
+            queryset = queryset.prefetch_related(*children)
+        lookups.append(Prefetch(name, queryset))
+    return lookups
 
-    for root in roots:
-        if root not in used_roots and root in meta.fields_map:
-            result.append(root)
-    return result
+
+async def _prefetch_onto(model: type, rows: list[Any], lookups: list[Any]) -> None:
+    """Prefetch *lookups* onto rows already in memory.
+
+    ``fetch_for_list`` only takes strings, so this runs the queryset's own
+    prefetch step, which takes ``Prefetch`` objects too.
+    """
+    queryset = model.all().prefetch_related(*lookups)  # type: ignore[attr-defined]
+    db = model._choose_db()  # type: ignore[attr-defined]
+    executor = db.executor_class(
+        model=model,
+        db=db,
+        prefetch_map=queryset._prefetch_map,
+        prefetch_queries=queryset._prefetch_queries,
+    )
+    await executor._execute_prefetch_queries(rows)
+
+
+def _cached_related(rows: list[Any], name: str) -> list[Any]:
+    """The rows cached under relation *name* on *rows*, each once."""
+    related: dict[int, Any] = {}
+    for row in rows:
+        value = row.__dict__.get(f"_{name}")
+        if value is None:
+            continue
+        if isinstance(value, Model):
+            related.setdefault(id(value), value)
+        elif getattr(value, "_fetched", False):
+            for item in value.related_objects:
+                related.setdefault(id(item), item)
+    return list(related.values())
+
+
+async def _hide_scoped_out(rows: list[Any], name: str, load: _PlannedPrefetch) -> None:
+    """Drop cached forward rows *load*'s scope rejects, leaving the FK alone."""
+    cache_attr = f"_{name}"
+    pk_attr = load.related_model._meta.pk_attr  # type: ignore[attr-defined]
+    cached = [row.__dict__.get(cache_attr) for row in rows]
+    pks = {getattr(obj, pk_attr) for obj in cached if obj is not None}
+    if not pks:
+        return
+    visible = set(
+        await load.scope(
+            load.related_model.filter(**{f"{pk_attr}__in": list(pks)})  # type: ignore[attr-defined]
+        ).values_list(pk_attr, flat=True)
+    )
+    for row, obj in zip(rows, cached, strict=True):
+        if obj is not None and getattr(obj, pk_attr) not in visible:
+            row.__dict__[cache_attr] = None
 
 
 def _counting_call(original: Any, probe: Any) -> Any:
@@ -149,35 +199,6 @@ def _counting_call(original: Any, probe: Any) -> Any:
         return await original(*args, **kwargs)
 
     return _counted
-
-
-class _CustomRel:
-    """Holds metadata for a relationship that uses a custom queryset."""
-
-    __slots__ = (
-        "full_path",
-        "field_name",
-        "related_model",
-        "fk_col",
-        "qs_fn",
-        "sub_prefetches",
-    )
-
-    def __init__(
-        self,
-        full_path: str,
-        field_name: str,
-        related_model: type,
-        fk_col: str | None,
-        qs_fn: Any,
-        sub_prefetches: list[str],
-    ) -> None:
-        self.full_path = full_path
-        self.field_name = field_name
-        self.related_model = related_model
-        self.fk_col = fk_col
-        self.qs_fn = qs_fn
-        self.sub_prefetches = sub_prefetches
 
 
 class TortoiseBackend(BaseBackend):
@@ -366,12 +387,18 @@ class TortoiseBackend(BaseBackend):
                         async def resolver(self: Any, info: Any) -> Any:
                             from strawberry_orm.lazy_resolution import (
                                 _tortoise_relation_prefetched,
+                                relation_cache_is_scoped,
                             )
 
                             rel_value = getattr(self, fname)
-                            # A prefetched relation was already scoped on the
-                            # way in; re-querying it would discard that work.
-                            if _tortoise_relation_prefetched(self, fname):
+                            restrict = backend.relation_scope(type(self), fname, info)
+                            # A cache is returned only when this library filled
+                            # it after applying scope_rows. A prefetch in the
+                            # resolver is re-queried.
+                            if _tortoise_relation_prefetched(self, fname) and (
+                                restrict is None
+                                or relation_cache_is_scoped(self, fname)
+                            ):
                                 return list(rel_value)
                             qs = (
                                 rel_value.all()
@@ -854,6 +881,15 @@ class TortoiseBackend(BaseBackend):
     def instance_pk(self, instance: Any) -> Any:
         return getattr(instance, "pk", None)
 
+    def query_model(self, query: Any) -> type | None:
+        return getattr(query, "model", None)
+
+    async def filter_scoped_pks(
+        self, model: type, pks: list[Any], info: Any
+    ) -> set[Any]:
+        queryset = self.apply_type_scope(model.filter(pk__in=pks), model, info)
+        return {self.instance_pk(row) for row in await queryset}
+
     def _relation_connection_spec(
         self, model: type, field_name: str, relation: str
     ) -> Any:
@@ -927,8 +963,8 @@ class TortoiseBackend(BaseBackend):
 
     def _relation_prefetches(
         self, store: Any, model: type, info: Any
-    ) -> tuple[list[str], list[_CustomRel]]:
-        """Return the prefetch paths and scoped relations the selection needs.
+    ) -> dict[str, _PlannedPrefetch]:
+        """Plan the relations the selection and its ``using=`` paths need.
 
         Shared by query optimization and by loading relations onto instances
         the caller already holds, so both apply the same row scoping.
@@ -941,9 +977,10 @@ class TortoiseBackend(BaseBackend):
 
         fragments = fragments_from_info(info)
 
-        prefetch_paths: list[str] = []
-        custom_rels: list[_CustomRel] = []
-        custom_sub_prefetches: dict[str, list[str]] = {}
+        # A relation reached both by the selection and by a ``using=`` path is
+        # loaded once, with one scope, so neither can leave the other's rows in
+        # the cache.
+        plan: dict[str, _PlannedPrefetch] = {}
 
         def _to_snake(name: str) -> str:
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
@@ -972,146 +1009,83 @@ class TortoiseBackend(BaseBackend):
 
             return combined
 
-        def _find_custom_ancestor(full_path: str) -> str | None:
-            for cp in custom_sub_prefetches:
-                if full_path.startswith(cp + "__"):
-                    return cp
-            return None
+        def _planned(
+            level: dict[str, _PlannedPrefetch],
+            current_model: type,
+            rel_name: str,
+            type_name: str | None,
+        ) -> _PlannedPrefetch | None:
+            field_obj = current_model._meta.fields_map.get(rel_name)  # type: ignore[attr-defined]
+            field_cls = type(field_obj).__name__
+            if field_obj is None or (
+                field_cls not in _FORWARD_REL_TYPES and field_cls not in _MANY_REL_TYPES
+            ):
+                return None
+            load = level.get(rel_name)
+            if load is None:
+                related_model = field_obj.related_model
+                load = level[rel_name] = _PlannedPrefetch(
+                    related_model=related_model,
+                    field_cls=field_cls,
+                    scope=_get_custom_qs(type_name, rel_name, related_model),
+                )
+            return load
 
-        def _hint_paths(
-            type_name: str | None, current_model: type, field_name: str, prefix: str
-        ) -> list[str]:
-            """Relation paths declared via ``using=`` for *field_name*."""
+        def _plan_hints(
+            level: dict[str, _PlannedPrefetch],
+            current_model: type,
+            type_name: str | None,
+            field_name: str,
+        ) -> None:
+            """Plan the relation paths declared on ``using=`` for *field_name*.
+
+            Declared against the field name, so they also apply to computed
+            fields that are not ORM fields themselves.
+            """
             hints = store.get(type_name, field_name) if type_name and store else None
             if not hints or hints.disable_optimization or not hints.using:
-                return []
-            fields_map = current_model._meta.fields_map  # type: ignore[attr-defined]
-            return [
-                f"{prefix}__{rel_name}" if prefix else rel_name
-                for rel_name in hints.using
-                if rel_name in fields_map
-            ]
+                return
+            for path in hints.using:
+                hop_level, hop_model, hop_type = level, current_model, type_name
+                for hop in hint_hops(path):
+                    load = _planned(hop_level, hop_model, hop, hop_type)
+                    if load is None:
+                        break
+                    hop_type = self._child_type_name(
+                        hop_type, hop, load.related_model, info
+                    )
+                    hop_level, hop_model = load.children, load.related_model
 
-        def _walk_selections(
+        def _plan_selection(
+            level: dict[str, _PlannedPrefetch],
             selection_set: Any,
             current_model: type,
-            prefix: str = "",
-            type_name: str | None = None,
+            type_name: str | None,
         ) -> None:
-            if selection_set is None:
-                return  # pragma: no cover
-            meta = current_model._meta  # type: ignore[attr-defined]
             for node in iter_field_nodes(selection_set, fragments):
                 field_name = _to_snake(node.name.value)
-                full_path = f"{prefix}__{field_name}" if prefix else field_name
-
-                # Declared against the field name, so these also apply to computed
-                # fields that are not ORM fields themselves.
-                for rel_path in _hint_paths(
-                    type_name, current_model, field_name, prefix
-                ):
-                    hint_ancestor = _find_custom_ancestor(rel_path)
-                    if hint_ancestor is not None:
-                        custom_sub_prefetches[hint_ancestor].append(
-                            rel_path[len(hint_ancestor) + 2 :]
-                        )
-                    else:
-                        prefetch_paths.append(rel_path)
-
-                if field_name not in meta.fields_map:
-                    continue
-                field_obj = meta.fields_map[field_name]
-                field_cls = type(field_obj).__name__
-
-                is_rel = (
-                    field_cls == "ForeignKeyFieldInstance"
-                    or field_cls in _MANY_REL_TYPES
-                )
-                if not is_rel:
-                    continue
 
                 # A field that answers for itself will ignore whatever the
                 # prefetch loads, so do not pay for it.
                 if self.resolves_itself(type_name, field_name):
                     continue
+                _plan_hints(level, current_model, type_name, field_name)
 
-                related_model = field_obj.related_model
-                child_type = self._child_type_name(
-                    type_name, node.name.value, related_model, info
-                )
-
-                ancestor = _find_custom_ancestor(full_path)
-                if ancestor is not None:
-                    sub_path = full_path[len(ancestor) + 2 :]
-                    custom_sub_prefetches[ancestor].append(sub_path)
-                    if node.selection_set:
-                        _walk_selections(
-                            node.selection_set,
-                            related_model,
-                            full_path,
-                            type_name=child_type,
-                        )
+                load = _planned(level, current_model, field_name, type_name)
+                if load is None or not node.selection_set:
                     continue
-
-                custom = _get_custom_qs(
-                    type_name,
-                    field_name,
-                    related_model,
+                child_type = self._child_type_name(
+                    type_name, node.name.value, load.related_model, info
                 )
-                if custom is not None:
-                    if field_cls == "ForeignKeyFieldInstance":
-                        fk_col = _get_reverse_fk_field(
-                            related_model,
-                            current_model,
-                            field_name,
-                        )
-                    elif field_cls == "BackwardFKRelation":
-                        fk_col = field_obj.relation_field
-                    elif field_cls == "ManyToManyFieldInstance":
-                        fk_col = None
-                    else:
-                        fk_col = getattr(
-                            field_obj, "relation_field", None
-                        )  # pragma: no cover
-
-                    custom_sub_prefetches[full_path] = []
-                    custom_rels.append(
-                        _CustomRel(
-                            full_path=full_path,
-                            field_name=field_name,
-                            related_model=related_model,
-                            fk_col=fk_col,
-                            qs_fn=custom,
-                            sub_prefetches=custom_sub_prefetches[full_path],
-                        )
-                    )
-                else:
-                    prefetch_paths.append(full_path)
-
-                if node.selection_set:
-                    _walk_selections(
-                        node.selection_set,
-                        related_model,
-                        full_path,
-                        type_name=child_type,
-                    )
+                _plan_selection(
+                    load.children, node.selection_set, load.related_model, child_type
+                )
 
         root_type_name = self._selection_type_name(model, info)
         for field_node in field_nodes_from_info(info):
-            _walk_selections(field_node.selection_set, model, type_name=root_type_name)
-
-        # Batching a scoped relation filters the related model by the column
-        # that points back at the parent. A forward FK has no such column - it
-        # lives on the parent - so there is nothing to batch on. Those edges are
-        # scoped per row by the relation resolver instead: slower, but correct,
-        # where attempting the batch raises on an unknown filter param.
-        custom_rels = [
-            crel
-            for crel in custom_rels
-            if crel.fk_col is None or crel.fk_col in crel.related_model._meta.fields_map
-        ]
-
-        return prefetch_paths, custom_rels
+            if field_node.selection_set is not None:
+                _plan_selection(plan, field_node.selection_set, model, root_type_name)
+        return plan
 
     async def apply_optimizer_hints(
         self,
@@ -1126,23 +1100,19 @@ class TortoiseBackend(BaseBackend):
         except AttributeError:
             return _apply_python_ordering(list(await query), orderings)
 
-        get_qs = self._type_querysets.get(model)
-        if get_qs is not None:
-            query = get_qs(query, info)
+        query = self.apply_type_scope(query, model, info)
 
-        prefetch_paths, custom_rels = self._relation_prefetches(store, model, info)
+        plan = self._relation_prefetches(store, model, info)
 
-        if prefetch_paths:
-            query = query.prefetch_related(
-                *_coalesce_tortoise_prefetch_paths(model, prefetch_paths)
-            )
+        if plan:
+            query = query.prefetch_related(*_prefetch_lookups(plan))
         if orderings:
             _remember_query_ordering(query, orderings)
 
         results = list(await query)
 
-        if custom_rels:
-            await self._apply_custom_prefetch(results, custom_rels)
+        if plan:
+            await self._finish_prefetches(results, plan)
 
         return results
 
@@ -1151,9 +1121,9 @@ class TortoiseBackend(BaseBackend):
     ) -> list[Any]:
         """Eager-load the selected relations onto instances already in memory.
 
-        ``fetch_for_list`` fills the relation caches in place, so scalar values
-        the caller is holding - which may be fresher than the database,
-        straight out of a mutation - are never overwritten.
+        Prefetching fills the relation caches in place, so scalar values the
+        caller is holding - which may be fresher than the database, straight
+        out of a mutation - are never overwritten.
 
         Returns the rows it actually loaded onto, which is empty when the
         selection named no relations.
@@ -1164,90 +1134,40 @@ class TortoiseBackend(BaseBackend):
 
         loaded: list[Any] = []
         for model, rows in by_model.items():
-            prefetch_paths, custom_rels = self._relation_prefetches(store, model, info)
-            if prefetch_paths:
-                # Paths go in raw here: ``fetch_for_list`` splits ``a__b``
-                # itself, and rejects the ``Prefetch`` objects the queryset
-                # path needs.
-                await model.fetch_for_list(rows, *prefetch_paths)
-            if custom_rels:
-                await self._apply_custom_prefetch(rows, custom_rels)
-            if prefetch_paths or custom_rels:
-                loaded.extend(rows)
+            plan = self._relation_prefetches(store, model, info)
+            if not plan:
+                continue
+            await _prefetch_onto(model, rows, _prefetch_lookups(plan))
+            await self._finish_prefetches(rows, plan)
+            loaded.extend(rows)
 
         return loaded
 
-    async def _apply_custom_prefetch(
-        self,
-        parents: list[Any],
-        custom_rels: list[_CustomRel],
+    async def _finish_prefetches(
+        self, rows: list[Any], plan: dict[str, _PlannedPrefetch]
     ) -> None:
-        """Execute batch queries for relationships that need custom querysets
-        (load callable or nested scope_rows) and assign results to parents."""
-        if not parents:
-            return
+        """Hide scoped-out forward rows, then mark every scoped cache.
 
-        for crel in custom_rels:
-            parent_ids = [p.id for p in parents if hasattr(p, "id")]
-            if not parent_ids:
+        A forward relation is prefetched unscoped: Tortoise clears the parent's
+        foreign key column when a filtered prefetch finds nothing, which a later
+        save would write back. The rows the scope rejects are dropped from the
+        cache here instead, leaving the column alone.
+        """
+        from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+        for name, load in plan.items():
+            if load.scope is not None:
+                if load.forward:
+                    await _hide_scoped_out(rows, name, load)
+                mark_relations_scoped(rows, [name])
+            if not load.children:
                 continue
-
-            if crel.fk_col is not None:
-                qs = crel.related_model.filter(
-                    **{f"{crel.fk_col}__in": parent_ids},
+            related = _cached_related(rows, name)
+            if load.many_to_many and related:
+                await _prefetch_onto(
+                    load.related_model, related, _prefetch_lookups(load.children)
                 )
-            else:
-                qs = crel.related_model.all()
-
-            qs = crel.qs_fn(qs)
-
-            if crel.sub_prefetches:
-                qs = qs.prefetch_related(*crel.sub_prefetches)
-
-            items = list(await qs)
-            if _query_orderings(qs) is None:
-                items = sorted(items, key=lambda item: getattr(item, "id", 0))
-
-            if crel.fk_col is not None:
-                groups: dict[int, list[Any]] = defaultdict(list)
-                for item in items:
-                    pid = getattr(item, crel.fk_col, None)
-                    if pid is not None:
-                        groups[pid].append(item)
-                for parent in parents:
-                    setattr(
-                        parent,
-                        f"_{crel.field_name}",
-                        groups.get(parent.id, []),
-                    )
-            else:
-                for parent in parents:
-                    rel_value = getattr(parent, crel.field_name)
-                    parent_qs = (
-                        rel_value.all()
-                        if hasattr(rel_value, "all")
-                        else crel.related_model.filter(
-                            pk__in=[item.id for item in list(rel_value)]
-                        )
-                    )
-                    parent_qs = crel.qs_fn(parent_qs)
-                    if crel.sub_prefetches:
-                        parent_qs = parent_qs.prefetch_related(
-                            *crel.sub_prefetches
-                        )  # pragma: no cover
-                    setattr(
-                        parent,
-                        f"_{crel.field_name}",
-                        _apply_python_ordering(
-                            sorted(
-                                list(await parent_qs),
-                                key=lambda item: getattr(item, "id", 0),
-                            )
-                            if _query_orderings(parent_qs) is None
-                            else list(await parent_qs),
-                            _query_orderings(parent_qs),
-                        ),
-                    )
+            await self._finish_prefetches(related, load.children)
 
 
 class _TortoiseUpsertOps:
@@ -1356,22 +1276,6 @@ class _TortoiseUpsertOps:
 # ---------------------------------------------------------------------------
 
 
-def _get_reverse_fk_field(
-    related_model: type,
-    parent_model: type,
-    field_name: str,
-) -> str:
-    """Find the FK column on related_model that points back to parent_model."""
-    meta = related_model._meta  # type: ignore[attr-defined]
-    for name, field_obj in meta.fields_map.items():
-        if (
-            type(field_obj).__name__ == "ForeignKeyFieldInstance"
-            and field_obj.related_model is parent_model
-        ):
-            return getattr(field_obj, "source_field", f"{name}_id")
-    return f"{field_name}_id"
-
-
 def _make_tortoise_to_one_resolver(
     backend: Any,
     fname: str,
@@ -1385,14 +1289,16 @@ def _make_tortoise_to_one_resolver(
     """
 
     async def resolver(self: Any, info: Any) -> Any:
-        from strawberry_orm.lazy_resolution import _tortoise_relation_prefetched
+        from strawberry_orm.lazy_resolution import (
+            _tortoise_relation_prefetched,
+            relation_cache_is_scoped,
+        )
 
         restrict = backend.relation_scope(type(self), fname, info)
-        if restrict is None:
-            related = getattr(self, fname, None)
-            return await related if inspect.isawaitable(related) else related
-
-        if _tortoise_relation_prefetched(self, fname):
+        if restrict is None or (
+            _tortoise_relation_prefetched(self, fname)
+            and relation_cache_is_scoped(self, fname)
+        ):
             related = getattr(self, fname, None)
             return await related if inspect.isawaitable(related) else related
 

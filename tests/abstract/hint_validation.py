@@ -48,20 +48,26 @@ class AbstractTestHintValidation:
 
         assert "Did you mean" not in str(excinfo.value)
 
-    def test_multi_hop_hint_is_rejected(self, orm, Post):
-        with pytest.raises(ValueError, match=r"multi-hop using='author__name'"):
+    def test_multi_hop_hint_is_accepted(self, orm, Post):
+        @orm.type(Post)
+        class PT:
+            id: auto
+            title: auto
 
-            @orm.type(Post)
-            class PT:
-                id: auto
-                title: auto
+            @orm.field.computed(using=["author.posts", "comments__author"])
+            def byline(self) -> str:
+                return ""
 
-                @orm.field.computed(using=["author__name"])
-                def byline(self) -> str:
-                    return ""
+        assert orm.backend._store.get("PT", "byline").using == [
+            "author.posts",
+            "comments__author",
+        ]
 
-    def test_dotted_hint_is_rejected(self, orm, Post):
-        with pytest.raises(ValueError, match=r"multi-hop using='author.name'"):
+    def test_multi_hop_hint_names_the_hop_that_fails(self, orm, Post):
+        with pytest.raises(
+            ValueError,
+            match=r"User has no relation 'name' \(in using='author.name'\)",
+        ):
 
             @orm.type(Post)
             class PT:
@@ -69,6 +75,18 @@ class AbstractTestHintValidation:
                 title: auto
 
                 @orm.field.computed(using=["author.name"])
+                def byline(self) -> str:
+                    return ""
+
+    def test_multi_hop_hint_suggests_at_the_failing_hop(self, orm, Post):
+        with pytest.raises(ValueError, match=r"Did you mean 'posts'"):
+
+            @orm.type(Post)
+            class PT:
+                id: auto
+                title: auto
+
+                @orm.field.computed(using=["author__post"])
                 def byline(self) -> str:
                     return ""
 

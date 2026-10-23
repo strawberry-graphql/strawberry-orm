@@ -147,7 +147,7 @@ A field you resolve yourself: your callable receives `self` and runs once per pa
 | Parameter | Applies to | Meaning |
 | --- | --- | --- |
 | `scope` | `eager` | Narrow rows through this relation edge; the keyword spelling of handing `eager` a `(query, info)` callable. |
-| `using` | `lazy` | Relation names the resolver reads; they are eager-loaded alongside the parent. |
+| `using` | `lazy` | Relations the resolver reads, eager-loaded alongside the parent. An entry can walk several hops, `"author.posts"` or `"author__posts"`, and each hop is scoped as a selection of it would be. |
 | `compute` | `eager` | Backend expressions annotated onto the query. |
 | `filters` / `order` | both | Attach generated `filter` / `order` arguments to this field. |
 | `disable_optimization` | `eager` | Skip the optimizer for this field, and silence its lazy-load warning. |

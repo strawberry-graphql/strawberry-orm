@@ -24,6 +24,7 @@ from ._base import (
     AggregateMeta,
     BaseBackend,
     extract_element_type,
+    hint_hops,
     input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
@@ -31,6 +32,45 @@ from ._base import (
 
 #: Relation-name sets by model class; see :meth:`DjangoBackend.relation_names`.
 _RELATION_NAMES: dict[type, set[str]] = {}
+
+_TO_ONE_FIELDS = frozenset({"ForeignKey", "OneToOneField", "OneToOneRel"})
+_TO_MANY_FIELDS = frozenset({"ManyToManyField", "ManyToManyRel", "ManyToOneRel"})
+
+
+def _relation_kind(field: Any) -> str | None:
+    """``"one"`` or ``"many"`` for a relation the optimizer can load, else ``None``."""
+    name = type(field).__name__
+    if name in _TO_ONE_FIELDS:
+        return "one"
+    if name in _TO_MANY_FIELDS:
+        return "many"
+    return None
+
+
+class _PlannedLookup:
+    """One relation in a query's load plan, with the relations under it.
+
+    ``to_attr`` is set for an ``on=`` view, which loads ``relation`` into an
+    attribute of its own and is never shared.
+    """
+
+    __slots__ = ("to_one", "queryset", "relation", "to_attr", "scoped", "children")
+
+    def __init__(
+        self,
+        to_one: bool,
+        queryset: Any,
+        relation: str = "",
+        to_attr: str | None = None,
+        scoped: bool = False,
+    ) -> None:
+        self.to_one = to_one
+        self.queryset = queryset
+        self.relation = relation
+        self.to_attr = to_attr
+        self.scoped = scoped
+        self.children: dict[str, _PlannedLookup] = {}
+
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
     "AutoField": int,
@@ -674,6 +714,18 @@ class DjangoBackend(BaseBackend):
     def instance_pk(self, instance: Any) -> Any:
         return getattr(instance, "pk", None)
 
+    def query_model(self, query: Any) -> type | None:
+        return getattr(query, "model", None)
+
+    def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> set[Any]:
+        def _run() -> set[Any]:
+            queryset = self.apply_type_scope(
+                model._default_manager.filter(pk__in=pks), model, info
+            )
+            return set(queryset.values_list("pk", flat=True))
+
+        return run_sync(_run, thread_sensitive=True)
+
     def split_parent_predicate(
         self, query: Any, parent_pk: Any
     ) -> tuple[str, Any, Any] | None:
@@ -879,6 +931,8 @@ class DjangoBackend(BaseBackend):
         """
         import re
 
+        from django.db.models import Prefetch
+
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
             fragments_from_info,
@@ -918,43 +972,70 @@ class DjangoBackend(BaseBackend):
                     qs = call_scope(load_fn, qs, info)
                 return qs
 
-            def _walk_selections(
+            # A relation reached both by the selection and by a ``using=`` path
+            # must be loaded once, with one queryset. A plain lookup next to a
+            # scoped one fills the cache with whichever rows Django loads first.
+            plan: dict[str, _PlannedLookup] = {}
+
+            def _planned(
+                level: dict[str, _PlannedLookup],
+                key: str,
+                to_one: bool,
+                type_name: str | None,
+                related_model: type,
+            ) -> _PlannedLookup:
+                lookup = level.get(key)
+                if lookup is None:
+                    lookup = level[key] = _PlannedLookup(
+                        to_one=to_one,
+                        queryset=_get_nested_queryset(type_name, key, related_model),
+                    )
+                return lookup
+
+            def _plan_hints(
+                level: dict[str, _PlannedLookup],
+                current_model: type,
+                type_name: str | None,
+                field_name: str,
+            ) -> None:
+                """Plan the relation paths declared on ``using=`` for *field_name*.
+
+                Declared against the field name, so they apply to computed
+                fields that are not ORM fields themselves.
+                """
+                hints = (
+                    store.get(type_name, field_name) if type_name and store else None
+                )
+                if not hints or hints.disable_optimization or not hints.using:
+                    return
+                for path in hints.using:
+                    hop_level, hop_model, hop_type = level, current_model, type_name
+                    for hop in hint_hops(path):
+                        try:
+                            rel_field = hop_model._meta.get_field(hop)  # type: ignore[attr-defined]
+                        except Exception:
+                            break
+                        kind = _relation_kind(rel_field)
+                        if kind is None:
+                            break
+                        related_model = rel_field.related_model
+                        lookup = _planned(
+                            hop_level, hop, kind == "one", hop_type, related_model
+                        )
+                        hop_type = self._child_type_name(
+                            hop_type, hop, related_model, info
+                        )
+                        hop_level, hop_model = lookup.children, related_model
+
+            def _plan_selection(
+                level: dict[str, _PlannedLookup],
                 selection_set: Any,
                 current_model: type,
-                prefix: str = "",
-                in_prefetch: bool = False,
-                type_name: str | None = None,
+                type_name: str | None,
             ) -> None:
-                if selection_set is None:
-                    return
                 meta = current_model._meta  # type: ignore[attr-defined]
                 for node in iter_field_nodes(selection_set, fragments):
                     field_name = _to_snake(node.name.value)
-                    full_path = f"{prefix}__{field_name}" if prefix else field_name
-
-                    # Eager-load hints are declared against the field name, so they
-                    # apply to computed fields that are not ORM fields themselves.
-                    if type_name and store:
-                        hints = store.get(type_name, field_name)
-                        if hints and not hints.disable_optimization and hints.using:
-                            for rel_name in hints.using:
-                                try:
-                                    rel_field = meta.get_field(rel_name)
-                                except Exception:
-                                    continue
-                                rel_class = type(rel_field).__name__
-                                rel_path = (
-                                    f"{prefix}__{rel_name}" if prefix else rel_name
-                                )
-                                is_fk = rel_class in (
-                                    "ForeignKey",
-                                    "OneToOneField",
-                                    "OneToOneRel",
-                                )
-                                if is_fk and not in_prefetch:
-                                    select_related.append(rel_path)
-                                else:
-                                    prefetch_related.append(rel_path)
 
                     # A on= field is served by a relation under another name,
                     # so ask the model about the relation, not the field.
@@ -963,158 +1044,99 @@ class DjangoBackend(BaseBackend):
                         on_hints = store.get(type_name, field_name)
                         on = getattr(on_hints, "on", None) if on_hints else None
                     relation_name = on or field_name
-                    on_path = f"{prefix}__{relation_name}" if prefix else relation_name
 
                     # A field that answers for itself will ignore whatever the
                     # prefetch loads, so do not pay for it.
                     if on is None and self.resolves_itself(type_name, field_name):
                         continue
+                    _plan_hints(level, current_model, type_name, field_name)
 
                     try:
                         field_obj = meta.get_field(relation_name)
                     except Exception:
                         continue
 
-                    field_class_name = type(field_obj).__name__
-
-                    if field_class_name in ("ForeignKey", "OneToOneField"):
-                        attname = getattr(field_obj, "attname", None)
-                        if (
-                            attname
-                            and field_name == attname
-                            and field_name != field_obj.name
-                        ):
-                            continue
-                        related_model = field_obj.related_model
-                        child_type = self._child_type_name(
-                            type_name, node.name.value, related_model, info
-                        )
-                        custom_qs = _get_nested_queryset(
-                            type_name, field_name, related_model
-                        )
-                        if custom_qs is not None:
-                            from django.db.models import Prefetch
-
-                            prefetch_related.append(
-                                Prefetch(full_path, queryset=custom_qs)
-                            )
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch=True,
-                                    type_name=child_type,
-                                )
-                        elif in_prefetch:
-                            prefetch_related.append(full_path)
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch,
-                                    type_name=child_type,
-                                )
-                        else:
-                            select_related.append(full_path)
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch,
-                                    type_name=child_type,
-                                )
-                    elif field_class_name == "OneToOneRel":
-                        related_model = field_obj.related_model
-                        child_type = self._child_type_name(
-                            type_name, node.name.value, related_model, info
-                        )
-                        custom_qs = _get_nested_queryset(
-                            type_name, field_name, related_model
-                        )
-                        if custom_qs is not None:
-                            from django.db.models import Prefetch
-
-                            prefetch_related.append(
-                                Prefetch(full_path, queryset=custom_qs)
-                            )
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch=True,
-                                    type_name=child_type,
-                                )
-                        elif in_prefetch:
-                            prefetch_related.append(full_path)
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch,
-                                    type_name=child_type,
-                                )
-                        else:
-                            select_related.append(full_path)
-                            if node.selection_set:
-                                _walk_selections(
-                                    node.selection_set,
-                                    related_model,
-                                    full_path,
-                                    in_prefetch,
-                                    type_name=child_type,
-                                )
-                    elif field_class_name in (
-                        "ManyToManyField",
-                        "ManyToManyRel",
-                        "ManyToOneRel",
+                    kind = _relation_kind(field_obj)
+                    if kind is None:
+                        continue
+                    attname = getattr(field_obj, "attname", None)
+                    if (
+                        attname
+                        and field_name == attname
+                        and field_name != field_obj.name
                     ):
-                        related_model = field_obj.related_model
-                        child_type = self._child_type_name(
-                            type_name, node.name.value, related_model, info
-                        )
+                        continue
+                    related_model = field_obj.related_model
+
+                    if kind == "many" and on is not None:
+                        # to_attr keeps the two views apart: without it the
+                        # second Prefetch of the same relation collides.
                         custom_qs = _get_nested_queryset(
                             type_name, field_name, related_model
                         )
-                        if on is not None:
-                            # to_attr keeps the two views apart: without it the
-                            # second Prefetch of the same relation collides.
-                            from django.db.models import Prefetch
+                        level.setdefault(
+                            f"@{field_name}",
+                            _PlannedLookup(
+                                to_one=False,
+                                queryset=(
+                                    custom_qs
+                                    if custom_qs is not None
+                                    else related_model._default_manager.all()
+                                ),
+                                relation=relation_name,
+                                to_attr=field_name,
+                                scoped=custom_qs is not None,
+                            ),
+                        )
+                        continue
 
-                            queryset = (
-                                custom_qs
-                                if custom_qs is not None
-                                else related_model._default_manager.all()
-                            )
-                            prefetch_related.append(
-                                Prefetch(on_path, queryset=queryset, to_attr=field_name)
-                            )
-                        elif custom_qs is not None:
-                            from django.db.models import Prefetch
+                    lookup = _planned(
+                        level, field_name, kind == "one", type_name, related_model
+                    )
+                    if node.selection_set:
+                        child_type = self._child_type_name(
+                            type_name, node.name.value, related_model, info
+                        )
+                        _plan_selection(
+                            lookup.children,
+                            node.selection_set,
+                            related_model,
+                            child_type,
+                        )
 
-                            prefetch_related.append(
-                                Prefetch(full_path, queryset=custom_qs)
-                            )
-                        else:
-                            prefetch_related.append(full_path)
-                        if node.selection_set and on is None:
-                            _walk_selections(
-                                node.selection_set,
-                                related_model,
-                                full_path,
-                                in_prefetch=True,
-                                type_name=child_type,
-                            )
+            def _emit(
+                level: dict[str, _PlannedLookup], prefix: str, in_prefetch: bool
+            ) -> None:
+                """Parents go first: Django resolves ``a__b`` through ``a``."""
+                for key, lookup in level.items():
+                    if lookup.to_attr is not None:
+                        relation = lookup.relation
+                        path = f"{prefix}__{relation}" if prefix else relation
+                        prefetch = Prefetch(
+                            path, queryset=lookup.queryset, to_attr=lookup.to_attr
+                        )
+                        if lookup.scoped:
+                            prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
+                        prefetch_related.append(prefetch)
+                        continue
+                    path = f"{prefix}__{key}" if prefix else key
+                    if lookup.queryset is not None:
+                        prefetch_related.append(_scoped_prefetch(path, lookup.queryset))
+                        _emit(lookup.children, path, True)
+                    elif lookup.to_one and not in_prefetch:
+                        select_related.append(path)
+                        _emit(lookup.children, path, False)
+                    else:
+                        prefetch_related.append(path)
+                        _emit(lookup.children, path, True)
 
             root_type_name = self._selection_type_name(model, info)
             for field_node in field_nodes_from_info(info):
-                _walk_selections(
-                    field_node.selection_set, model, type_name=root_type_name
-                )
+                if field_node.selection_set is not None:
+                    _plan_selection(
+                        plan, field_node.selection_set, model, root_type_name
+                    )
+            _emit(plan, "", False)
 
             return select_related, prefetch_related
 
@@ -1127,10 +1149,7 @@ class DjangoBackend(BaseBackend):
             except AttributeError:
                 return query
 
-            optimized_query = query
-            get_qs = self._type_querysets.get(model)
-            if get_qs is not None:
-                optimized_query = get_qs(optimized_query, info)
+            optimized_query = self.apply_type_scope(query, model, info)
 
             select_related, prefetch_related = self._relation_lookups(
                 store, model, info
@@ -1143,12 +1162,20 @@ class DjangoBackend(BaseBackend):
                 optimized_query = optimized_query.select_related(
                     *_dedupe_lookups(select_related)
                 )
+            # select_related wins over a later Prefetch of the same relation
+            # and would keep the unscoped row. Strip it after the optimizer's
+            # own select_related so a scoped prefetch actually runs.
+            optimized_query = _strip_conflicting_select_related(
+                optimized_query, prefetch_related
+            )
             if prefetch_related:
                 optimized_query = optimized_query.prefetch_related(
                     *_dedupe_lookups(prefetch_related)
                 )
 
-            return list(optimized_query)
+            rows = list(optimized_query)
+            _mark_scoped_prefetches(rows, prefetch_related)
+            return rows
 
         return run_sync(optimize, thread_sensitive=True)
 
@@ -1177,7 +1204,12 @@ class DjangoBackend(BaseBackend):
                 )
                 lookups = _dedupe_lookups([*select_related, *prefetch_related])
                 if lookups:
+                    # select_related / prefetch_related already on the instance
+                    # makes Django skip this prefetch and keep the unscoped
+                    # cache. Drop those caches so the scoped prefetch runs.
+                    _clear_scoped_relation_caches(rows, lookups)
                     prefetch_related_objects(rows, *lookups)
+                    _mark_scoped_prefetches(rows, lookups)
                     loaded.extend(rows)
             return loaded
 
@@ -1201,10 +1233,14 @@ def _make_on_resolver(
     """
 
     def resolver(self: Any, info: Any) -> Any:
+        from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+
         prefetched = self.__dict__.get(field_name)
-        if prefetched is not None:
-            return prefetched
         restrict = backend.relation_scope(type(self), field_name, info, on=relation)
+        if prefetched is not None and (
+            restrict is None or relation_cache_is_scoped(self, field_name)
+        ):
+            return prefetched
         queryset = getattr(self, relation).all()
         return queryset if restrict is None else restrict(queryset, info)
 
@@ -1218,6 +1254,120 @@ def _make_on_resolver(
     return resolver
 
 
+def _scoped_prefetch(path: str, queryset: Any, **kwargs: Any) -> Any:
+    """A ``Prefetch`` whose cache is safe to trust at resolve time."""
+    from django.db.models import Prefetch
+
+    prefetch = Prefetch(path, queryset=queryset, **kwargs)
+    prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
+    return prefetch
+
+
+def _scoped_prefetch_attr(lookup: Any) -> str | None:
+    """Attribute a scoped ``Prefetch`` writes, or ``None`` for other lookups."""
+    if not getattr(lookup, "_strawberry_orm_scoped", False):
+        return None
+    if getattr(lookup, "to_attr", None):
+        return lookup.to_attr
+    through = getattr(lookup, "prefetch_through", "") or ""
+    head = through.split("__")[0]
+    return head or None
+
+
+def _strip_conflicting_select_related(queryset: Any, lookups: list[Any]) -> Any:
+    """Drop ``select_related`` entries a scoped prefetch has to replace.
+
+    Django keeps the ``select_related`` object and skips the prefetch, which
+    would leave the unscoped row in the cache.
+    """
+    names = {name for lookup in lookups if (name := _scoped_prefetch_attr(lookup))}
+    current = queryset.query.select_related
+    if not current or not names:
+        return queryset
+    if current is True:
+        return queryset.select_related(None)
+
+    def prune(node: dict[str, Any]) -> dict[str, Any]:
+        return {key: prune(value) for key, value in node.items() if key not in names}
+
+    pruned = prune(current)
+    clone = queryset._clone()
+    clone.query.select_related = pruned or False
+    return clone
+
+
+def _clear_django_relation_cache(instance: Any, field_name: str) -> None:
+    try:
+        field = instance._meta.get_field(field_name)
+    except Exception:
+        field = None
+    if (
+        field is not None
+        and getattr(field, "is_cached", None)
+        and field.is_cached(instance)
+    ):
+        field.delete_cached_value(instance)
+    cache = getattr(instance, "_prefetched_objects_cache", None)
+    if isinstance(cache, dict):
+        cache.pop(field_name, None)
+    # on= stores its rows under to_attr, which is not a model field.
+    if field is None:
+        instance.__dict__.pop(field_name, None)
+
+
+def _clear_scoped_relation_caches(instances: list[Any], lookups: list[Any]) -> None:
+    names = [name for lookup in lookups if (name := _scoped_prefetch_attr(lookup))]
+    if not names:
+        return
+    for instance in instances:
+        for name in names:
+            _clear_django_relation_cache(instance, name)
+
+
+def _django_related_children(instances: list[Any], name: str) -> list[Any]:
+    children: list[Any] = []
+    for instance in instances:
+        value = None
+        state = getattr(instance, "_state", None)
+        fields_cache = getattr(state, "fields_cache", None)
+        if isinstance(fields_cache, dict) and name in fields_cache:
+            value = fields_cache[name]
+        if value is None:
+            prefetched = getattr(instance, "_prefetched_objects_cache", None)
+            if isinstance(prefetched, dict) and name in prefetched:
+                value = prefetched[name]
+        if value is None and name in getattr(instance, "__dict__", {}):
+            value = instance.__dict__[name]
+        if value is None:
+            continue
+        result_cache = getattr(value, "_result_cache", None)
+        if isinstance(result_cache, list):
+            children.extend(result_cache)
+        elif isinstance(value, list):
+            children.extend(value)
+        else:
+            children.append(value)
+    return children
+
+
+def _mark_scoped_prefetches(instances: list[Any], lookups: list[Any]) -> None:
+    """Mark caches filled by scoped prefetches so resolvers can trust them."""
+    from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+    for lookup in lookups:
+        if not getattr(lookup, "_strawberry_orm_scoped", False):
+            continue
+        through = getattr(lookup, "prefetch_through", "") or ""
+        path = [part for part in through.split("__") if part]
+        if not path:
+            continue
+        nodes = list(instances)
+        for segment in path[:-1]:
+            nodes = _django_related_children(nodes, segment)
+        attr = getattr(lookup, "to_attr", None) or path[-1]
+        mark_relations_scoped(nodes, [attr])
+
+
 def _scoped_related_queryset(
     backend: Any, instance: Any, field_name: str, info: Any
 ) -> Any:
@@ -1229,16 +1379,26 @@ def _scoped_related_queryset(
     ``scope_rows`` entirely and hand back rows the caller may not read, so the
     scope is applied here instead.
 
-    A prefetched relation was already scoped on the way in; re-filtering it
-    would throw the cache away and issue the query this path exists to avoid.
+    A cache is returned only when this library filled it after applying
+    ``scope_rows``. A ``prefetch_related`` in the resolver is re-queried.
     """
-    from strawberry_orm.lazy_resolution import _django_relation_prefetched
+    from strawberry_orm.lazy_resolution import (
+        _django_relation_prefetched,
+        relation_cache_is_scoped,
+    )
 
     manager = getattr(instance, field_name)
-    if _django_relation_prefetched(instance, field_name):
-        return manager.all()
-
     restrict = backend.relation_scope(type(instance), field_name, info)
+    prefetched = _django_relation_prefetched(instance, field_name)
+    if prefetched and (
+        restrict is None or relation_cache_is_scoped(instance, field_name)
+    ):
+        return manager.all()
+    if prefetched and restrict is not None:
+        cache = getattr(instance, "_prefetched_objects_cache", None)
+        if isinstance(cache, dict):
+            cache.pop(field_name, None)
+
     queryset = manager.all()
     return queryset if restrict is None else restrict(queryset, info)
 
@@ -1251,7 +1411,10 @@ def _scoped_related_instance(
     A scoped-out row reads as absent, matching what the optimizer produces
     when its scoped load finds nothing on the other end.
     """
-    from strawberry_orm.lazy_resolution import _django_relation_prefetched
+    from strawberry_orm.lazy_resolution import (
+        _django_relation_prefetched,
+        relation_cache_is_scoped,
+    )
 
     restrict = backend.relation_scope(type(instance), field_name, info)
     if restrict is None:
@@ -1259,9 +1422,21 @@ def _scoped_related_instance(
 
     # With a scope in play a removed row has to read as absent. The scoped
     # eager load leaves the cache empty, and Django's forward descriptor
-    # raises rather than returning None for a non-nullable column.
+    # raises rather than returning None for a non-nullable column. A cache
+    # this library did not fill is not that load: re-check the primary key.
     if _django_relation_prefetched(instance, field_name):
-        return getattr(instance, field_name, None)
+        if relation_cache_is_scoped(instance, field_name):
+            return getattr(instance, field_name, None)
+        related = getattr(instance, field_name, None)
+        if related is None:
+            return None
+        pk = getattr(related, "pk", None)
+        if pk is None:
+            # No key to re-check. Hiding the row is the safe result: a
+            # scope_rows hook cannot see an unsaved instance.
+            return None
+        queryset = type(related)._default_manager.filter(pk=pk)
+        return restrict(queryset, info).first()
 
     related = getattr(instance, field_name, None)
     if related is None:

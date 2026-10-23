@@ -6,10 +6,12 @@ import logging
 import re
 import warnings
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 from strawberry.extensions import SchemaExtension
 
@@ -17,6 +19,82 @@ if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
 
 logger = logging.getLogger("strawberry_orm.lazy_query")
+
+#: Relations this library loaded after applying ``scope_rows``. A cache filled
+#: any other way — ``select_related``, ``prefetch_related``, ``joinedload`` —
+#: is not in the set and must be re-checked.
+_SCOPED_RELATIONS = "_strawberry_orm_scoped_relations"
+_ROW_SCOPED = "_strawberry_orm_row_scoped"
+_QUERY_SCOPED = "_strawberry_orm_type_scoped"
+_SCOPED_QUERIES: WeakKeyDictionary[Any, None] = WeakKeyDictionary()
+_SCOPED_EDGES: WeakKeyDictionary[Any, list[tuple[type, str]]] = WeakKeyDictionary()
+
+
+def mark_relations_scoped(instances: Iterable[Any], names: Iterable[str]) -> None:
+    """Record that *names* on each instance were loaded with row scoping."""
+    adding = set(names)
+    if not adding:
+        return
+    for instance in instances:
+        if instance is None:
+            continue
+        current = getattr(instance, _SCOPED_RELATIONS, None)
+        if not isinstance(current, set):
+            current = set()
+            setattr(instance, _SCOPED_RELATIONS, current)
+        current.update(adding)
+
+
+def relation_cache_is_scoped(instance: Any, field_name: str) -> bool:
+    """Whether *field_name*'s loaded value was produced by a scoped load."""
+    current = getattr(instance, _SCOPED_RELATIONS, None)
+    return isinstance(current, set) and field_name in current
+
+
+def mark_rows_scoped(instances: Iterable[Any]) -> None:
+    """Record that these instances already came from a scoped query."""
+    for instance in instances:
+        with suppress(Exception):
+            setattr(instance, _ROW_SCOPED, True)
+
+
+def row_is_scoped(instance: Any) -> bool:
+    """Whether *instance* was loaded by a query that already applied scope_rows."""
+    return getattr(instance, _ROW_SCOPED, False) is True
+
+
+def mark_query_scoped(query: Any) -> None:
+    """Remember that ``scope_rows`` has already been applied to *query*."""
+    with suppress(Exception):
+        setattr(query, _QUERY_SCOPED, True)
+    with suppress(TypeError):
+        _SCOPED_QUERIES[query] = None
+
+
+def query_is_scoped(query: Any) -> bool:
+    """Return whether *query* was already passed through ``scope_rows``."""
+    if getattr(query, _QUERY_SCOPED, False):
+        return True
+    # WeakKeyDictionary treats an unhashable query as absent.
+    return query in _SCOPED_QUERIES
+
+
+def remember_scoped_edges(query: Any, edges: list[tuple[type, str]]) -> None:
+    """Attach the scoped relations a loader just added to *query*."""
+    if not edges:
+        return
+    try:
+        _SCOPED_EDGES[query] = list(edges)
+    except TypeError:
+        return
+
+
+def take_scoped_edges(query: Any) -> list[tuple[type, str]]:
+    """Return and forget the scoped relations recorded for *query*."""
+    try:
+        return _SCOPED_EDGES.pop(query, [])
+    except TypeError:
+        return []
 
 
 def extensions_include_lazy_resolution(extensions: list[Any]) -> bool:
@@ -210,13 +288,20 @@ def _tortoise_relation_prefetched(instance: Any, field_name: str) -> bool | None
     if related_model is None:
         return None
 
+    field_cls = type(field).__name__
+
+    # A forward relation reads straight from this cache, so a cached ``None``
+    # - a null key, or a row the scope hid - is as loaded as a cached row.
+    if field_cls in ("ForeignKeyFieldInstance", "OneToOneFieldInstance") and (
+        f"_{field_name}" in getattr(instance, "__dict__", {})
+    ):
+        return True
+
     fetched = getattr(instance, "_fetched", None)
     if isinstance(fetched, (set, frozenset)) and field_name in fetched:
         return True
     if isinstance(fetched, dict) and field_name in fetched:
         return True
-
-    field_cls = type(field).__name__
 
     try:
         rel_value = getattr(instance, field_name)

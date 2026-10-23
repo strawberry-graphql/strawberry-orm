@@ -2435,41 +2435,6 @@ class TestLastCoverageLines:
 
         assert _tortoise_relation_prefetched(RaisingTags(), "tags") is False
 
-    def test_coalesce_tortoise_prefetch_paths_skips_unknown_nested_roots(self):
-        from tortoise.query_utils import Prefetch
-
-        from strawberry_orm.backends.tortoise import _coalesce_tortoise_prefetch_paths
-
-        class _PostModel:
-            _meta = SimpleNamespace(basequery=object())
-
-        class _PostQuerySet:
-            model = _PostModel
-            query = object()
-
-            def prefetch_related(self, *_args: str):
-                return self
-
-        class _BackwardFK:
-            related_model = _PostModel
-
-        _PostModel.all = classmethod(lambda cls: _PostQuerySet())  # type: ignore[method-assign]
-
-        class _FakeUser:
-            _meta = SimpleNamespace(
-                fields_map={"posts": _BackwardFK(), "name": object()}
-            )
-
-        assert (
-            _coalesce_tortoise_prefetch_paths(_FakeUser, ["not_a_relation__nested"])
-            == []
-        )
-        coalesced = _coalesce_tortoise_prefetch_paths(
-            _FakeUser, ["posts__tags", "posts"]
-        )
-        assert len(coalesced) == 1
-        assert isinstance(coalesced[0], Prefetch)
-
     def test_sqlalchemy_final_helper_branches(self, sa_session, seed, Post):
         from strawberry_orm.backends.sqlalchemy import (
             _build_reference_lookup_clauses,

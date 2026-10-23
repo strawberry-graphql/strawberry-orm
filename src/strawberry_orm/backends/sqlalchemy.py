@@ -19,6 +19,7 @@ from strawberry_orm.backends._base import (
     AggregateMeta,
     BaseBackend,
     extract_element_type,
+    hint_hops,
     input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
@@ -33,6 +34,19 @@ from strawberry_orm.types import DateGroupByInterval
 
 #: Relation-name sets by model class; see :meth:`SQLAlchemyBackend.relation_names`.
 _RELATION_NAMES: dict[type, set[str]] = {}
+
+
+class _PlannedLoad:
+    """One relation in a query's load plan, with the relations under it."""
+
+    __slots__ = ("attr", "uselist", "mapper", "criteria", "children")
+
+    def __init__(self, attr: Any, uselist: bool, mapper: Any, criteria: Any) -> None:
+        self.attr = attr
+        self.uselist = uselist
+        self.mapper = mapper
+        self.criteria = criteria
+        self.children: dict[str, _PlannedLoad] = {}
 
 
 def _primary_key(value: Any) -> Any:
@@ -629,6 +643,31 @@ class SQLAlchemyBackend(BaseBackend):
             return None
         return identity[0]
 
+    def query_model(self, query: Any) -> type | None:
+        try:
+            return query.column_descriptions[0]["entity"]
+        except (AttributeError, IndexError, KeyError, TypeError):
+            return None
+
+    def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
+        from inspect import isawaitable
+
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import select
+
+        pk_column = sa_inspect(model).primary_key[0]
+        stmt = self.apply_type_scope(
+            select(model).where(pk_column.in_(pks)), model, info
+        )
+        rows = self._execute_stmt(stmt, info)
+        if isawaitable(rows):
+
+            async def _await_pks() -> set[Any]:
+                return {self.instance_pk(row) for row in await rows}
+
+            return _await_pks()
+        return {self.instance_pk(row) for row in rows}
+
     def split_parent_predicate(
         self, query: Any, parent_pk: Any
     ) -> tuple[str, Any, Any] | None:
@@ -852,6 +891,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         fragments = fragments_from_info(info)
         mapper = sa_inspect(entity)
+        scoped_edges: list[tuple[type, str]] = []
 
         def _get_field_name(node: Any) -> str:
             """Extract field name from a GraphQL FieldNode, converting camelCase
@@ -921,29 +961,62 @@ class SQLAlchemyBackend(BaseBackend):
                     return parent_loader.joinedload(rel_attr.and_(criteria))
                 return parent_loader.joinedload(rel_attr)
 
-        def _hint_relations(
-            type_name: str | None, current_mapper: Any, field_name: str
-        ) -> list[str]:
-            """Relation names declared on ``using=`` for *field_name*.
+        # A relation reached both by the selection and by a ``using=`` path
+        # must be loaded once, with one set of criteria. Two loaders on one
+        # attribute leave it to SQLAlchemy which rows end up there.
+        plan: dict[str, _PlannedLoad] = {}
+
+        def _planned(
+            level: dict[str, _PlannedLoad],
+            current_mapper: Any,
+            rel_name: str,
+            type_name: str | None,
+        ) -> _PlannedLoad:
+            load = level.get(rel_name)
+            if load is None:
+                rel = current_mapper.relationships[rel_name]
+                criteria = _get_nested_criteria(type_name, rel_name, rel.mapper.class_)
+                if criteria is not None:
+                    scoped_edges.append((current_mapper.class_, rel_name))
+                load = level[rel_name] = _PlannedLoad(
+                    attr=getattr(current_mapper.entity, rel_name),
+                    uselist=rel.uselist,
+                    mapper=rel.mapper,
+                    criteria=criteria,
+                )
+            return load
+
+        def _plan_hints(
+            level: dict[str, _PlannedLoad],
+            current_mapper: Any,
+            type_name: str | None,
+            field_name: str,
+        ) -> None:
+            """Plan the relation paths declared on ``using=`` for *field_name*.
 
             Keyed on the field name alone, so computed fields that are not mapped
             attributes can still declare the relations their resolver reads.
             """
             hints = store.get(type_name, field_name) if type_name and store else None
             if not hints or hints.disable_optimization or not hints.using:
-                return []
-            return [
-                name for name in hints.using if name in current_mapper.relationships
-            ]
+                return
+            for path in hints.using:
+                hop_level, hop_mapper, hop_type = level, current_mapper, type_name
+                for hop in hint_hops(path):
+                    if hop not in hop_mapper.relationships:
+                        break
+                    load = _planned(hop_level, hop_mapper, hop, hop_type)
+                    hop_type = self._child_type_name(
+                        hop_type, hop, load.mapper.class_, info
+                    )
+                    hop_level, hop_mapper = load.children, load.mapper
 
-        def _apply_loads(
-            stmt: Any,
+        def _plan_selection(
+            level: dict[str, _PlannedLoad],
             selection_set: Any,
             current_mapper: Any,
             type_name: str | None,
-        ) -> Any:
-            if selection_set is None:
-                return stmt
+        ) -> None:
             for node in iter_field_nodes(selection_set, fragments):
                 field_name = _get_field_name(node)
 
@@ -951,120 +1024,77 @@ class SQLAlchemyBackend(BaseBackend):
                 # loads, so do not pay for it.
                 if self.resolves_itself(type_name, field_name):
                     continue
-
-                if field_name in current_mapper.relationships:
-                    rel = current_mapper.relationships[field_name]
-                    rel_attr = getattr(current_mapper.entity, field_name)
-                    criteria = _get_nested_criteria(
-                        type_name,
-                        field_name,
-                        rel.mapper.class_,
+                _plan_hints(level, current_mapper, type_name, field_name)
+                if field_name not in current_mapper.relationships:
+                    continue
+                load = _planned(level, current_mapper, field_name, type_name)
+                if node.selection_set:
+                    child_type = self._child_type_name(
+                        type_name, node.name.value, load.mapper.class_, info
                     )
-                    base_loader = _make_loader(rel_attr, rel.uselist, criteria)
-
-                    if node.selection_set:
-                        child_mapper = sa_inspect(rel.mapper.class_)
-                        child_type = self._child_type_name(
-                            type_name, node.name.value, rel.mapper.class_, info
-                        )
-                        nested = _collect_nested_loaders(
-                            base_loader, node.selection_set, child_mapper, child_type
-                        )
-                        for nl in nested:
-                            stmt = stmt.options(nl)
-                    else:
-                        stmt = stmt.options(base_loader)
-
-                for rel_name in _hint_relations(type_name, current_mapper, field_name):
-                    extra_rel = current_mapper.relationships[rel_name]
-                    extra_attr = getattr(current_mapper.entity, rel_name)
-                    if extra_rel.uselist:
-                        stmt = stmt.options(selectinload(extra_attr))
-                    else:
-                        stmt = stmt.options(joinedload(extra_attr))
-
-            return stmt
-
-        def _collect_nested_loaders(
-            parent_loader: Any,
-            selection_set: Any,
-            child_mapper: Any,
-            type_name: str | None,
-        ) -> list[Any]:
-            """Collect all nested relationship loader chains from a selection set.
-
-            Each sibling relationship becomes a separate loader option branching
-            from parent_loader independently, avoiding invalid cross-relationship chaining.
-            """
-            if selection_set is None:
-                return [parent_loader]  # pragma: no cover
-            loaders: list[Any] = []
-            has_child_rels = False
-            for node in iter_field_nodes(selection_set, fragments):
-                field_name = _get_field_name(node)
-
-                for rel_name in _hint_relations(type_name, child_mapper, field_name):
-                    has_child_rels = True
-                    hint_rel = child_mapper.relationships[rel_name]
-                    loaders.append(
-                        _make_chained_loader(
-                            parent_loader,
-                            getattr(child_mapper.entity, rel_name),
-                            hint_rel.uselist,
-                            None,
-                        )
+                    _plan_selection(
+                        load.children, node.selection_set, load.mapper, child_type
                     )
 
-                if field_name in child_mapper.relationships:
-                    has_child_rels = True
-                    rel = child_mapper.relationships[field_name]
-                    rel_attr = getattr(child_mapper.entity, field_name)
-                    criteria = _get_nested_criteria(
-                        type_name,
-                        field_name,
-                        rel.mapper.class_,
+        def _loader_chains(parent: Any, level: dict[str, _PlannedLoad]) -> list[Any]:
+            """One option per leaf; siblings branch from the same parent loader."""
+            chains: list[Any] = []
+            for load in level.values():
+                if parent is None:
+                    loader = _make_loader(load.attr, load.uselist, load.criteria)
+                else:
+                    loader = _make_chained_loader(
+                        parent, load.attr, load.uselist, load.criteria
                     )
-                    child_loader = _make_chained_loader(
-                        parent_loader,
-                        rel_attr,
-                        rel.uselist,
-                        criteria,
-                    )
-                    if node.selection_set:
-                        nested_mapper = sa_inspect(rel.mapper.class_)
-                        nested_type = self._child_type_name(
-                            type_name, node.name.value, rel.mapper.class_, info
-                        )
-                        nested = _collect_nested_loaders(
-                            child_loader, node.selection_set, nested_mapper, nested_type
-                        )
-                        loaders.extend(nested)
-                    else:
-                        loaders.append(child_loader)
-            if not has_child_rels:
-                loaders.append(parent_loader)
-            return loaders
+                chains.extend(_loader_chains(loader, load.children) or [loader])
+            return chains
 
         root_type_name = self._selection_type_name(entity, info)
         for field_node in field_nodes_from_info(info):
-            query = _apply_loads(
-                query, field_node.selection_set, mapper, root_type_name
-            )
+            if field_node.selection_set is not None:
+                _plan_selection(plan, field_node.selection_set, mapper, root_type_name)
+        for loader in _loader_chains(None, plan):
+            query = query.options(loader)
+        from strawberry_orm.lazy_resolution import remember_scoped_edges
+
+        remember_scoped_edges(query, scoped_edges)
         return query
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
+        from inspect import isawaitable
+
+        from strawberry_orm.lazy_resolution import take_scoped_edges
+
         try:
             entity = query.column_descriptions[0]["entity"]
         except (AttributeError, IndexError, KeyError):
             return query
 
-        get_qs = self._type_querysets.get(entity)
-        if get_qs is not None:
-            query = get_qs(query, info)
+        # A statement that already eager-loads may keep that unscoped load
+        # when another loader for the same relationship is added. Don't mark
+        # those caches as trusted; the resolver re-checks them.
+        caller_had_options = bool(getattr(query, "_with_options", ()))
+        query = self.apply_type_scope(query, entity, info)
+        loaded = self._apply_relation_loads(store, query, entity, info)
+        edges = take_scoped_edges(loaded)
+        if caller_had_options or not edges:
+            return self._execute_stmt(loaded, info)
 
-        return self._execute_stmt(
-            self._apply_relation_loads(store, query, entity, info), info
-        )
+        session = self._get_session(info)
+        before = self._unloaded_snapshot(session, [])
+        rows = self._execute_stmt(loaded, info)
+
+        def mark(result: Any) -> Any:
+            self._mark_scoped_edges(result, edges, before=before)
+            return result
+
+        if isawaitable(rows):
+
+            async def _mark_async() -> Any:
+                return mark(await rows)
+
+            return _mark_async()
+        return mark(rows)
 
     def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
         """Eager-load the selected relations onto instances already in memory.
@@ -1077,24 +1107,35 @@ class SQLAlchemyBackend(BaseBackend):
         Returns the rows it actually loaded onto, which is empty when the
         selection named no relations.
         """
+        from strawberry_orm.lazy_resolution import take_scoped_edges
+
         plans = self._relation_load_statements(store, instances, info)
         if not plans:
             return []
 
         session = self._get_session(info)
         loaded = [row for _stmt, rows in plans for row in rows]
+        before = self._unloaded_snapshot(session, loaded)
+        edges: list[tuple[type, str]] = []
+        for stmt, _rows in plans:
+            edges.extend(take_scoped_edges(stmt))
+
+        def mark() -> list[Any]:
+            self._mark_scoped_edges(loaded, edges, before=before)
+            return loaded
+
         if self._is_async_session(session):
 
             async def _load_async() -> list[Any]:
                 for stmt, _rows in plans:
                     await self._execute_stmt_async(session, stmt)
-                return loaded
+                return mark()
 
             return _load_async()
 
         for stmt, _rows in plans:
             self._execute_stmt_sync(session, stmt)
-        return loaded
+        return mark()
 
     def _relation_load_statements(
         self, store: Any, instances: list[Any], info: Any
@@ -1124,6 +1165,88 @@ class SQLAlchemyBackend(BaseBackend):
             if with_loads is not stmt:
                 plans.append((with_loads, rows))
         return plans
+
+    def _unloaded_snapshot(self, session: Any, extra: list[Any]) -> dict[int, set[str]]:
+        """Relations still unloaded, so a later load can see what it filled.
+
+        Objects already in the identity map keep whatever they had loaded.
+        Marking those caches would trust a relation this query did not refresh.
+        """
+        from sqlalchemy import inspect as sa_inspect
+
+        snap: dict[int, set[str]] = {}
+
+        def add(obj: Any) -> None:
+            if not self.is_model_instance(obj) or id(obj) in snap:
+                return
+            snap[id(obj)] = set(sa_inspect(obj).unloaded)
+
+        for obj in extra:
+            add(obj)
+        sync = getattr(session, "sync_session", session)
+        identity_map = getattr(sync, "identity_map", None)
+        if identity_map is None:
+            return snap
+        for obj in identity_map.values():
+            add(obj)
+        return snap
+
+    def _mark_scoped_edges(
+        self,
+        roots: Any,
+        edges: list[tuple[type, str]],
+        *,
+        before: dict[int, set[str]],
+    ) -> None:
+        """Mark relations a scoped loader populated during this query.
+
+        An object missing from *before* was created by the load, so every
+        relation it now holds came from that loader. An object that was
+        already persistent is marked only for relations that moved from
+        unloaded to loaded.
+        """
+        if not edges or not roots:
+            return
+
+        from collections import defaultdict
+
+        from sqlalchemy import inspect as sa_inspect
+
+        from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+        by_model: dict[type, set[str]] = defaultdict(set)
+        for model, name in edges:
+            by_model[model].add(name)
+        seen: set[int] = set()
+
+        def walk(obj: Any) -> None:
+            if obj is None or id(obj) in seen or not self.is_model_instance(obj):
+                return
+            seen.add(id(obj))
+            state = sa_inspect(obj)
+            names = by_model.get(type(obj), set())
+            was = before.get(id(obj))
+            if was is None:
+                loaded = [name for name in names if name not in state.unloaded]
+            else:
+                loaded = [
+                    name for name in names if name in was and name not in state.unloaded
+                ]
+            if loaded:
+                mark_relations_scoped([obj], loaded)
+            # Iterating this namespace yields relationship objects, not names.
+            for name in state.mapper.relationships.keys():  # noqa: SIM118
+                if name in state.unloaded:
+                    continue
+                value = state.dict.get(name)
+                if isinstance(value, list):
+                    for child in value:
+                        walk(child)
+                else:
+                    walk(value)
+
+        for root in roots:
+            walk(root)
 
     # -- Helpers -------------------------------------------------------------
 
@@ -1616,18 +1739,22 @@ def _scoped_sa_relation(
     on. Reading the attribute would then emit an unscoped lazy SELECT and hand
     back rows the caller may not read, so the scope is applied here instead.
 
-    An already-loaded collection was scoped on the way in; re-querying it would
-    both waste a round trip and discard the optimizer's work.
+    A cache is returned only when this library filled it after applying
+    ``scope_rows``. A ``joinedload`` in the resolver is re-queried.
     """
     from sqlalchemy import select
     from sqlalchemy.orm import with_parent
 
-    from strawberry_orm.lazy_resolution import _sqlalchemy_relation_prefetched
-
-    if _sqlalchemy_relation_prefetched(instance, fname):
-        return getattr(instance, fname)
+    from strawberry_orm.lazy_resolution import (
+        _sqlalchemy_relation_prefetched,
+        relation_cache_is_scoped,
+    )
 
     restrict = backend.relation_scope(parent_model, fname, info)
+    if _sqlalchemy_relation_prefetched(instance, fname) and (
+        restrict is None or relation_cache_is_scoped(instance, fname)
+    ):
+        return getattr(instance, fname)
     if restrict is None:
         return getattr(instance, fname)
 

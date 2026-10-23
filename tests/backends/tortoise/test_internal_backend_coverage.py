@@ -16,10 +16,10 @@ from strawberry_orm.backends.tortoise import (
     _build_tortoise_order_from_input,
     _build_tortoise_reference_field_clause,
     _build_tortoise_reference_lookup,
-    _CustomRel,
     _extract_tortoise_group_fields,
     _extract_tortoise_overlapping_order,
-    _get_reverse_fk_field,
+    _hide_scoped_out,
+    _PlannedPrefetch,
 )
 from strawberry_orm.filters import ReferenceLookup, StringLookup
 
@@ -117,12 +117,8 @@ class Item:
         self.value = value
 
 
-class ParentWithoutId:
-    pass
-
-
 class TestInternalBackendCoverage:
-    def test_filter_helpers_handle_none_and_empty_groups(self, Post, Comment):
+    def test_filter_helpers_handle_none_and_empty_groups(self):
         assert _build_tortoise_filter(None) == (None, None)
         assert _build_tortoise_filter(EmptyFilterGroup()) == (None, None)
         assert _build_tortoise_filter(EmptyFilterGroup(all=[])) == (None, None)
@@ -142,7 +138,15 @@ class TestInternalBackendCoverage:
         with pytest.raises(ValueError, match="Regex filters are disabled"):
             _build_tortoise_lookup("name", RegexLookup(regex="a.*"))
 
-        assert _get_reverse_fk_field(Comment, Post, "post") == "post_id"
+    @pytest.mark.asyncio
+    async def test_hiding_scoped_out_rows_with_nothing_cached_queries_nothing(
+        self, tortoise_db, User
+    ):
+        def scope(queryset):
+            raise AssertionError("nothing cached, so nothing to check")
+
+        load = _PlannedPrefetch(User, "ForeignKeyFieldInstance", scope)
+        await _hide_scoped_out([], "author", load)
 
     @pytest.mark.asyncio
     async def test_count_query(self, tortoise_db, seed, User):
@@ -156,11 +160,6 @@ class TestInternalBackendCoverage:
         plain = NoModelQuery([Item(None), Item(1)])
         result = await backend.apply_optimizer_hints(None, plain, info=None)
         assert [item.value for item in result] == [None, 1]
-
-        await backend._apply_custom_prefetch([], [])
-        await backend._apply_custom_prefetch(
-            [ParentWithoutId()], [_CustomRel("", "", object, None, lambda qs: qs, [])]
-        )  # type: ignore[arg-type]
 
     def test_internal_queryset_hooks_and_ordering_helpers(self, seed, User):
         backend = TortoiseBackend()

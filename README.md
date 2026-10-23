@@ -546,12 +546,25 @@ class UserType:
 
 `using=` answers *what to load*, `scope=` answers *which rows*. Both run while the prefetch is built, so `using=["author"]` becomes `select_related` on Django, `joinedload` / `selectinload` on SQLAlchemy, and `prefetch_related` on Tortoise — one query, not one per row.
 
+A `using=` entry can walk several relations. `"author.posts"` loads each post's author and that author's posts; Django's `"author__posts"` spelling means the same:
+
+```python
+@orm.type(Post)
+class PostType:
+    @orm.field.lazy(using=["comments.author"])
+    def commenters(self, info: strawberry.Info) -> list[str]:
+        return [comment.author.name for comment in self.comments]
+```
+
+Rows loaded through `using=` are scoped exactly as if the client had selected them: each hop applies the related type's `scope_rows` and any `scope=` on the field of that name. A row the resolver may not see reads as absent, `None` for a to-one relation and missing from a list. On Django a hidden row behind a non-nullable foreign key raises `RelatedObjectDoesNotExist` instead, because that is how Django's descriptor reports an empty cache, so read it with `getattr(self, "author", None)`. When the client also selects a relation on the path, the two share one load.
+
 A `scope=` callable receives `(qs, info)` and never the parent instance, which is exactly what lets the optimizer hoist it. When the query really does depend on the parent row, write a resolver instead.
 
-Names are validated when the type is defined, so a typo fails immediately rather than silently doing nothing:
+Names are validated when the type is defined, hop by hop, so a typo fails immediately rather than silently doing nothing:
 
 ```
 ValueError: PostType.byline: Post has no relation 'athor'. Did you mean 'author'?
+ValueError: PostType.byline: User has no relation 'post' (in using='author.post'). Did you mean 'posts'?
 ```
 
 See [Declaring fields](#declaring-fields) for the full set of forms and arguments.
@@ -870,7 +883,7 @@ class UserType:
         return len(self.comments)
 ```
 
-A scope takes the **name of the relation it narrows** — `posts` above scopes `User.posts`. Unless you say otherwise with `on=`, a field is served by the relation sharing its name, and pointing `using=` at a relation you have also scoped asks for the same prefetch twice with different querysets, which Django rejects outright.
+A scope takes the **name of the relation it narrows** — `posts` above scopes `User.posts`. Unless you say otherwise with `on=`, a field is served by the relation sharing its name. A `using=` path through a scoped relation gets the same scope, so a resolver sees the rows that field would return.
 
 #### `on=` — a field named something other than its relation
 

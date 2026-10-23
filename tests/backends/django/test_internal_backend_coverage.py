@@ -708,3 +708,136 @@ class TestScopedRelationHelpers:
 
         opaque = object()
         assert _dedupe_lookups([opaque, opaque]) == [opaque, opaque]
+
+    def test_scoped_prefetch_helpers_cover_cache_shapes(self, seed, User, Post):
+        from strawberry_orm.backends.django import (
+            _clear_django_relation_cache,
+            _clear_scoped_relation_caches,
+            _django_related_children,
+            _mark_scoped_prefetches,
+            _scoped_prefetch,
+            _scoped_related_instance,
+            _scoped_related_queryset,
+            _strip_conflicting_select_related,
+        )
+        from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(User)
+        class AuthorType:
+            name: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(name="Alice")
+
+        @orm.type(Post)
+        class PostType:
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        info = SimpleNamespace()
+        author_prefetch = _scoped_prefetch("author", User.objects.all())
+        everything = _strip_conflicting_select_related(
+            Post.objects.select_related(), [author_prefetch]
+        )
+        assert not everything.query.select_related
+
+        narrowed = _strip_conflicting_select_related(
+            Post.objects.select_related("author"), [author_prefetch]
+        )
+        assert not narrowed.query.select_related
+
+        post = Post.objects.select_related("author").get(title="Hello World")
+        _clear_scoped_relation_caches([post], [author_prefetch])
+        assert not Post._meta.get_field("author").is_cached(post)
+
+        post.author = User(name="Ghost", email="ghost@example.com")
+        assert _scoped_related_instance(orm._backend, post, "author", info) is None
+
+        bob = User.objects.prefetch_related("posts").get(name="Bob")
+        scoped_posts = _scoped_related_queryset(orm._backend, bob, "posts", info)
+        assert list(scoped_posts) == []
+
+        alice = User.objects.get(name="Alice")
+        alice_post = Post.objects.get(title="Hello World")
+        alice_post.author = alice
+        nested = _scoped_prefetch("author__posts", Post.objects.all())
+        _mark_scoped_prefetches([alice_post], [nested])
+
+        class Bare:
+            pass
+
+        empty = Bare()
+        empty._strawberry_orm_scoped = True
+        empty.prefetch_through = ""
+        empty.to_attr = None
+        _mark_scoped_prefetches([alice_post], [empty])
+
+        holder = Bare()
+        holder._state = SimpleNamespace(fields_cache={"author": alice})
+        assert _django_related_children([holder], "author") == [alice]
+
+        listed = Bare()
+        listed._state = SimpleNamespace(fields_cache={})
+        listed._prefetched_objects_cache = {"posts": [alice_post]}
+        assert _django_related_children([listed], "posts") == [alice_post]
+
+        cached = Post.objects.filter(author=alice)
+        list(cached)
+        via_dict = Bare()
+        via_dict._state = SimpleNamespace(fields_cache={})
+        via_dict.__dict__["posts"] = cached
+        assert alice_post in _django_related_children([via_dict], "posts")
+
+        missing = Bare()
+        missing._state = SimpleNamespace(fields_cache={})
+        assert _django_related_children([missing], "nope") == []
+
+        _clear_django_relation_cache(alice, "not_a_field")
+        mark_relations_scoped([post], ["author"])
+        post.author = alice
+        assert _scoped_related_instance(orm._backend, post, "author", info) is alice
+
+    def test_an_already_checked_row_is_not_filtered_out(self, seed, Post):
+        from strawberry_orm.lazy_resolution import mark_rows_scoped
+
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        published = Post.objects.get(title="Hello World")
+        draft = Post.objects.get(title="Draft Post")
+        mark_rows_scoped([draft])
+        kept = orm._backend.scope_instances([published, draft], SimpleNamespace())
+        assert kept == [published, draft]
+
+    def test_a_cached_null_to_one_reads_as_absent(self, seed, Comment):
+        from strawberry_orm.backends.django import _scoped_related_instance
+
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Comment)
+        class CommentType:
+            body: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.exclude(body="unreachable")
+
+        comment = Comment.objects.select_related("parent").filter(parent=None).first()
+        assert comment is not None
+        assert (
+            _scoped_related_instance(orm._backend, comment, "parent", SimpleNamespace())
+            is None
+        )

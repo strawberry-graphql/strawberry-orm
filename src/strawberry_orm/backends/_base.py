@@ -122,6 +122,14 @@ def scoped_ordering_allowed(order_type: Any, relation: str) -> bool:
     return relation in getattr(order_type, "_scoped_ordering_allowed", ())
 
 
+def hint_hops(path: str) -> list[str]:
+    """The relations a ``using=`` entry walks, in order.
+
+    ``author.profile`` and Django's ``author__profile`` name the same path.
+    """
+    return path.replace("__", ".").split(".")
+
+
 def _nested_order_types(order_type: Any) -> dict[str, type]:
     """Order input reachable through each relation, by relation name.
 
@@ -1504,12 +1512,97 @@ class BaseBackend:
         """Model on the far side of *relation*, or ``None`` if unknown."""
         return None
 
+    def query_model(self, query: Any) -> type | None:
+        """Model a query object reads, or ``None`` if this backend cannot tell."""
+        return None
+
     def apply_type_scope(self, query: Any, model: type | None, info: Any) -> Any:
-        """Apply *model*'s ``scope_rows`` to *query*, if one is registered."""
+        """Apply *model*'s ``scope_rows`` to *query*, if one is registered.
+
+        A query is scoped at most once. The optimizer and a resolver can both
+        call this; the second call is a no-op so a scope that joins is not
+        applied twice.
+        """
         if model is None:
             return query
+        from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+
+        if query_is_scoped(query):
+            return query
         get_qs = self._type_querysets.get(model)
-        return query if get_qs is None else get_qs(query, info)
+        if get_qs is None:
+            return query
+        scoped = get_qs(query, info)
+        mark_query_scoped(scoped)
+        return scoped
+
+    def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
+        """Return the subset of *pks* ``scope_rows`` still allows.
+
+        May be a set or an awaitable of a set. Override per backend.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot re-check scope_rows against loaded rows"
+        )
+
+    def scope_instances(self, rows: list[Any], info: Any) -> Any:
+        """Drop instances whose model ``scope_rows`` rejects.
+
+        Returns a list, or an awaitable of a list on async backends. Instances
+        of models with no ``scope_rows`` pass through. A scoped model whose
+        instance has no primary key cannot be checked, so that raises rather
+        than returning the row.
+        """
+        from inspect import isawaitable
+
+        from strawberry_orm.lazy_resolution import mark_rows_scoped, row_is_scoped
+
+        groups: dict[type, list[Any]] = {}
+        for row in rows:
+            if row_is_scoped(row):
+                continue
+            model = type(row)
+            if model in self._type_querysets:
+                groups.setdefault(model, []).append(row)
+        if not groups:
+            return list(rows)
+
+        pending: list[tuple[type, Any]] = []
+        for model, group in groups.items():
+            pks: list[Any] = []
+            for row in group:
+                pk = self.instance_pk(row)
+                if pk is None:
+                    raise RuntimeError(
+                        f"{model.__name__} is row-scoped by scope_rows, but a "
+                        f"resolver returned a {model.__name__} with no primary "
+                        f"key, so the scope could not be checked."
+                    )
+                pks.append(pk)
+            pending.append((model, self.filter_scoped_pks(model, pks, info)))
+
+        def finish(allowed: dict[type, set[Any]]) -> list[Any]:
+            kept = [
+                row
+                for row in rows
+                if row_is_scoped(row)
+                or type(row) not in allowed
+                or self.instance_pk(row) in allowed[type(row)]
+            ]
+            mark_rows_scoped(kept)
+            return kept
+
+        if any(isawaitable(pks) for _model, pks in pending):
+
+            async def _await_allowed() -> list[Any]:
+                allowed: dict[type, set[Any]] = {}
+                for model, pks in pending:
+                    allowed[model] = await pks if isawaitable(pks) else pks
+                return finish(allowed)
+
+            return _await_allowed()
+
+        return finish({model: pks for model, pks in pending})
 
     # -- Scoping across relation traversal -----------------------------------
 
@@ -1553,10 +1646,15 @@ class BaseBackend:
         from strawberry_orm.fields import call_scope
 
         def restrict(query: Any, resolver_info: Any) -> Any:
+            from strawberry_orm.lazy_resolution import mark_query_scoped
+
             if get_qs is not None:
                 query = get_qs(query, resolver_info)
             if field_scope is not None:
                 query = call_scope(field_scope, query, resolver_info)
+            # The query is scoped, so a later apply_type_scope must not apply
+            # scope_rows a second time.
+            mark_query_scoped(query)
             return query
 
         return restrict
@@ -1829,25 +1927,30 @@ class BaseBackend:
         field_name: str,
         hints: Any,
     ) -> None:
-        """Reject ``using=`` names that can never resolve, at schema-build time."""
+        """Reject ``using=`` paths that can never resolve, at schema-build time."""
         if not self._strict_hints or not hints.using:
             return
 
-        names = self.relation_names(model)
         for rel in hints.using:
-            if rel in names:
-                continue
-            where = f"{type_name}.{field_name}: "
-            if "__" in rel or "." in rel:
-                raise ValueError(
-                    f"{where}multi-hop using={rel!r} is not supported. Declare the "
-                    f"first hop only, or scope the relation on its own type."
-                )
-            suggestion = get_close_matches(rel, sorted(names), n=1)
-            hint_text = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
-            raise ValueError(
-                f"{where}{model.__name__} has no relation {rel!r}.{hint_text}"
-            )
+            current: type | None = model
+            for hop in hint_hops(rel):
+                if current is None:
+                    # The far side is not known yet (Tortoise before init), so
+                    # the rest of the path cannot be checked.
+                    break
+                names = self.relation_names(current)
+                if hop not in names:
+                    where = f"{type_name}.{field_name}: "
+                    path = f" (in using={rel!r})" if hop != rel else ""
+                    suggestion = get_close_matches(hop, sorted(names), n=1)
+                    hint_text = (
+                        f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+                    )
+                    raise ValueError(
+                        f"{where}{current.__name__} has no relation {hop!r}"
+                        f"{path}.{hint_text}"
+                    )
+                current = self._relation_target_model(current, hop)
 
     def _type_name_for_model(self, model: type) -> str | None:
         for type_name, m in self._type_registry.items():

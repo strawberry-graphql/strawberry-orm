@@ -121,6 +121,9 @@ def _make_query_resolver(
 
     info_type = strawberry.types.Info
 
+    def scoped(query: Any, info: Any) -> Any:
+        return backend.apply_type_scope(query, model, info)
+
     if group_type:
 
         def resolver(
@@ -135,7 +138,7 @@ def _make_query_resolver(
                 query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
                 query = backend.apply_ordering(query, order, model, info=info)
-            return query
+            return scoped(query, info)
 
         annotations: dict[str, Any] = {"info": info_type}
         if filter_type:
@@ -154,7 +157,7 @@ def _make_query_resolver(
                 query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
                 query = backend.apply_ordering(query, order, model, info=info)
-            return query
+            return scoped(query, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -167,7 +170,7 @@ def _make_query_resolver(
             query = backend.get_default_queryset(model)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model, info=info)
-            return query
+            return scoped(query, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -179,7 +182,7 @@ def _make_query_resolver(
             query = backend.get_default_queryset(model)
             if order is not None:
                 query = backend.apply_ordering(query, order, model, info=info)
-            return query
+            return scoped(query, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -188,7 +191,7 @@ def _make_query_resolver(
     else:
 
         def resolver(self: Any, info: Any) -> Any:
-            return backend.get_default_queryset(model)
+            return scoped(backend.get_default_queryset(model), info)
 
         resolver.__annotations__ = {"info": info_type}
 
@@ -349,6 +352,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                     result, order, self._model, info=info
                 )
             if not self._defer_query_materialization(info):
+                result = self._backend.apply_type_scope(result, self._model, info)
                 result = materialize_result(
                     self._backend,
                     result,
@@ -390,6 +394,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                     result, order, self._model, info=info
                 )
             if not self._defer_query_materialization(info):
+                result = self._backend.apply_type_scope(result, self._model, info)
                 result = self._backend.materialize_query(result, info)
 
         return result
@@ -469,6 +474,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                         info=info,
                     )
                 if not self._defer_query_materialization(info):
+                    result = self._backend.apply_type_scope(result, self._model, info)
                     result = await materialize(result, info)
                 return self._cast_result(result)
 
@@ -727,9 +733,10 @@ class FieldFactory:
     ) -> Any:
         """Declare a computed value and the relations it reads.
 
-        ``using`` names relations on the field's own model that the resolver
-        touches, so the optimizer eager-loads them alongside the parent query
-        instead of taking a lazy load per row::
+        ``using`` names relations the resolver touches, starting from the
+        field's own model (``"author.posts"`` walks two), so the optimizer
+        eager-loads them alongside the parent query instead of taking a lazy
+        load per row::
 
             @orm.type(Post)
             class PostType:
@@ -1592,6 +1599,18 @@ class StrawberryORM:
 
             if not extensions_include_batching(extensions):
                 extensions.insert(0, self.batching_extension())
+
+        # Without the optimizer nothing re-checks a list a resolver already
+        # materialized, so this wrapper does. Index 0 is innermost: it has to
+        # be inserted after the wrappers above, which also want that slot.
+        if not optimizer and not extensions_include_optimizer(extensions):
+            from strawberry_orm.optimizer.extension import (
+                RowScopeExtension,
+                extensions_include_row_scope,
+            )
+
+            if not extensions_include_row_scope(extensions):
+                extensions.insert(0, RowScopeExtension.configure(self._backend))
 
         # A connection cannot go through the batcher, which has no way to
         # express a per-parent limit, so it gets its own windowed pass.

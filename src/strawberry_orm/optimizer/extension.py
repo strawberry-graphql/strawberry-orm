@@ -59,6 +59,35 @@ def get_configured_optimizer(info: Any) -> tuple[Backend | None, OptimizerStore 
     )
 
 
+def extensions_include_row_scope(extensions: list[Any]) -> bool:
+    """Return True if *extensions* already contains a row-scope extension."""
+    for ext in extensions:
+        if isinstance(ext, type) and issubclass(ext, RowScopeExtension):
+            return True
+        if getattr(ext, "__name__", "").startswith("RowScopeExtension_"):
+            return True
+    return False
+
+
+def _without_rejected(
+    result: Any, candidates: list[Any], kept: list[Any]
+) -> tuple[Any, list[Any]]:
+    """Remove *candidates* that ``scope_rows`` did not keep.
+
+    A list is filtered in place so a ``PreslicedRows`` subclass, and the total
+    it carries, survive. A single rejected instance becomes ``None``.
+    """
+    kept_ids = {id(row) for row in kept}
+    dropped = {id(row) for row in candidates if id(row) not in kept_ids}
+    if isinstance(result, list):
+        if dropped:
+            result[:] = [row for row in result if id(row) not in dropped]
+        return result, [row for row in result if id(row) in kept_ids]
+    if dropped:
+        return None, []
+    return result, list(kept)
+
+
 def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     """Return True when the field yields one ORM object rather than a list.
 
@@ -259,19 +288,47 @@ class OptimizerExtension(SchemaExtension):
         else:
             return result
 
+        # A materialized list never passed through apply_optimizer_hints, so
+        # scope_rows has not run. Relation fields of the parent returned
+        # above: those caches were scoped with the parent, and checking again
+        # would query once per parent.
+        scoped = backend.scope_instances(rows, info)
+        if isawaitable(scoped):
+
+            async def _await_scoped() -> Any:
+                kept = await scoped
+                loaded = self._load_kept(result, rows, kept, info)
+                return await await_maybe(loaded)
+
+            return _await_scoped()
+        return self._load_kept(result, rows, scoped, info)
+
+    def _load_kept(
+        self,
+        result: Any,
+        candidates: list[Any],
+        kept: list[Any],
+        info: Any,
+    ) -> Any:
+        """Drop rows ``scope_rows`` rejected, then eager-load the rest."""
+        backend = self._backend
+        filtered, to_load = _without_rejected(result, candidates, kept)
+        if not to_load or backend is None or self._store is None:
+            return filtered
+
         # Only rows that were actually loaded onto are marked. A selection
         # that named no relations leaves them unmarked, so a later field that
         # does name some still gets its chance.
-        loaded = backend.load_relations(self._store, rows, info)
+        loaded = backend.load_relations(self._store, to_load, info)
         if isawaitable(loaded):
 
             async def _await_loaded() -> Any:
                 _mark_prepared(await loaded)
-                return result
+                return filtered
 
             return _await_loaded()
         _mark_prepared(loaded)
-        return result
+        return filtered
 
     async def _resolve_async(
         self,
@@ -303,3 +360,75 @@ class OptimizerExtension(SchemaExtension):
 
         stash_parents(getattr(self, "execution_context", None), info, result)
         return _unwrap_single(result, singular)
+
+
+class RowScopeExtension(SchemaExtension):
+    """Re-apply ``scope_rows`` when the optimizer is not doing it.
+
+    The optimizer scopes a query before it runs and scopes a materialized list
+    while loading relations. With the optimizer off, a resolver can return
+    either and skip ``scope_rows``. This wrapper is the innermost extension in
+    that configuration, so it sees the resolver's return value first.
+    """
+
+    _backend: Any = None
+
+    @classmethod
+    def configure(cls, backend: Any) -> type[RowScopeExtension]:
+        return type(
+            f"{cls.__name__}_{backend.__class__.__name__}",
+            (cls,),
+            {"_backend": backend},
+        )
+
+    def resolve(
+        self,
+        _next: Any,
+        root: Any,
+        info: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = _next(root, info, *args, **kwargs)
+        if type(result) in _SCALAR_LEAF_TYPES:
+            return result
+        if isawaitable(result):
+            return self._resolve_async(result, info)
+        return self._scope(result, info)
+
+    async def _resolve_async(self, result: Any, info: Any) -> Any:
+        result = await await_maybe(result)
+        scoped = self._scope(result, info)
+        if isawaitable(scoped):
+            return await scoped
+        return scoped
+
+    def _scope(self, result: Any, info: Any) -> Any:
+        backend = self._backend
+        if backend is None or type(result) in _SCALAR_LEAF_TYPES:
+            return result
+        if backend.is_query_object(result):
+            return backend.apply_type_scope(result, backend.query_model(result), info)
+
+        if backend.is_model_instance(result):
+            rows: list[Any] | None = [result]
+        elif isinstance(result, list) and any(
+            backend.is_model_instance(row) for row in result
+        ):
+            rows = [row for row in result if backend.is_model_instance(row)]
+        else:
+            rows = None
+        if not rows:
+            return result
+
+        scoped = backend.scope_instances(rows, info)
+        if isawaitable(scoped):
+
+            async def _await_scoped() -> Any:
+                kept = await scoped
+                filtered, _to_load = _without_rejected(result, rows, kept)
+                return filtered
+
+            return _await_scoped()
+        filtered, _to_load = _without_rejected(result, rows, scoped)
+        return filtered

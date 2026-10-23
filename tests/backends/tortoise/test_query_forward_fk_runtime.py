@@ -249,7 +249,10 @@ class TestForwardFKScopingOnMaterializedParents:
         ]
 
     @pytest.mark.asyncio
-    async def test_a_null_to_one_stays_null_under_a_scope(self, seed, Comment):
+    @pytest.mark.parametrize("optimizer", [True, False])
+    async def test_a_null_to_one_stays_null_under_a_scope(
+        self, seed, Comment, optimizer
+    ):
         """Nothing on the other end means nothing to scope, and no query."""
         orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
 
@@ -274,7 +277,7 @@ class TestForwardFKScopingOnMaterializedParents:
             async def comments(self, info: strawberry.types.Info) -> list[ReplyType]:
                 return list(await Comment.all().order_by("id"))
 
-        result = await orm.schema(query=Query).execute(
+        result = await orm.schema(query=Query, optimizer=optimizer).execute(
             "{ comments { body parent { body } } }", context_value={}
         )
         assert result.errors is None, result.errors
@@ -283,11 +286,14 @@ class TestForwardFKScopingOnMaterializedParents:
         assert parents[1] == {"body": "Nice post!"}
 
     @pytest.mark.asyncio
-    async def test_an_already_loaded_to_one_is_taken_as_is(self, seed, User, Post):
-        """A loaded relation is trusted, so no second query is issued.
+    @pytest.mark.parametrize("optimizer", [True, False])
+    async def test_an_already_loaded_to_one_is_taken_as_is(
+        self, seed, User, Post, optimizer
+    ):
+        """A relation loaded by the resolver is re-checked against scope_rows.
 
-        Whatever loaded it is responsible for scoping it - which is what the
-        optimizer does when it builds the eager load.
+        ``prefetch_related`` fills the cache before this library can scope it.
+        Trusting that cache would return rows the scope removes.
         """
         orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
 
@@ -312,13 +318,124 @@ class TestForwardFKScopingOnMaterializedParents:
             async def posts(self, info: strawberry.types.Info) -> list[PostType]:
                 return list(await Post.all().order_by("id").prefetch_related("author"))
 
-        result = await orm.schema(query=Query, optimizer=False).execute(
+        result = await orm.schema(query=Query, optimizer=optimizer).execute(
             "{ posts { title author { name } } }", context_value={}
         )
         assert result.errors is None, result.errors
-        assert [row["author"]["name"] for row in result.data["posts"]] == [
-            "Alice",
-            "Alice",
-            "Bob",
-            "Charlie",
+        assert [row["author"] for row in result.data["posts"]] == [
+            {"name": "Alice"},
+            {"name": "Alice"},
+            None,
+            None,
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_materialized_list_drops_rows_scope_rows_rejects(self, seed, Post):
+        orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            async def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                return list(await Post.all().order_by("id"))
+
+        result = await orm.schema(query=Query).execute(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        assert [row["title"] for row in result.data["posts"]] == [
+            "Hello World",
+            "GraphQL Guide",
+            "Rust Adventures",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_auto_field_without_the_optimizer_drops_hidden_rows(self, seed, Post):
+        orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            posts: list[PostType] = orm.field.auto()
+
+        result = await orm.schema(query=Query, optimizer=False).execute(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        assert "Draft Post" not in [row["title"] for row in result.data["posts"]]
+
+    @pytest.mark.asyncio
+    async def test_a_prefetched_to_many_drops_rows_scope_rows_rejects(
+        self, seed, User, Post
+    ):
+        orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            async def users(self, info: strawberry.types.Info) -> list[UserType]:
+                return list(await User.all().order_by("id").prefetch_related("posts"))
+
+        result = await orm.schema(query=Query).execute(
+            "{ users { name posts { title } } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        by_name = {row["name"]: row["posts"] for row in result.data["users"]}
+        assert by_name["Bob"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_unsaved_scoped_instance_raises(self, seed, Post):
+        orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            async def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                return [Post(title="New", body="x", is_published=False)]
+
+        result = await orm.schema(query=Query).execute(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors
+        assert "scope_rows" in result.errors[0].message
+        assert "primary key" in result.errors[0].message

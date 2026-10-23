@@ -83,6 +83,62 @@ async def async_seed(async_session):
 
 class TestAsyncSessionExecution:
     @pytest.mark.asyncio
+    async def test_async_scope_rows_checks_materialized_rows_and_relations(
+        self, async_seed
+    ):
+        from sqlalchemy import select
+
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
+            session_getter=lambda info: info.context["session"],
+            warn_missing_scope=False,
+        )
+
+        @orm.type(SAPost)
+        class PostType:
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, select_stmt, info):
+                return select_stmt.where(SAPost.is_published == True)  # noqa: E712
+
+        @orm.type(SAUser)
+        class UserType:
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            async def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                result = await async_seed.scalars(select(SAPost).order_by(SAPost.id))
+                return list(result.all())
+
+            @strawberry.field
+            def users(self, info: strawberry.types.Info) -> list[UserType]:
+                return select(SAUser).order_by(SAUser.id)  # type: ignore[return-value]
+
+        schema = orm.schema(query=Query)
+        listed = await schema.execute(
+            "{ posts { title } }",
+            context_value={"session": async_seed},
+        )
+        assert listed.errors is None, listed.errors
+        assert [row["title"] for row in listed.data["posts"]] == [
+            "Hello World",
+            "GraphQL Guide",
+            "Rust Adventures",
+        ]
+
+        loaded = await schema.execute(
+            "{ users { name posts { title } } }",
+            context_value={"session": async_seed},
+        )
+        assert loaded.errors is None, loaded.errors
+        by_name = {row["name"]: row["posts"] for row in loaded.data["users"]}
+        assert by_name["Bob"] == []
+
+    @pytest.mark.asyncio
     async def test_async_schema_execute_supports_async_session(self, async_seed):
         result = await main_schema.execute(
             "{ users { name posts { title } } }",

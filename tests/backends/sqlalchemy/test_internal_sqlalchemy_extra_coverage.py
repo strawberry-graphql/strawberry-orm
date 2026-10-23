@@ -397,3 +397,19 @@ class TestInternalSqlalchemyExtraCoverage:
         await async_session.flush()
         await async_session.refresh(post, ["tags"])
         assert tag_id not in {tag.id for tag in post.tags}
+
+
+def test_scoped_edge_marks_walk_loaded_collections(sa_session, seed):
+    from sqlalchemy.orm import selectinload
+
+    from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+    from tests.backends.sqlalchemy.models import User
+
+    sa_session.expunge_all()
+    user = sa_session.scalars(
+        select(User).options(selectinload(User.posts)).order_by(User.id)
+    ).first()
+    backend = SQLAlchemyBackend(dialect="sqlite")
+    backend._mark_scoped_edges([user], [(User, "posts")], before={})
+    assert relation_cache_is_scoped(user, "posts")
+    assert user.posts

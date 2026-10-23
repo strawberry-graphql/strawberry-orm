@@ -608,16 +608,18 @@ class RelationConnectionExtension(SchemaExtension):
         totals: dict[Any, int],
     ) -> dict[int, Any]:
         """Pair every parent with its own page and that page's real total."""
+        from strawberry_orm.lazy_resolution import mark_rows_scoped
         from strawberry_orm.relay.connection import PreslicedRows
 
         # Every backend stringifies its group keys, so the parent key has to be
-        # compared in the same form.
-        return {
-            id(parent): PreslicedRows(
-                rows_by_key.get((str(pk),), []), totals.get(pk, 0)
-            )
-            for parent, pk in zip(parents, pks, strict=True)
-        }
+        # compared in the same form. The window already applied scope_rows, so
+        # the page must not be checked again one row at a time.
+        pages: dict[int, Any] = {}
+        for parent, pk in zip(parents, pks, strict=True):
+            page = rows_by_key.get((str(pk),), [])
+            mark_rows_scoped(page)
+            pages[id(parent)] = PreslicedRows(page, totals.get(pk, 0))
+        return pages
 
 
 def extensions_include_relation_connections(extensions: list[Any]) -> bool:

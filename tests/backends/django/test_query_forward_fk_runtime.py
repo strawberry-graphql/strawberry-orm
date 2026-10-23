@@ -300,11 +300,12 @@ class TestForwardFKScopingOnMaterializedParents:
         assert parents[0] is None
         assert parents[1] == {"body": "Nice post!"}
 
-    def test_an_already_loaded_to_one_is_taken_as_is(self, seed, User, Post):
-        """A loaded relation is trusted, so no second query is issued.
+    @pytest.mark.parametrize("optimizer", [True, False])
+    def test_an_already_loaded_to_one_is_taken_as_is(self, seed, User, Post, optimizer):
+        """A relation loaded by the resolver is re-checked against scope_rows.
 
-        Whatever loaded it is responsible for scoping it - which is what the
-        optimizer does when it builds the eager load.
+        ``select_related`` fills the cache before this library can scope it.
+        Trusting that cache would return rows the scope removes.
         """
         orm = StrawberryORM.for_django(warn_missing_scope=False)
 
@@ -329,13 +330,121 @@ class TestForwardFKScopingOnMaterializedParents:
             def posts(self, info: strawberry.types.Info) -> list[PostType]:
                 return list(Post.objects.order_by("id").select_related("author"))
 
-        result = orm.schema(query=Query, optimizer=False).execute_sync(
+        result = orm.schema(query=Query, optimizer=optimizer).execute_sync(
             "{ posts { title author { name } } }", context_value={}
         )
         assert result.errors is None, result.errors
-        assert [row["author"]["name"] for row in result.data["posts"]] == [
-            "Alice",
-            "Alice",
-            "Bob",
-            "Charlie",
+        assert [row["author"] for row in result.data["posts"]] == [
+            {"name": "Alice"},
+            {"name": "Alice"},
+            None,
+            None,
         ]
+
+    def test_a_materialized_list_drops_rows_scope_rows_rejects(self, seed, Post):
+        """``return list(qs)`` never reaches the optimizer's query scoping."""
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                return list(Post.objects.order_by("id"))
+
+        result = orm.schema(query=Query).execute_sync(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        assert [row["title"] for row in result.data["posts"]] == [
+            "Hello World",
+            "GraphQL Guide",
+            "Rust Adventures",
+        ]
+
+    def test_auto_field_without_the_optimizer_drops_hidden_rows(self, seed, Post):
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            posts: list[PostType] = orm.field.auto()
+
+        result = orm.schema(query=Query, optimizer=False).execute_sync(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        assert "Draft Post" not in [row["title"] for row in result.data["posts"]]
+
+    def test_a_prefetched_to_many_drops_rows_scope_rows_rejects(self, seed, User, Post):
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @orm.type(User)
+        class UserType:
+            id: auto
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def users(self, info: strawberry.types.Info) -> list[UserType]:
+                return list(User.objects.order_by("id").prefetch_related("posts"))
+
+        result = orm.schema(query=Query).execute_sync(
+            "{ users { name posts { title } } }", context_value={}
+        )
+        assert result.errors is None, result.errors
+        by_name = {row["name"]: row["posts"] for row in result.data["users"]}
+        assert by_name["Bob"] == []
+        titles = [post["title"] for posts in by_name.values() for post in posts]
+        assert "Draft Post" not in titles
+
+    def test_an_unsaved_scoped_instance_raises(self, seed, Post):
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostType:
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, queryset, info):
+                return queryset.filter(is_published=True)
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self, info: strawberry.types.Info) -> list[PostType]:
+                return [Post(title="New", body="x", is_published=False)]
+
+        result = orm.schema(query=Query).execute_sync(
+            "{ posts { title } }", context_value={}
+        )
+        assert result.errors
+        assert "scope_rows" in result.errors[0].message
+        assert "primary key" in result.errors[0].message

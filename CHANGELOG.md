@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.24.0
+
+### Added
+
+- **Multi-hop `using=` paths.** `using=["author.posts"]` (or `"author__posts"`) loads every relation on the path with the parent query, on all three backends. Each hop is checked when the type is defined, and an error names the hop that does not exist.
+
+### Fixed
+
+- **`scope_rows` applies to rows a resolver returns already loaded.** Returning a list (`list(qs)`, `.scalars().all()`, `await qs`) instead of a query, or rows whose relations the resolver already prefetched, no longer skips the related type's `scope_rows`: rejected rows are dropped from lists and to-one relations read as `None`, on all three backends. Returning an unsaved instance of a scoped type raises, since it has no primary key to check.
+- **Rows loaded through `using=` obey `scope_rows`.** Each hop applies the related type's `scope_rows` and the `scope=` of the field named for that relation, exactly as a selection of it would. Previously a hint loaded its relation unscoped. On Django and Tortoise, selecting the same relation alongside the hinted field returned the hidden row through the selected field.
+- A relation reached both by the selection and by a `using=` path is loaded once, so the two can no longer disagree about which rows are cached.
+- Tortoise: a scoped relation nested under another scoped relation loaded its rows unscoped. Scoped relations at any depth are now prefetched with their scope in one query per level, instead of falling back to one query per parent row.
+- Tortoise: scoped forward relations are loaded in bulk. A hidden row reads as `None` and leaves the foreign key column untouched.
+- Tortoise: forward one-to-one relations in the selection are prefetched.
+
 ## 0.23.0
 
 ### Added
