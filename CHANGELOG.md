@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.24.1
+
+### Added
+
+- `apply_page(query, offset, limit)` on the backend protocol. A backend returns the query cut to one page, or `None` to have the connection read it whole.
+
+### Fixed
+
+- **Connections read only the page they are asked for.** A connection over a query (`orm.connection.*`, `orm.payload.connection`, `ORMListConnection`) used to read every matching row, with its eager loads, and slice the page in Python. It now sends `LIMIT first + 1` and `OFFSET`, on all three backends, sync and async. `totalCount` is counted only when selected, and not when the page came back short. `last` counts to locate its window instead of reading the table. Pages, cursors and `pageInfo` are unchanged. See [Connection fields](README.md#connection-fields) for what is still read whole.
+- `totalCount` selected with `aggregates` or `groups` raised `'coroutine' object has no attribute 'total_count'` on async backends (Tortoise, SQLAlchemy `AsyncSession`, async Django).
+- Tortoise: `groups { items }` failed with an SQL syntax error, because the items were fetched before the group key fields were known.
+- `count_query` works under async execution on Django and with an `AsyncSession`, counts `DISTINCT` queries correctly on Tortoise, and on SQLAlchemy counts an entity a join repeats once, as the rows are read.
+- SQLAlchemy: a refused or dropped connection is reported as `ConnectionError("Database connection failed")` instead of `Invalid filter expression`. Both messages still hide the database error from clients, which names tables, columns or the host; it is kept as the exception's cause, for the server log.
+
 ## 0.24.0
 
 ### Added

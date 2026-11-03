@@ -423,6 +423,75 @@ class TestInternalBackendCoverage:
         query = backend.get_default_queryset(User)
         assert backend.count_query(query, info) >= 3
 
+    def test_a_bad_statement_keeps_the_database_error_as_its_cause(self, sa_session):
+        from sqlalchemy.exc import OperationalError
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        with pytest.raises(ValueError, match="Invalid filter expression") as caught:
+            backend._execute_stmt_sync(sa_session, text("select * from missing_table"))
+        assert isinstance(caught.value.__cause__, OperationalError)
+
+    def test_a_refused_connection_is_not_reported_as_a_bad_filter(self, User):
+        from sqlalchemy import create_engine
+        from sqlalchemy.exc import OperationalError
+        from sqlalchemy.orm import Session
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        unreachable = Session(create_engine("sqlite:////nonexistent/dir/db.sqlite"))
+        with pytest.raises(ConnectionError) as caught:
+            backend._execute_stmt_sync(unreachable, select(User))
+        # The message reaches clients, so it names neither host nor path.
+        assert str(caught.value) == "Database connection failed"
+        assert isinstance(caught.value.__cause__, OperationalError)
+
+    def test_a_dropped_connection_is_not_reported_as_a_bad_filter(self, User):
+        from sqlalchemy.exc import OperationalError
+
+        dropped = OperationalError(
+            "SELECT 1",
+            {},
+            Exception("server closed the connection"),
+            connection_invalidated=True,
+        )
+
+        def execute(stmt):
+            raise dropped
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        with pytest.raises(ConnectionError) as caught:
+            backend._execute_stmt_sync(SimpleNamespace(execute=execute), select(User))
+        # The original carries the statement; the message clients see does not.
+        assert str(caught.value) == "Database connection failed"
+        assert caught.value.__cause__ is dropped
+
+    def test_count_query_counts_a_repeated_entity_once(
+        self, sa_session, seed, User, Post
+    ):
+        """Rows are read with .unique(), so the count has to fold repeats too."""
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        info = SimpleNamespace(context={"session": sa_session})
+        repeated = select(User).join(User.posts).where(Post.is_published.is_(True))
+        assert len(sa_session.execute(repeated).all()) == 3
+        assert backend.count_query(repeated, info) == 2
+
+    def test_apply_page_composes_with_an_existing_cut(self, User):
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        page = backend.apply_page(select(User).offset(2).limit(5), 3, 4)
+        assert (page._offset, page._limit) == (5, 2)
+
+    def test_apply_page_refuses_what_it_cannot_compose(self, User):
+        from sqlalchemy import bindparam
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        assert backend.apply_page(select(User).limit(bindparam("n")), 0, 3) is None
+        assert backend.apply_page(select(User).fetch(5), 0, 3) is None
+
+    def test_apply_page_refuses_a_second_from(self, User, Post):
+        """An implicit cross join repeats each user once per matching post."""
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        crossed = select(User).where(User.id == Post.author_id)
+        assert backend.apply_page(crossed, 0, 3) is None
+
     def test_apply_optimizer_hints_chained_nested_relationships(
         self, sa_session, seed, User, Post
     ):

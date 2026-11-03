@@ -1516,6 +1516,10 @@ class BaseBackend:
         """Model a query object reads, or ``None`` if this backend cannot tell."""
         return None
 
+    def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
+        """Cut *query* to one page in SQL, or ``None`` to have it read whole."""
+        return None
+
     def apply_type_scope(self, query: Any, model: type | None, info: Any) -> Any:
         """Apply *model*'s ``scope_rows`` to *query*, if one is registered.
 

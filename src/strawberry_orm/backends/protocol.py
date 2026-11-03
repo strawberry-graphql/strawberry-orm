@@ -150,6 +150,19 @@ class Backend(Protocol):
         """
         ...
 
+    def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
+        """Cut *query* to *limit* rows starting *offset* rows in.
+
+        The cut composes with a limit or offset *query* already has. Returns
+        ``None`` when cutting in SQL could change which rows the page holds,
+        in which case the connection reads the whole result instead.
+        """
+        ...
+
+    def count_query(self, query: Any, info: Any) -> AwaitableOrValue[int]:
+        """Count the rows *query* yields, as the connection would read them."""
+        ...
+
     # -- Grouping / aggregation -----------------------------------------------
 
     def apply_aggregation(

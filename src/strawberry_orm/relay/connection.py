@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar, cast
 
 import strawberry
@@ -15,15 +16,40 @@ from strawberry.extensions.field_extension import (
 from strawberry.relay import Connection, Edge, ListConnection, PageInfo
 from strawberry.relay.fields import ConnectionExtension
 from strawberry.relay.types import Node
+from strawberry.relay.utils import (
+    SliceMetadata,
+    should_resolve_list_connection_edges,
+    to_base64,
+)
 from strawberry.types import Info
+from strawberry.types.base import StrawberryContainer, get_object_definition
 
-from strawberry_orm._async import AwaitableOrValue
+from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.backends._base import (
     _selection_requests,
 )
-from strawberry_orm.optimizer.extension import optimize_query_nodes
+from strawberry_orm.optimizer.extension import (
+    get_configured_optimizer,
+    optimize_query_nodes,
+)
 
 NodeType = TypeVar("NodeType", bound=relay.Node)
+T = TypeVar("T")
+
+#: Databases number rows with signed 64-bit integers, and a cursor can carry
+#: any number at all; nothing past this is sent as an offset or a limit.
+_LAST_POSITION = 2**63 - 1
+
+
+def _then(value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
+    """Apply *step* to *value*, awaiting either one where it is awaitable."""
+    if not inspect.isawaitable(value):
+        return step(value)
+
+    async def _chained() -> Any:
+        return await await_maybe(step(await value))
+
+    return _chained()
 
 
 def _should_await_nodes(nodes: Any, info: Info) -> bool:
@@ -59,6 +85,24 @@ def _orm_backend_from_info(info: Any) -> Any | None:
 
     backend, _store = get_configured_optimizer(info)
     return backend
+
+
+class _PageRows:
+    """A page the database cut at *offset*, indexed as the whole result.
+
+    Strawberry slices what it is given by absolute position and numbers the
+    cursors from there, so handing it the page at its original positions keeps
+    every cursor and ``pageInfo`` flag exactly what slicing the full list gave.
+    """
+
+    __slots__ = ("offset", "rows")
+
+    def __init__(self, rows: list[Any], offset: int) -> None:
+        self.rows = rows
+        self.offset = offset
+
+    def __getitem__(self, window: slice) -> list[Any]:
+        return self.rows[window.start - self.offset : window.stop - self.offset]
 
 
 class PreslicedRows(list):
@@ -131,7 +175,10 @@ class ORMConnectionExtension(ConnectionExtension):
         first: int | None = None,
         last: int | None = None,
     ) -> Any:
-        nodes = optimize_query_nodes(nodes, info)
+        # An ORM connection cuts its page out of the query before reading it,
+        # so it has to receive the query, not every row the query matches.
+        if not _cuts_its_own_page(self.connection_type):
+            nodes = optimize_query_nodes(nodes, info)
         if inspect.isawaitable(nodes):
 
             async def _await_optimized() -> Any:
@@ -230,6 +277,12 @@ class ORMConnectionExtension(ConnectionExtension):
         if inspect.isawaitable(connection):
             connection = await connection
         return connection
+
+
+def _cuts_its_own_page(connection_type: Any) -> bool:
+    return isinstance(connection_type, type) and issubclass(
+        connection_type, ORMListConnection
+    )
 
 
 def _use_orm_connection_extension(field: Any) -> None:
@@ -354,6 +407,10 @@ def connection_type_for_node(node_type: type) -> Any:
 class ORMListConnection(ORMConnection[NodeType]):
     """A ListConnection that works with any ORM backend.
 
+    Given a query, it reads only the requested page plus one row, which is
+    what answers ``hasNextPage``; ``totalCount`` is counted separately, and
+    only when selected. Given rows, it slices them as Strawberry does.
+
     When the generated connection subclass has ``_orm_aggregate_meta`` set,
     this override computes aggregates, groups, and page-level aggregates
     based on the client's selection set.
@@ -367,7 +424,183 @@ class ORMListConnection(ORMConnection[NodeType]):
         info,
         **kwargs,
     ) -> AwaitableOrValue:
-        nodes = optimize_query_nodes(nodes, info)
+        backend, store = get_configured_optimizer(info)
+        if backend is not None and store is not None and backend.is_query_object(nodes):
+            paged = cls._resolve_query_page(backend, nodes, info=info, **kwargs)
+            if paged is not None:
+                return paged
+        return cls._resolve_rows(nodes, info=info, **kwargs)
+
+    @classmethod
+    def _resolve_query_page(
+        cls,
+        backend: Any,
+        query: Any,
+        *,
+        info: Any,
+        before: str | None = None,
+        after: str | None = None,
+        first: int | None = None,
+        last: int | None = None,
+        max_results: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Read only the page *query* is asked for, or ``None`` to read it whole.
+
+        ``scope_rows`` goes on before the cut, so the count and the page see
+        the same rows, and Django can still filter a queryset it then slices.
+        """
+        prefix = cls._edge_type().CURSOR_PREFIX
+        window = SliceMetadata.from_arguments(
+            info,
+            before=before,
+            after=after,
+            first=first,
+            last=last,
+            max_results=max_results,
+            prefix=prefix,
+        )
+        # Cursors are the client's to forge. A negative position slices a
+        # Python list from its end, which only reading the whole list repeats.
+        if window.start < 0 or window.end < 0:
+            return None
+        query = backend.apply_type_scope(query, backend.query_model(query), info)
+        want_total = _selection_requests(info, "totalCount")
+        args = {
+            "before": before,
+            "after": after,
+            "first": first,
+            "last": last,
+            "max_results": max_results,
+            **kwargs,
+        }
+
+        def count() -> AwaitableOrValue[int | None]:
+            return backend.count_query(query, info) if want_total else None
+
+        if not should_resolve_list_connection_edges(info):
+            # Strawberry builds no edges without edges or pageInfo selected.
+            connection = cls._slice(_PageRows([], window.start), info=info, **args)
+            return cls._finish_connection(connection, count(), info=info, **args)
+
+        if window.end != sys.maxsize:
+            limit = min(window.overfetch, _LAST_POSITION) - window.start
+
+            def finish(rows: list[Any]) -> Any:
+                connection = cls._slice(
+                    _PageRows(rows, window.start), info=info, **args
+                )
+                # A short page is the end of the result, unless it started past
+                # the end, so it gives the total. Otherwise count - only now,
+                # after the page: an AsyncSession runs one statement at a time.
+                ended = len(rows) < limit and (rows or not window.start)
+                total = window.start + len(rows) if want_total and ended else count()
+                return cls._finish_connection(connection, total, info=info, **args)
+
+            # A window that ends where it starts, or past every addressable
+            # row, holds nothing - as slicing the list would have found.
+            if limit <= 0:
+                return finish([])
+            page = backend.apply_page(query, window.start, limit)
+            if page is None:
+                return None
+            return _then(optimize_query_nodes(page, info), finish)
+
+        # ``last`` without ``before`` counts back from the end, so the total
+        # locates the window. ``last: 0`` is Strawberry's ``[-0:]``: every row
+        # after the cursor, which is a full read either way.
+        if not last:
+            return None
+        return _then(
+            backend.count_query(query, info),
+            lambda total: cls._cut_tail(
+                backend,
+                query,
+                total,
+                start=window.start,
+                prefix=prefix,
+                info=info,
+                want_total=want_total,
+                **args,
+            ),
+        )
+
+    @classmethod
+    def _cut_tail(
+        cls,
+        backend: Any,
+        query: Any,
+        total: int,
+        *,
+        start: int,
+        prefix: str,
+        info: Any,
+        want_total: bool,
+        **args: Any,
+    ) -> Any:
+        """The last ``last`` rows after *start*, given the query's *total*."""
+        last = args["last"]
+        offset = max(start, total - last)
+        limit = min(offset + last, _LAST_POSITION) - offset
+
+        def finish(rows: list[Any]) -> Any:
+            # Asked for as the plain page it now is, so Strawberry numbers the
+            # cursors from *offset*. Relay measures hasPreviousPage from the
+            # ``after`` cursor, not from the start of the list.
+            connection = cls._slice(
+                _PageRows(rows, offset),
+                info=info,
+                after=to_base64(prefix, offset - 1) if offset else None,
+                first=len(rows),
+                max_results=args["max_results"],
+            )
+            connection.page_info.has_previous_page = offset > start
+            return cls._finish_connection(
+                connection, total if want_total else None, info=info, **args
+            )
+
+        if limit <= 0:
+            return finish([])
+        page = backend.apply_page(query, offset, limit)
+        if page is None:
+            return cls._resolve_rows(query, info=info, **args)
+        return _then(optimize_query_nodes(page, info), finish)
+
+    @classmethod
+    def _slice(cls, nodes: Any, **kwargs: Any) -> AwaitableOrValue[Any]:
+        return super().resolve_connection(nodes, **kwargs)
+
+    @classmethod
+    def _edge_type(cls) -> Any:
+        """The edge class, whose cursor prefix the page's cursors carry."""
+        type_def = get_object_definition(cls, strict=True)
+        edge = type_def.get_field("edges").resolve_type(type_definition=type_def)
+        while isinstance(edge, StrawberryContainer):
+            edge = edge.of_type
+        return edge
+
+    @classmethod
+    def _resolve_rows(
+        cls,
+        nodes,
+        *,
+        info,
+        **kwargs,
+    ) -> AwaitableOrValue:
+        """Read every row and slice the page out in Python."""
+        rows = optimize_query_nodes(nodes, info)
+        if _should_await_nodes(rows, info):
+            return _then(rows, lambda read: cls._slice_rows(read, info=info, **kwargs))
+        return cls._slice_rows(rows, info=info, **kwargs)
+
+    @classmethod
+    def _slice_rows(
+        cls,
+        nodes,
+        *,
+        info,
+        **kwargs,
+    ) -> AwaitableOrValue:
         want_total = _selection_requests(info, "totalCount")
         total_count: AwaitableOrValue[int | None] = (
             _connection_total_count(nodes, info) if want_total else None
@@ -408,21 +641,15 @@ class ORMListConnection(ORMConnection[NodeType]):
         info: Any,
         **kwargs: Any,
     ) -> AwaitableOrValue[Any]:
-        if inspect.isawaitable(total_count):
-
-            async def _await_total() -> Any:
-                count = await total_count
-                processed = cls._post_process_connection(
-                    connection, info=info, **kwargs
-                )
-                if inspect.isawaitable(processed):
-                    processed = await processed
-                return cls._attach_total_count(processed, count)
-
-            return _await_total()
-
-        processed = cls._post_process_connection(connection, info=info, **kwargs)
-        return cls._attach_total_count(processed, total_count)
+        # Groups and aggregates are awaitable on async backends whether or not
+        # the total is, so the total waits for them either way.
+        return _then(
+            total_count,
+            lambda count: _then(
+                cls._post_process_connection(connection, info=info, **kwargs),
+                lambda processed: cls._attach_total_count(processed, count),
+            ),
+        )
 
     @classmethod
     def _post_process_connection(cls, connection, *, info, **kwargs):
@@ -503,8 +730,11 @@ class ORMListConnection(ORMConnection[NodeType]):
             order_input=order_input,
         )
 
-        items_by_key = None
-        if _selection_requests(info, "groups", "items"):
+        def with_items(resolved: list[Any]) -> Any:
+            if not _selection_requests(info, "groups", "items"):
+                return resolved, None
+            # Only now are the group key fields known: an async apply_grouping
+            # records them on *meta* when it runs, not when it is called.
             after_cursor = _extract_items_after(info)
             offset = _decode_cursor_offset(after_cursor) if after_cursor else 0
             items_by_key = backend.batch_group_items(
@@ -515,20 +745,9 @@ class ORMListConnection(ORMConnection[NodeType]):
                 per_group_limit=(_extract_items_first(info) or 10) + offset + 1,
                 order_input=_extract_items_order(info),
             )
+            return _then(items_by_key, lambda by_key: (resolved, by_key))
 
-        if inspect.isawaitable(groups) or inspect.isawaitable(items_by_key):
-
-            async def _resolve() -> Any:
-                return (
-                    await groups if inspect.isawaitable(groups) else groups,
-                    await items_by_key
-                    if inspect.isawaitable(items_by_key)
-                    else items_by_key,
-                )
-
-            return _resolve()
-
-        return groups, items_by_key
+        return _then(groups, with_items)
 
     @classmethod
     def _attach_groups(

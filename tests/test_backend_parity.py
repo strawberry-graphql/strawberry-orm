@@ -99,6 +99,9 @@ TORT_EXCLUDED_FILES = {
     # A connection over a relation is refused on Tortoise, so its file asserts
     # that rather than the behaviour the other two share.
     "test_relation_connection.py",
+    # Tortoise only executes asynchronously, so it has no second variant to
+    # pair with the sync and async classes the other two run.
+    "test_relay_connection_pagination.py",
     # on= is refused on Tortoise, so its test_on.py asserts that rather than
     # the behaviour the other two share, and the duplicate-lookup case it
     # brings cannot arise there at all.

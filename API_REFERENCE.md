@@ -211,7 +211,7 @@ A Relay connection over a model, split on the same question as fields: does your
 
 On an `@orm.type` an eager connection is served by the parent's relation, and every parent's page is taken in one query using `ROW_NUMBER() OVER (PARTITION BY ...)`, with a second grouped query for the per-parent `totalCount`. All three backends support this; Tortoise, which has no window expression, wraps its own parameterized SQL to do the numbering. It does need a column on the related rows identifying the parent, so a many-to-many is refused when the type is defined and pointed at `lazy`.
 
-`lazy` takes a resolver receiving `self` that returns the rows, and runs once per parent row.
+`lazy` takes a resolver receiving `self` that returns the rows, and runs once per parent row. Return a query rather than a list and each parent's page is cut in SQL, like any other connection's.
 
 Either way you still get the generated `filter` / `order` / `groupBy` arguments, the grouped connection type, `totalCount`, and optimizer integration. Both also accept `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`; any other keyword raises rather than being ignored. Calling `orm.connection(...)` directly still works. See [Connection fields](README.md#connection-fields).
 
@@ -225,7 +225,7 @@ From `strawberry_orm.relay`:
 
 | Name | Meaning |
 | --- | --- |
-| `ORMListConnection` | Cursor-paginated connection over any backend. The usual choice. |
+| `ORMListConnection` | Cursor-paginated connection over any backend. Given a query, it reads only the requested page. The usual choice. |
 | `ORMConnection` | Adds `totalCount` for the full filtered result set. |
 | `Node`, `NodeID`, `GlobalID`, `Edge`, `PageInfo` | Re-exported from Strawberry for convenience. |
 

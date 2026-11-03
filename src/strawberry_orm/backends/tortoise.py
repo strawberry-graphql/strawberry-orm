@@ -863,7 +863,25 @@ class TortoiseBackend(BaseBackend):
                 setattr(client, name, original)
 
     async def count_query(self, query: Any, info: Any) -> int:
-        return await query.count()
+        if not query._distinct:
+            return await query.count()
+        # Tortoise's count drops DISTINCT and would count a join's repeats,
+        # so count the rows of the statement itself. Built on a clone: the
+        # caller may still cut its page from *query*.
+        counted = query._clone()
+        counted._choose_db_if_not_chosen()
+        counted._make_query()
+        inner, values = counted.query.get_parameterized_sql()
+        rows = await counted._db.execute_query_dict(
+            f"SELECT COUNT(*) AS n FROM ({inner}) _orm_counted", values
+        )
+        return rows[0]["n"]
+
+    def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
+        prior_offset, prior_limit = query._offset or 0, query._limit
+        if prior_limit is not None:
+            limit = max(0, min(limit, prior_limit - offset))
+        return query.offset(prior_offset + offset).limit(limit)
 
     async def materialize_query(self, query: Any, info: Any) -> list[Any]:
         return _apply_python_ordering(

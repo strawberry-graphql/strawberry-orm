@@ -2009,6 +2009,10 @@ This gives you:
 
 Filters and ordering are applied *before* pagination, so the connection always slices from a correctly filtered and sorted result set.
 
+The page is cut in the database, not in Python. `first: 50` reads 51 rows (the extra one answers `hasNextPage`), `after` becomes an `OFFSET`, and `totalCount` is a separate count sent only when it is selected — and not even then when the page comes back short, because a short page is the end of the result. `last` without `before` counts first, to find where the window starts. Cursors are the same either way. Each page is its own query, so give the connection an order that is unique — end it with the primary key — or rows that tie can move between pages.
+
+A few requests are still read whole and sliced in Python: a resolver that returns rows rather than a query, `last: 0` (which Relay defines as every row after the cursor), and, on SQLAlchemy, a join that can repeat a row — to a collection, or through a second `FROM` — without `.distinct()`. SQLAlchemy folds those repeats together with `.unique()` after reading, so a `LIMIT` would count them against the page.
+
 `orm.connection.eager()` accepts the same keyword arguments as `relay.connection()` — `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`.
 
 ### Supplying the queryset yourself

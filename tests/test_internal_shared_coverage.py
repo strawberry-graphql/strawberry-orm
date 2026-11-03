@@ -115,6 +115,10 @@ class TestInternalSharedCoverage:
         )
         assert resolved == ["value"]
 
+    def test_base_backend_has_a_connection_read_pages_whole(self):
+        base = BaseBackend(warn_missing_scope=False)
+        assert base.apply_page(object(), 0, 10) is None
+
     def test_base_backend_and_mutation_namespace_validation_errors(self):
         base = BaseBackend(warn_missing_scope=False)
         with pytest.raises(NotImplementedError):

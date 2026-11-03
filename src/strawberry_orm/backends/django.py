@@ -799,8 +799,22 @@ class DjangoBackend(BaseBackend):
         with connection.execute_wrapper(_wrapper):
             yield probe
 
-    def count_query(self, query: Any, info: Any) -> int:
-        return query.count()
+    def count_query(self, query: Any, info: Any) -> Any:
+        return run_sync(query.count, thread_sensitive=True)
+
+    def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
+        from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+
+        # Rows already in memory cost nothing to slice; a cut would re-read them.
+        if query._result_cache is not None:
+            return None
+        # Slicing composes with an existing slice. The clone forgets that
+        # scope_rows was applied, and a sliced queryset can no longer be
+        # filtered, so the optimizer must not try to apply it again.
+        page = query.all()[offset : offset + limit]
+        if query_is_scoped(query):
+            mark_query_scoped(page)
+        return page
 
     def materialize_query(self, query: Any, info: Any) -> Any:
         from strawberry_orm._async import in_async_context

@@ -178,6 +178,29 @@ class TestInternalSqlalchemyExtraCoverage:
                 async_session, text("select * from missing_table")
             )
 
+    @pytest.mark.asyncio
+    async def test_async_dropped_connection_is_not_reported_as_a_bad_filter(self):
+        from sqlalchemy.exc import OperationalError
+
+        dropped = OperationalError(
+            "SELECT 1",
+            {},
+            Exception("server closed the connection"),
+            connection_invalidated=True,
+        )
+
+        async def execute(stmt):
+            raise dropped
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+        with pytest.raises(
+            ConnectionError, match="^Database connection failed$"
+        ) as caught:
+            await backend._execute_stmt_async(
+                SimpleNamespace(execute=execute), text("select 1")
+            )
+        assert caught.value.__cause__ is dropped
+
     def test_ordering_and_regex_helper_edges(self):
         clause = _build_lookup_clauses(
             FlagModel.enabled, RegexLookup(i_regex="x"), enable_regex=True

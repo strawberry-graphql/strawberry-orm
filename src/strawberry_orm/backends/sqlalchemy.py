@@ -761,12 +761,41 @@ class SQLAlchemyBackend(BaseBackend):
         finally:
             event.remove(target, "do_orm_execute", _on_execute)
 
-    def count_query(self, query: Any, info: Any) -> int:
+    def count_query(self, query: Any, info: Any) -> Any:
         from sqlalchemy import func, select
 
         subq = query.subquery()
-        stmt = select(func.count()).select_from(subq)
-        return self._get_session(info).execute(stmt).scalar_one()
+        counted: Any = subq
+        if _may_repeat_rows(query):
+            # Rows are read with .unique(), so a join that repeats an entity
+            # yields it once; count the distinct entities to match.
+            entity = self.query_model(query)
+            keys = [
+                subq.corresponding_column(c) for c in sa_inspect(entity).primary_key
+            ]
+            counted = select(*keys).distinct().subquery()
+        stmt = select(func.count()).select_from(counted)
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._scalar_async(session, stmt)
+        return session.execute(stmt).scalar_one()
+
+    async def _scalar_async(self, session: Any, stmt: Any) -> Any:
+        return (await session.execute(stmt)).scalar_one()
+
+    def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
+        from sqlalchemy.exc import CompileError
+
+        if _may_repeat_rows(query) or query._fetch_clause is not None:
+            return None
+        try:
+            prior_offset, prior_limit = query._offset or 0, query._limit
+        except CompileError:
+            # A limit or offset given as an expression cannot be composed.
+            return None
+        if prior_limit is not None:
+            limit = max(0, min(limit, prior_limit - offset))
+        return query.offset(prior_offset + offset).limit(limit)
 
     def materialize_query(self, query: Any, info: Any) -> Any:
         return self._execute_stmt(query, info)
@@ -1295,8 +1324,8 @@ class SQLAlchemyBackend(BaseBackend):
 
         try:
             result = session.execute(stmt)
-        except (OperationalError, ProgrammingError):
-            raise ValueError("Invalid filter expression") from None
+        except (OperationalError, ProgrammingError) as exc:
+            raise _sanitized(exc) from exc
 
         return list(result.scalars().unique().all())
 
@@ -1305,8 +1334,8 @@ class SQLAlchemyBackend(BaseBackend):
 
         try:
             result = await session.execute(stmt)
-        except (OperationalError, ProgrammingError):
-            raise ValueError("Invalid filter expression") from None
+        except (OperationalError, ProgrammingError) as exc:
+            raise _sanitized(exc) from exc
 
         return list(result.scalars().unique().all())
 
@@ -1957,6 +1986,37 @@ def _get_sa_pk_column(model: type) -> Any:
     mapper = sa_inspect(model)
     pk_col = mapper.primary_key[0]
     return getattr(model, pk_col.key)
+
+
+def _sanitized(exc: Any) -> Exception:
+    """What a client sees in place of a database error.
+
+    The original names tables and columns, or the database host, so it is
+    kept only as the cause, for the server log. Only an error from running the
+    statement can be a bad filter: a refused connection ("too many clients")
+    carries no statement, and a dropped one is invalidated.
+    """
+    if exc.statement is None or exc.connection_invalidated:
+        return ConnectionError("Database connection failed")
+    return ValueError("Invalid filter expression")
+
+
+def _may_repeat_rows(stmt: Any) -> bool:
+    """True when *stmt* can return one entity on several rows.
+
+    That happens through a join to many rows, a join the ORM cannot see the
+    shape of, or a second FROM. A join along a many-to-one relationship
+    cannot repeat the row, and neither can a ``DISTINCT`` statement.
+    """
+    if stmt._distinct:
+        return False
+    if len(stmt.column_descriptions) != 1 or len(stmt.get_final_froms()) != 1:
+        return True
+    for target, *_rest in stmt._setup_joins:
+        prop = getattr(target, "property", None)
+        if getattr(prop, "uselist", True):
+            return True
+    return False
 
 
 def _introspect_sa_model(

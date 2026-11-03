@@ -6,6 +6,8 @@ loop rebuilds it once the model is known, and the pages are cut with one
 windowed query rather than one query per parent.
 """
 
+import base64
+
 import pytest
 import strawberry
 from sqlalchemy import event
@@ -133,6 +135,116 @@ class TestRelationConnection:
             "{ users { name posts(first: 5) { edges { node { title } } } } }",
         )
         assert by_user == {"Bob": ["Draft Post"]}
+
+    def test_a_single_parents_page_is_cut_like_the_window_cuts_it(self):
+        """Alone, the parent's rows are a plain query, so the page is a LIMIT.
+
+        It has to answer exactly what the windowed read gives the same parent
+        among siblings: the same edges, cursors, flags and total.
+        """
+        after = base64.b64encode(b"arrayconnection:0").decode()
+        page = (
+            f'posts(first: 1, after: "{after}") {{ totalCount '
+            "edges { cursor node { title } } "
+            "pageInfo { hasNextPage hasPreviousPage } }"
+        )
+        orm = _orm()
+
+        @orm.type(SAPost, filters=orm.filter(SAPost), order=orm.order(SAPost))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @orm.type(SAUser)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+            @classmethod
+            def scope_rows(cls, query, info):
+                return query.where(SAUser.name == "Alice")
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+
+        statements: list[str] = []
+
+        def _before(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        event.listen(self._s.bind, "before_cursor_execute", _before)
+        try:
+            alone = orm.schema(query=Query).execute_sync(
+                f"{{ users {{ name {page} }} }}", context_value={"session": self._s}
+            )
+        finally:
+            event.remove(self._s.bind, "before_cursor_execute", _before)
+        among_siblings = self._schema(_orm()).execute_sync(
+            f"{{ users {{ name {page} }} }}", context_value={"session": self._s}
+        )
+
+        assert alone.errors is None, alone.errors
+        assert among_siblings.errors is None, among_siblings.errors
+        windowed = next(u for u in among_siblings.data["users"] if u["name"] == "Alice")
+        assert alone.data["users"] == [windowed]
+        assert windowed["posts"]["totalCount"] == 2
+        assert [e["node"]["title"] for e in windowed["posts"]["edges"]] == [
+            "GraphQL Guide"
+        ]
+        reads = [sql for sql in statements if "FROM post" in sql and "count" not in sql]
+        assert len(reads) == 1 and "LIMIT" in reads[0], statements
+
+    def test_a_lazy_connection_pages_and_counts_each_parent(self):
+        """Each parent's query is cut, and a page that holds the rest is the total."""
+        from collections.abc import Iterable
+
+        from sqlalchemy import select
+
+        orm = _orm()
+
+        @orm.type(SAPost)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @orm.type(SAUser)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+            @orm.connection.lazy(ORMListConnection[PostNode])
+            def posts(self, info: strawberry.Info) -> Iterable[PostNode]:
+                return select(SAPost).where(SAPost.author_id == self.id)
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+
+        statements: list[str] = []
+
+        def _before(conn, cursor, statement, params, context, executemany):
+            statements.append(statement)
+
+        event.listen(self._s.bind, "before_cursor_execute", _before)
+        try:
+            result = orm.schema(query=Query).execute_sync(
+                "{ users { name posts(first: 5) { totalCount "
+                "edges { node { title } } } } }",
+                context_value={"session": self._s},
+            )
+        finally:
+            event.remove(self._s.bind, "before_cursor_execute", _before)
+        assert result.errors is None, result.errors
+        assert {u["name"]: u["posts"]["totalCount"] for u in result.data["users"]} == {
+            "Alice": 2,
+            "Bob": 1,
+            "Charlie": 1,
+        }
+        pages = [sql for sql in statements if "LIMIT" in sql]
+        assert len(pages) == 3, statements
+        assert not [sql for sql in statements if "count(" in sql], statements
 
     PAGE = "{ users { name posts(first: 1) { edges { node { title } } } } }"
 

@@ -5,6 +5,8 @@ Built from the annotation alone it would query the whole table, because
 loop rebuilds it once the model is known.
 """
 
+import base64
+
 import pytest
 import strawberry
 from django.db import connection
@@ -125,6 +127,84 @@ class TestRelationConnection:
             "{ users { name posts(first: 5) { edges { node { title } } } } }",
         )
         assert by_user == {"Bob": ["Draft Post"]}
+
+    def test_a_single_parents_page_is_cut_like_the_window_cuts_it(
+        self, seed, User, Post
+    ):
+        """Alone, the parent's rows are a plain query, so the page is a LIMIT.
+
+        It has to answer exactly what the windowed read gives the same parent
+        among siblings: the same edges, cursors, flags and total.
+        """
+        after = base64.b64encode(b"arrayconnection:0").decode()
+        query = (
+            f'{{ users {{ name posts(first: 1, after: "{after}") {{ totalCount '
+            "edges { cursor node { title } } "
+            "pageInfo { hasNextPage hasPreviousPage } } } }"
+        )
+        among_siblings = self._schema(_orm(), User, Post).execute_sync(
+            query, context_value={}
+        )
+        User.objects.exclude(name="Alice").delete()
+        with CaptureQueriesContext(connection) as ctx:
+            alone = self._schema(_orm(), User, Post).execute_sync(
+                query, context_value={}
+            )
+
+        assert alone.errors is None, alone.errors
+        assert among_siblings.errors is None, among_siblings.errors
+        windowed = next(u for u in among_siblings.data["users"] if u["name"] == "Alice")
+        assert alone.data["users"] == [windowed]
+        assert windowed["posts"]["totalCount"] == 2
+        assert [e["node"]["title"] for e in windowed["posts"]["edges"]] == [
+            "GraphQL Guide"
+        ]
+        reads = [
+            q["sql"]
+            for q in ctx.captured_queries
+            if 'FROM "post"' in q["sql"] and "COUNT" not in q["sql"]
+        ]
+        assert len(reads) == 1 and "LIMIT" in reads[0], ctx.captured_queries
+
+    def test_a_lazy_connection_pages_and_counts_each_parent(self, seed, User, Post):
+        """Each parent's query is cut, and a page that holds the rest is the total."""
+        from collections.abc import Iterable
+
+        orm = _orm()
+
+        @orm.type(Post)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @orm.type(User)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+            @orm.connection.lazy(ORMListConnection[PostNode])
+            def posts(self, info: strawberry.Info) -> Iterable[PostNode]:
+                return Post.objects.filter(author_id=self.pk)
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+
+        with CaptureQueriesContext(connection) as ctx:
+            result = orm.schema(query=Query).execute_sync(
+                "{ users { name posts(first: 5) { totalCount "
+                "edges { node { title } } } } }",
+                context_value={},
+            )
+        assert result.errors is None, result.errors
+        assert {u["name"]: u["posts"]["totalCount"] for u in result.data["users"]} == {
+            "Alice": 2,
+            "Bob": 1,
+            "Charlie": 1,
+        }
+        statements = [q["sql"] for q in ctx.captured_queries]
+        assert len([sql for sql in statements if "LIMIT" in sql]) == 3, statements
+        assert not [sql for sql in statements if "COUNT(" in sql], statements
 
     def _count(self, schema, query):
         with CaptureQueriesContext(connection) as ctx:

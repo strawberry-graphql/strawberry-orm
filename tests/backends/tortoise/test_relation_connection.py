@@ -10,6 +10,7 @@ SQL that numbers rows within each parent; these tests hold that wrapping to the
 same behaviour the other backends get from their ORM.
 """
 
+import base64
 from contextlib import contextmanager
 
 import pytest
@@ -29,17 +30,17 @@ def _orm():
 
 
 @contextmanager
-def _count_queries():
+def _record_queries():
     from tortoise import connections
 
     client = connections.get("default")
-    counter = {"n": 0}
+    statements: list[str] = []
     originals = {}
 
     def _wrap(original):
-        async def counting(*args, **kwargs):
-            counter["n"] += 1
-            return await original(*args, **kwargs)
+        async def counting(sql, *args, **kwargs):
+            statements.append(sql)
+            return await original(sql, *args, **kwargs)
 
         return counting
 
@@ -50,7 +51,7 @@ def _count_queries():
         originals[name] = original
         setattr(client, name, _wrap(original))
     try:
-        yield counter
+        yield statements
     finally:
         for name, original in originals.items():
             setattr(client, name, original)
@@ -200,32 +201,100 @@ class TestRelationConnection:
         )
         assert by_user == {"Bob": ["Draft Post"]}
 
+    async def test_a_single_parents_page_is_cut_like_the_window_cuts_it(self):
+        """Alone, the parent's rows are a plain query, so the page is a LIMIT.
+
+        It has to answer exactly what the windowed read gives the same parent
+        among siblings: the same edges, cursors, flags and total.
+        """
+        after = base64.b64encode(b"arrayconnection:0").decode()
+        query = (
+            f'{{ users {{ name posts(first: 1, after: "{after}") {{ totalCount '
+            "edges { cursor node { title } } "
+            "pageInfo { hasNextPage hasPreviousPage } } } }"
+        )
+        among_siblings = await self._schema(_orm()).execute(query)
+        await TUser.exclude(name="Alice").delete()
+        with _record_queries() as statements:
+            alone = await self._schema(_orm()).execute(query)
+
+        assert alone.errors is None, alone.errors
+        assert among_siblings.errors is None, among_siblings.errors
+        windowed = next(u for u in among_siblings.data["users"] if u["name"] == "Alice")
+        assert alone.data["users"] == [windowed]
+        assert windowed["posts"]["totalCount"] == 2
+        assert [e["node"]["title"] for e in windowed["posts"]["edges"]] == [
+            "GraphQL Guide"
+        ]
+        reads = [
+            sql for sql in statements if 'FROM "post"' in sql and "COUNT" not in sql
+        ]
+        assert len(reads) == 1 and "LIMIT" in reads[0], statements
+
+    async def test_a_lazy_connection_pages_and_counts_each_parent(self):
+        """Each parent's query is cut, and a page that holds the rest is the total."""
+        from collections.abc import Iterable
+
+        orm = _orm()
+
+        @orm.type(TPost)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @orm.type(TUser)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+            @orm.connection.lazy(ORMListConnection[PostNode])
+            def posts(self, info: strawberry.Info) -> Iterable[PostNode]:
+                return TPost.filter(author_id=self.pk)
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+
+        with _record_queries() as statements:
+            result = await orm.schema(query=Query).execute(
+                "{ users { name posts(first: 5) { totalCount "
+                "edges { node { title } } } } }"
+            )
+        assert result.errors is None, result.errors
+        assert {u["name"]: u["posts"]["totalCount"] for u in result.data["users"]} == {
+            "Alice": 2,
+            "Bob": 1,
+            "Charlie": 1,
+        }
+        assert len([sql for sql in statements if "LIMIT" in sql]) == 3, statements
+        assert not [sql for sql in statements if "COUNT(" in sql], statements
+
     async def test_a_page_costs_the_same_whether_or_not_it_is_scoped(self):
         """Root, one windowed query for every parent's page, one for the totals."""
         schema = self._schema(_orm())
-        with _count_queries() as counter:
+        with _record_queries() as statements:
             await self._by_user(schema, self.PAGE)
-        assert counter["n"] == 3
+        assert len(statements) == 3
 
         scoped = self._schema(_orm(), scope_drafts=True)
-        with _count_queries() as counter:
+        with _record_queries() as statements:
             await self._by_user(scoped, self.PAGE)
-        assert counter["n"] == 3
+        assert len(statements) == 3
 
     async def test_the_cost_does_not_grow_with_the_number_of_parents(self):
         """The point of the window: statements track the shape, not the rows."""
         schema = self._schema(_orm())
-        with _count_queries() as counter:
+        with _record_queries() as statements:
             await self._by_user(schema, self.PAGE)
-        before = counter["n"]
+        before = len(statements)
 
         for i in range(5):
             user = await TUser.create(name=f"Extra {i}", email=f"e{i}@x.com")
             await TPost.create(title=f"P{i}", body="b", author=user, is_published=True)
 
-        with _count_queries() as counter:
+        with _record_queries() as statements:
             by_user = await self._by_user(schema, self.PAGE)
-        assert counter["n"] == before
+        assert len(statements) == before
         assert len(by_user) == 8
 
     async def test_a_connection_over_a_many_to_many_is_refused(self):
@@ -306,9 +375,9 @@ class TestRelationConnection:
             'filter: {field: {title: {contains: "o"}}}) '
             "{ totalCount edges { node { title } } } } }"
         )
-        with _count_queries() as counter:
+        with _record_queries() as statements:
             await self._by_user(schema, query)
-        assert counter["n"] == 3
+        assert len(statements) == 3
 
     async def test_a_backend_that_cannot_window_refuses(self, monkeypatch):
         """Without a window every parent costs a query, so say so up front."""
