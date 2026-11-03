@@ -181,6 +181,27 @@ class TestInternalBackendCoverage:
         with pytest.raises(ValueError, match="Invalid filter expression"):
             backend._execute_stmt_sync(sa_session, text("select * from missing_table"))
 
+    def test_a_page_is_ordered_to_the_row(self, User):
+        """The cut ends its order with the key, and never names the key twice."""
+        from sqlalchemy.dialects import sqlite
+        from sqlalchemy.orm import aliased
+
+        backend = SQLAlchemyBackend(dialect="sqlite")
+
+        def order(query):
+            page = backend.apply_page(query, 0, 5)
+            sql = str(page.compile(dialect=sqlite.dialect()))
+            return sql.split("ORDER BY ")[1].split("\n")[0]
+
+        assert order(select(User).order_by(User.email)) == "user.email, user.id"
+        assert order(select(User).order_by(User.id.desc())) == "user.id DESC"
+        # An aliased entity is ordered by its own key, not the table it aliases.
+        rows = aliased(User, select(User).subquery())
+        assert order(select(rows).order_by(rows.email)) == "anon_1.email, anon_1.id"
+        # A table selected through Core has no mapper to name its key.
+        table = User.__table__
+        assert order(select(table).distinct().order_by(table.c.email)) == "user.email"
+
     def test_internal_queryset_hooks_and_ordering_helpers(self, User):
         backend = SQLAlchemyBackend(dialect="sqlite")
         backend._type_registry["UserType"] = User

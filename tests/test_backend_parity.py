@@ -102,6 +102,7 @@ TORT_EXCLUDED_FILES = {
     # Tortoise only executes asynchronously, so it has no second variant to
     # pair with the sync and async classes the other two run.
     "test_relay_connection_pagination.py",
+    "test_relay_connection_ties.py",
     # on= is refused on Tortoise, so its test_on.py asserts that rather than
     # the behaviour the other two share, and the duplicate-lookup case it
     # brings cannot arise there at all.

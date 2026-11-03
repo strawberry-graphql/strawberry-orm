@@ -881,7 +881,8 @@ class TortoiseBackend(BaseBackend):
         prior_offset, prior_limit = query._offset or 0, query._limit
         if prior_limit is not None:
             limit = max(0, min(limit, prior_limit - offset))
-        return query.offset(prior_offset + offset).limit(limit)
+        page = _ordered_to_the_row(query)
+        return page.offset(prior_offset + offset).limit(limit)
 
     async def materialize_query(self, query: Any, info: Any) -> list[Any]:
         return _apply_python_ordering(
@@ -1998,20 +1999,47 @@ def _quote_ident(name: str, model: type, quote_char: str) -> str:
 def _window_ordering(
     model: type, order_clauses: list[str], quote_char: str
 ) -> list[str]:
-    """Render the window's ORDER BY, falling back to the primary key."""
+    """Render the window's ORDER BY, ending with the primary key.
+
+    Rows that tie on the requested order would otherwise be numbered however
+    the database likes, differently from one page to the next.
+    """
     meta = model._meta  # type: ignore[attr-defined]
     projection = _db_columns(model)
     rendered: list[str] = []
+    columns: set[str] = set()
     for clause in order_clauses:
         descending = clause.startswith("-")
         field = clause[1:] if descending else clause
         column = projection.get(field, field)
+        columns.add(column)
         direction = " DESC" if descending else " ASC"
         rendered.append(_quote_ident(column, model, quote_char) + direction)
-    if not rendered:
-        pk_column = projection.get(meta.pk_attr, meta.db_pk_column)
+    pk_column = projection.get(meta.pk_attr, meta.db_pk_column)
+    if pk_column not in columns:
         rendered.append(_quote_ident(pk_column, model, quote_char) + " ASC")
     return rendered
+
+
+def _ordered_to_the_row(query: Any) -> Any:
+    """*query* in an order no two rows share: its own, then the primary key.
+
+    Each page is cut by its own query, and a database breaks ties in a
+    non-unique order however it likes, differently from one page to the next,
+    so a row could land on two pages and another on none.
+    """
+    from pypika_tortoise import Order
+
+    meta = query.model._meta
+    orderings = list(query._orderings)
+    # Tortoise falls back to the model's ordering, but not for annotated queries.
+    if not orderings and not query._annotations:
+        orderings = list(meta.ordering)
+    if any(field == meta.pk_attr for field, _ in orderings):
+        return query
+    ordered = query._clone()
+    ordered._orderings = [*orderings, (meta.pk_attr, Order.asc)]
+    return ordered
 
 
 def _windowed_sql(

@@ -149,6 +149,28 @@ class TestInternalBackendCoverage:
         await _hide_scoped_out([], "author", load)
 
     @pytest.mark.asyncio
+    async def test_a_page_is_ordered_to_the_row(self, tortoise_db, User):
+        """The cut ends its order with the key, and never names the key twice."""
+        from pypika_tortoise import Order
+        from tortoise.functions import Count
+
+        from strawberry_orm.backends.tortoise import _ordered_to_the_row
+
+        def orderings(query):
+            return list(_ordered_to_the_row(query)._orderings)
+
+        assert orderings(User.all().order_by("email")) == [
+            ("email", Order.asc),
+            ("id", Order.asc),
+        ]
+        by_key = User.all().order_by("-id")
+        assert _ordered_to_the_row(by_key) is by_key
+        # Tortoise skips the model's ordering on an annotated query, so the
+        # key is all there is to order by.
+        annotated = User.all().annotate(posts_count=Count("posts"))
+        assert orderings(annotated) == [("id", Order.asc)]
+
+    @pytest.mark.asyncio
     async def test_count_query(self, tortoise_db, seed, User):
         backend = TortoiseBackend()
         qs = backend.get_default_queryset(User)

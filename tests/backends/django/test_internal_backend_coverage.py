@@ -428,6 +428,27 @@ class TestInternalBackendCoverage:
         backend = DjangoBackend()
         assert backend.count_query(Post.objects.all(), info=None) == 4
 
+    def test_a_page_is_ordered_to_the_row(self):
+        """The cut ends its order with the key, and never names the key twice."""
+        from django.db.models import F
+
+        from strawberry_orm.backends.django import _ordered_to_the_row, _pk_tiebreak
+
+        assert _pk_tiebreak(["email"], User) == "id"
+        assert _pk_tiebreak(["-pk"], User) is None
+        assert _pk_tiebreak([F("id").desc()], User) is None
+        assert _ordered_to_the_row(User.objects.order_by("email")).query.order_by == (
+            "email",
+            "id",
+        )
+        # A slice cannot be reordered, and reordering would drop an
+        # .extra(order_by=), which outranks every other order.
+        capped = _ordered_to_the_row(User.objects.order_by("email")[:5])
+        assert capped.query.order_by == ("email",)
+        extra = _ordered_to_the_row(User.objects.extra(order_by=["-name"]))
+        assert list(extra.query.extra_order_by) == ["-name"]
+        assert extra.query.order_by == ()
+
     @pytest.mark.asyncio
     async def test_materialize_query_async_path(self, seed, Post):
         backend = DjangoBackend()

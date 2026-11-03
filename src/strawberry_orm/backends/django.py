@@ -645,10 +645,10 @@ class DjangoBackend(BaseBackend):
         from django.db.models.functions import RowNumber
 
         partition = [F(k) for k in group_key_fields]
-        if order_input:
-            ordering = _build_django_order_from_input(order_input)
-        else:
-            ordering = [F("pk")]
+        ordering = _build_django_order_from_input(order_input) if order_input else []
+        tiebreak = _pk_tiebreak(ordering, model)
+        if tiebreak is not None:
+            ordering = [*ordering, F(tiebreak)]
 
         def _run():
             qs = (
@@ -811,7 +811,7 @@ class DjangoBackend(BaseBackend):
         # Slicing composes with an existing slice. The clone forgets that
         # scope_rows was applied, and a sliced queryset can no longer be
         # filtered, so the optimizer must not try to apply it again.
-        page = query.all()[offset : offset + limit]
+        page = _ordered_to_the_row(query)[offset : offset + limit]
         if query_is_scoped(query):
             mark_query_scoped(page)
         return page
@@ -895,12 +895,14 @@ class DjangoBackend(BaseBackend):
         resolver.__name__ = field_name
         return resolver
 
-    def group_counts(self, query: Any, key_field: str, info: Any) -> dict[Any, int]:
-        """Only reached once the windowed page came back synchronously."""
+    def group_counts(self, query: Any, key_field: str, info: Any) -> Any:
         from django.db.models import Count
 
-        rows = query.values(key_field).annotate(_n=Count("pk"))
-        return {row[key_field]: row["_n"] for row in rows}
+        def _run() -> dict[Any, int]:
+            rows = query.values(key_field).annotate(_n=Count("pk"))
+            return {row[key_field]: row["_n"] for row in rows}
+
+        return run_sync(_run, thread_sensitive=True)
 
     def _relation_connection_spec(
         self, model: type, field_name: str, relation: str
@@ -1233,6 +1235,43 @@ class DjangoBackend(BaseBackend):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _pk_tiebreak(ordering: Any, model: type) -> str | None:
+    """The primary key to end *ordering* with, or ``None`` if it names it.
+
+    Each page is cut by its own query, and a database breaks ties in a
+    non-unique order however it likes, differently from one page to the next,
+    so a row could land on two pages and another on none.
+    """
+    pk = model._meta.pk  # type: ignore[attr-defined]
+    names = {"pk", pk.name, pk.attname}
+    for term in ordering:
+        if isinstance(term, str):
+            name = term.lstrip("-")
+        else:
+            name = getattr(getattr(term, "expression", term), "name", None)
+        if name in names:
+            return None
+    return pk.attname
+
+
+def _ordered_to_the_row(queryset: Any) -> Any:
+    """*queryset* in an order no two rows share: its own, then the primary key.
+
+    A sliced queryset can no longer be reordered, and reordering one with an
+    ``.extra(order_by=...)`` would drop that order, so those are left as they are.
+    """
+    query = queryset.query
+    if query.is_sliced or query.extra_order_by:
+        return queryset.all()
+    ordering = query.order_by or (
+        query.get_meta().ordering if query.default_ordering else ()
+    )
+    tiebreak = _pk_tiebreak(ordering, queryset.model)
+    if tiebreak is None:
+        return queryset.all()
+    return queryset.order_by(*ordering, tiebreak)
 
 
 def _make_on_resolver(

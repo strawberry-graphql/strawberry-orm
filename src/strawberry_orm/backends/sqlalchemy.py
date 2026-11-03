@@ -540,11 +540,10 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy import func, select
 
         key_cols = [getattr(model, k) for k in group_key_fields]
-        if order_input:
-            order_clauses = _build_sa_order_from_input(order_input, model)
-        else:
-            pk_col = _get_sa_pk_column(model)
-            order_clauses = [pk_col]
+        order_clauses = (
+            _build_sa_order_from_input(order_input, model) if order_input else []
+        )
+        order_clauses += _missing_pk(order_clauses, model)
 
         rn = (
             func.row_number()
@@ -795,6 +794,9 @@ class SQLAlchemyBackend(BaseBackend):
             return None
         if prior_limit is not None:
             limit = max(0, min(limit, prior_limit - offset))
+        missing = _missing_pk(query._order_by_clauses, self.query_model(query))
+        if missing:
+            query = query.order_by(*missing)
         return query.offset(prior_offset + offset).limit(limit)
 
     def materialize_query(self, query: Any, info: Any) -> Any:
@@ -841,8 +843,13 @@ class SQLAlchemyBackend(BaseBackend):
         subq = query.subquery()
         key_col = subq.c[key_field]
         stmt = select(key_col, func.count()).select_from(subq).group_by(key_col)
-        # Only reached once the windowed page came back synchronously.
-        return dict(self._get_session(info).execute(stmt).all())
+        session = self._get_session(info)
+        if self._is_async_session(session):
+            return self._group_counts_async(session, stmt)
+        return dict(session.execute(stmt).all())
+
+    async def _group_counts_async(self, session: Any, stmt: Any) -> dict[Any, int]:
+        return dict((await session.execute(stmt)).all())
 
     def _relation_connection_spec(
         self, model: type, field_name: str, relation: str
@@ -1986,6 +1993,39 @@ def _get_sa_pk_column(model: type) -> Any:
     mapper = sa_inspect(model)
     pk_col = mapper.primary_key[0]
     return getattr(model, pk_col.key)
+
+
+def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
+    """The primary-key columns an order lacks, to end it with.
+
+    Each page is cut by its own query, and a database breaks ties in a
+    non-unique order however it likes, differently from one page to the next,
+    so a row could land on two pages and another on none. The key is read
+    off *entity* itself, so an aliased entity is ordered by its own columns.
+    """
+    from sqlalchemy.sql import coercions, roles
+    from sqlalchemy.sql.util import unwrap_order_by
+
+    mapper = getattr(sa_inspect(entity, raiseerr=False), "mapper", None)
+    if mapper is None:
+        return []
+    ordered = [
+        column
+        for clause in order_clauses
+        for column in unwrap_order_by(coercions.expect(roles.OrderByRole, clause))
+    ]
+    primary_key = [
+        getattr(entity, mapper.get_property_by_column(column).key).expression
+        for column in mapper.primary_key
+    ]
+    return [
+        pk
+        for pk in primary_key
+        if not any(
+            pk.shares_lineage(column) and getattr(column, "table", None) is pk.table
+            for column in ordered
+        )
+    ]
 
 
 def _sanitized(exc: Any) -> Exception:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.2
+
+### Fixed
+
+- **Rows that tie on a connection's order no longer repeat or go missing between pages.** Since 0.24.1 each page is its own query, and where the order was not unique a database could break ties differently on each page, so a row could appear on two pages and another on none. The cut now ends every order with the primary key, unless it already includes it: the client's `order`, the resolver's, the model's default, or none at all. This applies on all three backends, sync and async, to root connections and to the windowed pages of relation connections and `groups { items }`. Cursors, `pageInfo`, `totalCount` and the order of rows that do not tie are unchanged.
+- Relation connections over several parents failed under async Django and with an SQLAlchemy `AsyncSession`: each parent's total was counted synchronously.
+
 ## 0.24.1
 
 ### Added
