@@ -269,6 +269,93 @@ class TestRelationConnection:
         assert len([sql for sql in statements if "LIMIT" in sql]) == 3, statements
         assert not [sql for sql in statements if "COUNT(" in sql], statements
 
+    async def _built(self, model, schema, query):
+        """The result, and the *model* rows built to answer it."""
+        built = []
+        build = model._init_from_db.__func__
+
+        def keep(cls, **row):
+            instance = build(cls, **row)
+            built.append(instance)
+            return instance
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(model, "_init_from_db", classmethod(keep))
+            result = await schema.execute(query)
+        return result, built
+
+    async def test_an_alias_gets_its_own_page(self):
+        """Each field reads its own page, even where both reach the same row."""
+        result = await self._schema(_orm()).execute(
+            "{ narrow: users { name posts(first: 5, "
+            'filter: {field: {title: {contains: "Hello"}}}) '
+            "{ edges { node { title } } } } "
+            "everything: users { name posts { edges { node { title } } } } }"
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["everything"] if u["name"] == "Alice")
+        assert sorted(e["node"]["title"] for e in alice["posts"]["edges"]) == [
+            "GraphQL Guide",
+            "Hello World",
+        ]
+
+    async def test_nothing_is_left_on_the_row(self):
+        """A later read of the same rows must not be handed this page."""
+        result, users = await self._built(
+            TUser,
+            self._schema(_orm()),
+            "{ users { posts(first: 5) { edges { node { title } } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert users
+        assert all(
+            not k.startswith("_orm_connection_page") for u in users for k in vars(u)
+        )
+
+    async def test_a_page_size_over_the_limit_reads_no_rows(self):
+        result, posts = await self._built(
+            TPost,
+            self._schema(_orm()),
+            "{ users { posts(first: 1000) { edges { node { title } } } } }",
+        )
+        assert "cannot be higher than 100" in result.errors[0].message
+        assert posts == [], f"read {len(posts)} posts before refusing the page size"
+
+    async def test_a_forged_cursor_reads_no_rows(self):
+        forged = base64.b64encode(b"arrayconnection:1000000").decode()
+        result, posts = await self._built(
+            TPost,
+            self._schema(_orm()),
+            f'{{ users {{ name posts(first: 2, after: "{forged}") '
+            "{ edges { node { title } } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert all(u["posts"]["edges"] == [] for u in result.data["users"])
+        assert posts == [], f"read {len(posts)} posts past the end of every page"
+
+    async def test_before_pages_as_strawberry_defines_it(self):
+        """``first`` with ``before`` starts at ``before - 1``, past ``first``'s reach."""
+        alice = await TUser.get(name="Alice")
+        for i in range(6):
+            await TPost.create(
+                title=f"Extra {i}", body="b", author=alice, is_published=True
+            )
+        before = base64.b64encode(b"arrayconnection:5").decode()
+        result = await self._schema(_orm()).execute(
+            f'{{ users {{ name posts(first: 2, before: "{before}") '
+            "{ edges { cursor } pageInfo { hasPreviousPage hasNextPage } } } }"
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["users"] if u["name"] == "Alice")
+        assert [e["cursor"] for e in alice["posts"]["edges"]] == [
+            base64.b64encode(b"arrayconnection:4").decode(),
+            base64.b64encode(b"arrayconnection:5").decode(),
+        ]
+        assert alice["posts"]["pageInfo"] == {
+            "hasPreviousPage": True,
+            "hasNextPage": True,
+        }
+
     async def test_a_page_costs_the_same_whether_or_not_it_is_scoped(self):
         """Root, one windowed query for every parent's page, one for the totals."""
         schema = self._schema(_orm())

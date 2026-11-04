@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.25.0
+
+### Added
+
+- **`strawberry_orm.contrib`**, a home for optional plugins, each installed through its own extra.
+- **`strawberry_orm.contrib.mcp`** (`pip install "strawberry-orm[contrib.mcp]"`): `mcp_server(QueryAgent(schema, model="anthropic:…"))` serves a schema as an MCP server with one `ask(question)` tool. A model writes a single GraphQL query for the question, and the query runs through the schema with the caller's context, so `scope_rows` and permissions apply. Mutations are rejected unless `allow_mutations=True`; queries are validated and depth-limited before they run. Models are called through any-llm, so the provider is a string. The rows of the answer never reach the model.
+  - Clarifying questions: the model can ask for missing details through `ask_user`, shown as an elicitation form. 2026-07-28 clients get `input_required` with the agent's progress in sealed request state, older clients a form during the call, and clients without forms a `needs_input` result. `clarify=` and `max_clarifications=`.
+  - Allowed mutations are confirmed by the person asking first (`confirm_mutations=True`). A paused confirmation runs its change once, within `confirm_within` seconds (default 600), and the change is checked again when it resumes.
+  - Opt-in lookups (`lookups=True`): small read-only queries whose rows, capped by `max_lookup_rows`, the model sees. Turning them on with mutations allowed and `confirm_mutations=False` warns, since an instruction hidden in a row another user wrote could then steer the model into an unconfirmed change.
+  - Hooks: `on_clarify(clarification, context)` answers or refuses a clarification; `before_query(query, variables, context)` rejects an operation with `QueryRejected` or stops with `QueryAgentError`.
+  - `QueryAgent.ask(..., clarifier=)` and `QueryAgent.resume(state, answers)` for use without MCP.
+
+### Changed
+
+- **Filters, ordering, group-by and aggregates cover what the type shows.** They were generated from every column of the model, so a column the type hid could still be filtered on (read one `startsWith` probe at a time), sorted by, returned verbatim as a group key, or read through `min`/`max`. Each now covers only the columns and relations shown by the types it serves: the types it is attached to, and through `object:` the type the relation returns. `orm.schema()` works this out for the types each schema reaches, so an admin schema can keep a column a public schema hides; a schema built with `strawberry.Schema` directly gets the inputs uncut. A field with its own resolver, `on=`, `compute=` or permission classes does not count, since it does not show the column as stored; a `scope=` does, because traversal applies it too. Kept fields carry the type field's tags. **Breaking:** clients filtering, sorting or grouping on a column the type does not show get a validation error; show the column on the type to keep it. This replaces the error raised when a type's `exclude=` and its inputs disagreed.
+
+### Fixed
+
+- A type with `group=` but neither `filters=` nor `order=` could not be listed through `orm.connection()`: the generated resolver declared `filter` and `order` arguments it had no types for, which Strawberry refuses.
+- Relation connections handed each parent's page to its resolver on the shared model instance and never removed it. On SQLAlchemy, whose session returns the same instance wherever a row is reached, an alias or a later request in the same session read that page, with the earlier field's filter and the earlier caller's `scope_rows`, instead of its own rows. Each field now takes its own page, and none outlives the field.
+- The windowed read behind relation connections and `groups { items }` used `first` and the `after` cursor as a row limit before they were checked. `first: 100000` read every related row before being refused, and a forged `after` cursor read every row and returned empty pages without an error. The window is now computed as Strawberry computes the page, so an out-of-range `first` is refused before any read, and it starts at the page rather than the first row. `first` with `before` now pages as Strawberry defines it, and `items` without `first` returns up to `max_results` rather than eleven rows reported as the last page.
+
 ## 0.24.2
 
 ### Fixed

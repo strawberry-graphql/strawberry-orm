@@ -932,6 +932,38 @@ class TestGroupItemsPagination:
             for edge in items["edges"]:
                 assert edge["node"]["status"] == grp["key"]["status"]
 
+    def test_items_without_first_are_not_cut_short(self, session, execute):
+        """Without ``first`` a page holds up to ``max_results``, as Relay says.
+
+        It used to hold ten rows and the one after, and report no next page.
+        """
+        session.add_all(
+            Order(
+                status="shipped",
+                customer_id=1,
+                amount=1.0,
+                quantity=1,
+                created_at=datetime.datetime(2026, 1, 1),
+            )
+            for _ in range(10)
+        )
+        session.commit()
+        data = execute("""
+            query {
+                orders(first: 1, groupBy: [{ field: { status: true } }]) {
+                    groups {
+                        key { status }
+                        items { edges { node { id } } pageInfo { hasNextPage } }
+                    }
+                }
+            }
+        """)
+        shipped = next(
+            g for g in data["orders"]["groups"] if g["key"]["status"] == "shipped"
+        )
+        assert len(shipped["items"]["edges"]) == 19
+        assert shipped["items"]["pageInfo"]["hasNextPage"] is False
+
     def test_items_first_limits_results(self, execute):
         data = execute("""
             query {

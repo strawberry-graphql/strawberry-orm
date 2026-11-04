@@ -166,6 +166,35 @@ PAYLOAD_PAGE = (
 )
 
 
+def _grouped_users_schema(orm, User, users_query):
+    @orm.type(
+        User,
+        filters=orm.filter(User),
+        order=orm.order(User),
+        group=orm.group(User),
+    )
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    @strawberry.type
+    class Query:
+        @orm.connection(ORMListConnection[UserNode])
+        def users(self, info: strawberry.Info) -> Iterable[UserNode]:
+            return users_query(User, info)
+
+    return orm.schema(query=Query)
+
+
+#: One group per user, so a group's items window reaches every row it allows.
+GROUP_ITEMS = (
+    "{ users(first: 1, groupBy: [{ field: { name: true } }]) "
+    "{ groups { key { name } items(%s) { edges { node { name } } } } } }"
+)
+FORGED_ITEMS = GROUP_ITEMS % f'first: 2, after: "{cursor(10**6)}"'
+OVERSIZED_ITEMS = GROUP_ITEMS % "first: 1000"
+
+
 def _posts_schema(orm, Post, posts_query):
     @orm.type(
         Post,
@@ -177,6 +206,7 @@ def _posts_schema(orm, Post, posts_query):
         id: relay.NodeID[int]
         title: auto
         is_published: auto
+        author_id: auto
 
     @strawberry.type
     class Query:
@@ -235,6 +265,18 @@ class _Checks:
     def _assert_matches_reference(self, results, names):
         for shape, result in zip(PAGE_SHAPES + REJECTED_SHAPES, results, strict=True):
             assert outcome(result) == reference(page_query(shape), names), shape
+
+    def _assert_items_past_the_end(self, result, seen):
+        assert result.errors is None, result.errors
+        groups = result.data["users"]["groups"]
+        assert groups and all(g["items"]["edges"] == [] for g in groups)
+        # Only the connection's own page: first: 1, plus the row for hasNextPage.
+        assert seen.loaded == 2, f"read {seen.loaded - 2} items past every group's end"
+
+    def _assert_oversized_items_refused(self, result, seen):
+        assert "cannot be higher than 100" in result.errors[0].message
+        assert result.errors[0].path[-1] == "items"
+        assert seen.loaded == 2, f"read {seen.loaded - 2} items before refusing first"
 
     def _assert_payload_page(self, result, seen, names):
         assert result.errors is None, result.errors
@@ -366,6 +408,22 @@ class AbstractTestRelayConnectionPagination(_Checks):
         with capture() as seen:
             result = execute(schema, PAYLOAD_PAGE)
         self._assert_payload_page(result, seen, many_users)
+
+    def test_group_items_past_a_forged_cursor_read_nothing(
+        self, orm, User, users_query, many_users, execute, capture
+    ):
+        schema = _grouped_users_schema(orm, User, users_query)
+        with capture() as seen:
+            result = execute(schema, FORGED_ITEMS)
+        self._assert_items_past_the_end(result, seen)
+
+    def test_oversized_group_items_are_refused_before_reading(
+        self, orm, User, users_query, many_users, execute, capture
+    ):
+        schema = _grouped_users_schema(orm, User, users_query)
+        with capture() as seen:
+            result = execute(schema, OVERSIZED_ITEMS)
+        self._assert_oversized_items_refused(result, seen)
 
     def test_after_skips_in_the_database(
         self,
@@ -526,6 +584,22 @@ class AbstractTestRelayConnectionPaginationAsync(_Checks):
         with capture() as seen:
             result = await execute(schema, PAYLOAD_PAGE)
         self._assert_payload_page(result, seen, many_users)
+
+    async def test_group_items_past_a_forged_cursor_read_nothing(
+        self, orm, User, users_query, many_users, execute, capture
+    ):
+        schema = _grouped_users_schema(orm, User, users_query)
+        with capture() as seen:
+            result = await execute(schema, FORGED_ITEMS)
+        self._assert_items_past_the_end(result, seen)
+
+    async def test_oversized_group_items_are_refused_before_reading(
+        self, orm, User, users_query, many_users, execute, capture
+    ):
+        schema = _grouped_users_schema(orm, User, users_query)
+        with capture() as seen:
+            result = await execute(schema, OVERSIZED_ITEMS)
+        self._assert_oversized_items_refused(result, seen)
 
     async def test_after_skips_in_the_database(
         self,

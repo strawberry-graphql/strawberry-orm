@@ -268,5 +268,39 @@ def show(
     uvicorn.run(graphql_app, host="127.0.0.1", port=port, log_level="warning")
 
 
+@app.command()
+def mcp(
+    model: str = typer.Option(
+        "anthropic:claude-sonnet-5-5",
+        "--model",
+        "-m",
+        help="Model as provider:model. The provider's API key is read from "
+        "its usual environment variable, e.g. ANTHROPIC_API_KEY.",
+    ),
+    port: int = typer.Option(8421, "--port", "-p", help="Port to serve on."),
+    allow_mutations: bool = typer.Option(
+        False, "--allow-mutations", help="Let the agent run confirmed mutations."
+    ),
+    lookups: bool = typer.Option(
+        False, "--lookups", help="Let the agent see a few rows to ask better questions."
+    ),
+) -> None:
+    """Serve the seeded SQLAlchemy demo schema as an MCP server with an ask tool."""
+    import uvicorn
+
+    from strawberry_orm.contrib.mcp import QueryAgent, mcp_server
+    from tests.backends.sqlalchemy.fixtures import main_schema
+
+    session = _seed_sqlalchemy()
+    agent = QueryAgent(
+        main_schema, model=model, allow_mutations=allow_mutations, lookups=lookups
+    )
+    server = mcp_server(agent, context_getter=lambda request: {"session": session})
+    typer.echo(f"MCP server ({model}) on http://localhost:{port}/mcp")
+    uvicorn.run(
+        server.streamable_http_app(), host="127.0.0.1", port=port, log_level="info"
+    )
+
+
 if __name__ == "__main__":
     app()

@@ -113,11 +113,13 @@ class PreslicedRows(list):
     figure is carried alongside, from a grouped count over the same query.
     """
 
-    __slots__ = ("orm_total_count",)
+    __slots__ = ("orm_offset", "orm_total_count")
 
-    def __init__(self, rows: Any, total_count: int) -> None:
+    def __init__(self, rows: Any, total_count: int, offset: int = 0) -> None:
         super().__init__(rows)
         self.orm_total_count = total_count
+        #: Where the first row sits in the parent's whole result.
+        self.orm_offset = offset
 
 
 def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
@@ -605,6 +607,8 @@ class ORMListConnection(ORMConnection[NodeType]):
         total_count: AwaitableOrValue[int | None] = (
             _connection_total_count(nodes, info) if want_total else None
         )
+        if getattr(nodes, "orm_offset", 0):
+            nodes = _PageRows(nodes, nodes.orm_offset)
 
         connection = super().resolve_connection(nodes, info=info, **kwargs)
 
@@ -675,35 +679,20 @@ class ORMListConnection(ORMConnection[NodeType]):
             agg = backend.apply_aggregation(base_query, info, meta)
             connection.aggregates = agg
 
-        grouping = cls._collect_groups(backend, base_query, info, meta)
+        def finish(grouping: Any) -> Any:
+            if grouping is not None:
+                cls._attach_groups(connection, *grouping, backend, base_query, meta)
+            cls._attach_page_aggregates(connection, info, meta)
+            return connection
 
-        if inspect.isawaitable(grouping):
-
-            async def _await_grouping() -> Any:
-                groups, items_by_key = await grouping
-                cls._attach_groups(
-                    connection, groups, items_by_key, backend, base_query, meta
-                )
-                cls._attach_page_aggregates(connection, info, meta)
-                return connection
-
-            return _await_grouping()
-
-        if grouping is not None:
-            groups, items_by_key = grouping
-            cls._attach_groups(
-                connection, groups, items_by_key, backend, base_query, meta
-            )
-
-        cls._attach_page_aggregates(connection, info, meta)
-        return connection
+        return _then(cls._collect_groups(backend, base_query, info, meta), finish)
 
     @classmethod
     def _collect_groups(cls, backend, base_query, info, meta):
         """Fetch the groups and their items.
 
-        Returns ``(groups, items_by_key)``, ``None`` when groups were not
-        asked for, or a coroutine yielding the pair on async backends.
+        Returns ``(groups, items_by_key, items_offset)``, ``None`` when groups
+        were not asked for, or a coroutine yielding them on async backends.
         """
         if not _selection_requests(info, "groups"):
             return None
@@ -731,27 +720,32 @@ class ORMListConnection(ORMConnection[NodeType]):
         )
 
         def with_items(resolved: list[Any]) -> Any:
-            if not _selection_requests(info, "groups", "items"):
-                return resolved, None
+            window = (
+                _items_window(info)
+                if _selection_requests(info, "groups", "items")
+                else None
+            )
+            if window is None:
+                return resolved, None, 0
+            start, limit = window
             # Only now are the group key fields known: an async apply_grouping
             # records them on *meta* when it runs, not when it is called.
-            after_cursor = _extract_items_after(info)
-            offset = _decode_cursor_offset(after_cursor) if after_cursor else 0
             items_by_key = backend.batch_group_items(
                 base_query,
                 meta.group_key_fields,
                 info,
                 meta.model,
-                per_group_limit=(_extract_items_first(info) or 10) + offset + 1,
+                per_group_limit=limit,
+                per_group_offset=start,
                 order_input=_extract_items_order(info),
             )
-            return _then(items_by_key, lambda by_key: (resolved, by_key))
+            return _then(items_by_key, lambda by_key: (resolved, by_key, start))
 
         return _then(groups, with_items)
 
     @classmethod
     def _attach_groups(
-        cls, connection, groups, items_by_key, backend, base_query, meta
+        cls, connection, groups, items_by_key, items_offset, backend, base_query, meta
     ):
         _assign_edge_indices(groups, connection.edges, meta.group_key_fields)
 
@@ -759,6 +753,7 @@ class ORMListConnection(ORMConnection[NodeType]):
             if items_by_key is not None:
                 key_tuple = tuple(getattr(grp.key, k) for k in meta.group_key_fields)
                 grp._items_nodes = items_by_key.get(key_tuple, [])
+                grp._items_offset = items_offset
             grp._orm_base_query = base_query
             grp._orm_backend = backend
             grp._orm_model = meta.model
@@ -823,16 +818,31 @@ def _extract_items_order(info: Any) -> Any:
     return _get_items_arg(info, "order")
 
 
-def _decode_cursor_offset(cursor: str) -> int:
-    """Decode a relay ``arrayconnection`` cursor to a 0-based offset."""
-    import base64
+def _items_window(info: Any) -> tuple[int, int] | None:
+    """Where each group's page of items starts, and how many rows it needs.
 
+    Strawberry's own arithmetic for the ``items`` arguments. ``None`` when it
+    would refuse them, or for a cursor before the first row: the field then
+    reports the arguments itself, and nothing is read for it.
+    """
     try:
-        decoded = base64.b64decode(cursor).decode("utf-8")
-        prefix, _, offset_str = decoded.rpartition(":")
-        return int(offset_str) + 1
-    except Exception:
-        return 0
+        window = SliceMetadata.from_arguments(
+            info,
+            first=_extract_items_first(info),
+            after=_extract_items_after(info),
+            last=_get_items_arg(info, "last"),
+            before=_get_items_arg(info, "before"),
+        )
+    except (TypeError, ValueError):
+        return None
+    if window.start < 0 or window.end < 0:
+        return None
+    start = min(window.start, _LAST_POSITION)
+    if window.end == sys.maxsize:
+        # ``last`` without ``before`` counts back from each group's end, which
+        # the window cannot see; it reads the default page after the cursor.
+        return start, 10 + 1
+    return start, min(window.overfetch, _LAST_POSITION) - start
 
 
 __all__ = [

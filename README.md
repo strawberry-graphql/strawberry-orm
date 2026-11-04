@@ -13,7 +13,7 @@ Backend-agnostic schema generation for [Strawberry GraphQL](https://strawberry.r
 
 **Before you ship:** [Security](#security) · [Production baseline](#production-baseline)
 
-**Feature guide:** [Defining types](#defining-types) · [Declaring fields](#declaring-fields) · [Filters and ordering](#filters-and-ordering) · [Custom filters and ordering](#custom-filters-and-ordering) · [Grouping and aggregation](#grouping-and-aggregation) · [Payloads](#data--errors-payloads) · [Mutations](#mutations) · [Relay](#relay-integration) · [Async](#async-usage)
+**Feature guide:** [Defining types](#defining-types) · [Declaring fields](#declaring-fields) · [Filters and ordering](#filters-and-ordering) · [Custom filters and ordering](#custom-filters-and-ordering) · [Grouping and aggregation](#grouping-and-aggregation) · [Payloads](#data--errors-payloads) · [Mutations](#mutations) · [Relay](#relay-integration) · [Async](#async-usage) · [Contrib](#contrib)
 
 **Reference:** [API reference](API_REFERENCE.md) · [Backend options](#backend-options) · [Public exports](#public-exports) · [Full example](#appendix-full-example)
 
@@ -157,7 +157,7 @@ byline(self, ...) is not a scope: a scope receives (query, info) and never
 sees the parent row. Use orm.field.lazy for a resolver that needs self.
 ```
 
-[Declaring fields](#declaring-fields) covers how to choose, what else the library checks, and the older spellings that still work.
+[Declaring fields](#declaring-fields) covers how to choose and what else the library checks.
 
 ### Connections
 
@@ -319,9 +319,6 @@ Define it on the `@orm.type` class for the model **being loaded**. A nested quer
 | `posts { … }`            | `PostType.scope_rows` | —                     |
 | `users { posts { … } }`  | `UserType.scope_rows` | `PostType.scope_rows` |
 | `posts { author { … } }` | `PostType.scope_rows` | `UserType.scope_rows` |
-
-
-> Renamed from `get_queryset` in 0.15. The old name named a Django type that only two of the three backends use, and `get_` suggested it returns a fresh query rather than narrowing the one it is handed. `warn_missing_queryset` is now `warn_missing_scope`.
 
 ### Parent scoping does not flow to children
 
@@ -657,6 +654,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 - Filter depth, branch count, and `inList` size are capped
 - `orm.ref()` provides explicit `unlink` and `delete` operations — both opt-in via `unlink=True` and `delete=True`
 - When you use `orm.schema()` (optimizer enabled by default), nested relation loads honor each type's `scope_rows` — but **only for types where you define it** (the ORM warns at type registration when `scope_rows` is missing)
+- Filters, ordering, group-by and aggregates cover only the columns and relations the GraphQL types they serve show — through `object:`, the type the relation returns. A column those types leave out, or show through a resolver of your own, `on=`, `compute=` or permission classes, cannot be filtered on, sorted by, grouped by, or read through `min`/`max` — any of which would reveal it. `orm.schema()` works this out for the types each schema reaches, and a kept field carries the tags of the type field it mirrors, so a tagged schema drops both together
 - Filtering through a relation (`filter: { object: { author: … } }`) is restricted to the rows the related type's `scope_rows` allows, so a filter cannot confirm values on rows the caller cannot read
 - Ordering through a relation into a scoped type is **rejected when `orm.schema()` builds**, because the resulting sequence would itself rank hidden rows — see [Ordering into a scoped type](#ordering-into-a-scoped-type)
 - Connection `aggregates` and `groups` are computed with the type's `scope_rows` applied, so counts and sums cover only readable rows
@@ -668,7 +666,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 | ---------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | Authentication   | —                             | middleware, `info.context`, permission classes                                                                                           |
 | Row access       | `scope_rows` per exposed type | define on **every** model type clients can reach — [parent scoping does not flow to children](#parent-scoping-does-not-flow-to-children) |
-| Column exposure  | —                             | `exclude=[...]` on `@orm.type`, or `orm.field.eager(permission_classes=…)`                                                                |
+| Column exposure  | inputs follow the type's fields | `exclude=[...]` on `@orm.type`, or `orm.field.eager(permission_classes=…)`                                                                |
 | Query size       | —                             | `default_query_limit`                                                                                                                    |
 | Mutations        | —                             | auth in resolvers; `authorize` callback on `apply_ref_list`                                                                              |
 | Custom resolvers | —                             | same as hand-written DB access — you own scoping                                                                                         |
@@ -728,7 +726,7 @@ Each one links to the mechanics.
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------- |
 | Parent `scope_rows` used to scope children, including via a join like `posts__is_published=True` | Tests existence of a child, does not filter children   | [Parent scoping does not flow to children](#parent-scoping-does-not-flow-to-children) |
 | A relation resolver that materializes — `list(self.posts.all())`, `.first()`                     | Skips `scope_rows` and the optimizer entirely          | [Resolver kinds](#resolver-kinds)                                                     |
-| `strawberry.Schema` instead of `orm.schema()`                                                    | Nested scoping hooks never run on Django or SQLAlchemy | `[orm.schema()](#ormschema)`                                                          |
+| `strawberry.Schema` instead of `orm.schema()`                                                    | Nested scoping hooks never run on Django or SQLAlchemy, and inputs cover every column | `[orm.schema()](#ormschema)`                                                          |
 | A root resolver returning instances                                                              | Optimizer cannot prefetch or scope anything below      | [Root custom query](#root-custom-query)                                               |
 | `scope_rows` that ignores `info.context`                                                         | Hardcoded tenant or user filters leak across requests  | `[scope_rows](#scope_rows--one-model-one-type)`                                       |
 | `@orm.type` exposing secrets through `auto`                                                      | Output types do not hide sensitive columns for you     | [Defining Types](#defining-types)                                                     |
@@ -1018,46 +1016,6 @@ Names are validated when the type is defined, so a typo fails immediately:
 ValueError: PostType.byline: Post has no relation 'athor'. Did you mean 'author'?
 ```
 
-Migrating from 0.14
-
-These spellings were removed in 0.15; there are no deprecation shims.
-
-
-| 0.14                                  | 0.15                                   |
-| ------------------------------------- | -------------------------------------- |
-| `@orm.field` (bare)                   | `@orm.field.custom`                    |
-| `orm.field()`, `orm.field(filters=…)` | `orm.field.auto(...)`                  |
-| `orm.field(hint=…, scope=…)`          | `orm.field.auto(using=…, scope=…)`     |
-| `make_field(permission_classes=…)`    | `orm.field.auto(permission_classes=…)` |
-| `@orm.computed_field(hint=…)`         | `@orm.field.computed(using=…)`         |
-| `hint=[...]`                          | `using=[...]`                          |
-| `load=[...]` / `load=callable`        | `using=[...]` / `scope=callable`       |
-| `only=[...]`                          | removed — every column loads           |
-| `get_queryset(cls, qs, info)`         | `scope_rows(cls, query, info)`         |
-| `warn_missing_queryset=`              | `warn_missing_scope=`                  |
-| `scope=lambda qs: …`                  | `scope=lambda qs, info: …`             |
-
-
-
-
-Migrating to 0.19
-
-`orm.field` and `orm.connection` each collapsed to two names. The old ones still work.
-
-| Before | Now |
-| --- | --- |
-| `orm.field.auto(...)` | `orm.field.eager(...)` |
-| `orm.field.scoped(fn)` | `orm.field.eager(fn)` |
-| `orm.field.custom(fn)` | `orm.field.lazy(fn)` |
-| `orm.field.computed(fn, using=…)` | `orm.field.lazy(fn, using=…)` |
-| `orm.field.auto(using=…)` | drop it — see below |
-| `orm.connection(...)` | `orm.connection.eager()` / `.lazy(resolver=…)` |
-
-Two behaviour changes worth knowing about:
-
-- `using=` is gone from `eager`. It exists to disclose relations the optimizer cannot see being read, and only a resolver hides anything, so it now lives on `lazy` alone. `auto(using=…)` still works and still registers the hint, as it always did.
-- `orm.connection` used to accept and ignore any keyword it did not recognise, so a misspelled or unsupported one silently did nothing. Unknown keywords now raise, and `scope=` genuinely narrows the connection — including `totalCount` and `aggregates`, not just `edges`.
-
 ### List fields
 
 `orm.field.eager()` builds a list resolver from the model attached to the return type:
@@ -1100,6 +1058,8 @@ List fields returning `UserType` then accept a `filter` argument:
   }
 }
 ```
+
+The filter covers what `UserType` shows — `id`, `name` and `email` here — and `object:` reaches only the relations it shows. A column the type leaves out is not filterable, because a filter on it would read it one `startsWith` probe at a time; to filter on a column, show it on the type. The same holds for `orm.order()`, `orm.group()` and aggregates. Through `object:`, a filter covers the type the relation returns: under `posts(filter: {object: {author: …}})`, whatever `PostType.author`'s type shows. `orm.schema()` works this out for the types each schema reaches, so an admin schema can filter on a column a public schema hides even when both use the same filter; within one schema, an input serving several types covers what all of them show. A schema built with `strawberry.Schema` directly gets the inputs uncut.
 
 #### Filter shape
 
@@ -2009,6 +1969,8 @@ This gives you:
 
 Filters and ordering are applied *before* pagination, so the connection always slices from a correctly filtered and sorted result set.
 
+`orm.connection` raises a `TypeError` for a keyword it does not accept, listing the ones it does, so a misspelling fails where you write it.
+
 The page is cut in the database, not in Python. `first: 50` reads 51 rows (the extra one answers `hasNextPage`), `after` becomes an `OFFSET`, and `totalCount` is a separate count sent only when it is selected — and not even then when the page comes back short, because a short page is the end of the result. `last` without `before` counts first, to find where the window starts. Cursors are the same either way. Each page is its own query, and a database may break ties in a non-unique order differently from one query to the next, so a row could land on two pages and another on none. The cut therefore ends every order — the client's, the resolver's or the model's — with the primary key, unless it already includes it; with no order at all, the primary key alone orders the pages. Rows that do not tie keep their order. A Django queryset the resolver already sliced, or ordered with `.extra(order_by=...)`, is cut in the order it has.
 
 A few requests are still read whole and sliced in Python: a resolver that returns rows rather than a query, `last: 0` (which Relay defines as every row after the cursor), and, on SQLAlchemy, a join that can repeat a row — to a collection, or through a second `FROM` — without `.distinct()`. SQLAlchemy folds those repeats together with `.unique()` after reading, so a `LIMIT` would count them against the page.
@@ -2072,19 +2034,102 @@ class Query:
 
 `apply_ref_list` is sync for Django/sync-SQLAlchemy and awaitable for Tortoise/async-SQLAlchemy.
 
-### Migrating from a custom Django async integration layer
+---
 
-If you previously monkey-patched `StrawberryORM` for `AsyncGraphQLView`, you can remove that module and rely on:
+## Contrib
+
+Optional plugins live in `strawberry_orm.contrib`. Each has its own extra, so its dependencies are only installed when you ask for them.
+
+### MCP: plain-language questions over your API
+
+`strawberry_orm.contrib.mcp` serves a schema as an [MCP](https://modelcontextprotocol.io) server with a single tool, `ask(question)`. A model on your side reads the schema, writes one GraphQL query, and runs it through the schema as the caller. The caller gets back the query and its result. Its tool list holds one short tool instead of your whole schema.
+
+```bash
+pip install "strawberry-orm[contrib.mcp]"
+```
+
+```python
+from strawberry_orm.contrib.mcp import QueryAgent, mcp_server
+
+agent = QueryAgent(
+    schema,  # e.g. orm.schema(query=Query, tags="mcp") to expose only part of it
+    model="anthropic:claude-sonnet-5-5",  # any provider:model that any-llm supports
+    api_key=settings.ANTHROPIC_API_KEY,  # or the provider's environment variable
+)
 
 
-| Old workaround                           | Built-in replacement                                 |
-| ---------------------------------------- | ---------------------------------------------------- |
-| `_patch_orm_filter_extension_for_async`  | `_AutoFilterOrderExtension` async/sync paths         |
-| `@orm.type` + `_ensure_async_resolver`   | `django_async_safe` + `@orm.type` post-processing    |
-| Custom resolver without filter extension | `@orm.field.lazy` (no `_AutoFilterOrderExtension`) |
-| `_materialize_django_result`             | `materialize_query` / extension materialization      |
-| Manual `is_type_of`                      | Automatic on `@orm.type(Model)`                      |
+async def get_context(request):
+    user = await user_for_token(request.headers.get("authorization"))
+    return {"request": request, "user": user}
 
+
+app = mcp_server(agent, context_getter=get_context).streamable_http_app()
+# uvicorn app:app, then point an MCP client at http://host:port/mcp
+```
+
+```json
+{"query": "{ users(filter: {field: {email: {iContains: \"example.com\"}}}) { id name } }",
+ "variables": {},
+ "data": {"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]}}
+```
+
+- **Models are swappable.** Models are called through [any-llm](https://github.com/mozilla-ai/any-llm), so changing `model=` from `"anthropic:…"` to `"openai:…"` is the whole change. Other providers need any-llm's extra for them, for example `pip install "any-llm-sdk[mistral]"` for `"mistral:…"`. Extra keyword arguments (`temperature=`, `api_base=`, …) go to the model call.
+- **Your permissions apply.** The query runs through `schema.execute` with the context from `context_getter`, so `scope_rows`, `scope=`, permission classes and the optimizer behave as for any other request. Over stdio, `context_getter` receives `None`.
+- **Authenticate it.** `mcp_server` adds no authentication of its own, and every call runs the model on your key. Pass `token_verifier=` and `auth=`, or serve it behind your own, before anyone else can reach it; `before_query` can enforce a quota.
+- **Reads only, unless you opt in.** The model only sees the query side of the schema, and anything but a query is rejected when it runs. Pass `allow_mutations=True` to show and allow mutations.
+- **Changes are confirmed.** With mutations allowed, each one is shown to the person asking and runs only once they confirm it (`confirm_mutations=False` turns this off). The MCP client shows the form, so a confirmation is only as good as the client: one that fills in forms itself confirms on its user's behalf. A paused confirmation runs once, within `confirm_within` seconds (default 600). The agent remembers which ran in its own process, so across several processes a resent state can run its change again until it expires; keep such mutations idempotent.
+- **Checked before it runs.** An operation must be a single operation within `max_depth` levels (default 10) that passes validation. When it fails, the model sees the errors and tries again, up to `max_attempts` (default 3). Depth does not bound width, so give the schema Strawberry's `MaxAliasesLimiter` or `MaxTokensLimiter` to cap that; they apply here as to any request.
+- **Rows stay out of the model.** The model sees the question, the schema, and the errors from its own attempts. The data goes straight back to the caller, unless you turn on lookups (below). Errors are passed on as they are, so one that quotes a stored value shows the model that value.
+- **Failures are tool errors.** If the model says the schema can't answer the question, or every attempt fails, the tool returns an error with the reason and the last query tried.
+
+#### Clarifying questions
+
+When a question leaves out something the query needs ("posts by *which* author?"), the model can ask instead of guessing. It sends one short question with typed fields, and the server shows it as an [elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation) form in whatever way the client supports:
+
+| Client | What happens |
+| --- | --- |
+| 2026-07-28 or later, with forms | `ask` returns `input_required`; the client shows the form and calls again with the answers. The agent's progress travels in the request state, which the MCP SDK encrypts. |
+| Older, with forms | The form is shown during the call. |
+| No forms | `ask` returns `{"needs_input": {"kind", "message", "schema"}}`, so the calling AI can ask its user and call again with a fuller question. A mutation that needs confirming is refused. |
+
+`clarify=False` turns questions off; `max_clarifications` (default 1) caps them per call. Request state is sealed with a key held by the server process, so a deployment with several processes passes a shared one: `mcp_server(agent, request_state_security=RequestStateSecurity(keys=[secret]))`.
+
+#### Lookups
+
+With `lookups=True` the model may run up to `max_lookups` (default 3) small read-only queries and see their rows, at most `max_lookup_rows` (default 20) of each list. That lets it find the exact value to filter on, or offer real choices ("Alice Smith or Alice Jones?"). Lookups run with the caller's permissions like everything else, so the model only sees rows the caller could see. They are off by default because, with them on, rows reach the model — including rows other users wrote, which may carry instructions aimed at it. With mutations allowed, keep `confirm_mutations` on so nothing a row says can change data unasked; the agent warns when it is off.
+
+#### Hooks
+
+Both receive the GraphQL context and may be sync or async.
+
+```python
+from strawberry_orm.contrib.mcp import QueryAgentError, QueryRejected
+
+
+def answer_from_the_user(clarification, context):
+    # Answer what the app already knows instead of asking.
+    if clarification.kind == "question" and clarification.fields == ["team"]:
+        return {"team": context["user"].team}
+    return None  # ask the person
+
+
+async def guard(query, variables, context):
+    if await over_quota(context["user"]):
+        raise QueryAgentError("Daily question limit reached.")  # stop
+    if "first:" not in query:
+        raise QueryRejected("Page with first: 50 or fewer.")  # the model tries again
+
+
+agent = QueryAgent(schema, model=..., on_clarify=answer_from_the_user, before_query=guard)
+```
+
+#### Without MCP
+
+`QueryAgent.ask(question, context=..., clarifier=...)` works anywhere, for example behind a chat endpoint. `clarifier` is an async function that puts a `Clarification` to the person and returns their answers (or `None` if they decline). Without one, a clarification pauses the agent and `ask` returns `{"needs_input": ..., "state": ...}`; call `agent.resume(state, answers, context=...)` once you have them. `state` is plain JSON, so it can be stored between requests, but it holds the conversation so far, so keep it server-side or encrypt it.
+
+`instructions=` adds your own guidance to the model's prompt, and `mcp_server(..., description=...)` replaces the tool description, which by default lists the root fields. Other keyword arguments go to `MCPServer`, for example `token_verifier=` and `auth=` for OAuth.
+
+To try it locally, `python cli.py mcp` serves the seeded SQLAlchemy test schema on `http://localhost:8421/mcp`, reading the key from `ANTHROPIC_API_KEY`. Add `--lookups` and `--allow-mutations` to try those.
 
 ---
 

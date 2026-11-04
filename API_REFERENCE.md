@@ -168,7 +168,7 @@ orm.group(model_or_type, *, name=None, include=None, exclude=None)
 orm.aggregate(model_or_type, *, name=None, include=None, exclude=None)
 ```
 
-Generate argument types from a model. `orm.filter_type`, `orm.order_type`, `orm.group_type`, and `orm.aggregate_type` are the class-decorator forms, for adding custom fields to a generated type. See [Filters and ordering](README.md#filters-and-ordering) and [Grouping](README.md#grouping-and-aggregation).
+Generate argument types from a model. In a schema built with `orm.schema()`, each covers only the columns and relations shown by the types it serves there — the types it is attached to, and through `object:` the types relations return — so nothing a type hides can be filtered, sorted, grouped or aggregated on. `orm.filter_type`, `orm.order_type`, `orm.group_type`, and `orm.aggregate_type` are the class-decorator forms, for adding custom fields to a generated type. See [Filters and ordering](README.md#filters-and-ordering) and [Grouping](README.md#grouping-and-aggregation).
 
 `filter_field`, `order_field`, `group_field`, and `aggregate_field` mark a custom field on a generated type. Each receives the client's value and the query, and returns a query:
 

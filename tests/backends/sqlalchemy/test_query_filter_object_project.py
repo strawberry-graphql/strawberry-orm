@@ -44,6 +44,12 @@ def _build_projected_schema():
         id: auto
         body: auto
 
+    @orm.type(SAUser)
+    class UserType:
+        id: auto
+        name: auto
+        email: auto
+
     @orm.type(SAPost, filters=PostFilter)
     class PostType:
         id: auto
@@ -52,13 +58,7 @@ def _build_projected_schema():
         is_published: auto
         tags: list[TagType]
         comments: list[CommentType]
-
-    @orm.type(SAUser)
-    class UserType:
-        id: auto
-        name: auto
-        email: auto
-        posts: list[PostType]
+        author: UserType
 
     @strawberry.type
     class Query:

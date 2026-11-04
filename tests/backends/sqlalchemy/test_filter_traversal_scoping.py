@@ -37,15 +37,23 @@ class TestFilterTraversalScoping(AbstractTestFilterTraversalScoping):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.where(SAUser.name == "Alice")
 
+        @orm.type(SAComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(SAPost, filters=post_filter, order=post_order)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -88,6 +96,7 @@ class TestJoinScopedTraversal(AbstractTestJoinScopedTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, query, info):
@@ -95,10 +104,17 @@ class TestJoinScopedTraversal(AbstractTestJoinScopedTraversal):
                     SAPost.title == "Hello World"
                 )
 
+        @orm.type(SAComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(SAPost, filters=post_filter)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -140,15 +156,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.where(SAUser.name == "Alice")
 
+        @orm.type(SAComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(SAPost, filters=post_filter, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -194,15 +218,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.where(SAUser.name == "Alice")
 
+        @orm.type(SAComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(SAPost, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:

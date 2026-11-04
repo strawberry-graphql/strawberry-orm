@@ -34,15 +34,23 @@ class TestFilterTraversalScoping(AbstractTestFilterTraversalScopingAsync):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(TortoiseComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(TortoisePost, filters=post_filter, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -77,15 +85,23 @@ class TestJoinScopedTraversal(AbstractTestJoinScopedTraversalAsync):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(posts__title="Hello World").distinct()
 
+        @orm.type(TortoiseComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(TortoisePost, filters=post_filter)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -124,15 +140,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversalAsync):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(TortoiseComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(TortoisePost, filters=post_filter, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -177,15 +201,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversalAsync):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(TortoiseComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(TortoisePost, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:

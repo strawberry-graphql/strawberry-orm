@@ -638,6 +638,7 @@ class DjangoBackend(BaseBackend):
         *,
         per_group_limit: int,
         order_input: Any | None = None,
+        per_group_offset: int = 0,
     ) -> dict[tuple, list[Any]]:
         from collections import defaultdict
 
@@ -659,7 +660,10 @@ class DjangoBackend(BaseBackend):
                         order_by=ordering,
                     )
                 )
-                .filter(_rn__lte=per_group_limit)
+                .filter(
+                    _rn__gt=per_group_offset,
+                    _rn__lte=per_group_offset + per_group_limit,
+                )
                 # Ordered by the row number so each group comes back in the
                 # order the window put it in; without it the rows arrive
                 # however the database found them and the order is lost.
@@ -883,9 +887,9 @@ class DjangoBackend(BaseBackend):
         backend = self
 
         def resolver(self: Any, info: Any) -> Any:
-            from strawberry_orm.batching import page_attr
+            from strawberry_orm.batching import take_page
 
-            page = getattr(self, page_attr(field_name), None)
+            page = take_page(self, field_name, info)
             if page is not None:
                 return page
             restrict = backend.relation_scope(model, field_name, info, on=relation)

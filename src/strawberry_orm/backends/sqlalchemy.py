@@ -534,6 +534,7 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         per_group_limit: int,
         order_input: Any | None = None,
+        per_group_offset: int = 0,
     ) -> dict[tuple, list[Any]]:
         from collections import defaultdict
 
@@ -559,7 +560,12 @@ class SQLAlchemyBackend(BaseBackend):
             # Ordered by the row number so each group comes back in the order
             # the window put it in; without it the rows arrive however the
             # database found them and the requested order is lost.
-            select(subq).where(subq.c._rn <= per_group_limit).order_by(subq.c._rn)
+            select(subq)
+            .where(
+                subq.c._rn > per_group_offset,
+                subq.c._rn <= per_group_offset + per_group_limit,
+            )
+            .order_by(subq.c._rn)
         )
 
         session = self._get_session(info)
@@ -823,9 +829,9 @@ class SQLAlchemyBackend(BaseBackend):
         pairs = list(rel.local_remote_pairs or ())
 
         def resolver(self: Any, info: Any) -> Any:
-            from strawberry_orm.batching import page_attr
+            from strawberry_orm.batching import take_page
 
-            page = getattr(self, page_attr(field_name), None)
+            page = take_page(self, field_name, info)
             if page is not None:
                 return page
             from sqlalchemy import select

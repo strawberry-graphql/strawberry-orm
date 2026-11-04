@@ -54,6 +54,9 @@ class CommentType:
     post_id: auto
     author_id: auto
     parent_id: auto
+    post: "PostType"
+    author: "UserType"
+    parent: "CommentType | None"
 
 
 @_main_orm.type(DjTag, filters=TagFilter, order=TagOrder)
@@ -70,6 +73,7 @@ class PostType:
     is_published: auto
     tags: list[TagType]
     comments: list[CommentType]
+    author: "UserType"
 
 
 @_main_orm.type(DjUser, filters=UserFilter, order=UserOrder)

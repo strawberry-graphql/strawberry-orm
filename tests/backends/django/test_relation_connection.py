@@ -10,6 +10,7 @@ import base64
 import pytest
 import strawberry
 from django.db import connection
+from django.db.models.signals import post_init
 from django.test.utils import CaptureQueriesContext
 from strawberry import relay
 
@@ -205,6 +206,94 @@ class TestRelationConnection:
         statements = [q["sql"] for q in ctx.captured_queries]
         assert len([sql for sql in statements if "LIMIT" in sql]) == 3, statements
         assert not [sql for sql in statements if "COUNT(" in sql], statements
+
+    def _built(self, model, schema, query):
+        """The result, and the *model* rows built to answer it."""
+        built = []
+
+        def keep(sender, instance, **kwargs):
+            built.append(instance)
+
+        post_init.connect(keep, sender=model, weak=False)
+        try:
+            result = schema.execute_sync(query, context_value={})
+        finally:
+            post_init.disconnect(keep, sender=model)
+        return result, built
+
+    def test_an_alias_gets_its_own_page(self, seed, User, Post):
+        """Each field reads its own page, even where both reach the same row."""
+        result = self._schema(_orm(), User, Post).execute_sync(
+            "{ narrow: users { name posts(first: 5, "
+            'filter: {field: {title: {contains: "Hello"}}}) '
+            "{ edges { node { title } } } } "
+            "everything: users { name posts { edges { node { title } } } } }",
+            context_value={},
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["everything"] if u["name"] == "Alice")
+        assert sorted(e["node"]["title"] for e in alice["posts"]["edges"]) == [
+            "GraphQL Guide",
+            "Hello World",
+        ]
+
+    def test_nothing_is_left_on_the_row(self, seed, User, Post):
+        """A later read of the same rows must not be handed this page."""
+        result, users = self._built(
+            User,
+            self._schema(_orm(), User, Post),
+            "{ users { posts(first: 5) { edges { node { title } } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert users
+        assert all(
+            not k.startswith("_orm_connection_page") for u in users for k in vars(u)
+        )
+
+    def test_a_page_size_over_the_limit_reads_no_rows(self, seed, User, Post):
+        result, posts = self._built(
+            Post,
+            self._schema(_orm(), User, Post),
+            "{ users { posts(first: 1000) { edges { node { title } } } } }",
+        )
+        assert "cannot be higher than 100" in result.errors[0].message
+        assert posts == [], f"read {len(posts)} posts before refusing the page size"
+
+    def test_a_forged_cursor_reads_no_rows(self, seed, User, Post):
+        forged = base64.b64encode(b"arrayconnection:1000000").decode()
+        result, posts = self._built(
+            Post,
+            self._schema(_orm(), User, Post),
+            f'{{ users {{ name posts(first: 2, after: "{forged}") '
+            "{ edges { node { title } } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert all(u["posts"]["edges"] == [] for u in result.data["users"])
+        assert posts == [], f"read {len(posts)} posts past the end of every page"
+
+    def test_before_pages_as_strawberry_defines_it(self, seed, User, Post):
+        """``first`` with ``before`` starts at ``before - 1``, past ``first``'s reach."""
+        alice = User.objects.get(name="Alice")
+        for i in range(6):
+            Post.objects.create(
+                title=f"Extra {i}", body="b", author=alice, is_published=True
+            )
+        before = base64.b64encode(b"arrayconnection:5").decode()
+        result = self._schema(_orm(), User, Post).execute_sync(
+            f'{{ users {{ name posts(first: 2, before: "{before}") '
+            "{ edges { cursor } pageInfo { hasPreviousPage hasNextPage } } } }",
+            context_value={},
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["users"] if u["name"] == "Alice")
+        assert [e["cursor"] for e in alice["posts"]["edges"]] == [
+            base64.b64encode(b"arrayconnection:4").decode(),
+            base64.b64encode(b"arrayconnection:5").decode(),
+        ]
+        assert alice["posts"]["pageInfo"] == {
+            "hasPreviousPage": True,
+            "hasNextPage": True,
+        }
 
     def _count(self, schema, query):
         with CaptureQueriesContext(connection) as ctx:

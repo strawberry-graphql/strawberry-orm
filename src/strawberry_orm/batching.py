@@ -340,27 +340,94 @@ class BatchingExtension(SchemaExtension):
 _CONNECTION_KEY = "_orm_connection_pages"
 
 
-def _connection_arg(info: Any, name: str) -> Any:
-    """Read a literal argument off the connection field's own AST node."""
-    from graphql.language import IntValueNode, StringValueNode
-
-    from strawberry_orm.optimizer.selections import field_nodes_from_info
-
-    for node in field_nodes_from_info(info):
-        for arg in getattr(node, "arguments", ()) or ():
-            if arg.name.value != name:
-                continue
-            value = arg.value
-            if isinstance(value, IntValueNode):
-                return int(value.value)
-            if isinstance(value, StringValueNode):
-                return value.value
-    return None
-
-
 def page_attr(field_name: str) -> str:
     """Where a windowed page is left for the field's own resolver to pick up."""
     return f"_orm_connection_page_{field_name}"
+
+
+def _occurrence(info: Any) -> tuple[Any, ...]:
+    """Where in the response this field is being read, list indices included."""
+    return tuple(info.path.as_list())
+
+
+def hand_over_page(root: Any, field_name: str, info: Any, page: Any) -> None:
+    """Leave *page* for the resolver of this one occurrence of the field.
+
+    The row is shared: an ORM hands back the same instance wherever it is
+    reached, so a page keyed only by the field would be read by an alias with
+    other arguments, or by a later request with another caller's scope.
+    """
+    pages = getattr(root, page_attr(field_name), None)
+    if pages is None:
+        pages = {}
+        setattr(root, page_attr(field_name), pages)
+    pages[_occurrence(info)] = page
+
+
+def take_page(root: Any, field_name: str, info: Any) -> Any:
+    """The page handed over for this occurrence, removed from the row."""
+    attr = page_attr(field_name)
+    pages = getattr(root, attr, None)
+    if not pages:
+        return None
+    page = pages.pop(_occurrence(info), None)
+    if not pages:
+        delattr(root, attr)
+    return page
+
+
+def _strawberry_field(info: Any) -> Any:
+    """The Strawberry field behind a raw graphql-core ``info``."""
+    fields = getattr(getattr(info, "parent_type", None), "fields", None) or {}
+    gql_field = fields.get(getattr(info, "field_name", None))
+    if gql_field is None:
+        return None
+    return gql_field.extensions.get("strawberry-definition")
+
+
+def _page_window(execution_context: Any, info: Any, kwargs: dict[str, Any]) -> Any:
+    """The rows every parent's page needs, read off the field's own arguments.
+
+    Strawberry's own arithmetic, with the field's ``max_results``, so a page
+    size over the limit or a malformed cursor is refused here, before any row
+    is read; the field then runs plain and reports it as usual.
+    """
+    from strawberry.relay.fields import ConnectionExtension
+    from strawberry.relay.utils import SliceMetadata
+
+    if kwargs.get("first") is None:
+        # No page size given, so there is nothing to window against and a
+        # plain batched read is already the whole answer.
+        raise _Bail("no page size, so there is nothing to window")
+    field = _strawberry_field(info)
+    extension = next(
+        (
+            e
+            for e in getattr(field, "extensions", ())
+            if isinstance(e, ConnectionExtension)
+        ),
+        None,
+    )
+    if extension is None:
+        raise _Bail("not a connection field")
+    max_results = extension.max_results
+    if max_results is None:
+        max_results = execution_context.schema.config.relay_max_results
+    try:
+        window = SliceMetadata.from_arguments(
+            info,
+            before=kwargs.get("before"),
+            after=kwargs.get("after"),
+            first=kwargs["first"],
+            last=kwargs.get("last"),
+            max_results=max_results,
+            prefix=extension.connection_type._edge_type().CURSOR_PREFIX,
+        )
+    except (TypeError, ValueError) as exc:
+        raise _Bail(str(exc)) from exc
+    if window.start < 0 or window.end < 0:
+        raise _Bail("a cursor before the first row")
+    return window
 
 
 def _connection_inputs(
@@ -375,13 +442,7 @@ def _connection_inputs(
     any later would be applied to rows that were already chosen without it.
     """
     schema = getattr(execution_context, "schema", None)
-    fields = getattr(getattr(info, "parent_type", None), "fields", None) or {}
-    gql_field = fields.get(getattr(info, "field_name", None))
-    field = (
-        gql_field.extensions.get("strawberry-definition")
-        if gql_field is not None
-        else None
-    )
+    field = _strawberry_field(info)
     if schema is None or field is None:
         return None, None
 
@@ -486,10 +547,26 @@ class RelationConnectionExtension(SchemaExtension):
         the resolver rather than returned here - returning rows would replace
         the connection itself.
         """
-        page = pages_by_parent.get(id(root))
-        if page is not None:
-            setattr(root, page_attr(spec.field_name), page)
-        return _next(root, info, *args, **kwargs)
+        hand_over_page(root, spec.field_name, info, pages_by_parent.get(id(root)))
+        result = None
+        try:
+            result = _next(root, info, *args, **kwargs)
+        finally:
+            # Whether or not the resolver took it, nothing outlives the field.
+            if not isawaitable(result):
+                take_page(root, spec.field_name, info)
+        if isawaitable(result):
+            return self._take_page_after(result, root, spec.field_name, info)
+        return result
+
+    @staticmethod
+    async def _take_page_after(
+        result: Any, root: Any, field_name: str, info: Any
+    ) -> Any:
+        try:
+            return await result
+        finally:
+            take_page(root, field_name, info)
 
     async def _resolve_async(
         self,
@@ -544,22 +621,22 @@ class RelationConnectionExtension(SchemaExtension):
         kwargs: dict[str, Any] | None = None,
     ) -> AwaitableOrValue[dict[int, Any]]:
         """One windowed query for the pages, one grouped query for the totals."""
-        from strawberry_orm.relay.connection import _decode_cursor_offset
+        from strawberry_orm.relay.connection import _LAST_POSITION
 
         pks = [backend.instance_pk(parent) for parent in parents]
         if any(pk is None for pk in pks):
             raise _Bail("a parent has no key to group its rows by")
 
-        after = _connection_arg(info, "after")
-        offset = _decode_cursor_offset(after) if after else 0
-        first = _connection_arg(info, "first")
-        if first is None:
-            # No page size given, so there is nothing to window against and a
-            # plain batched read is already the whole answer.
-            raise _Bail("no page size, so there is nothing to window")
+        execution_context = getattr(self, "execution_context", None)
+        window = _page_window(execution_context, info, kwargs or {})
+        # Relay slices each page itself, so it is handed the page at its
+        # positions plus the row that says whether another page exists. A
+        # cursor can name any position; none past the last one is sent.
+        start = min(window.start, _LAST_POSITION)
+        limit = min(window.overfetch, _LAST_POSITION) - start
 
         filter_input, order_input = _connection_inputs(
-            getattr(self, "execution_context", None), info, kwargs or {}
+            execution_context, info, kwargs or {}
         )
         base = backend.relation_base_query(spec, pks, info)
         if filter_input is not None:
@@ -571,17 +648,16 @@ class RelationConnectionExtension(SchemaExtension):
             [spec.key_field],
             info,
             spec.related_model,
-            # Relay slices this itself, so hand it the page plus the row that
-            # tells it whether another page exists.
-            per_group_limit=first + offset + 1,
+            per_group_limit=max(limit, 0),
+            per_group_offset=start,
             order_input=order_input,
         )
         if isawaitable(rows_by_key):
             return self._fetch_pages_async(
-                backend, spec, parents, pks, info, base, rows_by_key
+                backend, spec, parents, pks, info, base, rows_by_key, start
             )
         totals = backend.group_counts(base, spec.key_field, info)
-        return self._assemble(parents, pks, rows_by_key, totals)
+        return self._assemble(parents, pks, rows_by_key, totals, start)
 
     async def _fetch_pages_async(
         self,
@@ -592,13 +668,14 @@ class RelationConnectionExtension(SchemaExtension):
         info: Any,
         base: Any,
         rows_by_key: Any,
+        start: int,
     ) -> dict[int, Any]:
         """The same two reads, for a backend that only answers asynchronously."""
         from strawberry_orm._async import await_maybe
 
         rows = await rows_by_key
         totals = await await_maybe(backend.group_counts(base, spec.key_field, info))
-        return self._assemble(parents, pks, rows, totals)
+        return self._assemble(parents, pks, rows, totals, start)
 
     @staticmethod
     def _assemble(
@@ -606,8 +683,9 @@ class RelationConnectionExtension(SchemaExtension):
         pks: list[Any],
         rows_by_key: dict[tuple, list[Any]],
         totals: dict[Any, int],
+        start: int,
     ) -> dict[int, Any]:
-        """Pair every parent with its own page and that page's real total."""
+        """Pair every parent with its own page, from *start*, and its real total."""
         from strawberry_orm.lazy_resolution import mark_rows_scoped
         from strawberry_orm.relay.connection import PreslicedRows
 
@@ -618,7 +696,7 @@ class RelationConnectionExtension(SchemaExtension):
         for parent, pk in zip(parents, pks, strict=True):
             page = rows_by_key.get((str(pk),), [])
             mark_rows_scoped(page)
-            pages[id(parent)] = PreslicedRows(page, totals.get(pk, 0))
+            pages[id(parent)] = PreslicedRows(page, totals.get(pk, 0), start)
         return pages
 
 

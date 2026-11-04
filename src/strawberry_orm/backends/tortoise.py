@@ -764,8 +764,9 @@ class TortoiseBackend(BaseBackend):
         *,
         per_group_limit: int,
         order_input: Any | None = None,
+        per_group_offset: int = 0,
     ) -> dict[tuple, list[Any]]:
-        """Every group's first rows in one windowed query.
+        """Every group's page of rows in one windowed query.
 
         Tortoise has no window expression, so the query it built is wrapped in
         SQL that numbers rows within each group and keeps the low numbers. The
@@ -776,7 +777,12 @@ class TortoiseBackend(BaseBackend):
             _build_tortoise_order_from_input(order_input) if order_input else []
         )
         sql, values = _windowed_sql(
-            query, model, group_key_fields, order_clauses, per_group_limit
+            query,
+            model,
+            group_key_fields,
+            order_clauses,
+            per_group_limit,
+            per_group_offset,
         )
         rows = await query._db.execute_query_dict(sql, values)
 
@@ -945,9 +951,9 @@ class TortoiseBackend(BaseBackend):
         spec = self._relation_connection_spec(model, field_name, relation)
 
         def resolver(self: Any, info: Any) -> Any:
-            from strawberry_orm.batching import page_attr
+            from strawberry_orm.batching import take_page
 
-            page = getattr(self, page_attr(field_name), None)
+            page = take_page(self, field_name, info)
             if page is not None:
                 return page
             qs = spec.related_model.filter(
@@ -2048,8 +2054,9 @@ def _windowed_sql(
     group_key_fields: list[str],
     order_clauses: list[str],
     per_group_limit: int,
+    per_group_offset: int = 0,
 ) -> tuple[str, list[Any]]:
-    """Wrap *query* in SQL keeping the first rows of every group.
+    """Wrap *query* in SQL keeping one page of rows from every group.
 
     Returns the statement and the values its placeholders still expect, so the
     caller binds them rather than embedding them.
@@ -2066,13 +2073,14 @@ def _windowed_sql(
     )
     ordering = ", ".join(_window_ordering(model, order_clauses, quote_char))
     alias = f"{quote_char}{_ROW_NUMBER_ALIAS}{quote_char}"
+    low, high = int(per_group_offset), int(per_group_offset + per_group_limit)
 
     sql = (
         f"SELECT * FROM ("
         f"SELECT _orm_inner.*, ROW_NUMBER() OVER ("
         f"PARTITION BY {partition} ORDER BY {ordering}"
         f") AS {alias} FROM ({inner}) _orm_inner"
-        f") _orm_windowed WHERE {alias} <= {int(per_group_limit)} "
+        f") _orm_windowed WHERE {alias} > {low} AND {alias} <= {high} "
         # Ordered by the row number so each group comes back in the order the
         # window put it in; without it the rows arrive however the database
         # found them and the requested order is lost.

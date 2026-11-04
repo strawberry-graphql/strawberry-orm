@@ -17,6 +17,7 @@ from strawberry_orm.batching import (
     _Bail,
     extensions_include_relation_connections,
     page_attr,
+    take_page,
 )
 
 
@@ -53,17 +54,36 @@ class _Backend:
         return self._totals
 
 
-def _info(path="users.posts", args=None):
-    """A resolve info carrying just a path and the field's arguments."""
-    node = types.SimpleNamespace(arguments=args or ())
+class _Edge:
+    CURSOR_PREFIX = "arrayconnection"
+
+
+class _Connection:
+    @classmethod
+    def _edge_type(cls):
+        return _Edge
+
+
+def _info(path="users.posts"):
+    """A resolve info carrying a path and a connection field to read it off."""
+    from graphql.pyutils import Path
+    from strawberry.relay.fields import ConnectionExtension
+
     parts = path.split(".")
     node_path = None
     for part in parts:
-        node_path = types.SimpleNamespace(key=part, prev=node_path)
+        node_path = Path(node_path, part, None)
+    extension = ConnectionExtension(max_results=100)
+    extension.connection_type = _Connection
+    field = types.SimpleNamespace(
+        extensions={
+            "strawberry-definition": types.SimpleNamespace(extensions=[extension])
+        }
+    )
     return types.SimpleNamespace(
         path=node_path,
-        _raw_info=types.SimpleNamespace(field_nodes=[node]),
-        field_nodes=[node],
+        field_name=parts[-1],
+        parent_type=types.SimpleNamespace(fields={parts[-1]: field}),
     )
 
 
@@ -72,17 +92,6 @@ def _extension(backend):
     ext = cls()
     ext.execution_context = types.SimpleNamespace()
     return ext
-
-
-def _arg(name, value, kind="int"):
-    from graphql.language import IntValueNode, NameNode, StringValueNode
-
-    node = (
-        IntValueNode(value=str(value))
-        if kind == "int"
-        else StringValueNode(value=str(value))
-    )
-    return types.SimpleNamespace(name=NameNode(value=name), value=node)
 
 
 class TestSiblings:
@@ -124,9 +133,9 @@ class TestFetchGuards:
         backend = _Backend(awaitable=True, rows={("1",): ["row"]}, totals={1: 4})
         ext = _extension(backend)
         spec = types.SimpleNamespace(key_field="author_id", related_model=object)
-        info = _info(args=[_arg("first", 1)])
-
-        pending = ext._fetch_pages(backend, spec, [_Parent(1)], info)
+        pending = ext._fetch_pages(
+            backend, spec, [_Parent(1)], _info(), kwargs={"first": 1}
+        )
         pages = await pending
         assert list(pages.values())[0].orm_total_count == 4
 
@@ -151,21 +160,54 @@ class TestFetchGuards:
         ext = _extension(backend)
         parents = [_Parent(1), _Parent(2)]
         ext.execution_context._orm_batch_parents = {"users": parents}
-        info = _info(args=[_arg("first", 1)])
+        info = _info()
+        handed = []
 
         async def _next(root, info, *a, **k):
+            handed.append(take_page(root, "posts", info))
             return root
 
-        await asyncio.gather(*(ext.resolve(_next, p, info) for p in parents))
+        await asyncio.gather(*(ext.resolve(_next, p, info, first=1) for p in parents))
         assert reads["n"] == 1, "each sibling started its own read"
-        assert all(getattr(p, page_attr("posts"), None) is not None for p in parents)
+        assert all(handed), "a sibling was not handed its page"
+        assert all(not hasattr(p, page_attr("posts")) for p in parents), (
+            "a page outlived the field"
+        )
 
-    def test_a_cursor_widens_the_window(self):
-        """after= is applied by Relay, so the window has to reach past it."""
+    def test_a_field_that_is_not_a_connection_is_not_windowed(self):
+        ext = _extension(_Backend())
+        info = types.SimpleNamespace(
+            path=_info().path,
+            field_name="posts",
+            parent_type=types.SimpleNamespace(fields={}),
+        )
+        with pytest.raises(_Bail, match="not a connection"):
+            ext._fetch_pages(
+                ext._backend, object(), [_Parent(1)], info, kwargs={"first": 1}
+            )
+
+    def test_a_cursor_before_the_first_row_is_not_windowed(self):
+        """Python slices a negative position from the list's end; a window cannot."""
+        import base64
+
+        ext = _extension(_Backend())
+        cursor = base64.b64encode(b"arrayconnection:-5").decode()
+        with pytest.raises(_Bail, match="before the first row"):
+            ext._fetch_pages(
+                ext._backend,
+                object(),
+                [_Parent(1)],
+                _info(),
+                kwargs={"first": 1, "after": cursor},
+            )
+
+    def test_the_window_starts_at_the_cursor(self):
+        """Rows before after= are not read: a forged cursor would read them all."""
         seen = {}
 
         class _Recording(_Backend):
             def batch_group_items(self, *a, **kw):
+                seen["offset"] = kw["per_group_offset"]
                 seen["limit"] = kw["per_group_limit"]
                 return {("1",): ["row"]}
 
@@ -175,11 +217,13 @@ class TestFetchGuards:
         import base64
 
         cursor = base64.b64encode(b"arrayconnection:2").decode()
-        info = _info(args=[_arg("first", 3), _arg("after", cursor, kind="string")])
-
-        pages = ext._fetch_pages(backend, spec, [_Parent(1)], info)
-        assert seen["limit"] == 3 + 3 + 1, "the cursor offset was not included"
-        assert list(pages.values())[0].orm_total_count == 7
+        pages = ext._fetch_pages(
+            backend, spec, [_Parent(1)], _info(), kwargs={"first": 3, "after": cursor}
+        )
+        # The page plus the row that answers hasNextPage, from just past it.
+        assert seen == {"offset": 3, "limit": 3 + 1}
+        page = list(pages.values())[0]
+        assert (page.orm_offset, page.orm_total_count) == (3, 7)
 
 
 class TestResolveGuards:

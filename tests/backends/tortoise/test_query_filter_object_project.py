@@ -54,6 +54,7 @@ class _PostType:
     is_published: auto
     tags: list[_TagType]
     comments: list[_CommentType]
+    author: "_UserType"
 
 
 @_orm.type(TortUser)

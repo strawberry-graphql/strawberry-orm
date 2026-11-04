@@ -6,7 +6,7 @@ import sys
 import typing as _typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property, partial, wraps
-from inspect import Parameter, isawaitable, iscoroutinefunction
+from inspect import Parameter, isawaitable, iscoroutinefunction, signature
 from types import UnionType
 from typing import Any, Literal
 
@@ -33,6 +33,7 @@ from strawberry_orm._async import (
     run_orm_work_blocking,
 )
 from strawberry_orm.backends.protocol import Backend
+from strawberry_orm.cover import build_covered, reached_types
 from strawberry_orm.fields import (
     call_scope,
     check_resolver_signature,
@@ -147,6 +148,12 @@ def _make_query_resolver(
             annotations["order"] = list[order_type] | None
         annotations["group_by"] = list[group_type] | None
         resolver.__annotations__ = annotations
+        # A type may group without filtering or ordering, and Strawberry
+        # refuses a parameter it has no annotation for.
+        parameters = signature(resolver).parameters.values()
+        resolver.__signature__ = signature(resolver).replace(  # type: ignore[attr-defined]
+            parameters=[p for p in parameters if p.name in {"self", *annotations}]
+        )
     elif filter_type and order_type:
 
         def resolver(
@@ -410,7 +417,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             if carried is not None:
                 from strawberry_orm.relay.connection import PreslicedRows
 
-                return PreslicedRows(cast, carried)
+                return PreslicedRows(cast, carried, getattr(result, "orm_offset", 0))
             return cast
         return result
 
@@ -837,6 +844,7 @@ class _AutoField:
             metadata=self.metadata,
         )
         field._orm_auto_field = True  # type: ignore[attr-defined]
+        field._orm_reads_as_is = True  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
@@ -1009,6 +1017,12 @@ class _AutoConnection:
                         **target.__annotations__,
                         "return": return_ann,
                     }
+                    # One that takes only some arguments carries its own signature.
+                    fixed = vars(target).get("__signature__")
+                    if fixed is not None:
+                        target.__signature__ = fixed.replace(
+                            return_annotation=return_ann
+                        )
                     target = getattr(target, "__wrapped__", None)
 
         # On a backend that materializes asynchronously the field has to be
@@ -1132,9 +1146,14 @@ def _build_grouped_connection(
     import types as _types_mod
 
     from strawberry_orm.backends._base import AggregateMeta
-    from strawberry_orm.relay.connection import ORMListConnection, PageInfo
+    from strawberry_orm.relay.connection import ORMListConnection, PageInfo, _PageRows
 
     meta: AggregateMeta = backend._build_aggregate_types(model, aggregate_type)  # type: ignore[union-attr]
+    node_type = _extract_connection_node(connection_type)
+    if node_type in backend._shown_by_type:  # type: ignore[attr-defined]
+        # min/max return exact values and a group key echoes one, so they
+        # cover what the nodes show, like the filters beside them.
+        backend._attach_to_type(model, meta, node_type)  # type: ignore[attr-defined]
     model_name = model.__name__
     AggregatesType = meta.aggregates_type
     GroupKeyType = meta.group_key_type
@@ -1153,8 +1172,6 @@ def _build_grouped_connection(
         type(f"{model_name}PageInfo", (PageInfo,), page_info_ns),
         name=f"{model_name}PageInfo",
     )
-
-    node_type = _extract_connection_node(connection_type)
 
     # -- Group items connection (cursor-based pagination) --------------------
 
@@ -1188,10 +1205,12 @@ def _build_grouped_connection(
         last: int | None = None,
         before: str | None = None,
     ) -> Any:
-        nodes = getattr(self, "_items_nodes", [])
+        # None when the arguments were refused: nothing was read for them.
+        nodes = getattr(self, "_items_nodes", None) or []
         cast_nodes = [strawberry_cast(_items_node_type, n) for n in nodes]
         return _items_conn_cls.resolve_connection(
-            cast_nodes,
+            # The window started at the page, so it is handed over at its place.
+            _PageRows(cast_nodes, getattr(self, "_items_offset", 0)),
             info=info,
             first=first,
             after=after,
@@ -1571,6 +1590,10 @@ class StrawberryORM:
         argument and input field that is untagged or carries one of them, and
         leaves out types nothing kept reaches. ``schema_class`` is the class
         built, for a ``strawberry.Schema`` subclass of your own.
+
+        Filters, ordering, group-by and aggregates are cut to what the types
+        they serve in this schema show, so a column no type here shows cannot
+        be filtered on, sorted by, grouped by or aggregated.
         """
         from strawberry_orm.lazy_resolution import extensions_include_lazy_resolution
         from strawberry_orm.optimizer.extension import (
@@ -1626,7 +1649,15 @@ class StrawberryORM:
 
         if tags is not None:
             schema_class = tagged_schema_class(schema_class, tags)
-        return schema_class(extensions=extensions, **kwargs)
+        schema = schema_class(extensions=list(extensions), **kwargs)
+        # Which types each input serves is only known once the schema shows
+        # what it reaches, so the inputs are cut in a second build.
+        cuts = self._backend.input_cuts(
+            reached_types(schema), getattr(schema_class, "_orm_tags", None)
+        )
+        if not cuts:
+            return schema
+        return build_covered(schema_class, cuts, extensions=extensions, **kwargs)
 
     def batching_extension(self) -> type[SchemaExtension]:
         from strawberry_orm.batching import BatchingExtension

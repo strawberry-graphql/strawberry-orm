@@ -246,6 +246,101 @@ class TestRelationConnection:
         assert len(pages) == 3, statements
         assert not [sql for sql in statements if "count(" in sql], statements
 
+    def _loaded_posts(self, schema, query):
+        """The result, and how many Post rows were built to answer it."""
+        loaded = []
+
+        def on_load(target, context):
+            loaded.append(target)
+
+        self._s.expunge_all()
+        event.listen(SAPost, "load", on_load)
+        try:
+            result = schema.execute_sync(query, context_value={"session": self._s})
+        finally:
+            event.remove(SAPost, "load", on_load)
+        return result, len(loaded)
+
+    def _more_posts_for_alice(self, count):
+        alice = self._s.query(SAUser).filter(SAUser.name == "Alice").one()
+        self._s.add_all(
+            SAPost(title=f"Extra {i}", body="b", author=alice, is_published=True)
+            for i in range(count)
+        )
+        self._s.flush()
+
+    def test_an_alias_gets_its_own_page(self):
+        """Each field reads its own page, even where both reach the same row."""
+        result = self._schema(_orm()).execute_sync(
+            "{ narrow: users { name posts(first: 5, "
+            'filter: {field: {title: {contains: "Hello"}}}) '
+            "{ edges { node { title } } } } "
+            "everything: users { name posts { edges { node { title } } } } }",
+            context_value={"session": self._s},
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["everything"] if u["name"] == "Alice")
+        assert sorted(e["node"]["title"] for e in alice["posts"]["edges"]) == [
+            "GraphQL Guide",
+            "Hello World",
+        ]
+
+    def test_nothing_is_left_on_the_row(self):
+        """A later read of the same rows must not be handed this page."""
+        schema = self._schema(_orm())
+        first = schema.execute_sync(
+            '{ users { posts(first: 5, filter: {field: {title: {contains: "Hello"}}}) '
+            "{ edges { node { title } } } } }",
+            context_value={"session": self._s},
+        )
+        assert first.errors is None, first.errors
+        alice = self._s.query(SAUser).filter(SAUser.name == "Alice").one()
+        assert [k for k in vars(alice) if k.startswith("_orm_connection_page")] == []
+
+        later = self._by_user(
+            schema, "{ users { name posts { edges { node { title } } } } }"
+        )
+        assert sorted(later["Alice"]) == ["GraphQL Guide", "Hello World"]
+
+    def test_a_page_size_over_the_limit_reads_no_rows(self):
+        result, loaded = self._loaded_posts(
+            self._schema(_orm()),
+            "{ users { posts(first: 1000) { edges { node { title } } } } }",
+        )
+        assert "cannot be higher than 100" in result.errors[0].message
+        assert loaded == 0, f"read {loaded} posts before refusing the page size"
+
+    def test_a_forged_cursor_reads_no_rows(self):
+        forged = base64.b64encode(b"arrayconnection:1000000").decode()
+        result, loaded = self._loaded_posts(
+            self._schema(_orm()),
+            f'{{ users {{ name posts(first: 2, after: "{forged}") '
+            "{ edges { node { title } } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert all(u["posts"]["edges"] == [] for u in result.data["users"])
+        assert loaded == 0, f"read {loaded} posts past the end of every page"
+
+    def test_before_pages_as_strawberry_defines_it(self):
+        """``first`` with ``before`` starts at ``before - 1``, past ``first``'s reach."""
+        self._more_posts_for_alice(6)
+        before = base64.b64encode(b"arrayconnection:5").decode()
+        result = self._schema(_orm()).execute_sync(
+            f'{{ users {{ name posts(first: 2, before: "{before}") '
+            "{ edges { cursor } pageInfo { hasPreviousPage hasNextPage } } } }",
+            context_value={"session": self._s},
+        )
+        assert result.errors is None, result.errors
+        alice = next(u for u in result.data["users"] if u["name"] == "Alice")
+        assert [e["cursor"] for e in alice["posts"]["edges"]] == [
+            base64.b64encode(b"arrayconnection:4").decode(),
+            base64.b64encode(b"arrayconnection:5").decode(),
+        ]
+        assert alice["posts"]["pageInfo"] == {
+            "hasPreviousPage": True,
+            "hasNextPage": True,
+        }
+
     PAGE = "{ users { name posts(first: 1) { edges { node { title } } } } }"
 
     def test_each_parent_sees_only_its_own_rows(self):

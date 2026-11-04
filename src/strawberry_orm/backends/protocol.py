@@ -207,8 +207,10 @@ class Backend(Protocol):
         *,
         per_group_limit: int,
         order_input: Any | None = None,
+        per_group_offset: int = 0,
     ) -> AwaitableOrValue[dict[tuple, list[Any]]]:
-        """Fetch the first *per_group_limit* items for every group in one query.
+        """Fetch *per_group_limit* items, after the first *per_group_offset*,
+        for every group in one query.
 
         Uses ``ROW_NUMBER() OVER (PARTITION BY ...)`` to avoid N+1.
         Returns a dict mapping group-key tuples to lists of model instances.

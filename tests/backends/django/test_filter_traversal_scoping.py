@@ -35,15 +35,23 @@ class TestFilterTraversalScoping(AbstractTestFilterTraversalScoping):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(DjangoComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(DjangoPost, filters=post_filter, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -79,15 +87,23 @@ class TestJoinScopedTraversal(AbstractTestJoinScopedTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(posts__title="Hello World").distinct()
 
+        @orm.type(DjangoComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(DjangoPost, filters=post_filter)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -127,15 +143,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(DjangoComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(DjangoPost, filters=post_filter, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:
@@ -180,15 +204,23 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversal):
         class UT:
             id: auto
             name: auto
+            email: auto
 
             @classmethod
             def scope_rows(cls, qs, info):
                 return qs.filter(name="Alice")
 
+        @orm.type(DjangoComment)
+        class CT:
+            id: auto
+            author: UT
+
         @orm.type(DjangoPost, order=PostOrder)
         class PT:
             id: auto
             title: auto
+            author: UT
+            comments: list[CT]
 
         @strawberry.type
         class Query:

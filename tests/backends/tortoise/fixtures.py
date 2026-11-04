@@ -44,6 +44,9 @@ class CommentType:
     post_id: int
     author_id: int
     parent_id: int | None
+    post: "PostType"
+    author: "UserType"
+    parent: "CommentType | None"
 
 
 @_main_orm.type(TortTag, filters=TagFilter, order=TagOrder)
@@ -60,6 +63,7 @@ class PostType:
     is_published: auto
     tags: list[TagType]
     comments: list[CommentType]
+    author: "UserType"
 
 
 @_main_orm.type(TortUser, filters=UserFilter, order=UserOrder)

@@ -73,6 +73,104 @@ def _metadata_only_field(value: Any) -> bool:
     )
 
 
+def _reads_as_is(value: Any) -> bool:
+    """True when a type field reads its column or relation exactly as stored.
+
+    A resolver of the developer's own, an ``on=`` view, ``compute=`` or
+    permission classes all show the caller something other than the column,
+    or show it to fewer callers. Filtering or sorting on the column would get
+    around that, so such a field does not open its column to the inputs. A
+    ``scope=`` does: filter traversal applies the field's scope too.
+    """
+    from strawberry_orm.types import FieldDefinition
+
+    if isinstance(value, FieldDefinition):
+        return not (value.on or value.compute or value.permission_classes)
+    if isinstance(value, StrawberryField):
+        pending = getattr(value, "_orm_pending_connection", None)
+        if pending is not None:
+            return pending._kwargs.get("scope") is None
+        return getattr(value, "_orm_reads_as_is", False) or _metadata_only_field(value)
+    return True
+
+
+def _node_id_attr(graphql_type: type) -> str | None:
+    """The attribute a Relay node annotates ``NodeID``, or ``None``.
+
+    Strawberry evaluates every annotation of the class to find it, so this is
+    only asked once a schema is built, when the types they name exist.
+    """
+    from strawberry import relay
+    from strawberry.relay.exceptions import NodeIDAnnotationError
+
+    if not issubclass(graphql_type, relay.Node):
+        return None
+    try:
+        return graphql_type.resolve_id_attr()
+    except (NodeIDAnnotationError, NameError):
+        return None
+
+
+def _common_tags(
+    first: frozenset[str] | None, second: frozenset[str] | None
+) -> frozenset[str] | None:
+    """The schemas both tag sets are in, where ``None`` means every schema."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return first & second
+
+
+def _in_schema(tags: frozenset[str] | None, schema_tags: frozenset[str] | None) -> bool:
+    return schema_tags is None or tags is None or bool(tags & schema_tags)
+
+
+def _intersect(
+    covers: list[dict[str, frozenset[str] | None]],
+) -> dict[str, frozenset[str] | None]:
+    """The fields every cover keeps, each in the schemas all of them keep it in."""
+    first, *rest = covers
+    cover = dict(first)
+    for other in rest:
+        cover = {
+            name: _common_tags(tags, other[name])
+            for name, tags in cover.items()
+            if name in other
+        }
+    return cover
+
+
+_AGGREGATES = ("sum", "avg", "min", "max")
+
+
+def _reached_input(item: Any, reached: set[Any]) -> bool:
+    if isinstance(item, AggregateMeta):
+        return item.aggregates_type in reached or item.group_key_type in reached
+    return item in reached
+
+
+def _input_parts(item: Any) -> list[tuple[str | None, Any, Any]]:
+    """Each part an input is cut in, as ``(field on its container, part, container)``.
+
+    A filter or order is cut in its ``field`` and ``object`` parts. Aggregates
+    are cut in each sub-aggregate and in the group key, which has no container
+    to drop it from: a connection that groups needs one.
+    """
+    if isinstance(item, AggregateMeta):
+        parts: list[tuple[str | None, Any, Any]] = [
+            (label, getattr(item, f"{label}_type"), item.aggregates_type)
+            for label in _AGGREGATES
+        ]
+        parts.append((None, item.group_key_type, None))
+    else:
+        parts = [
+            (key, getattr(item, f"_{key}_type", None), item)
+            for key in ("field", "object")
+        ]
+    return [(label, part, container) for label, part, container in parts if part]
+
+
 def _annotate_filter_relation_presence(FilterCls: type) -> None:
     """Add ``is_null`` for FK presence when the filter is used under ``object``."""
     FilterCls.__annotations__["is_null"] = bool | None
@@ -364,6 +462,13 @@ class BaseBackend:
         self._batch_relations: bool = kwargs.get("batch_relations", True)
         self._type_excludes: dict[type, set[str]] = {}
         self._input_registry: dict[type, list[tuple[str, set[str]]]] = {}
+        #: Per GraphQL type, the columns and relations it shows as they are,
+        #: each with the tags of the field showing it.
+        self._shown_by_type: dict[type, dict[str, frozenset[str] | None]] = {}
+        self._types_by_model: dict[type, list[type]] = {}
+        #: Per model, every filter, order and group-by input and aggregate type
+        #: built for it, so each is cut again as types arrive.
+        self._model_inputs: dict[type, list[Any]] = {}
 
     def get_repo(self, model: type) -> Any | None:
         """Return an instantiated repo for *model*, or ``None``."""
@@ -672,6 +777,7 @@ class BaseBackend:
         if object_annotations:
             FilterType._object_type = ObjectType  # type: ignore[attr-defined]
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
+        self._cover_shown_fields(model, FilterType)
 
         if pending_self_relations:
             if project is None:
@@ -802,6 +908,7 @@ class BaseBackend:
             OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
         _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
+        self._cover_shown_fields(model, OrderType)
         self._order_registry[model] = OrderType
         return OrderType
 
@@ -985,6 +1092,7 @@ class BaseBackend:
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
         if custom_filters:
             FilterType._custom_filters = custom_filters  # type: ignore[attr-defined]
+        self._cover_shown_fields(model, FilterType)
 
         if pending_self_relations:
             self._filter_registry[model] = FilterType
@@ -1126,6 +1234,7 @@ class BaseBackend:
         if custom_orders:
             OrderType._custom_orders = custom_orders  # type: ignore[attr-defined]
         _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
+        self._cover_shown_fields(model, OrderType)
 
         self._order_registry[model] = OrderType
         return OrderType
@@ -1190,6 +1299,7 @@ class BaseBackend:
         GroupByType = strawberry.input(GroupByCls, one_of=True)
         GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
         GroupByType.__orm_model__ = model  # type: ignore[attr-defined]
+        self._cover_shown_fields(model, GroupByType)
 
         self._group_registry[model] = GroupByType
         return GroupByType
@@ -1284,6 +1394,7 @@ class BaseBackend:
             GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
         if custom_groups:
             GroupByType._custom_groups = custom_groups  # type: ignore[attr-defined]
+        self._cover_shown_fields(model, GroupByType)
 
         self._group_registry[model] = GroupByType
         return GroupByType
@@ -1450,6 +1561,7 @@ class BaseBackend:
             groupable_fields=groupable_fields,
             custom_fields=custom_agg_handlers,
         )
+        self._cover_shown_fields(model, meta)
         self._aggregate_type_cache[cache_key] = meta
         return meta
 
@@ -1792,45 +1904,190 @@ class BaseBackend:
     @staticmethod
     def _generated_input_field_names(input_cls: Any) -> set[str]:
         """Column names reachable through a generated filter/order input."""
-        if input_cls is None:
-            return set()
         nested = getattr(input_cls, "__annotations__", {}).get("field")
         args = getattr(nested, "__args__", None)
         inner = args[0] if args else nested
         return set(getattr(inner, "__annotations__", {}))
 
-    def _check_excluded_fields_are_not_queryable(
-        self,
-        type_name: str,
-        exclude: list[str] | tuple[str, ...] | set[str] | None,
-        filters: Any,
-        order: Any,
-        group: Any,
-    ) -> None:
-        """Refuse to expose an excluded column through filter/order/group.
+    def _cover_shown_fields(self, model: type, item: Any) -> Any:
+        """Track *item*, so every schema cuts it to what its types show there.
 
-        Hiding a column from the output type but leaving it filterable turns it
-        into an oracle: ``startsWith`` probes read the value one character at a
-        time. The generated inputs are built from the model, so they do not know
-        about the type's ``exclude`` unless it is passed to them as well.
+        The inputs are built from the model, which knows every column, while
+        the types decide which of them a caller may read. A hidden column left
+        in a filter is read one ``startsWith`` probe at a time, and through a
+        group key or ``min``/``max`` it is read outright.
         """
-        if not exclude:
-            return
+        tracked = self._model_inputs.setdefault(model, [])
+        if all(existing is not item for existing in tracked):
+            tracked.append(item)
+        return item
 
-        excluded = set(exclude)
-        for label, input_cls in (
-            ("filters", filters),
-            ("order", order),
-            ("group", group),
-        ):
-            leaked = sorted(excluded & self._generated_input_field_names(input_cls))
-            if leaked:
-                raise ValueError(
-                    f"{type_name} excludes {leaked} but its {label} input still "
-                    f"exposes them, which makes the hidden values readable one "
-                    f"probe at a time. Pass exclude={leaked!r} to the "
-                    f"orm.{'filter' if label == 'filters' else label}() call too."
+    def _attach_to_type(self, model: type, item: Any, graphql_type: type) -> None:
+        """Record that *item* is the input *graphql_type* uses."""
+        owners = getattr(item, "_orm_owners", None)
+        if owners is None:
+            owners = item._orm_owners = []
+        if graphql_type not in owners:
+            owners.append(graphql_type)
+        self._cover_shown_fields(model, item)
+
+    def _show_fields(
+        self,
+        model: type,
+        graphql_type: type,
+        shown: dict[str, frozenset[str] | None],
+    ) -> None:
+        """Record the columns and relations a type of *model* shows as they are."""
+        self._shown_by_type[graphql_type] = shown
+        self._types_by_model.setdefault(model, []).append(graphql_type)
+
+    def _shown(self, graphql_type: type) -> dict[str, frozenset[str] | None]:
+        """What *graphql_type* shows, with the column a Relay node serves as its id.
+
+        The id is encoded, not hidden, so its column counts as shown.
+        """
+        from strawberry_orm.tags import tags_of
+
+        shown = self._shown_by_type[graphql_type]
+        id_attr = _node_id_attr(graphql_type)
+        reads_as_is = vars(graphql_type).get("_orm_reads_as_is", frozenset())
+        if id_attr is None or id_attr in shown or id_attr not in reads_as_is:
+            return shown
+        definition = graphql_type.__strawberry_definition__  # type: ignore[attr-defined]
+        global_id = next(f for f in definition.fields if f.graphql_name == "id")
+        return {**shown, id_attr: tags_of(global_id)}
+
+    def input_cuts(
+        self, reached: set[Any], schema_tags: frozenset[str] | None = None
+    ) -> dict[Any, Any]:
+        """How a schema reaching *reached* cuts the generated inputs it reaches.
+
+        Each input covers what the types it serves in that schema show: the
+        types it is attached to, and the types its relations lead to through
+        ``object:`` from the types its parent serves. One serving several types
+        covers what all of them show. An input nothing attaches, such as one
+        passed to a field directly, covers what every type of its model the
+        schema reaches shows.
+        """
+        from strawberry_orm.cover import InputCut
+        from strawberry_orm.tags import tags_of
+
+        items = [
+            (model, item)
+            for model, inputs in self._model_inputs.items()
+            for item in inputs
+            if _reached_input(item, reached)
+        ]
+        uses = self._input_uses(items, reached)
+        part_covers: dict[Any, list[dict[str, frozenset[str] | None]]] = {}
+        holders: dict[Any, list[tuple[Any, str | None]]] = {}
+        messages: dict[Any, str] = {}
+        for model, item in items:
+            if not uses[id(item)]:
+                continue
+            cover = _intersect([self._shown(node) for node in uses[id(item)]])
+            for label, part, container in _input_parts(item):
+                part_covers.setdefault(part, []).append(cover)
+                holders.setdefault(part, []).append((container, label))
+                if container is None:
+                    messages[part] = (
+                        f"{model.__name__} cannot be grouped: the GraphQL types "
+                        f"its connection serves show none of its columns to "
+                        f"group by."
+                    )
+                elif container is item:
+                    messages[container] = (
+                        f"{item.__strawberry_definition__.name} is left with "
+                        f"nothing to use: the GraphQL types it serves show none "
+                        f"of {model.__name__}'s columns. Show one on the type, "
+                        f"or drop the input from it."
+                    )
+
+        cuts: dict[Any, Any] = {}
+        dropped: dict[Any, set[str]] = {}
+        for part, covers in part_covers.items():
+            cover = _intersect(covers)
+            fields = part.__strawberry_definition__.fields
+            keep = frozenset(
+                field.python_name
+                for field in fields
+                if field.python_name in cover
+                and _in_schema(
+                    _common_tags(tags_of(field), cover[field.python_name]),
+                    schema_tags,
                 )
+            )
+            if len(keep) == len(fields):
+                continue
+            cuts[part] = InputCut(keep, messages.get(part))
+            if not keep:
+                for container, label in holders[part]:
+                    if container is not None:
+                        dropped.setdefault(container, set()).add(label)
+        for container, labels in dropped.items():
+            names = {f.python_name for f in container.__strawberry_definition__.fields}
+            cuts[container] = InputCut(
+                frozenset(names - labels), messages.get(container)
+            )
+        return cuts
+
+    def _input_uses(
+        self, items: list[tuple[type, Any]], reached: set[Any]
+    ) -> dict[int, list[type]]:
+        """The types each input serves in a schema that reaches *reached*."""
+        uses = {
+            id(item): [o for o in getattr(item, "_orm_owners", ()) if o in reached]
+            for _, item in items
+        }
+        self._follow_relations(items, uses, reached)
+        for model, item in items:
+            if not uses[id(item)]:
+                types = self._types_by_model.get(model, [])
+                uses[id(item)] = [t for t in types if t in reached] or list(types)
+        self._follow_relations(items, uses, reached)
+        return uses
+
+    def _follow_relations(
+        self,
+        items: list[tuple[type, Any]],
+        uses: dict[int, list[type]],
+        reached: set[Any],
+    ) -> None:
+        """Add, to each input behind ``object:``, the types its relation leads to.
+
+        A parent serving ``PostNode`` reaches ``author`` as whatever type
+        ``PostNode.author`` returns, so the input behind it serves that type.
+        """
+        from strawberry_orm.cover import named_type
+
+        inputs = {item for _, item in items if isinstance(item, type)}
+        changed = True
+        while changed:
+            changed = False
+            for _, parent in items:
+                relations = getattr(parent, "_object_type", None)
+                if relations is None or relations not in reached:
+                    continue
+                for field in relations.__strawberry_definition__.fields:
+                    child = named_type(field.type)
+                    if child not in inputs:
+                        continue
+                    for node in list(uses[id(parent)]):
+                        target = self._relation_target(node, field.python_name)
+                        if target in reached and target not in uses[id(child)]:
+                            uses[id(child)].append(target)
+                            changed = True
+
+    def _relation_target(self, graphql_type: type, relation: str) -> type | None:
+        """The type *graphql_type* shows *relation* as, if it shows it as it is."""
+        from strawberry_orm.cover import named_type
+
+        if relation not in self._shown_by_type.get(graphql_type, {}):
+            return None
+        definition = graphql_type.__strawberry_definition__  # type: ignore[attr-defined]
+        field = next(f for f in definition.fields if f.python_name == relation)
+        target = named_type(field.type)
+        return target if target in self._shown_by_type else None
 
     def _register_type_scope(self, cls: type, model: type, type_name: str) -> None:
         """Record ``scope_rows`` for *model*, refusing to silently replace it.
@@ -2114,6 +2371,11 @@ class BaseBackend:
 
         cls.__annotations__ = annotations
         cls.__orm_model__ = model  # type: ignore[attr-defined]
+        # Read before the backend installs resolvers of its own, which would
+        # make every relation look like a field with a custom resolver.
+        cls._orm_reads_as_is = frozenset(  # type: ignore[attr-defined]
+            name for name in annotations if _reads_as_is(vars(cls).get(name))
+        )
 
         if self._warn_sensitive:
             for field_name in annotations:
@@ -2138,9 +2400,6 @@ class BaseBackend:
 
         type_name = name or cls.__name__
 
-        self._check_excluded_fields_are_not_queryable(
-            type_name, exclude, filters, order, group
-        )
         self._check_excluded_fields_are_not_writable(model, type_name, exclude)
         if exclude:
             self._type_excludes.setdefault(model, set()).update(exclude)
@@ -2366,6 +2625,8 @@ class BaseBackend:
         name: str | None,
     ) -> Any:
         """Call ``strawberry.type()`` and register the model in the type registry."""
+        from strawberry_orm.tags import tags_of
+
         result = strawberry.type(cls, name=name if name else None)
         removed = vars(cls).get("_orm_removed_metadata")
         if removed:
@@ -2374,6 +2635,20 @@ class BaseBackend:
                     field.metadata = MappingProxyType(
                         {**field.metadata, **removed[field.python_name]}
                     )
+        reads_as_is = vars(cls).get("_orm_reads_as_is", frozenset())
+        shown = {
+            field.python_name: tags_of(field)
+            for field in result.__strawberry_definition__.fields
+            if field.python_name in reads_as_is
+        }
+        self._show_fields(model, result, shown)
+        for attr in ("__orm_filter__", "__orm_order__", "__orm_group__"):
+            attached = vars(cls).get(attr)
+            if (
+                attached is not None
+                and getattr(attached, "__orm_model__", None) is model
+            ):
+                self._attach_to_type(model, attached, result)
         self._type_registry[type_name] = model
         self._graphql_type_registry[model] = result
         self._install_on_resolvers(result, model, type_name)

@@ -13,8 +13,19 @@ Subclasses supply ``orm``/``orm_factory`` plus these hooks:
 """
 
 import pytest
+import strawberry
 
 from strawberry_orm.types import auto
+
+
+def _input_fields(orm, graphql_type, input_name):
+    """The fields of *input_name* in a schema listing *graphql_type*."""
+
+    @strawberry.type
+    class Query:
+        rows: list[graphql_type] = orm.field.eager()
+
+    return set(orm.schema(query=Query)._schema.type_map[input_name].fields)
 
 
 class AbstractTestSecurityVulnerabilities:
@@ -67,12 +78,13 @@ class AbstractTestSecurityVulnerabilities:
         orm = orm_factory()
         filters = orm.filter(User)
 
-        with pytest.raises(ValueError, match=r"excludes \['email'\]"):
+        @orm.type(User, exclude=["email"], filters=filters)
+        class UT:
+            id: auto
+            name: auto
+            email: auto
 
-            @orm.type(User, exclude=["email"], filters=filters)
-            class UT:
-                id: auto
-                name: auto
+        assert "email" not in _input_fields(orm, UT, "UserField")
 
     def test_excluded_field_is_fine_when_the_filter_excludes_it_too(
         self, orm_factory, User
@@ -91,12 +103,13 @@ class AbstractTestSecurityVulnerabilities:
         orm = orm_factory()
         order = orm.order(User)
 
-        with pytest.raises(ValueError, match=r"excludes \['email'\]"):
+        @orm.type(User, exclude=["email"], order=order)
+        class UT:
+            id: auto
+            name: auto
+            email: auto
 
-            @orm.type(User, exclude=["email"], order=order)
-            class UT:
-                id: auto
-                name: auto
+        assert "email" not in _input_fields(orm, UT, "UserOrderField")
 
     def test_sensitive_columns_are_not_aggregatable(self, orm_factory):
         """``min``/``max`` return exact values, so a sensitive numeric column is

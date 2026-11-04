@@ -91,11 +91,11 @@ from strawberry_orm.relay.connection import (
     _await_nodes_if_needed,
     _compute_page_aggregates,
     _connection_total_count,
-    _decode_cursor_offset,
     _extract_items_after,
     _extract_items_first,
     _extract_items_order,
     _get_items_arg,
+    _items_window,
     _node_matches_group_key,
     _should_await_nodes,
     _use_orm_connection_extension,
@@ -1715,7 +1715,24 @@ class TestPushTo98:
         )
 
     def test_relay_items_helpers_and_bad_cursor(self):
-        assert _decode_cursor_offset("not-a-cursor") == 0
+        import base64
+
+        def _items_info(**arguments):
+            items = SimpleNamespace(name="items", arguments=arguments, selections=[])
+            return SimpleNamespace(
+                selected_fields=[SimpleNamespace(name="groups", selections=[items])],
+                schema=SimpleNamespace(config=SimpleNamespace(relay_max_results=100)),
+            )
+
+        def cursor(offset):
+            return base64.b64encode(f"arrayconnection:{offset}".encode()).decode()
+
+        # The page and the row that answers hasNextPage, from just past after.
+        assert _items_window(_items_info(first=2, after=cursor(4))) == (5, 3)
+        assert _items_window(_items_info(after="not-a-cursor")) is None
+        assert _items_window(_items_info(first=2, after=cursor(-5))) is None
+        # A tail counts back from each group's end, which the window cannot see.
+        assert _items_window(_items_info(last=2)) == (0, 11)
         assert _extract_items_first(SimpleNamespace(selected_fields=[])) is None
         assert _extract_items_after(SimpleNamespace(selected_fields=[])) is None
         assert _extract_items_order(SimpleNamespace(selected_fields=[])) is None

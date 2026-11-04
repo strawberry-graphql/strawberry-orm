@@ -38,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: >-
           uv sync --group dev --python ${{ matrix.python-version }}
-          --extra django --extra sqlalchemy --extra tortoise
+          --extra django --extra sqlalchemy --extra tortoise --extra contrib.mcp
 
       - name: Run tests with coverage
         run: uv run --python ${{ matrix.python-version }} pytest
