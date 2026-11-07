@@ -353,7 +353,11 @@ class TestRegexInjection:
         )
         assert result.errors is not None
         err_msg = str(result.errors[0]).lower()
-        assert "disabled" in err_msg or "not defined" in err_msg
+        assert (
+            "disabled" in err_msg
+            or "not defined" in err_msg
+            or "unknown field" in err_msg
+        )
 
     def test_complex_regex_accepted(self, seeded_session):
         """Complex regex patterns with backreferences are also rejected when disabled."""
@@ -368,7 +372,11 @@ class TestRegexInjection:
         )
         assert result.errors is not None
         err_msg = str(result.errors[0]).lower()
-        assert "disabled" in err_msg or "not defined" in err_msg
+        assert (
+            "disabled" in err_msg
+            or "not defined" in err_msg
+            or "unknown field" in err_msg
+        )
 
 
 # =========================================================================

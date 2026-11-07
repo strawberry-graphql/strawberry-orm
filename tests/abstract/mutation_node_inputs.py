@@ -336,14 +336,20 @@ class AbstractTestNodeMutationInputs(UpsertNodeInputCases):
     ):
         result = node_execute_result(PROJECTED_TOO_DEEP)
         assert result.errors is not None
-        assert "Field 'posts' is not defined by type" in str(result.errors[0])
+        message = str(result.errors[0])
+        assert "posts" in message and (
+            "not defined" in message or "unknown field" in message.lower()
+        )
 
     def test_a_projected_input_leaves_out_undeclared_relations(
         self, node_execute_result, seed
     ):
         result = node_execute_result(PROJECTED_UNDECLARED_RELATION)
         assert result.errors is not None
-        assert "Field 'post' is not defined by type" in str(result.errors[0])
+        message = str(result.errors[0])
+        assert "post" in message and (
+            "not defined" in message or "unknown field" in message.lower()
+        )
 
     def test_a_projected_update_input_selects_its_root(self, node_execute, seed):
         data = node_execute(PROJECTED_UPDATE)

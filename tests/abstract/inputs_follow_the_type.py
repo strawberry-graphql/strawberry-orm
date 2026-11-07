@@ -255,6 +255,85 @@ class AbstractTestInputsFollowTheType:
         # name is neither numeric nor comparable, so no sub-aggregate is left.
         assert fields(schema, "UserAggregates") == {"count"}
 
+    def test_fields_inherited_from_an_interface_stay_in_the_inputs(self, orm, models):
+        """Columns an interface declares still open the type's filters and orders."""
+        import datetime
+
+        @strawberry.interface
+        class Named:
+            name: str
+            email: str
+            created_at: datetime.datetime
+
+        @orm.order_type(models.User)
+        class OnlyCreatedAt:
+            created_at: auto
+
+        @orm.type(
+            models.User,
+            filters=orm.filter(models.User),
+            order=OnlyCreatedAt,
+        )
+        class UserNode(Named):
+            id: auto
+
+        schema = _lists_schema(orm, UserNode)
+        assert fields(schema, "UserField") == {"id", "name", "email", "createdAt"}
+        assert fields(schema, "UserOrderField") == {"createdAt"}
+
+    def test_an_order_whose_only_field_is_inherited_builds(self, orm, models):
+        import datetime
+
+        @strawberry.interface
+        class Stamped:
+            created_at: datetime.datetime
+
+        @orm.order_type(models.User)
+        class OnlyCreatedAt:
+            created_at: auto
+
+        @orm.type(models.User, order=OnlyCreatedAt)
+        class UserNode(Stamped):
+            id: auto
+
+        schema = _lists_schema(orm, UserNode)
+        assert fields(schema, "UserOrderField") == {"createdAt"}
+
+    def test_exclude_still_cuts_a_column_an_interface_declares(self, orm, models):
+        @strawberry.interface
+        class Contact:
+            name: str
+            email: str
+
+        @orm.type(
+            models.User,
+            exclude=["email"],
+            filters=orm.filter(models.User, exclude=["email"]),
+            order=orm.order(models.User, exclude=["email"]),
+        )
+        class UserNode(Contact):
+            id: auto
+
+        schema = _lists_schema(orm, UserNode)
+        assert "email" not in fields(schema, "UserField")
+        assert "email" not in fields(schema, "UserOrderField")
+
+    def test_an_interface_resolver_does_not_open_its_column(self, orm, models):
+        @strawberry.interface
+        class Labeled:
+            name: str
+
+            @strawberry.field
+            def email(self) -> str:
+                return "hidden"  # pragma: no cover - never resolved
+
+        @orm.type(models.User, filters=orm.filter(models.User))
+        class UserNode(Labeled):
+            id: auto
+
+        schema = _lists_schema(orm, UserNode)
+        assert fields(schema, "UserField") == {"id", "name"}
+
     def test_an_input_left_with_nothing_is_refused(self, orm, models):
         import pytest
 

@@ -94,6 +94,31 @@ def _reads_as_is(value: Any) -> bool:
     return True
 
 
+def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
+    """Fields a base Strawberry type shows as stored that *cls* does not redeclare.
+
+    ``cls.__annotations__`` holds only the class's own names, so a column an
+    interface declares would otherwise never open to the type's filters and
+    orders. Walk each base's Strawberry fields and count a field the same way
+    an own annotation is counted: no resolver of its own, no permission
+    classes, and not listed in the type's ``exclude=``.
+    """
+    own_declared = set(getattr(cls, "__annotations__", {})) | set(vars(cls))
+    found: set[str] = set()
+    for base in cls.__mro__[1:]:
+        definition = getattr(base, "__strawberry_definition__", None)
+        if definition is None:
+            continue
+        for field in definition.fields:
+            name = field.python_name
+            if not name or name in own_declared or name in excluded or name in found:
+                continue
+            if field.base_resolver is not None or field.permission_classes:
+                continue
+            found.add(name)
+    return frozenset(found)
+
+
 def _node_id_attr(graphql_type: type) -> str | None:
     """The attribute a Relay node annotates ``NodeID``, or ``None``.
 
@@ -2372,10 +2397,12 @@ class BaseBackend:
         cls.__annotations__ = annotations
         cls.__orm_model__ = model  # type: ignore[attr-defined]
         # Read before the backend installs resolvers of its own, which would
-        # make every relation look like a field with a custom resolver.
+        # make every relation look like a field with a custom resolver. Own
+        # annotations alone miss columns an interface or mixin declares.
+        excluded = set(exclude) if exclude else set()
         cls._orm_reads_as_is = frozenset(  # type: ignore[attr-defined]
             name for name in annotations if _reads_as_is(vars(cls).get(name))
-        )
+        ) | _inherited_reads_as_is(cls, excluded=excluded)
 
         if self._warn_sensitive:
             for field_name in annotations:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import strawberry
@@ -547,6 +548,126 @@ def test_lookups_with_unconfirmed_mutations_are_warned_about():
     stands between an instruction in one and an unconfirmed change."""
     with pytest.warns(UserWarning, match="Keep confirm_mutations on"):
         agent(lookups=True, allow_mutations=True, confirm_mutations=False)
+
+
+async def test_a_sync_schema_falls_back_to_execute_sync(caplog):
+    """Strawberry wraps SynchronousOnlyOperation in errors; offload and warn once."""
+    import logging
+
+    from django.core.exceptions import SynchronousOnlyOperation
+    from graphql import GraphQLError
+
+    calls = {"execute": 0, "execute_sync": 0}
+
+    class SyncOnlySchema:
+        _schema = schema._schema
+
+        async def execute(self, *args, **kwargs):
+            calls["execute"] += 1
+            # Strawberry's normal path: resolver exception becomes a GraphQL error.
+            return SimpleNamespace(
+                data=None,
+                errors=[
+                    GraphQLError(
+                        "You cannot call this from an async context",
+                        original_error=SynchronousOnlyOperation(
+                            "You cannot call this from an async context"
+                        ),
+                    )
+                ],
+            )
+
+        def execute_sync(self, *args, **kwargs):
+            calls["execute_sync"] += 1
+            return schema.execute_sync(*args, **kwargs)
+
+    model = Model(reply(call(POSTS_QUERY)), reply(call(POSTS_QUERY, id="c2")))
+    qa = QueryAgent(
+        SyncOnlySchema(),
+        model="test:model",
+        completion=model,
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="strawberry_orm.contrib.mcp.agent"),
+        pytest.warns(UserWarning, match="execute_sync in a worker thread"),
+    ):
+        first = await qa.ask("Posts?", context={})
+    second = await qa.ask("Again?", context={})
+
+    assert first["data"] == ALL_TITLES
+    assert second["data"] == ALL_TITLES
+    assert calls == {"execute": 1, "execute_sync": 2}
+    assert qa._sync_execute
+    assert any("execute_sync" in record.message for record in caplog.records)
+
+
+async def test_a_raised_sync_only_operation_also_falls_back(caplog):
+    """If execute raises instead of wrapping, still switch to execute_sync."""
+    import logging
+
+    from django.core.exceptions import SynchronousOnlyOperation
+
+    class RaisingSchema:
+        _schema = schema._schema
+
+        async def execute(self, *args, **kwargs):
+            raise SynchronousOnlyOperation("async unsafe")
+
+        def execute_sync(self, *args, **kwargs):
+            return schema.execute_sync(*args, **kwargs)
+
+    qa = QueryAgent(
+        RaisingSchema(),
+        model="test:model",
+        completion=Model(reply(call(POSTS_QUERY))),
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="strawberry_orm.contrib.mcp.agent"),
+        pytest.warns(UserWarning, match="execute_sync in a worker thread"),
+    ):
+        answer = await qa.ask("Posts?", context={})
+    assert answer["data"] == ALL_TITLES
+    assert qa._sync_execute
+
+
+async def test_other_schema_execute_errors_still_raise():
+    class BoomSchema:
+        _schema = schema._schema
+
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+    qa = QueryAgent(
+        BoomSchema(),
+        model="test:model",
+        completion=Model(reply(call(POSTS_QUERY))),
+    )
+    with pytest.raises(RuntimeError, match="db down"):
+        await qa.ask("?", context={})
+
+
+def test_sync_only_check_without_django(monkeypatch):
+    import builtins
+
+    from strawberry_orm.contrib.mcp.agent import (
+        _is_sync_only_operation,
+        _result_has_sync_only_operation,
+    )
+
+    real_import = builtins.__import__
+
+    def no_django(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "django.core.exceptions" or name.split(".", 1)[0] == "django":
+            raise ImportError("no django")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", no_django)
+    assert _is_sync_only_operation(Exception("x")) is False
+    assert (
+        _result_has_sync_only_operation(SimpleNamespace(errors=[Exception("x")]))
+        is False
+    )
 
 
 # Lookups

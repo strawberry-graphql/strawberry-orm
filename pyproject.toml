@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.25.0"
+version = "0.25.1"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "strawberry-graphql>=0.311.0",
+    "strawberry-graphql>=0.341.2",
 ]
 
 [project.urls]

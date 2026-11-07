@@ -272,7 +272,7 @@ class TestRelationConnection:
         assert posts == [], f"read {len(posts)} posts past the end of every page"
 
     def test_before_pages_as_strawberry_defines_it(self, seed, User, Post):
-        """``first`` with ``before`` starts at ``before - 1``, past ``first``'s reach."""
+        """``first`` with ``before`` takes the first *n* rows that precede the cursor."""
         alice = User.objects.get(name="Alice")
         for i in range(6):
             Post.objects.create(
@@ -287,11 +287,11 @@ class TestRelationConnection:
         assert result.errors is None, result.errors
         alice = next(u for u in result.data["users"] if u["name"] == "Alice")
         assert [e["cursor"] for e in alice["posts"]["edges"]] == [
-            base64.b64encode(b"arrayconnection:4").decode(),
-            base64.b64encode(b"arrayconnection:5").decode(),
+            base64.b64encode(b"arrayconnection:0").decode(),
+            base64.b64encode(b"arrayconnection:1").decode(),
         ]
         assert alice["posts"]["pageInfo"] == {
-            "hasPreviousPage": True,
+            "hasPreviousPage": False,
             "hasNextPage": True,
         }
 

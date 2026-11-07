@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.25.1
+
+### Changed
+
+- Requires **strawberry-graphql ≥ 0.341.2**. Connection pages still follow Strawberry's `SliceMetadata`: `first` with `before` takes the first *n* rows that precede the cursor (from the start, or after `after`), not the *n* rows immediately before it.
+
+### Fixed
+
+- **Columns declared on an interface count as shown.** `_orm_reads_as_is` only looked at the type's own `__annotations__`, so a field inherited from a `strawberry.interface` never opened its column to the type's filters, orders, groups or aggregates. An order whose only field was inherited failed with `InputCutError`; every other input quietly dropped those columns. Inherited fields that read as stored are now counted the same way as own annotations. A type's `exclude=` still cuts them from the inputs.
+- **`ORMListConnection` is a decorated Strawberry type.** strawberry-graphql 0.334+ refuses undecorated subclasses of Strawberry types; the README's `posts: ORMListConnection[PostType] = orm.connection.eager()` pattern then failed schema build. `ORMListConnection` is now `@strawberry.type`, like `ORMConnection`.
+- **`QueryAgent` rejects a non-object `variables` value.** `variables: []` was treated as `{}` because empty lists are falsy, so a malformed tool call could run. It is now refused like any other non-object.
+- **`QueryAgent` runs sync schemas.** If `await schema.execute` raises Django's `SynchronousOnlyOperation`, or Strawberry returns it as a GraphQL error's `original_error`, the agent switches to `schema.execute_sync` in a worker thread, logs a warning, and keeps that path for later calls on the same agent.
+
 ## 0.25.0
 
 ### Added

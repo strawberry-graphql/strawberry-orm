@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import json
+import logging
 import secrets
 import time
 import warnings
@@ -18,6 +20,15 @@ from .clarification import ASK_USER_TOOL, Clarification
 
 Completion = Callable[..., Awaitable[Any]]
 Clarifier = Callable[[Clarification], Awaitable[dict[str, Any] | None]]
+
+logger = logging.getLogger(__name__)
+
+_SYNC_EXECUTE_WARNING = (
+    "QueryAgent fell back to schema.execute_sync in a worker thread because "
+    "await schema.execute raised SynchronousOnlyOperation. Sync resolvers "
+    "(for example Django's ORM) cannot run on the event loop; later calls "
+    "on this agent will keep using execute_sync."
+)
 
 
 def _query_tool(name: str, description: str) -> dict[str, Any]:
@@ -103,6 +114,10 @@ class QueryAgent:
 
     The operation runs through ``schema`` with the caller's context, so
     ``scope_rows``, permissions and the optimizer apply as for any request.
+    Async schemas use ``await schema.execute``. If that hits Django's
+    ``SynchronousOnlyOperation`` — raised or returned as a GraphQL error —
+    the agent switches to ``schema.execute_sync`` in a worker thread, logs a
+    warning, and keeps that path for later calls.
     The model sees the question, the schema and its own errors; the rows of
     the answer go to the caller only. With ``lookups=True`` it may also run
     small read-only queries whose rows it does see, at most
@@ -165,6 +180,8 @@ class QueryAgent:
         self.confirm_within = confirm_within
         #: Paused confirmations already run, kept until they would expire.
         self._confirmed: dict[str, float] = {}
+        #: ``True`` once a sync schema forced ``execute_sync`` in a thread.
+        self._sync_execute = False
         self.clarify = clarify
         self.max_clarifications = max_clarifications
         self.lookups = lookups
@@ -361,11 +378,11 @@ class QueryAgent:
     async def _execute(self, state, call_id, query, variables, context):
         errors = await self._before_query(query, variables, context)
         if not errors:
-            result = await self.schema.execute(
+            result = await self._run_schema(
                 query,
-                variable_values=variables,
-                context_value=context,
-                allowed_operation_types=self._allowed,
+                variables,
+                context,
+                allowed=self._allowed,
             )
             if result.data is not None:
                 answer = {"query": query, "variables": variables, "data": result.data}
@@ -389,11 +406,11 @@ class QueryAgent:
             errors = await self._before_query(query, variables, context)
         reply: dict[str, Any] = {"errors": errors}
         if not errors:
-            result = await self.schema.execute(
+            result = await self._run_schema(
                 query,
-                variable_values=variables,
-                context_value=context,
-                allowed_operation_types={OperationType.QUERY},
+                variables,
+                context,
+                allowed={OperationType.QUERY},
             )
             data, cut = truncate(result.data, self.max_lookup_rows)
             reply = {"data": data}
@@ -403,6 +420,69 @@ class QueryAgent:
                 reply["errors"] = [e.message for e in result.errors]
         state["messages"].append(_tool_reply(call.id, reply))
         return None
+
+    async def _run_schema(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        context: Any,
+        *,
+        allowed: set[OperationType],
+    ) -> Any:
+        """Run *query* on ``schema``, offloading sync Django to a worker thread.
+
+        Prefers ``await schema.execute``. Strawberry usually surfaces Django's
+        ``SynchronousOnlyOperation`` as a GraphQL error (``original_error``)
+        rather than raising; either way, switch this agent to
+        ``schema.execute_sync`` via ``asyncio.to_thread`` and log a warning.
+        """
+        if self._sync_execute:
+            return await self._execute_sync(query, variables, context, allowed)
+        try:
+            result = await self.schema.execute(
+                query,
+                variable_values=variables,
+                context_value=context,
+                allowed_operation_types=allowed,
+            )
+        except Exception as exc:
+            if not _is_sync_only_operation(exc):
+                raise
+            return await self._switch_to_sync_execute(
+                query, variables, context, allowed
+            )
+        if _result_has_sync_only_operation(result):
+            return await self._switch_to_sync_execute(
+                query, variables, context, allowed
+            )
+        return result
+
+    async def _switch_to_sync_execute(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        context: Any,
+        allowed: set[OperationType],
+    ) -> Any:
+        self._sync_execute = True
+        logger.warning(_SYNC_EXECUTE_WARNING)
+        warnings.warn(_SYNC_EXECUTE_WARNING, UserWarning, stacklevel=3)
+        return await self._execute_sync(query, variables, context, allowed)
+
+    async def _execute_sync(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        context: Any,
+        allowed: set[OperationType],
+    ) -> Any:
+        return await asyncio.to_thread(
+            self.schema.execute_sync,
+            query,
+            variable_values=variables,
+            context_value=context,
+            allowed_operation_types=allowed,
+        )
 
     async def _ask_user(self, state, call, context, clarifier):
         state["used"]["clarifications"] += 1
@@ -472,6 +552,24 @@ class QueryAgent:
                 errors=errors,
             )
         return None
+
+
+def _is_sync_only_operation(exc: BaseException) -> bool:
+    """True when *exc* is Django refusing sync ORM work on the event loop."""
+    try:
+        from django.core.exceptions import SynchronousOnlyOperation
+    except ImportError:
+        return False
+    return isinstance(exc, SynchronousOnlyOperation)
+
+
+def _result_has_sync_only_operation(result: Any) -> bool:
+    """True when Strawberry wrapped a ``SynchronousOnlyOperation`` in *result*."""
+    for error in getattr(result, "errors", None) or ():
+        original = getattr(error, "original_error", None)
+        if original is not None and _is_sync_only_operation(original):
+            return True
+    return False
 
 
 async def _maybe_await(value: Any) -> Any:

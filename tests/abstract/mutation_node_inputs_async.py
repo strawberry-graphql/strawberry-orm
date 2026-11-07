@@ -27,14 +27,20 @@ class AbstractTestNodeMutationInputsAsync(sync_cases.UpsertNodeInputCases):
     ):
         result = await node_execute_result(sync_cases.PROJECTED_TOO_DEEP)
         assert result.errors is not None
-        assert "Field 'posts' is not defined by type" in str(result.errors[0])
+        message = str(result.errors[0])
+        assert "posts" in message and (
+            "not defined" in message or "unknown field" in message.lower()
+        )
 
     async def test_a_projected_input_leaves_out_undeclared_relations(
         self, node_execute_result, seed
     ):
         result = await node_execute_result(sync_cases.PROJECTED_UNDECLARED_RELATION)
         assert result.errors is not None
-        assert "Field 'post' is not defined by type" in str(result.errors[0])
+        message = str(result.errors[0])
+        assert "post" in message and (
+            "not defined" in message or "unknown field" in message.lower()
+        )
 
     async def test_a_projected_update_input_selects_its_root(self, node_execute, seed):
         data = await node_execute(sync_cases.PROJECTED_UPDATE)

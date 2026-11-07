@@ -76,7 +76,9 @@ def tool_arguments(raw: str) -> tuple[str, dict[str, Any], list[str]]:
     except json.JSONDecodeError:
         return "", {}, ["The tool arguments were not valid JSON."]
     query = arguments.get("query")
-    variables = arguments.get("variables") or {}
+    variables = arguments.get("variables", {})
+    if variables is None:
+        variables = {}
     if not isinstance(query, str) or not isinstance(variables, dict):
         return "", {}, ["Pass query as a string and variables as an object."]
     return query, variables, []

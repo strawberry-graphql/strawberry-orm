@@ -406,6 +406,7 @@ def connection_type_for_node(node_type: type) -> Any:
     return strawberry.type(new_cls, name=type_name)
 
 
+@strawberry.type(description="A connection to a list of items.")
 class ORMListConnection(ORMConnection[NodeType]):
     """A ListConnection that works with any ORM backend.
 
