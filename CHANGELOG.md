@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.26.0
+
+### Changed
+
+- **Breaking: `contrib.mcp` serves your operations as tools, with no model on the server.** `mcp_server(schema, operations=DOCUMENT)` turns each named operation in a GraphQL document into one MCP tool. The operation's name and description become the tool's, its variables become typed arguments (a JSON Schema with your input types, enums, defaults and descriptions), and its selection set becomes the tool's output schema. Queries are marked read-only and mutations destructive. The document is validated when the server is built. `QueryAgent`, the `ask` tool, clarifications, confirmations, lookups and the hooks are removed, and the extra no longer installs any-llm.
+- `sync=True` runs `schema.execute_sync` in a worker thread, `sync=False` always awaits `schema.execute`, and `execute=` is an async `(query, variables, context, allowed) -> ExecutionResult` of your own. By default a query that Django refuses on the event loop is rerun with `execute_sync`, with a warning; a mutation fails asking for `sync=True` rather than run twice.
+
+### Added
+
+- **`graphql_tool=`** adds a `graphql` tool that runs one operation the client writes, and a `graphql_schema` tool that returns the schema it is written against. `GraphQLTool(allow_mutations=, root_fields=, max_depth=, descriptions=)` configures them; only queries run by default.
+- A weekly CI run against the newest strawberry-graphql release.
+
+### Fixed
+
+- Sync execution closes Django's stale connections before and after each operation, as Django's request handler does. Executor threads used to keep their connection past `CONN_MAX_AGE` and never noticed one the database had dropped.
+
 ## 0.25.1
 
 ### Changed
@@ -10,6 +26,7 @@
 
 - **Columns declared on an interface count as shown.** `_orm_reads_as_is` only looked at the type's own `__annotations__`, so a field inherited from a `strawberry.interface` never opened its column to the type's filters, orders, groups or aggregates. An order whose only field was inherited failed with `InputCutError`; every other input quietly dropped those columns. Inherited fields that read as stored are now counted the same way as own annotations. A type's `exclude=` still cuts them from the inputs.
 - **`ORMListConnection` is a decorated Strawberry type.** strawberry-graphql 0.334+ refuses undecorated subclasses of Strawberry types; the README's `posts: ORMListConnection[PostType] = orm.connection.eager()` pattern then failed schema build. `ORMListConnection` is now `@strawberry.type`, like `ORMConnection`.
+  - **Breaking:** this renames the published type. Strawberry used to publish the undecorated subclass under its parent's name, so `ORMListConnection[PostType]` appeared as `PostTypeORMConnection`; it is now `PostTypeORMListConnection`. Every operation still validates, but anything that names the type breaks without an error: `__typename` checks, fragments `on PostTypeORMConnection`, persisted queries, client cache `possibleTypes`/`typePolicies`, and test mocks. Search clients for `ORMConnection` and rename it to `ORMListConnection`.
 - **`QueryAgent` rejects a non-object `variables` value.** `variables: []` was treated as `{}` because empty lists are falsy, so a malformed tool call could run. It is now refused like any other non-object.
 - **`QueryAgent` runs sync schemas.** If `await schema.execute` raises Django's `SynchronousOnlyOperation`, or Strawberry returns it as a GraphQL error's `original_error`, the agent switches to `schema.execute_sync` in a worker thread, logs a warning, and keeps that path for later calls on the same agent.
 

@@ -1,0 +1,40 @@
+name: Tests (newest strawberry-graphql)
+
+# The lock pins the strawberry-graphql the suite passes on, while the
+# dependency floor lets users install anything newer. This run moves to the
+# newest release so a breaking change there fails here before users hit it.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test against the newest strawberry-graphql
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies with strawberry-graphql upgraded
+        run: >-
+          uv sync --group dev --upgrade-package strawberry-graphql
+          --extra django --extra sqlalchemy --extra tortoise --extra contrib.mcp
+
+      - name: Show the strawberry-graphql under test
+        run: uv run python -c "import importlib.metadata as m; print(m.version('strawberry-graphql'))"
+
+      - name: Run tests
+        run: uv run pytest

@@ -2040,22 +2040,34 @@ class Query:
 
 Optional plugins live in `strawberry_orm.contrib`. Each has its own extra, so its dependencies are only installed when you ask for them.
 
-### MCP: plain-language questions over your API
+### MCP: your operations as tools
 
-`strawberry_orm.contrib.mcp` serves a schema as an [MCP](https://modelcontextprotocol.io) server with a single tool, `ask(question)`. A model on your side reads the schema, writes one GraphQL query, and runs it through the schema as the caller. The caller gets back the query and its result. Its tool list holds one short tool instead of your whole schema.
+`strawberry_orm.contrib.mcp` serves a schema as an [MCP](https://modelcontextprotocol.io) server whose tools are GraphQL operations you write. Each named operation in a document becomes one tool, so an AI client calls `ListPosts(first: 5)` instead of writing GraphQL, and can only do what your operations do. There is no model on the server.
 
 ```bash
 pip install "strawberry-orm[contrib.mcp]"
 ```
 
 ```python
-from strawberry_orm.contrib.mcp import QueryAgent, mcp_server
+from strawberry_orm.contrib.mcp import mcp_server
 
-agent = QueryAgent(
-    schema,  # e.g. orm.schema(query=Query, tags="mcp") to expose only part of it
-    model="anthropic:claude-sonnet-5-5",  # any provider:model that any-llm supports
-    api_key=settings.ANTHROPIC_API_KEY,  # or the provider's environment variable
-)
+OPERATIONS = '''
+"""Published posts, newest first."""
+query ListPosts(
+  """How many to return, at most 50."""
+  $first: Int = 10
+  $filter: PostFilter
+) {
+  posts(first: $first, filter: $filter) { ...PostSummary }
+}
+
+"""Publish a draft post. The author must be the caller."""
+mutation PublishPost($id: ID!) {
+  publishPost(id: $id) { ...PostSummary }
+}
+
+fragment PostSummary on Post { id title author { name } }
+'''
 
 
 async def get_context(request):
@@ -2063,73 +2075,45 @@ async def get_context(request):
     return {"request": request, "user": user}
 
 
-app = mcp_server(agent, context_getter=get_context).streamable_http_app()
+server = mcp_server(schema, operations=OPERATIONS, context_getter=get_context)
+app = server.streamable_http_app()
 # uvicorn app:app, then point an MCP client at http://host:port/mcp
 ```
 
+A call returns the GraphQL result:
+
 ```json
-{"query": "{ users(filter: {field: {email: {iContains: \"example.com\"}}}) { id name } }",
- "variables": {},
- "data": {"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]}}
+{"data": {"posts": [{"id": "1", "title": "Hello", "author": {"name": "Alice"}}]}}
 ```
 
-- **Models are swappable.** Models are called through [any-llm](https://github.com/mozilla-ai/any-llm), so changing `model=` from `"anthropic:…"` to `"openai:…"` is the whole change. Other providers need any-llm's extra for them, for example `pip install "any-llm-sdk[mistral]"` for `"mistral:…"`. Extra keyword arguments (`temperature=`, `api_base=`, …) go to the model call.
-- **Your permissions apply.** The query runs through `schema.execute` with the context from `context_getter`, so `scope_rows`, `scope=`, permission classes and the optimizer behave as for any other request. Over stdio, `context_getter` receives `None`.
-- **Authenticate it.** `mcp_server` adds no authentication of its own, and every call runs the model on your key. Pass `token_verifier=` and `auth=`, or serve it behind your own, before anyone else can reach it; `before_query` can enforce a quota.
-- **Reads only, unless you opt in.** The model only sees the query side of the schema, and anything but a query is rejected when it runs. Pass `allow_mutations=True` to show and allow mutations.
-- **Changes are confirmed.** With mutations allowed, each one is shown to the person asking and runs only once they confirm it (`confirm_mutations=False` turns this off). The MCP client shows the form, so a confirmation is only as good as the client: one that fills in forms itself confirms on its user's behalf. A paused confirmation runs once, within `confirm_within` seconds (default 600). The agent remembers which ran in its own process, so across several processes a resent state can run its change again until it expires; keep such mutations idempotent.
-- **Checked before it runs.** An operation must be a single operation within `max_depth` levels (default 10) that passes validation. When it fails, the model sees the errors and tries again, up to `max_attempts` (default 3). Depth does not bound width, so give the schema Strawberry's `MaxAliasesLimiter` or `MaxTokensLimiter` to cap that; they apply here as to any request.
-- **Rows stay out of the model.** The model sees the question, the schema, and the errors from its own attempts. The data goes straight back to the caller, unless you turn on lookups (below). Errors are passed on as they are, so one that quotes a stored value shows the model that value.
-- **Failures are tool errors.** If the model says the schema can't answer the question, or every attempt fails, the tool returns an error with the reason and the last query tried.
+- **The document is the tool definition.** An operation's name is the tool's name and its description is the tool's description; without one the tool says which operation it runs. Its variables, with their descriptions and defaults, are the tool's arguments, published as a JSON Schema that includes your input types and enums. Its selection set is the tool's output schema, so clients know the shape of `data`. Fragments may be shared between operations. Subscriptions and anonymous operations are refused.
+- **Checked at startup.** The document is validated against the schema when the server is built, so a schema change that breaks a tool fails then, not on a call.
+- **Queries read, mutations are marked.** Query tools carry MCP's `readOnlyHint` and mutation tools `destructiveHint`, which clients use to ask their user before a change. Nothing else can run: a client can only call the operations you listed.
+- **Your permissions apply.** Every operation runs through the schema with the context from `context_getter`, so `scope_rows`, `scope=`, permission classes and the optimizer behave as for any other request. Over stdio, `context_getter` receives `None`; by default the context is `{"request": request}`.
+- **Results are GraphQL results.** A tool returns `{"data": ..., "errors": [...]}`. Partial data comes back with its errors; a result with no data at all is a tool error. Arguments are coerced by GraphQL, so a wrong one comes back as GraphQL's own error message.
+- **Authenticate it.** `mcp_server` adds no authentication of its own. Pass `token_verifier=` and `auth=`, or serve it behind your own, before anyone else can reach it. Other keyword arguments, such as `instructions=` and `tools=`, go to `MCPServer`, and the server it returns takes more tools with `@server.tool()`.
+- **Sync schemas need `sync=True`.** It runs `schema.execute_sync` in a worker thread and, with Django, closes stale connections around each call as Django's request handler would. Use it for Django's sync ORM, or whenever a resolver blocks. Without it the server awaits `schema.execute`; if Django refuses with `SynchronousOnlyOperation`, it warns and reruns the query with `execute_sync` from then on, but a mutation fails rather than run twice. `execute=` takes over entirely: an async `(query, variables, context, allowed) -> ExecutionResult`.
 
-#### Clarifying questions
+#### Letting clients write their own queries
 
-When a question leaves out something the query needs ("posts by *which* author?"), the model can ask instead of guessing. It sends one short question with typed fields, and the server shows it as an [elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation) form in whatever way the client supports:
-
-| Client | What happens |
-| --- | --- |
-| 2026-07-28 or later, with forms | `ask` returns `input_required`; the client shows the form and calls again with the answers. The agent's progress travels in the request state, which the MCP SDK encrypts. |
-| Older, with forms | The form is shown during the call. |
-| No forms | `ask` returns `{"needs_input": {"kind", "message", "schema"}}`, so the calling AI can ask its user and call again with a fuller question. A mutation that needs confirming is refused. |
-
-`clarify=False` turns questions off; `max_clarifications` (default 1) caps them per call. Request state is sealed with a key held by the server process, so a deployment with several processes passes a shared one: `mcp_server(agent, request_state_security=RequestStateSecurity(keys=[secret]))`.
-
-#### Lookups
-
-With `lookups=True` the model may run up to `max_lookups` (default 3) small read-only queries and see their rows, at most `max_lookup_rows` (default 20) of each list. That lets it find the exact value to filter on, or offer real choices ("Alice Smith or Alice Jones?"). Lookups run with the caller's permissions like everything else, so the model only sees rows the caller could see. They are off by default because, with them on, rows reach the model — including rows other users wrote, which may carry instructions aimed at it. With mutations allowed, keep `confirm_mutations` on so nothing a row says can change data unasked; the agent warns when it is off.
-
-#### Hooks
-
-Both receive the GraphQL context and may be sync or async.
+`graphql_tool=True` adds two tools: `graphql_schema`, which returns the schema as SDL, and `graphql`, which runs one operation the client writes. Pass a `GraphQLTool` to configure them:
 
 ```python
-from strawberry_orm.contrib.mcp import QueryAgentError, QueryRejected
+from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
 
-
-def answer_from_the_user(clarification, context):
-    # Answer what the app already knows instead of asking.
-    if clarification.kind == "question" and clarification.fields == ["team"]:
-        return {"team": context["user"].team}
-    return None  # ask the person
-
-
-async def guard(query, variables, context):
-    if await over_quota(context["user"]):
-        raise QueryAgentError("Daily question limit reached.")  # stop
-    if "first:" not in query:
-        raise QueryRejected("Page with first: 50 or fewer.")  # the model tries again
-
-
-agent = QueryAgent(schema, model=..., on_clarify=answer_from_the_user, before_query=guard)
+server = mcp_server(
+    schema,
+    operations=OPERATIONS,  # optional with graphql_tool
+    graphql_tool=GraphQLTool(root_fields=["posts", "users"], max_depth=6),
+    context_getter=get_context,
+)
 ```
 
-#### Without MCP
+- **Queries only, unless you opt in.** `graphql` runs only queries, and `graphql_schema` shows no mutations. `allow_mutations=True` shows and allows them, and marks `graphql` destructive.
+- **Checked before it runs.** An operation must be a single operation within `max_depth` levels (default 10) that passes validation. Depth does not bound width, so give the schema Strawberry's `MaxAliasesLimiter` or `MaxTokensLimiter` to cap that; they apply here as to any request.
+- **`root_fields`** limits the root fields `graphql` may use, and `graphql_schema` shows only those and the types they reach. `descriptions=False` leaves the schema's descriptions out of `graphql_schema`. To expose only part of the schema in the first place, build it with `orm.schema(query=Query, tags="mcp")`.
 
-`QueryAgent.ask(question, context=..., clarifier=...)` works anywhere, for example behind a chat endpoint. `clarifier` is an async function that puts a `Clarification` to the person and returns their answers (or `None` if they decline). Without one, a clarification pauses the agent and `ask` returns `{"needs_input": ..., "state": ...}`; call `agent.resume(state, answers, context=...)` once you have them. `state` is plain JSON, so it can be stored between requests, but it holds the conversation so far, so keep it server-side or encrypt it.
-
-`instructions=` adds your own guidance to the model's prompt, and `mcp_server(..., description=...)` replaces the tool description, which by default lists the root fields. Other keyword arguments go to `MCPServer`, for example `token_verifier=` and `auth=` for OAuth.
-
-To try it locally, `python cli.py mcp` serves the seeded SQLAlchemy test schema on `http://localhost:8421/mcp`, reading the key from `ANTHROPIC_API_KEY`. Add `--lookups` and `--allow-mutations` to try those.
+To try it locally, `python cli.py mcp` serves a few operations on the seeded SQLAlchemy test schema at `http://localhost:8421/mcp`. Add `--graphql-tool` for the `graphql` and `graphql_schema` tools, and `--allow-mutations` to let `graphql` run mutations.
 
 ---
 

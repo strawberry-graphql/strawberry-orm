@@ -1,13 +1,18 @@
-"""A small schema and a scripted model for the MCP plugin's tests."""
+"""A small schema and an operations document for the MCP plugin's tests."""
 
 from __future__ import annotations
 
-import json
-from types import SimpleNamespace
+import datetime
+import enum
+from typing import Annotated
 
 import strawberry
 
-from strawberry_orm.contrib.mcp import QueryAgent
+
+@strawberry.enum(description="Where a post is in its life.")
+class Status(enum.Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
 
 
 @strawberry.interface
@@ -15,14 +20,16 @@ class Named:
     name: str
 
 
-@strawberry.type
+@strawberry.type(description="Someone who writes posts.")
 class Author(Named):
-    id: int
+    id: strawberry.ID
 
 
 @strawberry.type
 class Post:
-    title: str
+    title: str = strawberry.field(description="The headline.")
+    status: Status
+    published: datetime.date | None
     author: Author
 
     @strawberry.field
@@ -30,88 +37,156 @@ class Post:
         raise PermissionError("You may not read secrets.")
 
 
+@strawberry.type
+class Tag:
+    label: str
+    uses: int
+    pinned: Post
+
+
+SearchResult = Annotated[Post | Tag, strawberry.union("SearchResult")]
+
+
+@strawberry.input(description="Which posts to return.")
+class PostFilter:
+    title: str | None = None
+    status: Status | None = strawberry.UNSET
+    drafts: bool = strawberry.field(default=False, description="Include drafts.")
+    any_of: list[PostFilter] | None = strawberry.UNSET
+
+
+@strawberry.input(one_of=True)
+class PostKey:
+    id: strawberry.ID | None = strawberry.UNSET
+    title: str | None = strawberry.UNSET
+
+
+@strawberry.input
+class NewTag:
+    label: str
+    uses: int = 0
+
+
+ALICE = Author(id=strawberry.ID("1"), name="Alice")
 POSTS = [
-    Post(title="Hello", author=Author(id=1, name="Alice")),
-    Post(title="Rust", author=Author(id=2, name="Bob")),
-    Post(title="Draft", author=Author(id=1, name="Alice")),
+    Post(
+        title="Hello",
+        status=Status.PUBLISHED,
+        published=datetime.date(2026, 1, 2),
+        author=ALICE,
+    ),
+    Post(title="Draft", status=Status.DRAFT, published=None, author=ALICE),
 ]
+
+
+def _matches(post: Post, where: PostFilter | None) -> bool:
+    if where is None:
+        return post.status is Status.PUBLISHED
+    if where.title is not None and post.title != where.title:
+        return False
+    return where.drafts or post.status is Status.PUBLISHED
 
 
 @strawberry.type
 class Query:
     @strawberry.field
-    def posts(self, info: strawberry.Info, title: str | None = None) -> list[Post]:
-        info.context.setdefault("seen", []).append(info.context.get("user"))
-        return [post for post in POSTS if title in (None, post.title)]
+    def posts(
+        self, info: strawberry.Info, filter: PostFilter | None = None, first: int = 10
+    ) -> list[Post]:
+        context = info.context
+        if isinstance(context, dict):
+            context.setdefault("seen", []).append(context.get("user"))
+        return [post for post in POSTS if _matches(post, filter)][:first]
+
+    @strawberry.field
+    def posts_on(self, day: datetime.date) -> list[Post]:
+        return [post for post in POSTS if post.published == day]
+
+    @strawberry.field
+    def post(self, key: PostKey) -> Post | None:
+        return next((p for p in POSTS if key.title in (None, p.title)), None)
 
     @strawberry.field
     def named(self) -> Named:
-        return Author(id=1, name="Alice")
+        return ALICE
 
     @strawberry.field
-    def post(self) -> Post:
-        raise LookupError("No such post.")
+    def search(self, text: str) -> list[SearchResult]:
+        return [POSTS[0], Tag(label=text, uses=3, pinned=POSTS[0])]
+
+    @strawberry.field
+    def missing(self) -> str:
+        raise LookupError("No such thing.")
+
+
+RUNS = {"publish": 0}
 
 
 @strawberry.type
 class Mutation:
-    @strawberry.mutation
-    def publish(self, title: str) -> str:
-        return f"published {title}"
+    @strawberry.mutation(description="Publish a post.")
+    def publish(self, title: str) -> Post:
+        RUNS["publish"] += 1
+        return Post(title=title, status=Status.PUBLISHED, published=None, author=ALICE)
 
     @strawberry.mutation
-    def fail(self) -> str:
-        raise RuntimeError("Publishing is down.")
+    def tag(self, input: NewTag) -> Tag:
+        return Tag(label=input.label, uses=input.uses, pinned=POSTS[0])
 
 
 schema = strawberry.Schema(query=Query, mutation=Mutation)
 
-PUBLISH = 'mutation { publish(title: "x") }'
+OPERATIONS = '''
+"""Published posts, or drafts too when asked."""
+query ListPosts(
+  """Only posts matching this."""
+  $filter: PostFilter
+  $first: Int = 10
+) {
+  posts(filter: $filter, first: $first) {
+    ...PostFields
+    author { name }
+  }
+}
 
+query FindPost($key: PostKey!, $withStatus: Boolean!) {
+  post(key: $key) {
+    title
+    status @include(if: $withStatus)
+  }
+}
 
-def call(query=None, variables=None, *, name="run_graphql", raw=None, id="c1"):
-    arguments = (
-        raw if raw is not None else json.dumps({"query": query, "variables": variables})
-    )
-    return SimpleNamespace(
-        id=id, function=SimpleNamespace(name=name, arguments=arguments)
-    )
+query Search($text: String!) {
+  search(text: $text) {
+    __typename
+    ... on Post { title }
+    ... on Tag { label }
+  }
+}
 
+query WhoIsNamed {
+  named {
+    name
+    ... on Author { id }
+  }
+}
 
-def ask_user(message="Which author?", fields=None, *, id="q1"):
-    fields = fields or {"author": {"type": "string", "description": "Their name"}}
-    return call(
-        name="ask_user", raw=json.dumps({"message": message, "fields": fields}), id=id
-    )
+query Secrets {
+  posts { title secret }
+}
 
+query Missing {
+  missing
+}
 
-def reply(*calls, content=None):
-    message = SimpleNamespace(tool_calls=list(calls) or None, content=content)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+fragment PostFields on Post {
+  title
+  status
+  published
+}
 
-
-class Model:
-    """Replays scripted replies and keeps what each request was sent."""
-
-    def __init__(self, *replies):
-        self.replies = list(replies)
-        self.requests = []
-
-    async def __call__(self, **request):
-        self.requests.append({**request, "messages": list(request["messages"])})
-        return self.replies.pop(0)
-
-    def tool_replies(self, request=-1):
-        return [
-            json.loads(m["content"])
-            for m in self.requests[request]["messages"]
-            if m["role"] == "tool"
-        ]
-
-    def tools(self, request=-1):
-        return [t["function"]["name"] for t in self.requests[request]["tools"]]
-
-
-def agent(*replies, **options):
-    model = Model(*replies)
-    return QueryAgent(schema, model="test:model", completion=model, **options), model
+"""Publish a post under this title."""
+mutation Publish($title: String!) {
+  publish(title: $title) { title }
+}
+'''

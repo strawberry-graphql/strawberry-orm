@@ -1,22 +1,13 @@
-"""Let AI agents query a GraphQL API in plain language over MCP.
+"""Serve a GraphQL API's operations as MCP tools.
 
 Install with ``pip install "strawberry-orm[contrib.mcp]"``::
 
-    from strawberry_orm.contrib.mcp import QueryAgent, mcp_server
+    from strawberry_orm.contrib.mcp import mcp_server
 
-    agent = QueryAgent(schema, model="anthropic:claude-sonnet-5-5")
-    app = mcp_server(agent, context_getter=get_context).streamable_http_app()
+    server = mcp_server(schema, operations=OPERATIONS, context_getter=get_context)
+    app = server.streamable_http_app()
 """
 
-from .agent import PAUSE, QueryAgent, QueryAgentError, QueryRejected
-from .clarification import Clarification
-from .server import mcp_server
+from .server import GraphQLTool, mcp_server
 
-__all__ = [
-    "PAUSE",
-    "Clarification",
-    "QueryAgent",
-    "QueryAgentError",
-    "QueryRejected",
-    "mcp_server",
-]
+__all__ = ["GraphQLTool", "mcp_server"]

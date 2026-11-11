@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.25.1"
+version = "0.26.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -32,7 +32,7 @@ Issues = "https://github.com/strawberry-graphql/strawberry-orm/issues"
 django = ["django>=4.2"]
 sqlalchemy = ["sqlalchemy>=2.0"]
 tortoise = ["tortoise-orm>=0.25.0"]
-"contrib.mcp" = ["mcp>=2.3.0", "any-llm-sdk>=1.40.1"]
+"contrib.mcp" = ["mcp>=2.3.0"]
 dev = [
     "greenlet>=3.3.2",
     "pytest>=8.0",

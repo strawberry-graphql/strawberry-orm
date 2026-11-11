@@ -268,35 +268,62 @@ def show(
     uvicorn.run(graphql_app, host="127.0.0.1", port=port, log_level="warning")
 
 
+MCP_OPERATIONS = '''
+"""Every user, with their email address."""
+query ListUsers {
+  users { id name email }
+}
+
+"""Every post, with its author and tags."""
+query ListPosts {
+  posts { ...PostSummary isPublished tags { name } }
+}
+
+"""One user and the posts they wrote."""
+query GetUser(
+  """The user's id."""
+  $id: Int!
+) {
+  user(id: $id) { id name posts { ...PostSummary } }
+}
+
+"""Write a new post."""
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) { ...PostSummary }
+}
+
+fragment PostSummary on PostType { id title author { name } }
+'''
+
+
 @app.command()
 def mcp(
-    model: str = typer.Option(
-        "anthropic:claude-sonnet-5-5",
-        "--model",
-        "-m",
-        help="Model as provider:model. The provider's API key is read from "
-        "its usual environment variable, e.g. ANTHROPIC_API_KEY.",
-    ),
     port: int = typer.Option(8421, "--port", "-p", help="Port to serve on."),
-    allow_mutations: bool = typer.Option(
-        False, "--allow-mutations", help="Let the agent run confirmed mutations."
+    graphql_tool: bool = typer.Option(
+        False,
+        "--graphql-tool",
+        help="Add the graphql and graphql_schema tools for queries clients write.",
     ),
-    lookups: bool = typer.Option(
-        False, "--lookups", help="Let the agent see a few rows to ask better questions."
+    allow_mutations: bool = typer.Option(
+        False, "--allow-mutations", help="Let the graphql tool run mutations."
     ),
 ) -> None:
-    """Serve the seeded SQLAlchemy demo schema as an MCP server with an ask tool."""
+    """Serve operations on the seeded SQLAlchemy demo schema as MCP tools."""
     import uvicorn
 
-    from strawberry_orm.contrib.mcp import QueryAgent, mcp_server
+    from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
     from tests.backends.sqlalchemy.fixtures import main_schema
 
     session = _seed_sqlalchemy()
-    agent = QueryAgent(
-        main_schema, model=model, allow_mutations=allow_mutations, lookups=lookups
+    server = mcp_server(
+        main_schema,
+        operations=MCP_OPERATIONS,
+        graphql_tool=GraphQLTool(allow_mutations=allow_mutations)
+        if graphql_tool
+        else False,
+        context_getter=lambda request: {"session": session},
     )
-    server = mcp_server(agent, context_getter=lambda request: {"session": session})
-    typer.echo(f"MCP server ({model}) on http://localhost:{port}/mcp")
+    typer.echo(f"MCP server on http://localhost:{port}/mcp")
     uvicorn.run(
         server.streamable_http_app(), host="127.0.0.1", port=port, log_level="info"
     )
