@@ -1,6 +1,5 @@
 """Focused backend-adapter coverage for exact helper branches."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -16,11 +15,9 @@ from strawberry_orm.backends.sqlalchemy import (
     _build_sa_field_clause,
     _build_sa_filter,
     _build_sa_order_field,
-    _build_sa_order_from_input,
     _build_sa_ordering,
     _build_sa_reference_field_clause,
-    _extract_overlapping_order,
-    _extract_sa_group_columns,
+    _truncate,
 )
 from strawberry_orm.filters import (
     IntComparisonLookup,
@@ -28,7 +25,8 @@ from strawberry_orm.filters import (
     ReferenceLookup,
     StringLookup,
 )
-from strawberry_orm.types import DateGroupByInterval, DateGroupByOption, auto
+from strawberry_orm.grouping import GroupPath, group_paths
+from strawberry_orm.types import DateGroupByInterval, auto
 
 
 @strawberry.input
@@ -74,16 +72,6 @@ class _AuthorGroupField:
 @strawberry.input
 class _AuthorGroupBy:
     field: _AuthorGroupField | None = strawberry.UNSET
-
-
-@strawberry.input
-class _CreatedGroupField:
-    created_at: DateGroupByOption | None = strawberry.UNSET
-
-
-@strawberry.input
-class _CreatedGroupBy:
-    field: _CreatedGroupField | None = strawberry.UNSET
 
 
 @strawberry.input
@@ -284,17 +272,21 @@ class TestInternalBackendCoverage:
                 local_col=Post.author_id,
             )
 
-    def test_grouping_helpers_cover_date_intervals(self, Post):
-        subq = select(Post).subquery()
+    def test_truncate_per_dialect(self, Post):
+        from sqlalchemy import Date, cast
+        from sqlalchemy.dialects import postgresql
+
+        as_date = cast(Post.created_at, Date)
         for interval in DateGroupByInterval:
-            group_by = _CreatedGroupBy(
-                field=_CreatedGroupField(
-                    created_at=DateGroupByOption(interval=interval)
-                )
-            )
-            cols, key_fields = _extract_sa_group_columns([group_by], Post, subq)
-            assert key_fields == ["created_at"]
-            assert len(cols) == 1
+            kind = interval.value.lower()
+            pg = _truncate(Post.created_at, interval, "postgresql")
+            assert "date_trunc" in str(pg.compile(dialect=postgresql.dialect()))
+            pg_date = str(_truncate(as_date, interval, "postgresql").compile())
+            assert pg_date.startswith("CAST(date_trunc")
+            assert kind
+            assert "strftime" in str(_truncate(as_date, interval, "sqlite").compile())
+        with pytest.raises(ValueError, match="PostgreSQL and SQLite, not mysql"):
+            _truncate(Post.created_at, DateGroupByInterval.DAY, "mysql")
 
     def test_apply_aggregation_grouping_and_batch_helpers(
         self, sa_session, seed, Post, User
@@ -316,25 +308,19 @@ class TestInternalBackendCoverage:
         )
         groups = backend.apply_grouping(
             query,
-            _AuthorGroupBy(field=_AuthorGroupField(author_id=True)),
+            group_paths(
+                backend, Post, _AuthorGroupBy(field=_AuthorGroupField(author_id=True))
+            ),
             group_info,
             meta,
             order_input=_AuthorOrder(field=_AuthorOrderField(author_id=Ordering.DESC)),
         )
-        assert len(groups) == 3
-        assert all(group.key.author_id is not None for group in groups)
-
-        @dataclass
-        class ScopeKey:
-            author_id: int | None = 1
-
-        scoped = backend.scope_query_to_group(select(Post), ScopeKey())
-        assert "author_id" in str(scoped)
+        assert [group.key.author_id for group in groups] == ["3", "2", "1"]
 
         batch_info = SimpleNamespace(context={"session": sa_session})
         batched = backend.batch_group_items(
             select(Post),
-            ["author_id"],
+            [GroupPath(alias="_g0", name="author_id", column="author_id")],
             batch_info,
             Post,
             per_group_limit=1,
@@ -801,128 +787,9 @@ class TestInternalBackendCoverage:
         with pytest.raises(TypeError, match="Expected ReferenceLookup"):
             _build_reference_lookup_clauses(Post.id, StringLookup(exact="1"))
 
-    def test_extract_sa_group_skips_duplicate_columns(self, Post):
-        @strawberry.input
-        class GroupField:
-            author_id: bool | None = True
-
-        @strawberry.input
-        class GroupEntry:
-            field: GroupField | None = strawberry.UNSET
-
-        subq = select(Post).subquery()
-        cols, keys = _extract_sa_group_columns(
-            [
-                GroupEntry(field=GroupField(author_id=True)),
-                GroupEntry(field=GroupField(author_id=True)),
-            ],
-            Post,
-            subq,
-        )
-        assert keys == ["author_id"]
-        assert len(cols) == 1
-
-    def test_extract_overlapping_order_skips_missing_column(self, Post):
-        @strawberry.input
-        class OrderField:
-            missing: Ordering | None = Ordering.ASC
-
-        @strawberry.input
-        class OrderEntry:
-            field: OrderField | None = strawberry.UNSET
-
-        subq = select(Post).subquery()
-        clauses = _extract_overlapping_order(
-            OrderEntry(field=OrderField(missing=Ordering.ASC)),
-            {"missing"},
-            Post,
-            subq,
-        )
-        assert clauses == []
-
-    def test_build_sa_order_from_input_pk_fallback(self, Post):
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyOrder:
-            field: EmptyField | None = strawberry.UNSET
-
-        clauses = _build_sa_order_from_input(EmptyOrder(), Post)
-        assert len(clauses) == 1
-
     def test_build_sa_order_field_skips_missing_column(self, Post):
         @strawberry.input
         class BadOrderField:
             missing: Ordering | None = Ordering.DESC
 
         assert _build_sa_order_field(BadOrderField(), Post) == []
-
-    def test_build_sa_order_field_clauses_skips_missing_columns(self, Post):
-        from strawberry_orm.backends.sqlalchemy import (
-            _build_sa_order_field,
-            _build_sa_order_field_clauses,
-        )
-
-        @strawberry.input
-        class BadOrderField:
-            missing: Ordering | None = Ordering.DESC
-
-        @strawberry.input
-        class BadOrderEntry:
-            field: BadOrderField | None = strawberry.UNSET
-
-        assert _build_sa_order_field_clauses(BadOrderEntry(), Post) == []
-        assert _build_sa_order_field(BadOrderField(), Post) == []
-
-        @strawberry.input
-        class MixedOrderField:
-            title: Ordering | None = None
-            body: Ordering | None = Ordering.DESC
-
-        @strawberry.input
-        class MixedOrderEntry:
-            field: MixedOrderField | None = strawberry.UNSET
-
-        clauses = _build_sa_order_field_clauses(
-            MixedOrderEntry(field=MixedOrderField(body=Ordering.DESC)),
-            Post,
-        )
-        assert len(clauses) == 1
-
-        @strawberry.input
-        class OnlyMissingField:
-            missing: Ordering | None = Ordering.ASC
-
-        @strawberry.input
-        class OnlyMissingEntry:
-            field: OnlyMissingField | None = strawberry.UNSET
-
-        assert (
-            _build_sa_order_field_clauses(
-                OnlyMissingEntry(field=OnlyMissingField(missing=Ordering.ASC)),
-                Post,
-            )
-            == []
-        )
-
-    def test_extract_overlapping_order_skips_non_group_columns(self, Post):
-        @strawberry.input
-        class OrderField:
-            title: Ordering | None = Ordering.ASC
-
-        @strawberry.input
-        class OrderEntry:
-            field: OrderField | None = strawberry.UNSET
-
-        subq = select(Post).subquery()
-        assert (
-            _extract_overlapping_order(
-                OrderEntry(field=OrderField(title=Ordering.ASC)),
-                {"author_id"},
-                Post,
-                subq,
-            )
-            == []
-        )

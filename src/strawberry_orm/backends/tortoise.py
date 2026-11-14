@@ -68,6 +68,10 @@ _FORWARD_REL_TYPES = frozenset({"ForeignKeyFieldInstance", "OneToOneFieldInstanc
 
 _REL_FIELD_TYPES = _MANY_REL_TYPES | _FORWARD_REL_TYPES
 
+#: Relations a row can have many of. A reverse one-to-one is in
+#: ``_MANY_REL_TYPES`` for loading, but never repeats a row when joined.
+_TO_MANY_REL_TYPES = frozenset({"BackwardFKRelation", "ManyToManyFieldInstance"})
+
 _Ordering = tuple[str, bool, bool | None, bool | None]
 
 # Tortoise querysets use ``__slots__`` without ``__weakref__``, so python-side
@@ -454,6 +458,13 @@ class TortoiseBackend(BaseBackend):
             max_in_list_size=self._max_in_list_size,
         )
         if q_obj is not None:
+            if self.filter_crosses_to_many(filter_input, model):
+                # Matched in a subquery, so the outer query keeps each row once.
+                from tortoise.expressions import Q, Subquery
+
+                pk = model._meta.pk_attr  # type: ignore[attr-defined]
+                matching = model.filter(q_obj).values_list(pk, flat=True)  # type: ignore[attr-defined]
+                q_obj = Q(**{f"{pk}__in": Subquery(matching)})
             query = query.filter(q_obj)
         return query
 
@@ -679,86 +690,59 @@ class TortoiseBackend(BaseBackend):
             row = type("Row", (), {k: 0 for k in agg_kwargs})()  # pragma: no cover
         return aggregate_meta.build_aggregates(row, requested)
 
+    def relation_hop(self, model: type, relation: str) -> Any:
+        from strawberry_orm.grouping import GroupHop
+
+        field = model._meta.fields_map[relation]  # type: ignore[attr-defined]
+        return GroupHop(
+            relation=relation,
+            model=model,
+            target=field.related_model,
+            many=type(field).__name__ in _TO_MANY_REL_TYPES,
+        )
+
     async def apply_grouping(
         self,
         query: Any,
-        group_by_input: Any,
+        paths: list[Any],
         info: Any,
         aggregate_meta: AggregateMeta,
         *,
         order_input: Any | None = None,
     ) -> list[Any]:
-        from tortoise.functions import Avg, Count, Max, Min, Sum
+        from pypika_tortoise import functions
 
-        group_by_list = (
-            group_by_input if isinstance(group_by_input, list) else [group_by_input]
-        )
-        group_fields, group_key_fields = _extract_tortoise_group_fields(group_by_list)
-        aggregate_meta.group_key_fields = group_key_fields
+        from strawberry_orm.grouping import build_group
 
-        if not group_fields:
-            return []
-
+        model = aggregate_meta.model
         requested = requested_aggregates(info, "groups.aggregates") or {}
-        agg_kwargs: dict[str, Any] = {}
-        if requested.get("count"):
-            agg_kwargs["_count"] = Count("id")
-        _TORT_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
-        for func_name, AggCls in _TORT_AGG.items():
-            for fname in requested.get(func_name, []):
-                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+        rows = _GroupedRows(self, query, model, paths, info)
+        aggregates = rows.aggregates(requested)
+        ordering = rows.ordering(query, order_input)
+        stmt = rows.stmt.select(
+            *rows.selected(),
+            *(term.as_(name) for name, (term, _) in aggregates.items()),
+        ).groupby(*rows.values.values())
+        # Read in the connection's order, a group starts at its least value of
+        # each clause, or its greatest for a descending one.
+        for term, descending, nulls in ordering:
+            first = (functions.Max if descending else functions.Min)(term)
+            stmt = _order_by(stmt, first, descending, nulls)
+        for term in rows.values.values():
+            stmt = stmt.orderby(term)
 
-        # Any ordering inherited from the base query would join the GROUP BY
-        # and split the groups; the explicit clauses below are the only
-        # ordering that should apply.
-        qs = (
-            query.order_by()
-            .annotate(**agg_kwargs)
-            .group_by(*group_fields)
-            .values(*group_fields, *agg_kwargs.keys())
-        )
-        if order_input:
-            order_clauses = _extract_tortoise_overlapping_order(
-                order_input, set(group_key_fields)
-            )
-            if order_clauses:
-                qs = qs.order_by(*order_clauses)
-
-        rows = await qs
         groups = []
-        for row_dict in rows:
-            row = type("Row", (), row_dict)()
-            key = aggregate_meta.build_group_key(row, group_key_fields)
-            aggregates = aggregate_meta.build_aggregates(row, requested)
-            group_obj = type(
-                "_Group",
-                (),
-                {
-                    "key": key,
-                    "aggregates": aggregates,
-                    "edge_indices": [],
-                    "_items_nodes": None,
-                    "_orm_base_query": None,
-                    "_orm_backend": None,
-                    "_orm_model": None,
-                },
-            )()
-            groups.append(group_obj)
+        for found in await rows.execute(stmt):
+            values = rows.read(found)
+            for name, (_term, read) in aggregates.items():
+                values[name] = read(found[name])
+            groups.append(build_group(aggregate_meta, paths, values, requested))
         return groups
-
-    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
-        key_fields = group_key.__class__.__dataclass_fields__
-        filters: dict[str, Any] = {}
-        for fname in key_fields:
-            val = getattr(group_key, fname, None)
-            if val is not None:
-                filters[fname] = val
-        return query.filter(**filters)
 
     async def batch_group_items(
         self,
         query: Any,
-        group_key_fields: list[str],
+        paths: list[Any],
         info: Any,
         model: type,
         *,
@@ -766,35 +750,69 @@ class TortoiseBackend(BaseBackend):
         order_input: Any | None = None,
         per_group_offset: int = 0,
     ) -> dict[tuple, list[Any]]:
-        """Every group's page of rows in one windowed query.
+        """Every group's page of rows in one windowed query."""
+        from pypika_tortoise import Order
+        from pypika_tortoise.analytics import RowNumber
 
-        Tortoise has no window expression, so the query it built is wrapped in
-        SQL that numbers rows within each group and keeps the low numbers. The
-        wrapping keeps the placeholders and values Tortoise produced, so filter
-        values are still bound rather than pasted into the statement.
-        """
-        order_clauses = (
-            _build_tortoise_order_from_input(order_input) if order_input else []
+        from strawberry_orm.grouping import key_tuple
+
+        rows = _GroupedRows(self, query, model, paths, info)
+        window = RowNumber().over(*rows.values.values())
+        for term, descending, nulls in [
+            *rows.ordering(query, order_input),
+            # Rows that tie on the order would be numbered however the
+            # database likes, differently from one page to the next.
+            (rows.pk, False, None),
+        ]:
+            if nulls is not None:
+                window = window.orderby(_nulls_rank(term, nulls))
+            window = window.orderby(term, order=Order.desc if descending else Order.asc)
+        # The model's columns one by one: pypika drops a table's other
+        # columns, the group values among them, from a select of its star.
+        columns = model._meta.fields_db_projection.values()  # type: ignore[attr-defined]
+        ranked = rows.stmt.select(
+            *(rows.base.field(column) for column in columns),
+            *rows.selected(),
+            window.as_(_ROW_NUMBER_ALIAS),
+        ).as_("_orm_windowed")
+        number = ranked.field(_ROW_NUMBER_ALIAS)
+        page = (
+            rows.query_class.from_(ranked)
+            .select(ranked.star)
+            .where(
+                (number > per_group_offset)
+                & (number <= per_group_offset + per_group_limit)
+            )
+            # Ordered by the row number so each group comes back in the order
+            # the window put it in; without it the rows arrive however the
+            # database found them and the requested order is lost.
+            .orderby(number)
         )
-        sql, values = _windowed_sql(
-            query,
-            model,
-            group_key_fields,
-            order_clauses,
-            per_group_limit,
-            per_group_offset,
-        )
-        rows = await query._db.execute_query_dict(sql, values)
 
         items_by_key: dict[tuple, list[Any]] = defaultdict(list)
-        for row in rows:
-            key = tuple(
-                str(row[k]) if row.get(k) is not None else None
-                for k in group_key_fields
-            )
-            row.pop(_ROW_NUMBER_ALIAS, None)
-            items_by_key[key].append(model._init_from_db(**row))
+        for found in await rows.execute(page):
+            found.pop(_ROW_NUMBER_ALIAS)
+            values = rows.read(found)
+            for alias in rows.values:
+                found.pop(alias)
+            items_by_key[key_tuple(paths, values)].append(model._init_from_db(**found))
         return dict(items_by_key)
+
+    async def group_memberships(
+        self, query: Any, paths: list[Any], pks: list[Any], info: Any
+    ) -> dict[Any, set[tuple]]:
+        from strawberry_orm.grouping import key_tuple
+
+        model = query.model
+        rows = _GroupedRows(self, query, model, paths, info)
+        stmt = rows.stmt.select(rows.pk.as_("_orm_pk"), *rows.selected()).where(
+            rows.pk.isin(pks)
+        )
+        read_pk = model._meta.pk.to_python_value
+        found: dict[Any, set[tuple]] = defaultdict(set)
+        for row in await rows.execute(stmt):
+            found[read_pk(row["_orm_pk"])].add(key_tuple(paths, rows.read(row)))
+        return dict(found)
 
     async def group_counts(
         self, query: Any, key_field: str, info: Any
@@ -1927,104 +1945,331 @@ def _build_tortoise_order_field(
 # ---------------------------------------------------------------------------
 
 
-def _extract_tortoise_group_fields(
-    group_by_list: list[Any],
-) -> tuple[list[str], list[str]]:
-    """Extract field names for Tortoise GROUP BY from group-by input."""
-    fields: list[str] = []
-    key_fields: list[str] = []
-    seen: set[str] = set()
+def _pypika(queryset: Any) -> Any:
+    """The pypika query *queryset* runs, to be nested in a larger one.
 
-    for entry in group_by_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            val = getattr(field_val, col_name)
-            if val is strawberry.UNSET or val is None:
-                continue
-            if col_name in seen:
-                continue
-            seen.add(col_name)
-            fields.append(col_name)
-            key_fields.append(col_name)
-
-    return fields, key_fields
+    Nested, it keeps its values as parameters, numbered with the rest of the
+    statement's when that is rendered.
+    """
+    queryset._choose_db_if_not_chosen()
+    queryset._make_query()
+    return queryset.query
 
 
-def _extract_tortoise_overlapping_order(
-    order_input: Any, group_field_names: set[str]
-) -> list[str]:
-    """Extract Tortoise order_by strings for group fields overlapping with root order."""
-    order_list = order_input if isinstance(order_input, list) else [order_input]
-    clauses: list[str] = []
+class _GroupedRows:
+    """*query*'s rows, once per key, joined to what every group-by path reads.
 
-    for entry in order_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            direction = getattr(field_val, col_name)
-            if direction is strawberry.UNSET or direction is None:
-                continue
-            if col_name not in group_field_names:
-                continue
-            dir_value = (
-                direction.value if hasattr(direction, "value") else str(direction)
+    Built as one pypika statement over the model's table: Tortoise cannot
+    join a scoped subquery, nor number rows in a window. Each hop is an outer
+    join to the related type's scoped rows, so a hidden related row reads as
+    ``None``, as it does on the type. Across a to-many hop the join is to the
+    visible rows alone, leaving one ``None`` row for a parent with none.
+    """
+
+    def __init__(
+        self, backend: Any, query: Any, model: type, paths: list[Any], info: Any
+    ) -> None:
+        from pypika_tortoise import Table
+
+        query._choose_db_if_not_chosen()
+        self.db = query._db
+        self.query_class = self.db.query_class
+        self.backend = backend
+        self.model = model
+        self.info = info
+        meta = model._meta  # type: ignore[attr-defined]
+        self.base = Table(meta.db_table)
+        self.pk = self.base.field(meta.db_pk_column)
+        # Ordering means nothing to a set of keys, unless it picks the rows a
+        # limit keeps.
+        if query._limit is None and not query._offset:
+            query = query.order_by()
+        own = _pypika(query.values_list(meta.pk_attr, flat=True))
+        self.stmt = self.query_class.from_(self.base).where(self.pk.isin(own))
+        self._joined: dict[tuple[str, ...], Any] = {}
+        self.values: dict[str, Any] = {}
+        self._readers: dict[str, Any] = {}
+        for path in paths:
+            self._add(path)
+        if any(hop.many for path in paths for hop in path.hops):
+            # A row joined to two related rows with the same values would be
+            # grouped twice under one key, so its keys are taken once each.
+            pairs = (
+                self.stmt.select(self.pk.as_("_orm_pk"), *self.selected())
+                .distinct()
+                .as_("_orm_pairs")
             )
-            if dir_value.startswith("DESC"):
-                clauses.append(f"-{col_name}")
-            else:
-                clauses.append(col_name)
+            self.stmt = (
+                self.query_class.from_(self.base)
+                .join(pairs)
+                .on(pairs.field("_orm_pk") == self.pk)
+            )
+            self.values = {alias: pairs.field(alias) for alias in self.values}
 
-    return clauses
+    def selected(self) -> list[Any]:
+        return [term.as_(alias) for alias, term in self.values.items()]
 
+    def read(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Each path's value in *row*, as the field reads it."""
+        return {alias: read(row[alias]) for alias, read in self._readers.items()}
 
-def _db_columns(model: type) -> dict[str, str]:
-    """Field name to column name, for every column the model really has."""
-    return dict(model._meta.fields_db_projection)  # type: ignore[attr-defined]
+    async def execute(self, stmt: Any) -> list[dict[str, Any]]:
+        sql, values = stmt.get_parameterized_sql()
+        return await self.db.execute_query_dict(sql, values)
 
+    def aggregates(self, requested: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+        """The requested aggregates over the model's columns, with their readers."""
+        from pypika_tortoise import functions
 
-def _quote_ident(name: str, model: type, quote_char: str) -> str:
-    """Quote *name* for the dialect, having checked the model owns it.
+        meta = self.model._meta  # type: ignore[attr-defined]
+        found: dict[str, tuple[Any, Any]] = {}
+        if requested.get("count"):
+            found["_count"] = (functions.Count("*"), _same)
+        for name, aggregate in (
+            ("sum", functions.Sum),
+            ("avg", functions.Avg),
+            ("min", functions.Min),
+            ("max", functions.Max),
+        ):
+            for field_name in requested.get(name, []):
+                column = self.base.field(meta.fields_db_projection[field_name])
+                # A raw row holds what the driver hands back, which for a
+                # date or a boolean on SQLite is not what the field reads as.
+                read = (
+                    _same
+                    if name == "avg"
+                    else meta.fields_map[field_name].to_python_value
+                )
+                found[f"_{name}_{field_name}"] = (aggregate(column), read)
+        return found
 
-    Only ever called with names the caller derived from the model, so an
-    unknown one means a bug rather than user input; refusing it anyway keeps
-    the window's SQL from being assembled out of anything but real columns.
-    """
-    columns = set(_db_columns(model).values())
-    if name not in columns:
-        raise ValueError(
-            f"{model.__name__} has no column {name!r} to build a window from."
+    def ordering(self, query: Any, order_input: Any) -> list[tuple[Any, bool, Any]]:
+        """``(term, descending, nulls)`` for the order the connection reads in.
+
+        The client's ``order`` when given, else the query's own. An order
+        through a to-many relation is left out: its join would repeat rows.
+        """
+        meta = self.model._meta  # type: ignore[attr-defined]
+        found: list[tuple[Any, bool, Any]] = []
+        if order_input:
+            entries = order_input if isinstance(order_input, list) else [order_input]
+            for entry in entries:
+                self._order_entry(entry, self.model, self.base, (), found)
+            return found
+        from pypika_tortoise import Order
+
+        orderings = list(query._orderings)
+        # Tortoise falls back to the model's ordering, but not for annotated queries.
+        if not orderings and not query._annotations:
+            orderings = list(meta.ordering)
+        for name, order in orderings:
+            column = meta.fields_db_projection.get(name)
+            if column is not None:
+                found.append((self.base.field(column), order == Order.desc, None))
+        return found
+
+    def _order_entry(
+        self,
+        entry: Any,
+        model: type,
+        table: Any,
+        chain: tuple[str, ...],
+        found: list[tuple[Any, bool, Any]],
+    ) -> None:
+        from pypika_tortoise import JoinType, Table
+
+        meta = model._meta  # type: ignore[attr-defined]
+        for key in entry.__class__.__dataclass_fields__:
+            value = getattr(entry, key)
+            if value is strawberry.UNSET or value is None:
+                continue
+            if key == "field":
+                for name, descending, first, last in _build_tortoise_order_field(value):
+                    nulls = "first" if first else "last" if last else None
+                    column = table.field(meta.fields_db_projection[name])
+                    found.append((column, descending, nulls))
+            elif key == "object":
+                for relation in value.__class__.__dataclass_fields__:
+                    nested = getattr(value, relation)
+                    if nested is strawberry.UNSET or nested is None:
+                        continue
+                    field = meta.fields_map[relation]
+                    if type(field).__name__ not in _FORWARD_REL_TYPES:
+                        continue
+                    target = field.related_model
+                    hop = (*chain, relation)
+                    joined = self._joined.get(("_orm_order", *hop))
+                    if joined is None:
+                        joined = Table(target._meta.db_table).as_(
+                            f"_orm_o{len(self._joined)}"
+                        )
+                        to_name = field.to_field_instance.model_field_name
+                        self.stmt = self.stmt.join(joined, how=JoinType.left).on(
+                            joined.field(target._meta.fields_db_projection[to_name])
+                            == table.field(
+                                meta.fields_db_projection[field.source_field]
+                            )
+                        )
+                        self._joined[("_orm_order", *hop)] = joined
+                    self._order_entry(nested, target, joined, hop, found)
+
+    def _add(self, path: Any) -> None:
+        entity, owner, chain = self.base, self.model, ()
+        for hop in path.hops:
+            chain = (*chain, hop.relation)
+            if chain not in self._joined:
+                self._joined[chain] = self._join(entity, hop)
+            entity, owner = self._joined[chain], hop.target
+        if path.custom is not None:
+            term, read = self._custom(path), _same
+        else:
+            field = owner._meta.fields_map[path.column]
+            term = entity.field(owner._meta.fields_db_projection[path.column])
+            read = field.to_python_value
+            if path.interval is not None:
+                dialect = self.db.capabilities.dialect
+                term = _truncate(term, field, path.interval, dialect)
+                read = _same
+        self.values[path.alias] = term
+        self._readers[path.alias] = read
+
+    def _join(self, entity: Any, hop: Any) -> Any:
+        """Outer-join the rows of *hop*'s target the caller may see."""
+        from pypika_tortoise import JoinType, Table
+
+        alias = f"_orm_r{len(self._joined)}"
+        restrict = self.backend.relation_scope(hop.model, hop.relation, self.info)
+        rows = hop.target.all()
+        if restrict is not None:
+            rows = restrict(rows, self.info)
+        field = hop.model._meta.fields_map[hop.relation]
+        parent, target = hop.model._meta, hop.target._meta
+        kind = type(field).__name__
+        if kind == "ManyToManyFieldInstance":
+            # The through table goes inside the scoped rows: joined outside, a
+            # link to a hidden row would still add a row of its own.
+            through = Table(field.through)
+            visible = _pypika(rows).as_(f"{alias}_rows")
+            joined = (
+                self.query_class.from_(through)
+                .join(visible)
+                .on(
+                    through.field(field.forward_key)
+                    == visible.field(target.db_pk_column)
+                )
+                .select(
+                    visible.star, through.field(field.backward_key).as_("_orm_parent")
+                )
+                .as_(alias)
+            )
+            on = joined.field("_orm_parent") == entity.field(parent.db_pk_column)
+        elif kind in _FORWARD_REL_TYPES:
+            joined = _pypika(rows).as_(alias)
+            to_name = field.to_field_instance.model_field_name
+            on = joined.field(target.fields_db_projection[to_name]) == entity.field(
+                parent.fields_db_projection[field.source_field]
+            )
+        else:
+            joined = _pypika(rows).as_(alias)
+            to_name = field.to_field_instance.model_field_name
+            on = joined.field(
+                target.fields_db_projection[field.relation_field]
+            ) == entity.field(parent.fields_db_projection[to_name])
+        self.stmt = self.stmt.join(joined, how=JoinType.left).on(on)
+        return joined
+
+    def _custom(self, path: Any) -> Any:
+        """The term a ``@group_field`` method groups by.
+
+        The method may return a Tortoise expression (``F``, a function, a
+        ``Case``), a field name, or a pypika term.
+        """
+        from pypika_tortoise import JoinType
+        from tortoise.expressions import Expression, F, ResolveContext
+
+        expr = invoke_custom_callback(
+            path.custom,
+            path.owner,
+            query=self.model.all(),
+            value=path.value,
+            info=self.info,
         )
-    return f"{quote_char}{name}{quote_char}"
+        if isinstance(expr, tuple):
+            expr = expr[0]
+        if isinstance(expr, str):
+            expr = F(expr)
+        if not isinstance(expr, Expression):
+            return expr
+        resolved = expr.resolve(
+            ResolveContext(
+                model=self.model, table=self.base, annotations={}, custom_filters={}
+            )
+        )
+        for table, criterion in resolved.joins:
+            self.stmt = self.stmt.join(table, how=JoinType.left).on(criterion)
+        return resolved.term
 
 
-def _window_ordering(
-    model: type, order_clauses: list[str], quote_char: str
-) -> list[str]:
-    """Render the window's ORDER BY, ending with the primary key.
+def _same(value: Any) -> Any:
+    return value
 
-    Rows that tie on the requested order would otherwise be numbered however
-    the database likes, differently from one page to the next.
+
+def _nulls_rank(term: Any, nulls: str) -> Any:
+    """A term sorting *term*'s nulls before (``"first"``) or after the rest."""
+    from pypika_tortoise import Case
+
+    first = nulls == "first"
+    return Case().when(term.isnull(), 0 if first else 1).else_(1 if first else 0)
+
+
+def _order_by(stmt: Any, term: Any, descending: bool, nulls: str | None) -> Any:
+    from pypika_tortoise import Order
+
+    if nulls is not None:
+        stmt = stmt.orderby(_nulls_rank(term, nulls))
+    return stmt.orderby(term, order=Order.desc if descending else Order.asc)
+
+
+def _truncate(term: Any, field: Any, interval: Any, dialect: str) -> Any:
+    """*term* cut down to the start of its *interval*.
+
+    PostgreSQL cuts a ``timestamptz`` in the session's time zone. SQLite keeps
+    datetimes as text, so the start of the period is rendered as ISO text.
+    The constants are written into the statement rather than bound: a bound
+    value would make the grouped expression differ from the selected one.
     """
-    meta = model._meta  # type: ignore[attr-defined]
-    projection = _db_columns(model)
-    rendered: list[str] = []
-    columns: set[str] = set()
-    for clause in order_clauses:
-        descending = clause.startswith("-")
-        field = clause[1:] if descending else clause
-        column = projection.get(field, field)
-        columns.add(column)
-        direction = " DESC" if descending else " ASC"
-        rendered.append(_quote_ident(column, model, quote_char) + direction)
-    pk_column = projection.get(meta.pk_attr, meta.db_pk_column)
-    if pk_column not in columns:
-        rendered.append(_quote_ident(pk_column, model, quote_char) + " ASC")
-    return rendered
+    from pypika_tortoise.functions import Cast, Function
+    from pypika_tortoise.terms import LiteralValue
+
+    from strawberry_orm.grouping import SQLITE_PERIOD_START
+    from strawberry_orm.types import DateGroupByInterval
+
+    is_datetime = type(field).__name__ == "DatetimeField"
+    if dialect == "postgres":
+        kind = LiteralValue(f"'{interval.value.lower()}'")
+        truncated = Function("DATE_TRUNC", kind, term)
+        return truncated if is_datetime else Cast(truncated, "DATE")
+    if dialect == "sqlite":
+        fmt = "'%Y-%m-%dT%H:%M:%S'" if is_datetime else "'%Y-%m-%d'"
+        if interval is DateGroupByInterval.QUARTER:
+            month = (
+                Cast(Function("STRFTIME", LiteralValue("'%m'"), term), "INTEGER") - 1
+            )
+            months_in = month - month / 3 * 3
+            modifiers: list[Any] = [
+                LiteralValue("'start of month'"),
+                Function("PRINTF", LiteralValue("'-%d months'"), months_in),
+            ]
+        else:
+            modifiers = [
+                LiteralValue(f"'{modifier}'")
+                for modifier in SQLITE_PERIOD_START[interval]
+            ]
+        return Function("STRFTIME", LiteralValue(fmt), term, *modifiers)
+    raise ValueError(
+        f"Grouping by a date interval is supported on PostgreSQL and SQLite, "
+        f"not {dialect}."
+    )
 
 
 def _ordered_to_the_row(query: Any) -> Any:
@@ -2046,67 +2291,3 @@ def _ordered_to_the_row(query: Any) -> Any:
     ordered = query._clone()
     ordered._orderings = [*orderings, (meta.pk_attr, Order.asc)]
     return ordered
-
-
-def _windowed_sql(
-    query: Any,
-    model: type,
-    group_key_fields: list[str],
-    order_clauses: list[str],
-    per_group_limit: int,
-    per_group_offset: int = 0,
-) -> tuple[str, list[Any]]:
-    """Wrap *query* in SQL keeping one page of rows from every group.
-
-    Returns the statement and the values its placeholders still expect, so the
-    caller binds them rather than embedding them.
-    """
-    query._choose_db_if_not_chosen()
-    query._make_query()
-    inner, values = query.query.get_parameterized_sql()
-
-    quote_char = query._db.query_class.SQL_CONTEXT.quote_char
-    projection = _db_columns(model)
-    partition = ", ".join(
-        _quote_ident(projection.get(field, field), model, quote_char)
-        for field in group_key_fields
-    )
-    ordering = ", ".join(_window_ordering(model, order_clauses, quote_char))
-    alias = f"{quote_char}{_ROW_NUMBER_ALIAS}{quote_char}"
-    low, high = int(per_group_offset), int(per_group_offset + per_group_limit)
-
-    sql = (
-        f"SELECT * FROM ("
-        f"SELECT _orm_inner.*, ROW_NUMBER() OVER ("
-        f"PARTITION BY {partition} ORDER BY {ordering}"
-        f") AS {alias} FROM ({inner}) _orm_inner"
-        f") _orm_windowed WHERE {alias} > {low} AND {alias} <= {high} "
-        # Ordered by the row number so each group comes back in the order the
-        # window put it in; without it the rows arrive however the database
-        # found them and the requested order is lost.
-        f"ORDER BY {alias}"
-    )
-    return sql, values
-
-
-def _build_tortoise_order_from_input(order_input: Any) -> list[str]:
-    """Convert an order input to Tortoise order_by strings."""
-    order_list = order_input if isinstance(order_input, list) else [order_input]
-    clauses: list[str] = []
-    for entry in order_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            direction = getattr(field_val, col_name)
-            if direction is strawberry.UNSET or direction is None:
-                continue
-            dir_value = (
-                direction.value if hasattr(direction, "value") else str(direction)
-            )
-            if dir_value.startswith("DESC"):
-                clauses.append(f"-{col_name}")
-            else:
-                clauses.append(col_name)
-    return clauses

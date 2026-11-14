@@ -23,6 +23,8 @@ EXCLUDED_FILES = {
     # test_batching_differential.py and test_batching_security.py.
     "test_batching_internals.py",
     "test_grouping.py",
+    # Only Django has a current time zone to cut a date period in.
+    "test_grouping_in_a_time_zone.py",
     "test_lazy_resolution.py",
     "test_lazy_query_logging.py",
     "test_mutation_meta_ops.py",

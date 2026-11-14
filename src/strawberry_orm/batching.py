@@ -26,6 +26,7 @@ from graphql import GraphQLList, GraphQLNonNull
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import AwaitableOrValue
+from strawberry_orm.grouping import GroupPath
 from strawberry_orm.lazy_resolution import _path_field_names
 
 if TYPE_CHECKING:
@@ -643,9 +644,10 @@ class RelationConnectionExtension(SchemaExtension):
             base = backend.apply_filters(
                 base, filter_input, spec.related_model, info=info
             )
+        parent_key = GroupPath(alias="_g0", name=spec.key_field, column=spec.key_field)
         rows_by_key = backend.batch_group_items(
             base,
-            [spec.key_field],
+            [parent_key],
             info,
             spec.related_model,
             per_group_limit=max(limit, 0),

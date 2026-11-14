@@ -285,12 +285,13 @@ class AggregateMeta:
     comparable_fields: list[tuple[str, type]] = dc_field(default_factory=list)
     groupable_fields: list[tuple[str, type]] = dc_field(default_factory=list)
 
-    group_key_fields: list[str] = dc_field(default_factory=list)
-
     custom_fields: list[tuple[str, Callable[..., Any], type]] = dc_field(
         default_factory=list,
     )
     """Each entry is ``(field_name, handler_callable, python_return_type)``."""
+
+    relation_keys: dict[str, AggregateMeta] = dc_field(default_factory=dict)
+    """The related model's metadata behind each relation the key nests."""
 
     def build_aggregates(self, row: Any, requested: dict[str, Any]) -> Any:
         """Construct an ``Aggregates`` instance from a SQL result *row*."""
@@ -316,14 +317,6 @@ class AggregateMeta:
                 kwargs[field_name] = val
 
         return self.aggregates_type(**kwargs)
-
-    def build_group_key(self, row: Any, key_fields: list[str]) -> Any:
-        """Construct a ``GroupKey`` instance from a SQL result *row*."""
-        kwargs: dict[str, Any] = {}
-        for fname in key_fields:
-            val = getattr(row, fname, None)
-            kwargs[fname] = str(val) if val is not None else None
-        return self.group_key_type(**kwargs)
 
 
 def _find_selection(info: Any, field_path: str) -> Any:
@@ -467,6 +460,7 @@ class BaseBackend:
         self._order_registry: dict[type, type] = {}
         self._group_registry: dict[type, type] = {}
         self._aggregate_type_cache: dict[type, AggregateMeta] = {}
+        self._group_key_cache: dict[tuple, tuple[type, dict[str, Any]]] = {}
         self._type_querysets: dict[type, Any] = {}
         self._type_queryset_owner: dict[type, str] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
@@ -1320,14 +1314,93 @@ class BaseBackend:
             "__annotations__": {"field": GroupByFieldType | None},
             "field": strawberry.UNSET,
         }
+        object_type, relation_models = self._group_object_arm(
+            model, fields_meta, include, exclude
+        )
+        if object_type is not None:
+            group_ns["__annotations__"]["object"] = object_type | None
+            group_ns["object"] = strawberry.UNSET
         GroupByCls = type(group_type_name, (), group_ns)
         GroupByType = strawberry.input(GroupByCls, one_of=True)
         GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
         GroupByType.__orm_model__ = model  # type: ignore[attr-defined]
+        if object_type is not None:
+            GroupByType._object_type = object_type  # type: ignore[attr-defined]
+            GroupByType._relation_models = relation_models  # type: ignore[attr-defined]
         self._cover_shown_fields(model, GroupByType)
 
         self._group_registry[model] = GroupByType
         return GroupByType
+
+    def _group_object_arm(
+        self, model: type, fields_meta: Any, include: Any, exclude: Any
+    ) -> tuple[type | None, dict[str, type]]:
+        """The ``object:`` input reaching each related model that can be grouped.
+
+        As with ordering, a relation is offered once its model has a group-by
+        type of its own, which is what it is grouped through.
+        """
+        annotations: dict[str, Any] = {}
+        defaults: dict[str, Any] = {}
+        relation_models: dict[str, type] = {}
+        for fname, _ftype, is_relation, rel_model in fields_meta:
+            if not is_relation or rel_model is None:
+                continue
+            if include and fname not in include:
+                continue
+            if exclude and fname in exclude:
+                continue
+            if self._exclude_generated_sensitive_field(fname, include):
+                continue
+            rel_group = self._group_registry.get(rel_model)
+            if rel_group is None:
+                continue
+            annotations[fname] = rel_group | None
+            defaults[fname] = strawberry.UNSET
+            relation_models[fname] = rel_model
+        if not annotations:
+            return None, {}
+        object_cls = type(
+            f"{model.__name__}GroupByObject",
+            (),
+            {"__annotations__": annotations, **defaults},
+        )
+        return strawberry.input(object_cls, one_of=True), relation_models
+
+    def relation_hop(self, model: type, relation: str) -> Any:
+        """The ``GroupHop`` across *model*'s *relation*: its target, and whether
+        a row can have many of them."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot group through relations"
+        )
+
+    def filter_crosses_to_many(self, filter_input: Any, model: type | None) -> bool:
+        """True when *filter_input* reaches across a relation a row has many of.
+
+        Filtered through a join, such a relation repeats a row once for every
+        related row that matches.
+        """
+        if model is None or filter_input is None or filter_input is strawberry.UNSET:
+            return False
+        for key in filter_input.__class__.__dataclass_fields__:
+            value = getattr(filter_input, key)
+            if value is strawberry.UNSET or value is None:
+                continue
+            if key in ("all", "any", "one_of"):
+                if any(self.filter_crosses_to_many(entry, model) for entry in value):
+                    return True
+            elif key == "not_":
+                if self.filter_crosses_to_many(value, model):
+                    return True
+            elif key == "object":
+                for relation in value.__class__.__dataclass_fields__:
+                    nested = getattr(value, relation)
+                    if nested is strawberry.UNSET or nested is None:
+                        continue
+                    hop = self.relation_hop(model, relation)
+                    if hop.many or self.filter_crosses_to_many(nested, hop.target):
+                        return True
+        return False
 
     def group_type(
         self,
@@ -1408,6 +1481,22 @@ class BaseBackend:
             group_ns["__annotations__"]["field"] = GroupByFieldType | None
             group_ns["field"] = strawberry.UNSET
 
+        relation_names = {
+            fname
+            for fname, ann in user_annotations.items()
+            if ann is strawberry.auto
+            and fname not in col_types
+            and (not include or fname in include)
+        }
+        object_type, relation_models = (
+            self._group_object_arm(model, fields_meta, relation_names, exclude)
+            if relation_names
+            else (None, {})
+        )
+        if object_type is not None:
+            group_ns["__annotations__"]["object"] = object_type | None
+            group_ns["object"] = strawberry.UNSET
+
         for cname, cann in custom_group_annotations.items():
             group_ns["__annotations__"][cname] = cann
             group_ns[cname] = custom_group_defaults[cname]
@@ -1417,6 +1506,9 @@ class BaseBackend:
         GroupByType.__orm_model__ = model  # type: ignore[attr-defined]
         if GroupByFieldType is not None:
             GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
+        if object_type is not None:
+            GroupByType._object_type = object_type  # type: ignore[attr-defined]
+            GroupByType._relation_models = relation_models  # type: ignore[attr-defined]
         if custom_groups:
             GroupByType._custom_groups = custom_groups  # type: ignore[attr-defined]
         self._cover_shown_fields(model, GroupByType)
@@ -1468,7 +1560,10 @@ class BaseBackend:
     # -- Aggregate output type generation ------------------------------------
 
     def _build_aggregate_types(
-        self, model: type, aggregate_cls: type | None = None
+        self,
+        model: type,
+        aggregate_cls: type | None = None,
+        group_type: Any = None,
     ) -> AggregateMeta:
         """Build the aggregate output types and return an ``AggregateMeta``.
 
@@ -1478,15 +1573,32 @@ class BaseBackend:
         decorated with ``@aggregate_field`` become additional top-level
         fields on the aggregates type.
 
-        Cached per ``(model, aggregate_cls)`` so repeated calls return
-        the same types.
+        The group key has a string for each column, a nested key for each
+        relation *group_type* reaches through ``object:``, and a string for
+        each of its ``@group_field`` methods.
+
+        Cached per ``(model, aggregate_cls, group_type)`` so repeated calls
+        return the same types.
         """
         import datetime as _dt
 
-        cache_key = (model, aggregate_cls)
+        cache_key = (model, aggregate_cls, group_type)
         cached = self._aggregate_type_cache.get(cache_key)
         if cached is not None:
             return cached
+        if group_type is not None:
+            # The aggregates do not depend on how rows are grouped, and two
+            # types of one name cannot share a schema.
+            plain = self._build_aggregate_types(model, aggregate_cls)
+            key_type, relation_keys = self._group_key_type(
+                model, [fname for fname, _ftype in plain.groupable_fields], group_type
+            )
+            meta = dataclasses.replace(
+                plain, group_key_type=key_type, relation_keys=relation_keys
+            )
+            self._cover_shown_fields(model, meta)
+            self._aggregate_type_cache[cache_key] = meta
+            return meta
 
         fields_meta = self._introspect_model(model)
         model_name = model.__name__
@@ -1564,13 +1676,8 @@ class BaseBackend:
         agg_ns = {"__annotations__": agg_ann, **agg_defs}
         AggregatesType = strawberry.type(type(agg_cls_name, (), agg_ns))
 
-        key_ann: dict[str, Any] = {}
-        key_defs: dict[str, Any] = {}
-        for fname, _ftype in groupable_fields:
-            key_ann[fname] = str | None
-            key_defs[fname] = None
-        GroupKeyType = strawberry.type(
-            type(f"{model_name}GroupKey", (), {"__annotations__": key_ann, **key_defs})
+        GroupKeyType, relation_keys = self._group_key_type(
+            model, [fname for fname, _ftype in groupable_fields], group_type
         )
 
         meta = AggregateMeta(
@@ -1585,10 +1692,56 @@ class BaseBackend:
             comparable_fields=comparable_fields,
             groupable_fields=groupable_fields,
             custom_fields=custom_agg_handlers,
+            relation_keys=relation_keys,
         )
         self._cover_shown_fields(model, meta)
         self._aggregate_type_cache[cache_key] = meta
         return meta
+
+    def _group_key_type(
+        self, model: type, columns: list[str], group_type: Any
+    ) -> tuple[type, dict[str, AggregateMeta]]:
+        """The ``GroupKey`` type for *group_type*, and the metadata behind each
+        relation it nests.
+
+        Shared by every connection keyed the same way: a related model's key
+        reached through ``object:`` is the one its own connection reports, and
+        two types of one name cannot share a schema.
+        """
+        cache_key = (model, tuple(columns), group_type)
+        cached = self._group_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        key_ann: dict[str, Any] = {}
+        key_defs: dict[str, Any] = {}
+        for fname in columns:
+            key_ann[fname] = str | None
+            key_defs[fname] = None
+        relation_keys: dict[str, AggregateMeta] = {}
+        object_type = getattr(group_type, "_object_type", None)
+        for relation, rel_model in getattr(group_type, "_relation_models", {}).items():
+            nested_group = typing.get_args(object_type.__annotations__[relation])[0]
+            relation_keys[relation] = self._build_aggregate_types(
+                rel_model, None, nested_group
+            )
+            key_ann[relation] = relation_keys[relation].group_key_type | None
+            key_defs[relation] = None
+        custom_keys = set(getattr(group_type, "_custom_groups", {}))
+        for name in custom_keys:
+            key_ann[name] = str | None
+            key_defs[name] = None
+        GroupKeyType = strawberry.type(
+            type(
+                f"{model.__name__}GroupKey",
+                (),
+                {"__annotations__": key_ann, **key_defs},
+            )
+        )
+        # A @group_field is the developer's own expression, not a column the
+        # types might hide, so the cut keeps it.
+        GroupKeyType._orm_uncut = frozenset(custom_keys)  # type: ignore[attr-defined]
+        self._group_key_cache[cache_key] = (GroupKeyType, relation_keys)
+        return GroupKeyType, relation_keys
 
     # -- Fields --------------------------------------------------------------
 
@@ -2033,13 +2186,17 @@ class BaseBackend:
         for part, covers in part_covers.items():
             cover = _intersect(covers)
             fields = part.__strawberry_definition__.fields
+            uncut = getattr(part, "_orm_uncut", frozenset())
             keep = frozenset(
                 field.python_name
                 for field in fields
-                if field.python_name in cover
-                and _in_schema(
-                    _common_tags(tags_of(field), cover[field.python_name]),
-                    schema_tags,
+                if field.python_name in uncut
+                or (
+                    field.python_name in cover
+                    and _in_schema(
+                        _common_tags(tags_of(field), cover[field.python_name]),
+                        schema_tags,
+                    )
                 )
             )
             if len(keep) == len(fields):

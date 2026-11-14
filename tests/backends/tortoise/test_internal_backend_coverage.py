@@ -1,6 +1,5 @@
 """Focused backend-adapter coverage for exact helper branches."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -13,15 +12,13 @@ from strawberry_orm.backends.tortoise import (
     _apply_python_ordering,
     _build_tortoise_filter,
     _build_tortoise_lookup,
-    _build_tortoise_order_from_input,
     _build_tortoise_reference_field_clause,
     _build_tortoise_reference_lookup,
-    _extract_tortoise_group_fields,
-    _extract_tortoise_overlapping_order,
     _hide_scoped_out,
     _PlannedPrefetch,
 )
 from strawberry_orm.filters import ReferenceLookup, StringLookup
+from strawberry_orm.grouping import GroupPath, group_paths
 
 
 @strawberry.input
@@ -233,19 +230,6 @@ class TestInternalBackendCoverage:
         )
         assert field_q is not None
 
-        group_fields, key_fields = _extract_tortoise_group_fields(
-            [_TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True))]
-        )
-        assert group_fields == ["author_id"]
-        assert key_fields == ["author_id"]
-
-        order = _TortoiseAuthorOrder(
-            field=_TortoiseAuthorOrderField(author_id=Ordering.DESC)
-        )
-        overlapping = _extract_tortoise_overlapping_order(order, {"author_id"})
-        assert overlapping == ["-author_id"]
-        assert _build_tortoise_order_from_input(order) == ["-author_id"]
-
     @pytest.mark.asyncio
     async def test_apply_aggregation_grouping_scope_and_batch(self, seed, Post, User):
         backend = TortoiseBackend()
@@ -265,24 +249,20 @@ class TestInternalBackendCoverage:
         )
         groups = await backend.apply_grouping(
             Post.all(),
-            _TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True)),
+            group_paths(
+                backend,
+                Post,
+                _TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True)),
+            ),
             group_info,
             meta,
         )
         assert len(groups) == 3
 
-        @dataclass
-        class ScopeKey:
-            author_id: int | None = 1
-
-        scoped = backend.scope_query_to_group(Post.all(), ScopeKey())
-        rows = await scoped
-        assert len(rows) == 2
-
         batch_info = SimpleNamespace(context={})
         batched = await backend.batch_group_items(
             Post.all(),
-            ["author_id"],
+            [GroupPath(alias="_g0", name="author_id", column="author_id")],
             batch_info,
             Post,
             per_group_limit=1,
@@ -292,61 +272,6 @@ class TestInternalBackendCoverage:
         )
         assert ("1",) in batched
         assert len(batched[("1",)]) == 1
-
-    @pytest.mark.asyncio
-    async def test_apply_grouping_order_branch_with_mock_queryset(self, Post):
-        backend = TortoiseBackend()
-        meta = _tortoise_aggregate_meta(Post)
-        group_info = _tortoise_info_with_aggregates(
-            path="groups.aggregates", count=True
-        )
-
-        class FakeValuesQuery:
-            def __init__(self):
-                self.order_args: tuple[str, ...] = ()
-
-            def order_by(self, *args):
-                self.order_args = args
-                return self
-
-            def __await__(self):
-                async def _run():
-                    return [{"author_id": 1, "_count": 2}]
-
-                return _run().__await__()
-
-        class FakeQuery:
-            def __init__(self):
-                self.ordering_cleared = False
-
-            def order_by(self, *args):
-                self.ordering_cleared = not args
-                return self
-
-            def annotate(self, **_kwargs):
-                return self
-
-            def group_by(self, *_args):
-                return self
-
-            def values(self, *_args):
-                return FakeValuesQuery()
-
-        fake = FakeQuery()
-        groups = await backend.apply_grouping(
-            fake,
-            _TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True)),
-            group_info,
-            meta,
-            order_input=_TortoiseAuthorOrder(
-                field=_TortoiseAuthorOrderField(author_id=Ordering.ASC)
-            ),
-        )
-        assert len(groups) == 1
-        assert groups[0].key.author_id == "1"
-        assert fake.ordering_cleared, (
-            "inherited ordering would join the GROUP BY and split the groups"
-        )
 
     @pytest.mark.asyncio
     async def test_apply_ref_list_respects_authorize(self, seed, Post, Tag):
@@ -435,7 +360,7 @@ class TestInternalBackendCoverage:
         assert [item.value for item in ordered] == [None, 1]
 
     @pytest.mark.asyncio
-    async def test_apply_aggregation_with_sum_and_empty_group_fields(self, seed, Post):
+    async def test_apply_aggregation_with_sum(self, seed, Post):
         backend = TortoiseBackend()
         meta = _tortoise_aggregate_meta(Post)
 
@@ -445,19 +370,6 @@ class TestInternalBackendCoverage:
         result = await backend.apply_aggregation(Post.all(), sum_info, meta)
         assert result.count >= 0
 
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyGroup:
-            field: EmptyField | None = strawberry.UNSET
-
-        groups = await backend.apply_grouping(
-            Post.all(), EmptyGroup(), _tortoise_info_with_aggregates(), meta
-        )
-        assert groups == []
-
     @pytest.mark.asyncio
     async def test_apply_aggregation_empty_sum_request(self, seed, Post):
         backend = TortoiseBackend()
@@ -465,22 +377,6 @@ class TestInternalBackendCoverage:
         info = _tortoise_info_with_aggregates(sum_fields=[])
         result = await backend.apply_aggregation(Post.all(), info, meta)
         assert result.count == 0
-
-    @pytest.mark.asyncio
-    async def test_grouping_helpers_skip_duplicate_fields(self):
-        from strawberry_orm.backends.tortoise import _extract_tortoise_group_fields
-
-        @strawberry.input
-        class DupField:
-            title: bool | None = True
-
-        @strawberry.input
-        class DupGroup:
-            field: DupField | None = strawberry.UNSET
-
-        entry = DupGroup(field=DupField())
-        fields, keys = _extract_tortoise_group_fields([entry, entry])
-        assert fields.count("title") == 1
 
     def test_introspect_annotation_only_relation(self):
         from tests.backends.tortoise.models import User
@@ -518,20 +414,6 @@ class TestInternalBackendCoverage:
         q = _build_tortoise_lookup("author_id", ReferenceLookup(exact="1"))
         assert q is not None
 
-    def test_extract_tortoise_overlapping_order_empty_field(self):
-        @strawberry.input
-        class EmptyOrder:
-            field: object | None = strawberry.UNSET
-
-        assert _extract_tortoise_overlapping_order(EmptyOrder(), {"title"}) == []
-
-    def test_build_tortoise_order_from_input_empty_field(self):
-        @strawberry.input
-        class EmptyOrder:
-            field: object | None = strawberry.UNSET
-
-        assert _build_tortoise_order_from_input(EmptyOrder()) == []
-
     def test_build_tortoise_ordering_nulls_first_skips_sql_clause(self, seed, Post):
         backend = TortoiseBackend()
 
@@ -568,7 +450,6 @@ class TestInternalBackendCoverage:
     async def test_tortoise_final_coverage_lines(self, seed, Post, User):
         from strawberry_orm.backends.tortoise import (
             _build_tortoise_filter,
-            _build_tortoise_order_from_input,
             _build_tortoise_reference_lookup,
         )
 
@@ -583,12 +464,6 @@ class TestInternalBackendCoverage:
         assert clause is None
         assert query is not None
 
-        @strawberry.input
-        class EmptyOrder:
-            field: object | None = strawberry.UNSET
-
-        assert _build_tortoise_order_from_input(EmptyOrder()) == []
-
         backend = TortoiseBackend()
         meta = _tortoise_aggregate_meta(Post)
         info = _tortoise_info_with_aggregates(sum_fields=[])
@@ -600,7 +475,11 @@ class TestInternalBackendCoverage:
         )
         groups = await backend.apply_grouping(
             Post.all(),
-            _TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True)),
+            group_paths(
+                backend,
+                Post,
+                _TortoiseAuthorGroupBy(field=_TortoiseAuthorGroupField(author_id=True)),
+            ),
             group_info,
             meta,
         )
@@ -643,43 +522,6 @@ class TestInternalBackendCoverage:
                 ReferenceLookup(in_list=[str(i) for i in range(501)]),
                 max_in_list_size=500,
             )
-
-    def test_tortoise_group_and_order_skip_empty_values(self):
-        from strawberry_orm.backends.tortoise import (
-            _build_tortoise_order_from_input,
-            _extract_tortoise_group_fields,
-            _extract_tortoise_overlapping_order,
-        )
-
-        @strawberry.input
-        class PartialField:
-            title: bool | None = None
-
-        @strawberry.input
-        class PartialGroup:
-            field: PartialField | None = strawberry.UNSET
-
-        fields, _ = _extract_tortoise_group_fields([PartialGroup(field=PartialField())])
-        assert fields == []
-
-        @strawberry.input
-        class PartialOrderField:
-            title: Ordering | None = None
-
-        @strawberry.input
-        class PartialOrder:
-            field: PartialOrderField | None = strawberry.UNSET
-
-        assert (
-            _extract_tortoise_overlapping_order(
-                PartialOrder(field=PartialOrderField()), {"title"}
-            )
-            == []
-        )
-        assert (
-            _build_tortoise_order_from_input(PartialOrder(field=PartialOrderField()))
-            == []
-        )
 
     @pytest.mark.asyncio
     async def test_tortoise_apply_aggregation_empty_agg_kwargs(self, seed, Post):
@@ -769,3 +611,45 @@ class TestRelationScopeCondition:
         from strawberry_orm.backends.tortoise import _tortoise_relation_scope_q
 
         assert _tortoise_relation_scope_q(None, None, "author", None, "") is None
+
+
+class TestGroupedRows:
+    async def _keys(self, Post, custom):
+        from strawberry_orm.backends.tortoise import _GroupedRows
+
+        path = GroupPath(alias="_g0", name="by", custom=custom, value=True)
+        rows = _GroupedRows(
+            TortoiseBackend(), Post.all(), Post, [path], SimpleNamespace(context={})
+        )
+        found = await rows.execute(rows.stmt.select(*rows.selected()))
+        return sorted({str(row["_g0"]) for row in found})
+
+    async def test_a_group_field_may_name_a_column_through_a_relation(self, seed, Post):
+        keys = await self._keys(Post, lambda self, value, query: "author__name")
+        assert keys == ["Alice", "Bob", "Charlie"]
+
+    async def test_a_group_field_may_return_a_pypika_term(self, seed, Post):
+        from pypika_tortoise.terms import Field
+
+        keys = await self._keys(Post, lambda self, value, query: Field("author_id"))
+        assert keys == ["1", "2", "3"]
+
+    def test_a_period_is_cut_by_postgres_and_refused_elsewhere(self, Post):
+        from pypika_tortoise import Query
+        from pypika_tortoise.terms import Field
+
+        from strawberry_orm.backends.tortoise import _truncate
+        from strawberry_orm.types import DateGroupByInterval
+
+        def sql(field):
+            return str(Query.select(_truncate(term, field, month, "postgres")))
+
+        created = Post._meta.fields_map["created_at"]
+        month = DateGroupByInterval.MONTH
+        term = Field("created_at")
+        assert sql(created) == "SELECT DATE_TRUNC('month',\"created_at\")"
+        assert (
+            sql(object()) == "SELECT CAST(DATE_TRUNC('month',\"created_at\") AS DATE)"
+        )
+        with pytest.raises(ValueError, match="not mysql"):
+            _truncate(term, created, month, "mysql")

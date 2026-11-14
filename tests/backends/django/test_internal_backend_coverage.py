@@ -1,6 +1,8 @@
 """Focused backend-adapter coverage for exact helper branches."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import strawberry
@@ -13,14 +15,11 @@ from strawberry_orm.backends.django import (
     _build_django_field_clause,
     _build_django_filter,
     _build_django_lookup,
-    _build_django_order_from_input,
     _build_django_reference_field_clause,
     _build_django_reference_lookup,
     _coerce_reference_value,
     _django_forward_fk_attname,
     _django_related_model,
-    _extract_django_group_fields,
-    _extract_django_overlapping_order,
     _primary_key,
 )
 from strawberry_orm.backends.filter_pk_shortcut import (
@@ -28,6 +27,7 @@ from strawberry_orm.backends.filter_pk_shortcut import (
     filter_tree_uses_only_reference_lookups,
 )
 from strawberry_orm.filters import IntComparisonLookup, ReferenceLookup, StringLookup
+from strawberry_orm.grouping import GroupPath, group_paths
 from strawberry_orm.types import Ordering, auto
 from tests.backends.django.fixtures import PostFilter, PostOrder, UserFilter
 from tests.backends.django.models import Book, Publisher, User
@@ -306,47 +306,6 @@ class TestInternalBackendCoverage:
         )
         assert nested == Q(publisher_id__exact="ACE")
 
-    def test_grouping_helper_functions(self, Post):
-        orm = StrawberryORM.for_django(lazy_resolution="off")
-        post_group = orm.group(Post)
-        post_order = orm.order(Post)
-        group_field = post_group._field_type
-        order_field = post_order._field_type
-
-        group_fields, key_fields = _extract_django_group_fields(
-            [post_group(field=group_field(is_published=True))]
-        )
-        assert group_fields == ["is_published"]
-        assert key_fields == ["is_published"]
-
-        overlapping = _extract_django_overlapping_order(
-            [post_order(field=order_field(is_published=Ordering.DESC))],
-            {"is_published"},
-        )
-        assert overlapping == ["-is_published"]
-        assert (
-            _extract_django_overlapping_order(
-                [post_order(field=order_field(title=Ordering.ASC))],
-                {"is_published"},
-            )
-            == []
-        )
-
-        desc_exprs = _build_django_order_from_input(
-            [post_order(field=order_field(title=Ordering.DESC))]
-        )
-        assert "descending=True" in str(desc_exprs[0])
-
-        order_exprs = _build_django_order_from_input(
-            [post_order(field=order_field(title=Ordering.ASC))]
-        )
-        assert len(order_exprs) == 1
-        assert "descending=False" in str(order_exprs[0])
-
-        fallback_exprs = _build_django_order_from_input([])
-        assert len(fallback_exprs) == 1
-        assert str(fallback_exprs[0]) == "F(pk)"
-
     @pytest.mark.django_db
     def test_apply_aggregation_and_grouping(self, seed, Post):
         backend = DjangoBackend()
@@ -368,15 +327,12 @@ class TestInternalBackendCoverage:
         assert sum_agg.count == 4
         assert sum_agg.sum.id == 10
 
-        empty_groups = backend.apply_grouping(
-            Post.objects.all(), post_group(), _mock_info_with_aggregates(), meta
-        )
-        assert empty_groups == []
-
         group_info = _mock_info_with_aggregates(path="groups.aggregates", count=True)
         groups = backend.apply_grouping(
             Post.objects.all(),
-            post_group(field=group_field(is_published=True)),
+            group_paths(
+                backend, Post, post_group(field=group_field(is_published=True))
+            ),
             group_info,
             meta,
             order_input=PostOrder(
@@ -388,20 +344,13 @@ class TestInternalBackendCoverage:
         assert published.aggregates.count == 3
 
     @pytest.mark.django_db
-    def test_scope_query_to_group_and_batch_group_items(self, seed, Post):
+    def test_batch_group_items(self, seed, Post):
         backend = DjangoBackend()
-        meta = backend._build_aggregate_types(Post)
-        key_type = meta.group_key_type
-
-        scoped = backend.scope_query_to_group(
-            Post.objects.all(),
-            key_type(author_id="1", is_published=None),
-        )
-        assert scoped.count() == 2
+        by_author = [GroupPath(alias="_g0", name="author_id", column="author_id")]
 
         items_by_key = backend.batch_group_items(
             Post.objects.all(),
-            ["author_id"],
+            by_author,
             info=None,
             model=Post,
             per_group_limit=1,
@@ -412,7 +361,7 @@ class TestInternalBackendCoverage:
 
         fallback_items = backend.batch_group_items(
             Post.objects.all(),
-            ["author_id"],
+            by_author,
             info=None,
             model=Post,
             per_group_limit=2,
@@ -502,63 +451,6 @@ class TestInternalBackendCoverage:
         assert result.count == 0
 
     @pytest.mark.django_db
-    def test_grouping_helpers_skip_empty_field_values(self, seed, Post):
-        from strawberry_orm.backends.django import (
-            _build_django_order_from_input,
-            _extract_django_group_fields,
-            _extract_django_overlapping_order,
-        )
-
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyGroup:
-            field: EmptyField | None = strawberry.UNSET
-
-        assert _extract_django_group_fields([EmptyGroup()]) == ([], [])
-
-        @strawberry.input
-        class OrderField:
-            title: Ordering | None = strawberry.UNSET
-            body: Ordering | None = Ordering.ASC
-
-        @strawberry.input
-        class OrderEntry:
-            field: OrderField | None = strawberry.UNSET
-
-        overlap = _extract_django_overlapping_order(
-            OrderEntry(field=OrderField(body=Ordering.ASC)), {"title"}
-        )
-        assert overlap == []
-        order_clauses = _build_django_order_from_input(
-            OrderEntry(field=OrderField(body=Ordering.ASC))
-        )
-        assert len(order_clauses) == 1
-
-    @pytest.mark.django_db
-    def test_apply_grouping_returns_empty_without_fields(self, seed, Post):
-        backend = DjangoBackend()
-        meta = backend._build_aggregate_types(Post)
-
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyGroup:
-            field: EmptyField | None = strawberry.UNSET
-
-        groups = backend.apply_grouping(
-            Post.objects.all(),
-            EmptyGroup(),
-            _mock_info_with_aggregates(path="groups.aggregates", count=True),
-            meta,
-        )
-        assert groups == []
-
-    @pytest.mark.django_db
     def test_apply_grouping_with_sum_aggregate(self, seed, Post):
         backend = DjangoBackend()
         orm = StrawberryORM.for_django(lazy_resolution="off")
@@ -570,7 +462,9 @@ class TestInternalBackendCoverage:
         )
         groups = backend.apply_grouping(
             Post.objects.all(),
-            post_group(field=group_field(is_published=True)),
+            group_paths(
+                backend, Post, post_group(field=group_field(is_published=True))
+            ),
             info,
             meta,
         )
@@ -582,38 +476,6 @@ class TestInternalBackendCoverage:
     def test_build_django_lookup_reference_branch(self):
         q = _build_django_lookup("author_id", ReferenceLookup(exact="1"))
         assert q is not None
-
-    def test_extract_django_group_fields_skips_duplicate(self):
-        @strawberry.input
-        class DupField:
-            title: bool | None = True
-
-        @strawberry.input
-        class DupGroup:
-            field: DupField | None = strawberry.UNSET
-
-        entry = DupGroup(field=DupField())
-        fields, keys = _extract_django_group_fields([entry, entry])
-        assert fields.count("title") == 1
-
-    def test_extract_django_overlapping_order_empty_field(self):
-        @strawberry.input
-        class EmptyOrder:
-            field: object | None = strawberry.UNSET
-
-        assert _extract_django_overlapping_order(EmptyOrder(), {"title"}) == []
-
-    def test_build_django_order_from_input_empty_field(self):
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyOrder:
-            field: EmptyField | None = strawberry.UNSET
-
-        clauses = _build_django_order_from_input(EmptyOrder())
-        assert len(clauses) == 1
 
     @pytest.mark.django_db
     def test_post_process_skips_empty_python_name(self, User):
@@ -862,3 +724,89 @@ class TestScopedRelationHelpers:
             _scoped_related_instance(orm._backend, comment, "parent", SimpleNamespace())
             is None
         )
+
+
+@dataclass
+class _Arm:
+    field: Any = strawberry.UNSET
+    object: Any = strawberry.UNSET
+
+
+@dataclass
+class _Relations:
+    author: Any = strawberry.UNSET
+    posts: Any = strawberry.UNSET
+    tags: Any = strawberry.UNSET
+
+
+@dataclass
+class _Columns:
+    id: Any = strawberry.UNSET
+
+
+@dataclass
+class _ByCustom:
+    by: Any = strawberry.UNSET
+
+
+_ByCustom._custom_groups = {"by": lambda self, value, query: "id"}
+
+
+@dataclass
+class _Filter:
+    all: Any = strawberry.UNSET
+    not_: Any = strawberry.UNSET
+    object: Any = strawberry.UNSET
+
+
+class TestGroupingHelpers:
+    def test_an_unset_entry_groups_by_nothing(self, Post):
+        assert group_paths(DjangoBackend(), Post, [None]) == []
+
+    def test_a_to_many_relation_is_only_grouped_by_directly(self, Post):
+        posts = _Arm(object=_Relations(posts=_Arm(field=_Columns(id=True))))
+        with pytest.raises(ValueError, match="only be grouped by directly"):
+            group_paths(DjangoBackend(), Post, _Arm(object=_Relations(author=posts)))
+
+    def test_a_group_field_is_not_reached_through_a_relation(self, Post):
+        through = _Arm(object=_Relations(author=_ByCustom(by=True)))
+        with pytest.raises(ValueError, match="cannot be reached through object"):
+            group_paths(DjangoBackend(), Post, through)
+
+    def test_a_filter_crosses_to_many_inside_any_branch(self, Post):
+        backend = DjangoBackend()
+        tags = _Filter(object=_Relations(tags=_Filter()))
+        assert backend.filter_crosses_to_many(tags, None) is False
+        assert backend.filter_crosses_to_many(_Filter(all=[tags]), Post) is True
+        assert backend.filter_crosses_to_many(_Filter(not_=tags), Post) is True
+        author = _Filter(object=_Relations(author=_Filter()))
+        assert backend.filter_crosses_to_many(author, Post) is False
+
+    def test_the_object_arm_leaves_out_excluded_and_sensitive_relations(
+        self, Post, User
+    ):
+        backend = DjangoBackend()
+        backend.group(User)
+        fields_meta = [
+            ("author", None, True, User),
+            ("secret_owner", None, True, User),
+        ]
+        assert backend._group_object_arm(Post, fields_meta, None, {"author"}) == (
+            None,
+            {},
+        )
+
+    def test_only_single_valued_names_rank_groups(self, Post):
+        from django.db.models import F
+        from django.db.models.expressions import OrderBy
+
+        from strawberry_orm.backends.django import _connection_ordering, _single_valued
+
+        assert _single_valued(Post, "pk")
+        assert _single_valued(Post, "author")
+        assert not _single_valued(Post, "nothing")
+        query = Post.objects.order_by("?", OrderBy(F("title")), F("id"))
+        assert [str(clause) for clause in _connection_ordering(query, None)] == [
+            str(OrderBy(F("title"))),
+            str(F("id").asc()),
+        ]

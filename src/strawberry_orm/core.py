@@ -322,20 +322,20 @@ class _AutoFilterOrderExtension(FieldExtension):
         rows that were fetched, so the type's row scoping has to be applied
         here. The optimizer applies it on the read path, which runs later.
         """
-        ctx = info.context
-        if ctx is None:
+        from strawberry_orm.relay.connection import ConnectionState, stash_state
+
+        if info.context is None:
             return
         base_query = self._backend.apply_type_scope(base_query, self._model, info)
-        if isinstance(ctx, dict):
-            ctx["_orm_base_query"] = base_query
-            ctx["_orm_backend"] = self._backend
-            ctx["_orm_group_by"] = group_by
-            ctx["_orm_order"] = order
-        else:
-            ctx._orm_base_query = base_query  # type: ignore[attr-defined]
-            ctx._orm_backend = self._backend  # type: ignore[attr-defined]
-            ctx._orm_group_by = group_by  # type: ignore[attr-defined]
-            ctx._orm_order = order  # type: ignore[attr-defined]
+        stash_state(
+            info,
+            ConnectionState(
+                backend=self._backend,
+                base_query=base_query,
+                group_by=group_by,
+                order=order,
+            ),
+        )
 
     def _run_filter_work(
         self,
@@ -432,6 +432,11 @@ class _AutoFilterOrderExtension(FieldExtension):
         **kwargs: Any,
     ) -> Any:
         result = next_(source, info, **self._resolver_kwargs(kwargs))
+        if isawaitable(result) and not self._is_query(result):
+            # An async-safe Django resolver hands its query back from a worker
+            # thread. Filtered and stashed only once it is a query, or the
+            # connection has nothing to aggregate or group.
+            result = await_maybe_blocking(result)
         result = self._apply(
             result,
             info,
@@ -439,11 +444,12 @@ class _AutoFilterOrderExtension(FieldExtension):
             order=kwargs.get("order"),
             group_by=kwargs.get("group_by"),
         )
-        if isawaitable(result) and not (
-            self._model is not None and self._backend.is_query_object(result)
-        ):
+        if isawaitable(result) and not self._is_query(result):
             result = await_maybe_blocking(result)
         return self._cast_result(result)
+
+    def _is_query(self, result: Any) -> bool:
+        return self._model is not None and self._backend.is_query_object(result)
 
     async def resolve_async(
         self,
@@ -1148,7 +1154,9 @@ def _build_grouped_connection(
     from strawberry_orm.backends._base import AggregateMeta
     from strawberry_orm.relay.connection import ORMListConnection, PageInfo, _PageRows
 
-    meta: AggregateMeta = backend._build_aggregate_types(model, aggregate_type)  # type: ignore[union-attr]
+    meta: AggregateMeta = backend._build_aggregate_types(  # type: ignore[union-attr]
+        model, aggregate_type, group_type
+    )
     node_type = _extract_connection_node(connection_type)
     if node_type in backend._shown_by_type:  # type: ignore[attr-defined]
         # min/max return exact values and a group key echoes one, so they

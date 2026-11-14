@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import sys
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 import strawberry
@@ -34,14 +35,13 @@ from strawberry_orm.optimizer.extension import (
 )
 
 NodeType = TypeVar("NodeType", bound=relay.Node)
-T = TypeVar("T")
 
 #: Databases number rows with signed 64-bit integers, and a cursor can carry
 #: any number at all; nothing past this is sent as an offset or a limit.
 _LAST_POSITION = 2**63 - 1
 
 
-def _then(value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
+def _then[T](value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
     """Apply *step* to *value*, awaiting either one where it is awaitable."""
     if not inspect.isawaitable(value):
         return step(value)
@@ -81,6 +81,9 @@ def _orm_backend_from_info(info: Any) -> Any | None:
         backend = getattr(ctx, "_orm_backend", None)
     if backend is not None:
         return backend
+    state = connection_state(info)
+    if state is not None:
+        return state.backend
     from strawberry_orm.optimizer.extension import get_configured_optimizer
 
     backend, _store = get_configured_optimizer(info)
@@ -297,28 +300,69 @@ def _use_orm_connection_extension(field: Any) -> None:
     ]
 
 
-def _node_matches_group_key(node: Any, key: Any, key_fields: list[str]) -> bool:
-    """Return ``True`` if *node*'s attributes match the group *key*."""
-    for fname in key_fields:
-        key_val = getattr(key, fname, None)
-        if key_val is None:
-            continue
-        node_val = getattr(node, fname, None)
-        if str(node_val) != str(key_val):
-            return False
-    return True
+@dataclass(frozen=True)
+class ConnectionState:
+    """What a connection field's aggregates and groups are computed from."""
+
+    backend: Any
+    base_query: Any
+    group_by: Any = None
+    order: Any = None
 
 
-def _assign_edge_indices(
-    groups: list[Any], edges: list[Any], key_fields: list[str]
-) -> None:
-    """Compute ``edge_indices`` for each group by scanning the page edges."""
-    for group in groups:
-        indices: list[int] = []
-        for i, edge in enumerate(edges):
-            if _node_matches_group_key(edge.node, group.key, key_fields):
-                indices.append(i)
-        group.edge_indices = indices
+_STATE_KEY = "_orm_connections"
+
+
+def _states(context: Any) -> dict[tuple, ConnectionState]:
+    if isinstance(context, dict):
+        return context.setdefault(_STATE_KEY, {})
+    states = getattr(context, _STATE_KEY, None)
+    if states is None:
+        states = {}
+        setattr(context, _STATE_KEY, states)
+    return states
+
+
+def stash_state(info: Any, state: ConnectionState) -> None:
+    """Keep *state* for the connection field *info* resolves.
+
+    Keyed by the field's path: under async execution the same field resolves
+    for every parent row at once, and a single slot would hand each of them
+    whichever parent stashed last.
+    """
+    path = getattr(info, "path", None)
+    if path is not None:
+        _states(info.context)[tuple(path.as_list())] = state
+
+
+def connection_state(info: Any) -> ConnectionState | None:
+    path = getattr(info, "path", None)
+    if info.context is None or path is None:
+        return None
+    return _states(info.context).get(tuple(path.as_list()))
+
+
+def _edge_memberships(
+    connection: Any, state: ConnectionState, paths: list[Any], info: Any
+) -> Any:
+    """Each edge's group key, or the set of them, for ``edgeIndices``.
+
+    A column of the row itself is read off the row. Anything the database
+    works out, a related column, a truncated date or a ``@group_field``, is
+    asked of it for the page's rows.
+    """
+    from strawberry_orm.grouping import needs_database_membership, own_key_values
+
+    if not _selection_requests(info, "groups", "edgeIndices"):
+        return None
+    nodes = [edge.node for edge in connection.edges]
+    if not needs_database_membership(paths):
+        return [own_key_values(node, paths) for node in nodes]
+    if not nodes:
+        return []
+    pks = [state.backend.instance_pk(node) for node in nodes]
+    by_pk = state.backend.group_memberships(state.base_query, paths, pks, info)
+    return _then(by_pk, lambda found: [found.get(pk, set()) for pk in pks])
 
 
 def _compute_page_aggregates(edges: list[Any], meta: Any) -> Any:
@@ -661,103 +705,87 @@ class ORMListConnection(ORMConnection[NodeType]):
         meta = getattr(cls, "_orm_aggregate_meta", None)
         if meta is None:
             return connection
-
-        backend = (
-            info.context.get("_orm_backend")
-            if isinstance(info.context, dict)
-            else getattr(info.context, "_orm_backend", None)
-        )
-        base_query = (
-            info.context.get("_orm_base_query")
-            if isinstance(info.context, dict)
-            else getattr(info.context, "_orm_base_query", None)
-        )
-
-        if backend is None or base_query is None:
+        state = connection_state(info)
+        if state is None:
             return connection
 
         if _selection_requests(info, "aggregates"):
-            agg = backend.apply_aggregation(base_query, info, meta)
-            connection.aggregates = agg
+            connection.aggregates = state.backend.apply_aggregation(
+                state.base_query, info, meta
+            )
 
         def finish(grouping: Any) -> Any:
             if grouping is not None:
-                cls._attach_groups(connection, *grouping, backend, base_query, meta)
+                cls._attach_groups(connection, *grouping)
             cls._attach_page_aggregates(connection, info, meta)
             return connection
 
-        return _then(cls._collect_groups(backend, base_query, info, meta), finish)
+        return _then(cls._collect_groups(connection, state, info, meta), finish)
 
     @classmethod
-    def _collect_groups(cls, backend, base_query, info, meta):
-        """Fetch the groups and their items.
+    def _collect_groups(cls, connection, state, info, meta):
+        """Fetch the groups, their items, and the keys of the page's edges.
 
-        Returns ``(groups, items_by_key, items_offset)``, ``None`` when groups
-        were not asked for, or a coroutine yielding them on async backends.
+        Returns ``(groups, items_by_key, items_offset, memberships)``, ``None``
+        when groups were not asked for, or a coroutine yielding them on async
+        backends. The reads run one after another: an async backend's
+        connection serves one statement at a time.
         """
-        if not _selection_requests(info, "groups"):
+        from strawberry_orm.grouping import group_paths
+
+        if not _selection_requests(info, "groups") or state.group_by is None:
             return None
+        backend, base_query = state.backend, state.base_query
+        paths = group_paths(backend, meta.model, state.group_by)
+        if not paths:
+            return [], None, 0, None
 
-        ctx = info.context
-        group_by = (
-            ctx.get("_orm_group_by")
-            if isinstance(ctx, dict)
-            else getattr(ctx, "_orm_group_by", None)
+        window = (
+            _items_window(info)
+            if _selection_requests(info, "groups", "items")
+            else None
         )
-        if group_by is None:
-            return None
-        order_input = (
-            ctx.get("_orm_order")
-            if isinstance(ctx, dict)
-            else getattr(ctx, "_orm_order", None)
-        )
+        start = window[0] if window is not None else 0
 
-        groups = backend.apply_grouping(
-            base_query,
-            group_by,
-            info,
-            meta,
-            order_input=order_input,
-        )
-
-        def with_items(resolved: list[Any]) -> Any:
-            window = (
-                _items_window(info)
-                if _selection_requests(info, "groups", "items")
-                else None
-            )
+        def items() -> Any:
             if window is None:
-                return resolved, None, 0
-            start, limit = window
-            # Only now are the group key fields known: an async apply_grouping
-            # records them on *meta* when it runs, not when it is called.
-            items_by_key = backend.batch_group_items(
+                return None
+            return backend.batch_group_items(
                 base_query,
-                meta.group_key_fields,
+                paths,
                 info,
                 meta.model,
-                per_group_limit=limit,
+                per_group_limit=window[1],
                 per_group_offset=start,
-                order_input=_extract_items_order(info),
+                order_input=state.order,
             )
-            return _then(items_by_key, lambda by_key: (resolved, by_key, start))
 
-        return _then(groups, with_items)
+        groups = backend.apply_grouping(
+            base_query, paths, info, meta, order_input=state.order
+        )
+        return _then(
+            groups,
+            lambda resolved: _then(
+                items(),
+                lambda by_key: _then(
+                    _edge_memberships(connection, state, paths, info),
+                    lambda memberships: (resolved, by_key, start, memberships),
+                ),
+            ),
+        )
 
     @classmethod
     def _attach_groups(
-        cls, connection, groups, items_by_key, items_offset, backend, base_query, meta
+        cls, connection, groups, items_by_key, items_offset, memberships
     ):
-        _assign_edge_indices(groups, connection.edges, meta.group_key_fields)
+        from strawberry_orm.grouping import assign_edge_indices
 
+        if memberships is not None:
+            assign_edge_indices(groups, memberships)
         for grp in groups:
             if items_by_key is not None:
-                key_tuple = tuple(getattr(grp.key, k) for k in meta.group_key_fields)
-                grp._items_nodes = items_by_key.get(key_tuple, [])
+                grp._items_nodes = items_by_key.get(grp._orm_key_values, [])
                 grp._items_offset = items_offset
-            grp._orm_base_query = base_query
-            grp._orm_backend = backend
-            grp._orm_model = meta.model
 
         connection.groups = groups
 
@@ -812,11 +840,6 @@ def _extract_items_after(info: Any) -> str | None:
     if val is not None:
         return str(val)
     return None
-
-
-def _extract_items_order(info: Any) -> Any:
-    """Extract the ``order`` argument from ``groups.items``."""
-    return _get_items_arg(info, "order")
 
 
 def _items_window(info: Any) -> tuple[int, int] | None:

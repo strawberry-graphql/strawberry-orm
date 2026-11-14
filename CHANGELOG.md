@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.26.0
+## 0.27.0
+
+### Added
+
+- **Group by related rows.** `groupBy: [{object: {author: {field: {name: true}}}}]` groups by any column of a related row, through a foreign key, a reverse foreign key or a many-to-many relation. The key nests one level per relation (`key { author { id name } }`). A relation is offered when its model has a group-by type and the type shows the relation as stored; `@orm.group_type` classes name relations with `auto`. The related row is read through its type's `scope_rows`, so a hidden one groups as `null`. Across a to-many relation a row is grouped once under each distinct key its visible related rows give, and once under `null` if it has none.
+- **`@group_field` works.** Its value is grouped by in the database on all three backends, and is reported as a string under the method's name in the key. It may return an expression, a field name, an `(expression, label)` tuple or, on Tortoise, a pypika term.
+
+### Changed
+
+- **Groups follow the connection's order.** Each group is ranked by its first row under `order` (or the query's own ordering), then by its key, so a group's edges sit together. `items` within a group follow the same order.
+- **`DateGroupByOption.interval` is honoured on every backend.** Django truncates in the current time zone. SQLAlchemy and Tortoise truncate on PostgreSQL and SQLite and raise on other databases. `batch_group_items` partitions by the same expression.
+  - **Breaking:** an interval key is now the ISO 8601 start of the period (`"2026-03-01T00:00:00"`, with its offset on Django under `USE_TZ`). SQLAlchemy used to key by `strftime` text such as `"2026-03"` (SQLite only), and Django and Tortoise grouped by the raw value.
+- **Breaking for custom backends:** `apply_grouping` and `batch_group_items` take a list of `strawberry_orm.grouping.GroupPath` instead of the group-by input or key field names, and backends implement `relation_hop` and `group_memberships`. `scope_query_to_group`, `AggregateMeta.group_key_fields` and `AggregateMeta.build_group_key` are removed.
+
+### Fixed
+
+- **Grouping without `order` gave one group per row** on Django, because the query's default ordering leaked into `GROUP BY`. It no longer does on any backend.
+- **A `null` group's `edgeIndices` claimed every edge.** A `null` key now matches only rows whose value is null. Related, interval and `@group_field` keys are matched by asking the database for the page's rows.
+- **A filter through a to-many relation repeated rows.** On Django and Tortoise, `filter: {object: {posts: ...}}` listed and counted a parent once per matching related row. The match is now a subquery, so each row appears once in edges, `totalCount`, aggregates and groups.
+- **Async Django connections returned `null` aggregates and groups** when the resolver ran through `async_safe_resolver`. The query was stashed for aggregation before the worker thread had returned it.
+- **A nested connection's aggregates and groups ignored its parent on Tortoise.** Every parent's connection shared one slot on the context, and concurrent async resolvers overwrote each other's query. The state is now kept per field path.
+
+### Known issues
+
+- On Tortoise, a `NULLS_FIRST`/`NULLS_LAST` order is not applied to a connection's edges, as before. Groups and their `items` do follow it, so `edgeIndices` may not be contiguous under such an order.
 
 ### Changed
 

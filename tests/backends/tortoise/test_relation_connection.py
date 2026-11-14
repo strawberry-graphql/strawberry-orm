@@ -485,14 +485,6 @@ class TestRelationConnection:
                 id: relay.NodeID[int]
                 posts: ORMListConnection[PostNode] = orm.connection.eager()
 
-    async def test_the_window_is_built_only_from_real_columns(self):
-        """The partition and ordering are pasted in, so they are checked first."""
-        from strawberry_orm.backends.tortoise import _quote_ident
-
-        assert _quote_ident("author_id", TPost, '"') == '"author_id"'
-        with pytest.raises(ValueError, match="no column 'nope'"):
-            _quote_ident("nope", TPost, '"')
-
     async def test_filter_values_are_still_bound_not_pasted(self):
         """The window wraps Tortoise's SQL, so its placeholders must survive."""
         orm = _orm()

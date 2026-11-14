@@ -451,155 +451,230 @@ class SQLAlchemyBackend(BaseBackend):
         row = result.one()
         return meta.build_aggregates(row, requested)
 
+    def relation_hop(self, model: type, relation: str) -> Any:
+        from strawberry_orm.grouping import GroupHop
+
+        prop = sa_inspect(model).relationships[relation]
+        return GroupHop(
+            relation=relation,
+            model=model,
+            target=prop.mapper.class_,
+            many=bool(prop.uselist),
+        )
+
     def apply_grouping(
         self,
         query: Any,
-        group_by_input: Any,
+        paths: list[Any],
         info: Any,
         aggregate_meta: AggregateMeta,
         *,
         order_input: Any | None = None,
-    ) -> list[Any]:
-        from sqlalchemy import select
+    ) -> Any:
+        from strawberry_orm.grouping import build_group
 
         model = aggregate_meta.model
-        group_by_list = (
-            group_by_input if isinstance(group_by_input, list) else [group_by_input]
-        )
-
-        subq = query.subquery()
-
-        group_cols, group_key_fields = _extract_sa_group_columns(
-            group_by_list, model, subq
-        )
-        aggregate_meta.group_key_fields = group_key_fields
-
-        if not group_cols:
-            return []
-
         requested = requested_aggregates(info, "groups.aggregates") or {}
-        agg_cols = _build_sa_agg_cols(
+        stmt, values = self._grouped_select(query, model, paths, info)
+        aggregates = _build_sa_agg_cols(
             model,
             requested,
-            subq,
             custom_fields=aggregate_meta.custom_fields,
             info=info,
         )
-
-        stmt = select(*group_cols, *agg_cols).select_from(subq).group_by(*group_cols)
-
-        if order_input:
-            order_clauses = _extract_overlapping_order(
-                order_input, set(group_key_fields), model, subq
-            )
-            if order_clauses:
-                stmt = stmt.order_by(*order_clauses)
-
-        session = self._get_session(info)
-        if self._is_async_session(session):
-            return self._apply_grouping_async(
-                session, stmt, aggregate_meta, requested, group_key_fields
-            )
-
-        result = session.execute(stmt)
-        rows = result.all()
-        return [
-            _build_sa_group(row, aggregate_meta, requested, group_key_fields)
-            for row in rows
-        ]
-
-    async def _apply_grouping_async(
-        self, session, stmt, meta, requested, group_key_fields
-    ):
-        result = await session.execute(stmt)
-        rows = result.all()
-        return [_build_sa_group(row, meta, requested, group_key_fields) for row in rows]
-
-    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
-        key_fields = group_key.__class__.__dataclass_fields__
-        for fname in key_fields:
-            val = getattr(group_key, fname, None)
-            if val is not None:
-                col = getattr(query.column_descriptions[0]["entity"], fname, None)
-                if col is not None:
-                    query = query.where(col == val)
-        return query
+        clauses, joins = _sa_connection_ordering(query, order_input, model)
+        for join in joins:
+            stmt = stmt.outerjoin(join)
+        firsts, ordering = _sa_group_ordering(clauses)
+        keys = list(values.values())
+        stmt = (
+            stmt.add_columns(*aggregates, *firsts)
+            .group_by(*keys)
+            .order_by(*ordering, *keys)
+        )
+        return self._execute_then(
+            info,
+            stmt,
+            lambda result: [
+                build_group(aggregate_meta, paths, row._mapping, requested)
+                for row in result.all()
+            ],
+        )
 
     def batch_group_items(
         self,
         query: Any,
-        group_key_fields: list[str],
+        paths: list[Any],
         info: Any,
         model: type,
         *,
         per_group_limit: int,
         order_input: Any | None = None,
         per_group_offset: int = 0,
-    ) -> dict[tuple, list[Any]]:
+    ) -> Any:
         from collections import defaultdict
 
         from sqlalchemy import func, select
+        from sqlalchemy.orm import aliased
 
-        key_cols = [getattr(model, k) for k in group_key_fields]
-        order_clauses = (
-            _build_sa_order_from_input(order_input, model) if order_input else []
+        from strawberry_orm.grouping import key_tuple
+
+        stmt, values = self._grouped_select(query, model, paths, info)
+        clauses, joins = _sa_connection_ordering(query, order_input, model)
+        for join in joins:
+            stmt = stmt.outerjoin(join)
+        clauses += _missing_pk(clauses, model)
+        rn = func.row_number().over(
+            partition_by=list(values.values()), order_by=clauses
         )
-        order_clauses += _missing_pk(order_clauses, model)
-
-        rn = (
-            func.row_number()
-            .over(
-                partition_by=key_cols,
-                order_by=order_clauses,
+        ranked = stmt.add_columns(*model.__table__.c, rn.label("_rn")).subquery()
+        row = aliased(model, ranked)
+        page = (
+            select(row, *(ranked.c[alias] for alias in values))
+            .where(
+                ranked.c._rn > per_group_offset,
+                ranked.c._rn <= per_group_offset + per_group_limit,
             )
-            .label("_rn")
-        )
-
-        subq = query.add_columns(rn).subquery()
-        ranked_stmt = select(model).from_statement(
             # Ordered by the row number so each group comes back in the order
             # the window put it in; without it the rows arrive however the
             # database found them and the requested order is lost.
-            select(subq)
-            .where(
-                subq.c._rn > per_group_offset,
-                subq.c._rn <= per_group_offset + per_group_limit,
-            )
-            .order_by(subq.c._rn)
+            .order_by(ranked.c._rn)
         )
 
-        session = self._get_session(info)
-        if self._is_async_session(session):
-            return self._batch_group_items_async(
-                session, ranked_stmt, group_key_fields, model
-            )
+        def collect(result: Any) -> dict[tuple, list[Any]]:
+            items_by_key: dict[tuple, list[Any]] = defaultdict(list)
+            for found in result.all():
+                key = key_tuple(paths, found._mapping)
+                items_by_key[key].append(found[0])
+            return dict(items_by_key)
 
-        result = session.execute(ranked_stmt)
-        rows = list(result.scalars().unique().all())
+        return self._execute_then(info, page, collect)
 
-        items_by_key: dict[tuple, list[Any]] = defaultdict(list)
-        for row in rows:
-            key = tuple(
-                str(getattr(row, k)) if getattr(row, k) is not None else None
-                for k in group_key_fields
-            )
-            items_by_key[key].append(row)
-        return dict(items_by_key)
-
-    async def _batch_group_items_async(self, session, stmt, group_key_fields, model):
+    def group_memberships(
+        self, query: Any, paths: list[Any], pks: list[Any], info: Any
+    ) -> Any:
         from collections import defaultdict
 
-        result = await session.execute(stmt)
-        rows = list(result.scalars().unique().all())
+        from strawberry_orm.grouping import key_tuple
 
-        items_by_key: dict[tuple, list[Any]] = defaultdict(list)
-        for row in rows:
-            key = tuple(
-                str(getattr(row, k)) if getattr(row, k) is not None else None
-                for k in group_key_fields
+        model = self.query_model(query)
+        pk = _get_sa_pk_column(model)
+        stmt, _values = self._grouped_select(query, model, paths, info)
+        stmt = stmt.add_columns(pk.label("_pk")).where(pk.in_(pks))
+
+        def collect(result: Any) -> dict[Any, set[tuple]]:
+            found: dict[Any, set[tuple]] = defaultdict(set)
+            for row in result.all():
+                found[row._mapping["_pk"]].add(key_tuple(paths, row._mapping))
+            return dict(found)
+
+        return self._execute_then(info, stmt, collect)
+
+    def _execute_then(self, info: Any, stmt: Any, finish: Any) -> Any:
+        """Run *stmt* on the request's session and hand the result to *finish*."""
+        session = self._get_session(info)
+        if self._is_async_session(session):
+
+            async def run() -> Any:
+                return finish(await session.execute(stmt))
+
+            return run()
+        return finish(session.execute(stmt))
+
+    def _grouped_select(
+        self, query: Any, model: type, paths: list[Any], info: Any
+    ) -> tuple[Any, dict[str, Any]]:
+        """A select over *query*'s rows, once per key, with every path's value.
+
+        Returns the select, whose only columns are the path values labelled by
+        their aliases, and those values by alias. Each hop is an outer join to
+        the related type's scoped rows, so a hidden related row reads as
+        ``None``, as it does on the type. Across a to-many hop the join is to
+        the visible rows alone, leaving one ``None`` row for a parent with none.
+        """
+        from sqlalchemy import select
+
+        pk = _get_sa_pk_column(model)
+        own = query.with_only_columns(pk).order_by(None)
+        stmt = select().select_from(model).where(pk.in_(own))
+        joined: dict[tuple[str, ...], Any] = {}
+        values: dict[str, Any] = {}
+        for path in paths:
+            entity: Any = model
+            chain: tuple[str, ...] = ()
+            for hop in path.hops:
+                chain = (*chain, hop.relation)
+                if chain not in joined:
+                    joined[chain], stmt = self._join_hop(stmt, entity, hop, info)
+                entity = joined[chain]
+            if path.custom is not None:
+                expr = invoke_custom_callback(
+                    path.custom, path.owner, query=query, value=path.value, info=info
+                )
+                if isinstance(expr, tuple):
+                    expr = expr[0]
+            else:
+                expr = getattr(entity, path.column)
+                if path.interval is not None:
+                    expr = _truncate(expr, path.interval, self._dialect)
+            values[path.alias] = expr.label(path.alias)
+        if any(hop.many for path in paths for hop in path.hops):
+            # A row joined to two related rows with the same values would be
+            # grouped twice under one key, so its keys are taken once each.
+            pairs = (
+                stmt.add_columns(pk.label("_orm_pk"), *values.values())
+                .distinct()
+                .subquery()
             )
-            items_by_key[key].append(row)
-        return dict(items_by_key)
+            stmt = select().select_from(model).join(pairs, pairs.c._orm_pk == pk)
+            values = {alias: pairs.c[alias] for alias in values}
+        return stmt.add_columns(*values.values()), values
+
+    def _join_hop(self, stmt: Any, entity: Any, hop: Any, info: Any) -> Any:
+        """Outer-join *hop*'s related rows the caller may see onto *stmt*."""
+        from sqlalchemy import and_, select
+        from sqlalchemy.orm import aliased
+
+        restrict = self.relation_scope(hop.model, hop.relation, info)
+        rows = select(hop.target)
+        if restrict is not None:
+            rows = restrict(rows, info)
+        prop = sa_inspect(hop.model).relationships[hop.relation]
+        if prop.secondary is None:
+            target = aliased(hop.target, rows.subquery())
+            return target, stmt.outerjoin(
+                target, getattr(entity, hop.relation).of_type(target)
+            )
+        # The association table goes inside the scoped rows: joined outside,
+        # a link to a hidden row would still add a row of its own.
+        link = prop.secondary.alias()
+        parents = [
+            link.c[secondary.key].label(f"_orm_parent_{index}")
+            for index, (_parent, secondary) in enumerate(prop.synchronize_pairs)
+        ]
+        linked = (
+            rows.add_columns(*parents)
+            .join(
+                link,
+                and_(
+                    *(
+                        column == link.c[secondary.key]
+                        for column, secondary in prop.secondary_synchronize_pairs
+                    )
+                ),
+            )
+            .subquery()
+        )
+        target = aliased(hop.target, linked)
+        return target, stmt.outerjoin(
+            target,
+            and_(
+                *(
+                    linked.c[f"_orm_parent_{index}"] == parent
+                    for index, (parent, _secondary) in enumerate(prop.synchronize_pairs)
+                )
+            ),
+        )
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -2572,69 +2647,40 @@ def _build_sa_ordering(
     return clauses, joins, query
 
 
-def _resolve_sa_column(col_name: str, model: type, subq: Any = None) -> Any:
-    """Get a column from the subquery (if given) or the model."""
-    if subq is not None:
-        return subq.c.get(col_name)
-    return getattr(model, col_name, None)
+def _truncate(column: Any, interval: Any, dialect: str) -> Any:
+    """*column* cut down to the start of its *interval*.
 
+    PostgreSQL cuts a ``timestamptz`` in the session's time zone. SQLite keeps
+    datetimes as text, so the start of the period is rendered as ISO text.
+    """
+    from sqlalchemy import Date, DateTime, Integer, cast, func
 
-def _extract_sa_group_columns(
-    group_by_list: list[Any], model: type, subq: Any = None
-) -> tuple[list[Any], list[str]]:
-    """Extract SQLAlchemy column expressions and field names from group-by input."""
-    from sqlalchemy import func
+    from strawberry_orm.grouping import SQLITE_PERIOD_START
 
-    cols: list[Any] = []
-    key_fields: list[str] = []
-    seen: set[str] = set()
-
-    for entry in group_by_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            val = getattr(field_val, col_name)
-            if val is strawberry.UNSET or val is None:
-                continue
-            if col_name in seen:
-                continue
-            seen.add(col_name)
-
-            column = _resolve_sa_column(col_name, model, subq)
-            if column is None:
-                continue
-
-            if hasattr(val, "interval"):
-                interval = val.interval
-                if interval == DateGroupByInterval.DAY:
-                    expr = func.date(column)
-                elif interval == DateGroupByInterval.WEEK:
-                    expr = func.strftime("%Y-%W", column)
-                elif interval == DateGroupByInterval.MONTH:
-                    expr = func.strftime("%Y-%m", column)
-                elif interval == DateGroupByInterval.QUARTER:
-                    expr = func.strftime(
-                        "%Y-Q",
-                        column,
-                    )
-                elif interval == DateGroupByInterval.YEAR:
-                    expr = func.strftime("%Y", column)
-                else:
-                    expr = column
-                cols.append(expr.label(col_name))
-            else:
-                cols.append(column.label(col_name))
-            key_fields.append(col_name)
-
-    return cols, key_fields
+    is_datetime = isinstance(column.type, DateTime)
+    if dialect.startswith("postgres"):
+        truncated = func.date_trunc(interval.value.lower(), column)
+        return truncated if is_datetime else cast(truncated, Date)
+    if dialect == "sqlite":
+        fmt = "%Y-%m-%dT%H:%M:%S" if is_datetime else "%Y-%m-%d"
+        if interval is DateGroupByInterval.QUARTER:
+            months_in = (cast(func.strftime("%m", column), Integer) - 1) % 3
+            modifiers: tuple[Any, ...] = (
+                "start of month",
+                func.printf("-%d months", months_in),
+            )
+        else:
+            modifiers = SQLITE_PERIOD_START[interval]
+        return func.strftime(fmt, column, *modifiers)
+    raise ValueError(
+        f"Grouping by a date interval is supported on PostgreSQL and SQLite, "
+        f"not {dialect}."
+    )
 
 
 def _build_sa_agg_cols(
     model: type,
     requested: dict[str, Any],
-    subq: Any = None,
     *,
     custom_fields: list[tuple[str, Any, type]] | None = None,
     info: Any = None,
@@ -2652,116 +2698,115 @@ def _build_sa_agg_cols(
         ("max", func.max),
     ]:
         for fname in requested.get(func_name, []):
-            col = _resolve_sa_column(fname, model, subq)
+            col = getattr(model, fname, None)
             if col is not None:
                 agg_cols.append(sql_func(col).label(f"_{func_name}_{fname}"))
     if custom_fields:
-        columns = subq.c if subq is not None else None
-        if columns is not None:
-            for field_name, handler, _rtype in custom_fields:
-                expr = _invoke_aggregate_handler(handler, columns, info=info)
-                if expr is not None:
-                    agg_cols.append(expr.label(f"_custom_{field_name}"))
+        columns = model.__table__.c  # type: ignore[attr-defined]
+        for field_name, handler, _rtype in custom_fields:
+            expr = _invoke_aggregate_handler(handler, columns, info=info)
+            if expr is not None:
+                agg_cols.append(expr.label(f"_custom_{field_name}"))
     return agg_cols
 
 
-def _build_sa_group(
-    row: Any,
-    meta: Any,
-    requested: dict[str, Any],
-    group_key_fields: list[str],
-) -> Any:
-    """Build a group instance from a SQL row."""
-    key = meta.build_group_key(row, group_key_fields)
-    aggregates = meta.build_aggregates(row, requested)
+def _order_parts(clause: Any) -> tuple[Any, bool, str | None]:
+    """``(expression, descending, nulls)`` for one ORDER BY clause."""
+    from sqlalchemy.sql import operators
+    from sqlalchemy.sql.elements import UnaryExpression
 
-    group_cls = type(
-        "_Group",
-        (),
-        {
-            "key": key,
-            "aggregates": aggregates,
-            "edge_indices": [],
-            "_items_nodes": None,
-            "_orm_base_query": None,
-            "_orm_backend": None,
-            "_orm_model": None,
-        },
-    )
-    return group_cls()
+    descending = False
+    nulls: str | None = None
+    while isinstance(clause, UnaryExpression) and clause.modifier in (
+        operators.asc_op,
+        operators.desc_op,
+        operators.nulls_first_op,
+        operators.nulls_last_op,
+    ):
+        if clause.modifier is operators.desc_op:
+            descending = True
+        elif clause.modifier is operators.nulls_first_op:
+            nulls = "first"
+        elif clause.modifier is operators.nulls_last_op:
+            nulls = "last"
+        clause = clause.element
+    return clause, descending, nulls
 
 
-def _extract_overlapping_order(
+def _sa_connection_ordering(
+    query: Any, order_input: Any, model: type
+) -> tuple[list[Any], list[Any]]:
+    """The order the connection reads its rows in, and the joins it needs.
+
+    The client's ``order`` when given, else the query's own. An order through
+    a to-many relation is left out: its join would repeat rows. A query's own
+    clauses are kept only when they read the model's table, the one thing a
+    select over the model's rows is sure to have.
+    """
+    if not order_input:
+        table = model.__table__  # type: ignore[attr-defined]
+        return [
+            clause
+            for clause in query._order_by_clauses
+            if getattr(_order_parts(clause)[0], "table", None) is table
+        ], []
+    clauses: list[Any] = []
+    joins: list[Any] = []
+    for entry in order_input if isinstance(order_input, list) else [order_input]:
+        _sa_order_clauses(entry, model, (), clauses, joins)
+    return clauses, joins
+
+
+def _sa_order_clauses(
     order_input: Any,
-    group_field_names: set[str],
     model: type,
-    subq: Any = None,
-) -> list[Any]:
-    """Extract ORDER BY clauses for group fields that overlap with root order."""
-    from sqlalchemy import asc, desc
-
-    order_list = order_input if isinstance(order_input, list) else [order_input]
-    clauses: list[Any] = []
-
-    for entry in order_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
+    path: tuple[Any, ...],
+    clauses: list[Any],
+    joins: list[Any],
+) -> None:
+    """Collect one order input's column clauses, and the joins they need."""
+    for key in order_input.__class__.__dataclass_fields__:
+        value = getattr(order_input, key)
+        if value is strawberry.UNSET or value is None:
             continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            direction = getattr(field_val, col_name)
-            if direction is strawberry.UNSET or direction is None:
-                continue
-            if col_name not in group_field_names:
-                continue
-            column = _resolve_sa_column(col_name, model, subq)
-            if column is None:
-                continue
-            dir_value = (
-                direction.value if hasattr(direction, "value") else str(direction)
-            )
-            if dir_value.startswith("ASC"):
-                clauses.append(asc(column))
-            else:
-                clauses.append(desc(column))
-
-    return clauses
+        if key == "field":
+            if path:
+                joins.extend(join for join in path if join not in joins)
+            clauses.extend(_build_sa_order_field(value, model))
+        elif key == "object":
+            for relation in value.__class__.__dataclass_fields__:
+                nested = getattr(value, relation)
+                if nested is strawberry.UNSET or nested is None:
+                    continue
+                join = getattr(model, relation)
+                if join.property.uselist:
+                    continue
+                _sa_order_clauses(
+                    nested, join.property.mapper.class_, (*path, join), clauses, joins
+                )
 
 
-def _build_sa_order_from_input(order_input: Any, model: type) -> list[Any]:
-    """Convert an order input into SQLAlchemy ORDER BY clauses."""
-    order_list = order_input if isinstance(order_input, list) else [order_input]
-    clauses: list[Any] = []
-    for entry in order_list:
-        clauses.extend(_build_sa_order_field_clauses(entry, model))
-    if not clauses:
-        pk_col = _get_sa_pk_column(model)
-        clauses.append(pk_col)
-    return clauses
+def _sa_group_ordering(clauses: list[Any]) -> tuple[list[Any], list[Any]]:
+    """Order groups as their first rows come in the connection's order.
 
+    Read in that order, a group starts at its least value of each clause, or
+    its greatest for a descending one, so groups are ranked by those.
+    """
+    from sqlalchemy import func
 
-def _build_sa_order_field_clauses(entry: Any, model: type) -> list[Any]:
-    """Extract clauses from a single order entry."""
-    from sqlalchemy import asc, desc
-
-    clauses: list[Any] = []
-    field_val = getattr(entry, "field", None)
-    if field_val is None or field_val is strawberry.UNSET:
-        return clauses
-    entry_fields = field_val.__class__.__dataclass_fields__
-    for col_name in entry_fields:
-        direction = getattr(field_val, col_name)
-        if direction is strawberry.UNSET or direction is None:
-            continue
-        column = getattr(model, col_name, None)
-        if column is None:
-            continue
-        dir_value = direction.value if hasattr(direction, "value") else str(direction)
-        if dir_value.startswith("ASC"):
-            clauses.append(asc(column))
-        else:
-            clauses.append(desc(column))
-    return clauses
+    firsts: list[Any] = []
+    ordering: list[Any] = []
+    for index, clause in enumerate(clauses):
+        expr, descending, nulls = _order_parts(clause)
+        first = (func.max if descending else func.min)(expr).label(f"_o{index}")
+        ranked = first.desc() if descending else first.asc()
+        if nulls == "first":
+            ranked = ranked.nulls_first()
+        elif nulls == "last":
+            ranked = ranked.nulls_last()
+        firsts.append(first)
+        ordering.append(ranked)
+    return firsts, ordering
 
 
 def _build_sa_order_field(field_input: Any, model: type) -> list[Any]:

@@ -39,19 +39,14 @@ if not settings.configured:
     )
     django.setup()
 
-from strawberry_orm import AbstractRepo, Ordering
+from strawberry_orm import AbstractRepo
 from strawberry_orm._async import async_safe_resolver
 from strawberry_orm.backends._base import AggregateMeta, BaseBackend
-from strawberry_orm.backends.django import (
-    DjangoBackend,
-    _extract_django_overlapping_order,
-)
+from strawberry_orm.backends.django import DjangoBackend
 from strawberry_orm.backends.sqlalchemy import (
     SQLAlchemyBackend,
     _build_sa_filter,
     _coerce_reference_value,
-    _extract_overlapping_order,
-    _extract_sa_group_columns,
     _introspect_sa_model,
     _invoke_aggregate_handler,
 )
@@ -509,26 +504,6 @@ class TestSQLAlchemyRemaining:
         result = backend.apply_aggregation(select(Post), info, meta)
         assert result.count == 0
 
-    def test_apply_grouping_empty_group_cols(self, sa_session, seed, Post):
-        backend = SQLAlchemyBackend(dialect="sqlite")
-        meta = backend._build_aggregate_types(Post)
-
-        @strawberry.input
-        class EmptyField:
-            pass
-
-        @strawberry.input
-        class EmptyGroup:
-            field: EmptyField | None = strawberry.UNSET
-
-        groups = backend.apply_grouping(
-            select(Post),
-            EmptyGroup(),
-            SimpleNamespace(selected_fields=[], context={"session": sa_session}),
-            meta,
-        )
-        assert groups == []
-
     def test_coerce_reference_value_branches(self):
         assert _coerce_reference_value(3) == 3
         assert _coerce_reference_value("abc") == "abc"
@@ -543,40 +518,6 @@ class TestSQLAlchemyRemaining:
         )
         clause, _ = _build_sa_filter(PostFilter(object=obj), Post)
         assert clause is not None
-
-    def test_extract_sa_group_duplicate_and_overlapping_order(self, Post):
-        @strawberry.input
-        class GroupField:
-            author_id: bool | None = True
-            author_id_dup: bool | None = True
-
-        @strawberry.input
-        class GroupEntry:
-            field: GroupField | None = strawberry.UNSET
-
-        subq = select(Post).subquery()
-        _, keys = _extract_sa_group_columns(
-            [GroupEntry(field=GroupField(author_id=True, author_id_dup=True))],
-            Post,
-            subq,
-        )
-        assert keys == ["author_id"]
-
-        @strawberry.input
-        class OrderField:
-            author_id: Ordering | None = Ordering.ASC
-
-        @strawberry.input
-        class OrderEntry:
-            field: OrderField | None = strawberry.UNSET
-
-        clauses = _extract_overlapping_order(
-            OrderEntry(field=OrderField(author_id=Ordering.ASC)),
-            {"author_id"},
-            Post,
-            subq,
-        )
-        assert len(clauses) == 1
 
     def test_optimizer_leaf_loader_and_only(self, sa_session, seed, User, Post):
         backend = SQLAlchemyBackend(dialect="sqlite")
@@ -776,8 +717,7 @@ class TestFinal100Coverage:
         assert not any("author" in str(w.message) for w in caught)
 
     @pytest.mark.django_db
-    def test_django_apply_aggregation_and_overlapping_order(self, seed):
-        from tests.backends.django.fixtures import PostOrder
+    def test_django_apply_aggregation_with_nothing_to_sum(self, seed):
         from tests.backends.django.models import Post as DjPost
 
         backend = DjangoBackend()
@@ -792,9 +732,3 @@ class TestFinal100Coverage:
         )
         result = backend.apply_aggregation(DjPost.objects.all(), info, meta)
         assert result.count == 0
-
-        overlap = _extract_django_overlapping_order(
-            PostOrder(field=PostOrder._field_type(is_published=Ordering.ASC)),
-            {"is_published"},
-        )
-        assert overlap == ["is_published"]

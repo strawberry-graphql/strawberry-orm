@@ -1401,7 +1401,7 @@ class UserOrder:
 
 ### Custom group-by types
 
-`orm.group_type(Model)` works like `orm.filter_type()` and `orm.order_type()`. `auto` fields get the standard group-by type (`Boolean` or `DateGroupByOption`). Methods decorated with `@group_field` add custom grouping logic:
+`orm.group_type(Model)` works like `orm.filter_type()` and `orm.order_type()`. `auto` columns get the standard group-by type (`Boolean` or `DateGroupByOption`), and an `auto` relation is offered under `object:` once its model has a group-by type of its own. Methods decorated with `@group_field` add custom grouping logic:
 
 ```python
 from strawberry_orm import group_field
@@ -1410,6 +1410,7 @@ from strawberry_orm import group_field
 class OrderGroupBy:
     status: auto         # standard Boolean group-by
     created_at: auto     # DateGroupByOption with interval
+    customer: auto       # object: { customer: ... }, given orm.group(Customer)
 
     @group_field
     def by_customer_tier(self, value: bool, query):
@@ -1420,6 +1421,8 @@ class OrderGroupBy:
             else_="standard",
         ).label("customer_tier")
 ```
+
+A `@group_field` method takes `(self, value, query)`, plus `info` if it names it, and returns what to group by: a column expression on SQLAlchemy; an expression or a field name (`"customer__tier"`) on Django; an `F`, a function, a `Case`, a field name or a pypika term on Tortoise. An `(expression, label)` tuple is accepted too. The group key reports the value as a string under the method's name (`key { byCustomerTier }`). It groups the model itself, so it cannot be reached through another model's `object:`.
 
 ### Combining with `orm.filter()` / `orm.order()`
 
@@ -1515,10 +1518,41 @@ Auto-generated aggregate types include `count`, `sum`, `avg`, `min`, and `max` �
 
 Each group includes:
 
-- `key` — the group-by column values
+- `key` — the group-by values, as strings (`null` for rows with no value)
 - `aggregates` — per-group aggregate values (count, sum, avg, min, max)
-- `edgeIndices` — indices into the parent connection's `edges` array
-- `items` — a nested cursor-paginated connection of items in that group
+- `edgeIndices` — indices into the parent connection's `edges` array. A `null` key matches only rows whose value is null.
+- `items` — a nested cursor-paginated connection of items in that group, in the connection's order
+
+Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `order` through a to-many relation does not rank groups. Grouping does not need an `order` on the grouped column.
+
+### Grouping by related rows
+
+`object:` groups by a column of a related row, through a foreign key, a reverse foreign key or a many-to-many relation. The key nests one level per relation, and you can group by any column the related type shows, not only its primary key:
+
+```graphql
+{
+  posts(
+    groupBy: [{ object: { author: { field: { id: true } } } },
+              { object: { author: { field: { name: true } } } }]
+    order: [{ object: { author: { field: { name: ASC } } } }]
+  ) {
+    groups {
+      key { author { id name } }
+      aggregates { count sum { views } }
+      edgeIndices
+    }
+  }
+}
+```
+
+- A relation is offered when the related model has a group-by type (`orm.group(Author)`, registered first) and the type shows the relation as stored, e.g. `author: AuthorNode | None`.
+- Grouping reads the related row through the related type's `scope_rows`. A row whose related row the caller cannot see is grouped under `null`, as the field reads on the type.
+- Across a to-many relation (`tags`, or a reverse foreign key such as `author.posts`), a row is grouped once under each distinct key its visible related rows give, and once under `null` if it has none. A post tagged `python` and `rust` is counted in both groups, and in its own edge's `edgeIndices` for each. The groups' counts can therefore add up to more than `totalCount`.
+- A to-many relation can only be the first relation in a path.
+
+A relation the type shows through its own resolver (`@strawberry.field def category(self) -> CategoryNode`) is not offered, because the ORM cannot tell what the resolver returns. You can show the relation as stored (`category: CategoryNode | None`), show its foreign key column (`category_id: auto`) and group by that, or declare a `@group_field` that returns the column you want to group by.
+
+### Grouping by date intervals
 
 Date/datetime fields support interval-based grouping:
 
@@ -1535,7 +1569,7 @@ Date/datetime fields support interval-based grouping:
 }
 ```
 
-Supported intervals: `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`.
+Supported intervals: `DAY`, `WEEK` (starting Monday), `MONTH`, `QUARTER`, `YEAR`. The key is the start of the period in ISO 8601 (`"2026-03-01T00:00:00"`). On Django the period is cut in the current time zone when `USE_TZ` is on, and the key carries its offset (`"2026-03-01T00:00:00-05:00"`). SQLAlchemy and Tortoise cut periods on PostgreSQL (in the session's time zone) and SQLite; other databases raise an error.
 
 ### Custom aggregates
 

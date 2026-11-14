@@ -175,33 +175,31 @@ class Backend(Protocol):
         """
         ...
 
+    def relation_hop(self, model: type, relation: str) -> Any:
+        """The ``GroupHop`` a group-by path takes across *model*'s *relation*."""
+        ...
+
     def apply_grouping(
         self,
         query: Any,
-        group_by_input: Any,
+        paths: list[Any],
         info: Any,
         aggregate_meta: Any,
         *,
         order_input: Any | None = None,
     ) -> AwaitableOrValue[list[Any]]:
-        """Run GROUP BY with aggregates and return Group instances.
+        """Run GROUP BY over *paths* with aggregates and return the groups.
 
-        If *order_input* contains fields that overlap with *group_by_input*,
-        the groups are sorted by those fields.
-        """
-        ...
-
-    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
-        """Add WHERE clauses to *query* matching the group key values.
-
-        Fallback for unbatched per-group ``items`` resolution.
+        Each related hop is read through the related type's scope, so a row
+        the caller cannot see groups as ``None``. Groups come in the order the
+        connection's own order puts their first rows in.
         """
         ...
 
     def batch_group_items(
         self,
         query: Any,
-        group_key_fields: list[str],
+        paths: list[Any],
         info: Any,
         model: type,
         *,
@@ -213,8 +211,15 @@ class Backend(Protocol):
         for every group in one query.
 
         Uses ``ROW_NUMBER() OVER (PARTITION BY ...)`` to avoid N+1.
-        Returns a dict mapping group-key tuples to lists of model instances.
+        Returns a dict mapping each group's formatted key values to lists of
+        model instances.
         """
+        ...
+
+    def group_memberships(
+        self, query: Any, paths: list[Any], pks: list[Any], info: Any
+    ) -> AwaitableOrValue[dict[Any, set[tuple]]]:
+        """The formatted group keys each of the rows *pks* is grouped under."""
         ...
 
     def group_counts(

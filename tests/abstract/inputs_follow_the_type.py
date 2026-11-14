@@ -349,13 +349,31 @@ class AbstractTestInputsFollowTheType:
     def test_grouping_needs_a_column_to_group_by(self, orm, models):
         import pytest
 
+        @orm.group_type(models.User)
+        class ByName:
+            name: strawberry.auto
+
+        @orm.type(models.User, group=ByName)
+        class UserNode(relay.Node):
+            @classmethod
+            def resolve_id(cls, root, *, info):
+                return "x"  # pragma: no cover - never resolved
+
+            @strawberry.field
+            def label(self) -> str:
+                return "x"  # pragma: no cover - never resolved
+
+        with pytest.raises(ValueError, match="UserGroupBy is left with nothing"):
+            _users_schema(orm, UserNode)
+
+    def test_a_custom_group_needs_no_column_shown(self, orm, models):
         from strawberry_orm import group_field
 
         @orm.group_type(models.User)
         class ByDomain:
             @group_field
-            def domain(self, query, value, info):
-                return query  # pragma: no cover - never queried
+            def domain(self, value, query):
+                return "name"  # pragma: no cover - never queried
 
         @orm.type(models.User, group=ByDomain)
         class UserNode(relay.Node):
@@ -367,8 +385,8 @@ class AbstractTestInputsFollowTheType:
             def label(self) -> str:
                 return "x"  # pragma: no cover - never resolved
 
-        with pytest.raises(ValueError, match="cannot be grouped"):
-            _users_schema(orm, UserNode)
+        sdl = str(_users_schema(orm, UserNode))
+        assert "domain: Boolean" in sdl
 
     def test_a_shared_input_is_in_the_schemas_both_types_show_it_in(self, orm, models):
         shared = orm.filter(models.User)

@@ -1,6 +1,5 @@
 """SQLAlchemy-specific exact branch coverage."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +18,7 @@ from strawberry_orm.backends.sqlalchemy import (
     _introspect_sa_model,
 )
 from strawberry_orm.filters import ReferenceLookup, StringLookup
+from strawberry_orm.grouping import GroupPath, group_paths
 from tests.backends.sqlalchemy.models import Base as SABase
 from tests.backends.sqlalchemy.models import Post as SAPost
 from tests.backends.sqlalchemy.models import Tag as SATag
@@ -238,7 +238,11 @@ class TestInternalSqlalchemyExtraCoverage:
         )
         groups = await backend.apply_grouping(
             query,
-            _AsyncAuthorGroupBy(field=_AsyncAuthorGroupField(author_id=True)),
+            group_paths(
+                backend,
+                SAPost,
+                _AsyncAuthorGroupBy(field=_AsyncAuthorGroupField(author_id=True)),
+            ),
             group_info,
             meta,
             order_input=_AsyncAuthorOrder(
@@ -247,17 +251,10 @@ class TestInternalSqlalchemyExtraCoverage:
         )
         assert len(groups) == 3
 
-        @dataclass
-        class ScopeKey:
-            author_id: int | None = 1
-
-        scoped = backend.scope_query_to_group(select(SAPost), ScopeKey())
-        assert "author_id" in str(scoped)
-
         batch_info = SimpleNamespace(context={"session": async_session})
         batched = await backend.batch_group_items(
             select(SAPost),
-            ["author_id"],
+            [GroupPath(alias="_g0", name="author_id", column="author_id")],
             batch_info,
             SAPost,
             per_group_limit=1,

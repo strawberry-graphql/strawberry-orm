@@ -86,6 +86,7 @@ from strawberry_orm.optimizer.extension import (
 )
 from strawberry_orm.policy import _policy_to_repos
 from strawberry_orm.relay.connection import (
+    ConnectionState,
     ORMConnectionExtension,
     ORMListConnection,
     _await_nodes_if_needed,
@@ -93,15 +94,15 @@ from strawberry_orm.relay.connection import (
     _connection_total_count,
     _extract_items_after,
     _extract_items_first,
-    _extract_items_order,
     _get_items_arg,
     _items_window,
-    _node_matches_group_key,
     _should_await_nodes,
     _use_orm_connection_extension,
+    connection_state,
     connection_type_for_node,
+    stash_state,
 )
-from strawberry_orm.types import DateGroupByOption, Ordering, auto
+from strawberry_orm.types import auto
 from tests.backends.sqlalchemy.models import Base as SABase
 from tests.backends.sqlalchemy.models import Comment as SAComment
 from tests.backends.sqlalchemy.models import Post as SAPost
@@ -948,6 +949,19 @@ class TestCoreCoverage:
             result = ext.resolve(lambda *_args, **_kwargs: [], None, SimpleNamespace())
         assert result is query
 
+    def test_auto_filter_order_sync_resolve_finishes_pending_rows(self):
+        backend = SimpleNamespace(is_query_object=lambda value: False)
+        ext = _AutoFilterOrderExtension(backend)
+        ext._model = object
+        ext._is_configured = True
+
+        async def rows():
+            return [1, 2]
+
+        with patch.object(ext, "_apply", return_value=rows()):
+            result = ext.resolve(lambda *_args, **_kwargs: [], None, SimpleNamespace())
+        assert result == [1, 2]
+
     def test_build_grouped_connection_without_node(self, Post):
         backend = SQLAlchemyBackend(dialect="sqlite")
         group_type = backend.group(SAPost)
@@ -1202,13 +1216,16 @@ class TestMiscCoverage:
                     selections=[agg_sel, groups_sel],
                 )
             ],
-            context={
-                "session": sa_session,
-                "_orm_backend": backend,
-                "_orm_base_query": backend.get_default_queryset(SAPost),
-                "_orm_group_by": [group_type(field=group_field(is_published=True))],
-                "_orm_order": None,
-            },
+            context={"session": sa_session},
+            path=SimpleNamespace(as_list=lambda: ["orders"]),
+        )
+        stash_state(
+            info,
+            ConnectionState(
+                backend=backend,
+                base_query=backend.get_default_queryset(SAPost),
+                group_by=[group_type(field=group_field(is_published=True))],
+            ),
         )
 
         result = Conn._post_process_connection(connection, info=info)
@@ -1357,69 +1374,10 @@ class TestFinalCoveragePush:
         assert _primary_key(SimpleNamespace(id=5)) == 5
         assert _primary_key(SimpleNamespace(pk=7)) == 7
 
-    @pytest.mark.asyncio
-    async def test_tortoise_grouping_helper_duplicate_and_order_branches(self):
-        from strawberry_orm.backends.tortoise import (
-            _build_tortoise_order_from_input,
-            _extract_tortoise_group_fields,
-            _extract_tortoise_overlapping_order,
-        )
-        from strawberry_orm.types import Ordering
-
-        @strawberry.input
-        class GroupField:
-            title: bool | None = True
-            title_dup: bool | None = True
-
-        @strawberry.input
-        class GroupEntry:
-            field: GroupField | None = strawberry.UNSET
-
-        fields, keys = _extract_tortoise_group_fields([GroupEntry(field=GroupField())])
-        assert "title" in fields
-
-        @strawberry.input
-        class OrderField:
-            title: Ordering | None = strawberry.UNSET
-            other: Ordering | None = strawberry.UNSET
-
-        @strawberry.input
-        class OrderEntry:
-            field: OrderField | None = strawberry.UNSET
-
-        overlap = _extract_tortoise_overlapping_order(
-            OrderEntry(field=OrderField(title=Ordering.ASC, other=Ordering.DESC)),
-            {"title"},
-        )
-        assert overlap == ["title"]
-        assert _build_tortoise_order_from_input(
-            OrderEntry(field=OrderField(title=Ordering.ASC, other=Ordering.DESC))
-        ) == ["title", "-other"]
-
-    def test_sqlalchemy_primary_key_and_group_else_interval(self):
-        from strawberry_orm.backends.sqlalchemy import (
-            _extract_sa_group_columns,
-            _primary_key,
-        )
+    def test_sqlalchemy_primary_key(self):
+        from strawberry_orm.backends.sqlalchemy import _primary_key
 
         assert _primary_key(SimpleNamespace(id=1)) == 1
-
-        @strawberry.input
-        class UnknownInterval:
-            interval: str = "unknown"
-
-        @strawberry.input
-        class DateField:
-            created_at: DateGroupByOption | UnknownInterval | None = strawberry.UNSET
-
-        @strawberry.input
-        class GroupEntry:
-            field: DateField | None = strawberry.UNSET
-
-        cols, keys = _extract_sa_group_columns(
-            [GroupEntry(field=DateField(created_at=UnknownInterval()))], SAUser
-        )
-        assert keys == ["created_at"]
 
     @pytest.mark.asyncio
     async def test_sqlalchemy_apply_ref_list_async_no_repo_branches(self):
@@ -1501,11 +1459,6 @@ class TestFinalCoveragePush:
     def test_lazy_resolution_extension_class_detection(self):
         ext_cls = LazyResolutionExtension.configure(DjangoBackend(), mode="off")
         assert extensions_include_lazy_resolution([ext_cls]) is True
-
-    def test_relay_node_matches_group_key_skips_none_key(self):
-        key = SimpleNamespace(status=None)
-        node = SimpleNamespace(status="x")
-        assert _node_matches_group_key(node, key, ["status"]) is True
 
     @pytest.mark.asyncio
     async def test_repo_tortoise_and_sa_delete_paths(self):
@@ -1735,7 +1688,6 @@ class TestPushTo98:
         assert _items_window(_items_info(last=2)) == (0, 11)
         assert _extract_items_first(SimpleNamespace(selected_fields=[])) is None
         assert _extract_items_after(SimpleNamespace(selected_fields=[])) is None
-        assert _extract_items_order(SimpleNamespace(selected_fields=[])) is None
 
     def test_filter_pk_shortcut_failure_and_limit_branches(self):
         from strawberry_orm.filters import StringLookup
@@ -1981,15 +1933,15 @@ class TestPushTo98:
         arg_names = {arg.python_name for arg in field.arguments}
         assert "group_by" in arg_names
 
-        ctx = SimpleNamespace()
-        ext._stash_context(
-            SimpleNamespace(context=ctx),
-            orm.backend.get_default_queryset(SAUser),
-            group_by=[],
-            order=[],
+        info = SimpleNamespace(
+            context=SimpleNamespace(), path=SimpleNamespace(as_list=lambda: ["users"])
         )
-        assert ctx._orm_backend is orm.backend
-        assert ctx._orm_base_query is not None
+        ext._stash_context(
+            info, orm.backend.get_default_queryset(SAUser), group_by=[], order=[]
+        )
+        state = connection_state(info)
+        assert state.backend is orm.backend
+        assert state.base_query is not None
 
     def test_lazy_resolution_prefetch_and_unknown_backend(self):
         from strawberry_orm.lazy_resolution import (
@@ -2457,8 +2409,6 @@ class TestLastCoverageLines:
             _build_reference_lookup_clauses,
             _build_sa_filter,
             _build_sa_order_field,
-            _build_sa_order_from_input,
-            _extract_overlapping_order,
         )
         from tests.backends.sqlalchemy.fixtures import PostType
 
@@ -2484,21 +2434,10 @@ class TestLastCoverageLines:
                 max_in_list_size=500,
             )
 
-        subq = select(Post).subquery()
-
         @strawberry.input
         class EmptyOrderField:
             pass
 
-        @strawberry.input
-        class EmptyOrderEntry:
-            field: EmptyOrderField | None = strawberry.UNSET
-
-        assert (
-            _extract_overlapping_order(EmptyOrderEntry(), {"author_id"}, Post, subq)
-            == []
-        )
-        assert _build_sa_order_from_input(EmptyOrderEntry(), Post)
         assert _build_sa_order_field(EmptyOrderField(), Post) == []
 
         backend._type_registry["UserType"] = SAUser

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal
 from inspect import iscoroutinefunction
 from typing import Any
@@ -513,6 +514,12 @@ class DjangoBackend(BaseBackend):
             max_in_list_size=self._max_in_list_size,
         )
         if q_obj is not None:
+            if self.filter_crosses_to_many(filter_input, model):
+                # Matched in a subquery, so the outer query keeps each row once.
+                from django.db.models import Q
+
+                matching = model._base_manager.filter(q_obj)  # type: ignore[attr-defined]
+                q_obj = Q(pk__in=matching.values("pk"))
             query = query.filter(q_obj)
         return query
 
@@ -553,86 +560,57 @@ class DjangoBackend(BaseBackend):
             return aggregate_meta.aggregates_type(count=0)
 
         def _run():
-            result = query.aggregate(**agg_kwargs)
+            result = _own_rows(query).aggregate(**agg_kwargs)
             row = type("Row", (), result)()
             return aggregate_meta.build_aggregates(row, requested)
 
         return run_sync(_run, thread_sensitive=True)
 
+    def relation_hop(self, model: type, relation: str) -> Any:
+        from strawberry_orm.grouping import GroupHop
+
+        field = model._meta.get_field(relation)  # type: ignore[attr-defined]
+        return GroupHop(
+            relation=relation,
+            model=model,
+            target=field.related_model,
+            many=_relation_kind(field) == "many",
+        )
+
     def apply_grouping(
         self,
         query: Any,
-        group_by_input: Any,
+        paths: list[Any],
         info: Any,
         aggregate_meta: AggregateMeta,
         *,
         order_input: Any | None = None,
     ) -> list[Any]:
-        from django.db.models import Avg, Count, Max, Min, Sum
-
-        group_by_list = (
-            group_by_input if isinstance(group_by_input, list) else [group_by_input]
-        )
-        group_fields, group_key_fields = _extract_django_group_fields(group_by_list)
-        aggregate_meta.group_key_fields = group_key_fields
-
-        if not group_fields:
-            return []
+        from strawberry_orm.grouping import build_group
 
         requested = requested_aggregates(info, "groups.aggregates") or {}
-        agg_kwargs: dict[str, Any] = {}
-        if requested.get("count"):
-            agg_kwargs["_count"] = Count("*")
-        _DJANGO_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
-        for func_name, AggCls in _DJANGO_AGG.items():
-            for fname in requested.get(func_name, []):
-                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
+        aggregates = _django_aggregates(requested)
+        aliases = [path.alias for path in paths]
 
         def _run():
-            qs = query.values(*group_fields).annotate(**agg_kwargs)
-            if order_input:
-                order_clauses = _extract_django_overlapping_order(
-                    order_input, set(group_key_fields)
-                )
-                if order_clauses:
-                    qs = qs.order_by(*order_clauses)
-            results = list(qs)
-            groups = []
-            for row_dict in results:
-                row = type("Row", (), row_dict)()
-                key = aggregate_meta.build_group_key(row, group_key_fields)
-                aggregates = aggregate_meta.build_aggregates(row, requested)
-                group_obj = type(
-                    "_Group",
-                    (),
-                    {
-                        "key": key,
-                        "aggregates": aggregates,
-                        "edge_indices": [],
-                        "_items_nodes": None,
-                        "_orm_base_query": None,
-                        "_orm_backend": None,
-                        "_orm_model": None,
-                    },
-                )()
-                groups.append(group_obj)
-            return groups
+            rows = self._grouped_rows(query, paths, info)
+            firsts, ordering = _group_ordering(_connection_ordering(query, order_input))
+            grouped = (
+                rows.order_by()
+                .values(*aliases)
+                .annotate(**aggregates, **firsts)
+                .order_by(*ordering, *aliases)
+            )
+            return [
+                build_group(aggregate_meta, paths, row, requested) for row in grouped
+            ]
 
         return run_sync(_run, thread_sensitive=True)
-
-    def scope_query_to_group(self, query: Any, group_key: Any) -> Any:
-        key_fields = group_key.__class__.__dataclass_fields__
-        filters: dict[str, Any] = {}
-        for fname in key_fields:
-            val = getattr(group_key, fname, None)
-            if val is not None:
-                filters[fname] = val
-        return query.filter(**filters)
 
     def batch_group_items(
         self,
         query: Any,
-        group_key_fields: list[str],
+        paths: list[Any],
         info: Any,
         model: type,
         *,
@@ -645,18 +623,20 @@ class DjangoBackend(BaseBackend):
         from django.db.models import F, Window
         from django.db.models.functions import RowNumber
 
-        partition = [F(k) for k in group_key_fields]
-        ordering = _build_django_order_from_input(order_input) if order_input else []
+        from strawberry_orm.grouping import key_tuple
+
+        ordering = _connection_ordering(query, order_input)
         tiebreak = _pk_tiebreak(ordering, model)
         if tiebreak is not None:
-            ordering = [*ordering, F(tiebreak)]
+            ordering = [*ordering, F(tiebreak).asc()]
 
         def _run():
             qs = (
-                query.annotate(
+                self._grouped_rows(query, paths, info)
+                .annotate(
                     _rn=Window(
                         expression=RowNumber(),
-                        partition_by=partition,
+                        partition_by=[F(path.alias) for path in paths],
                         order_by=ordering,
                     )
                 )
@@ -669,17 +649,147 @@ class DjangoBackend(BaseBackend):
                 # however the database found them and the order is lost.
                 .order_by("_rn")
             )
-            rows = list(qs)
             items_by_key: dict[tuple, list[Any]] = defaultdict(list)
-            for row in rows:
-                key = tuple(
-                    str(getattr(row, k)) if getattr(row, k) is not None else None
-                    for k in group_key_fields
-                )
-                items_by_key[key].append(row)
+            for row in qs:
+                values = {path.alias: getattr(row, path.alias) for path in paths}
+                items_by_key[key_tuple(paths, values)].append(row)
             return dict(items_by_key)
 
         return run_sync(_run, thread_sensitive=True)
+
+    def group_memberships(
+        self, query: Any, paths: list[Any], pks: list[Any], info: Any
+    ) -> Any:
+        from collections import defaultdict
+
+        from strawberry_orm.grouping import key_tuple
+
+        def _run():
+            rows = (
+                self._grouped_rows(query, paths, info)
+                .filter(pk__in=pks)
+                .order_by()
+                .values("pk", *(path.alias for path in paths))
+            )
+            found: dict[Any, set[tuple]] = defaultdict(set)
+            for row in rows:
+                found[row["pk"]].add(key_tuple(paths, row))
+            return dict(found)
+
+        return run_sync(_run, thread_sensitive=True)
+
+    def _grouped_rows(self, query: Any, paths: list[Any], info: Any) -> Any:
+        """*query*'s rows, each annotated with its value for every path.
+
+        A row appears once per key a to-many path reads off its related rows,
+        and once with ``None`` when it has none the caller may see.
+        """
+        from django.db.models import Exists, F
+
+        rows = _own_rows(query)
+        markers: dict[str, Any] = {}
+        keep: list[Any] = []
+        values = {
+            path.alias: self._group_value(path, rows, info, markers, keep)
+            for path in paths
+        }
+        through_many: dict[str, list[Any]] = {}
+        for path in paths:
+            if path.hops and path.hops[0].many:
+                through_many.setdefault(path.hops[0].relation, []).append(path)
+                markers.setdefault(
+                    f"_m_{path.hops[0].relation}", F(f"{path.hops[0].relation}__pk")
+                )
+        if markers:
+            rows = rows.alias(**markers)
+        rows = rows.annotate(**values)
+        for condition in keep:
+            rows = rows.filter(condition)
+        for through in through_many.values():
+            rows = rows.exclude(Exists(self._same_key_earlier(through, info)))
+        return rows
+
+    def _same_key_earlier(self, paths: list[Any], info: Any) -> Any:
+        """The related rows, ahead of the one joined, that give the same key.
+
+        Every path here starts across one to-many relation. A row joined to
+        two related rows with the same values would be grouped twice under
+        one key, so only the first related row with those values is kept.
+        """
+        from django.db.models import OuterRef, Q
+        from django.db.models.lookups import IsNull
+
+        hop = paths[0].hops[0]
+        restrict = self.relation_scope(hop.model, hop.relation, info)
+        related = (
+            restrict(hop.target._default_manager.all(), info)
+            if restrict is not None
+            else hop.target._base_manager.all()
+        )
+        earlier = related.filter(
+            **{
+                _remote_name(hop): OuterRef("pk"),
+                "pk__lt": OuterRef(f"_m_{hop.relation}"),
+            }
+        )
+        for path in paths:
+            onward = replace(path, hops=path.hops[1:])
+            name = f"_v{path.alias}"
+            earlier = earlier.annotate(
+                **{name: self._group_value(onward, earlier, info, {}, [])}
+            ).filter(
+                Q(**{name: OuterRef(path.alias)})
+                | (Q(**{f"{name}__isnull": True}) & IsNull(OuterRef(path.alias), True))
+            )
+        return earlier
+
+    def _group_value(
+        self,
+        path: Any,
+        rows: Any,
+        info: Any,
+        markers: dict[str, Any],
+        keep: list[Any],
+    ) -> Any:
+        """The expression *path* groups by, read through every hop's scope.
+
+        A related row the caller may not see reads as ``None``, as it does on
+        the type. Across a to-many hop the hidden rows are dropped instead,
+        leaving one ``None`` row for a parent with no visible ones.
+        """
+        from functools import reduce
+        from operator import and_
+
+        from django.db.models import Case, F, Q, When
+
+        if path.custom is not None:
+            expr = invoke_custom_callback(
+                path.custom, path.owner, query=rows, value=path.value, info=info
+            )
+            if isinstance(expr, tuple):
+                expr = expr[0]
+            return F(expr) if isinstance(expr, str) else expr
+
+        prefix = ""
+        conditions = []
+        for hop in path.hops:
+            restrict = self.relation_scope(hop.model, hop.relation, info)
+            if restrict is not None:
+                visible = restrict(hop.target._default_manager.all(), info)
+                if hop.many:
+                    _keep_visible_links(hop, visible, markers, keep)
+                conditions.append(
+                    Q(**{f"{prefix}{hop.relation}__in": visible.values("pk")})
+                )
+            prefix = f"{prefix}{hop.relation}__"
+
+        expr = F(f"{prefix}{path.column}")
+        if path.interval is not None:
+            owner = path.model or rows.model
+            expr = _truncate(expr, owner._meta.get_field(path.column), path.interval)
+        if conditions:
+            expr = Case(When(reduce(and_, conditions), then=expr), default=None)
+        return expr
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -2253,84 +2363,183 @@ def _build_django_order_field(field_input: Any, prefix: str = "") -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
-def _extract_django_group_fields(
-    group_by_list: list[Any],
-) -> tuple[list[str], list[str]]:
-    """Extract field names for Django GROUP BY from group-by input."""
+def _own_rows(query: Any) -> Any:
+    """*query*'s rows, once each, read through a query with no joins of its own.
 
-    fields: list[str] = []
-    key_fields: list[str] = []
-    seen: set[str] = set()
-
-    for entry in group_by_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            val = getattr(field_val, col_name)
-            if val is strawberry.UNSET or val is None:
-                continue
-            if col_name in seen:
-                continue
-            seen.add(col_name)
-            fields.append(col_name)
-            key_fields.append(col_name)
-
-    return fields, key_fields
+    A filter across a to-many relation joins it, repeating a row once for
+    every related row that matched. Counted, summed or grouped as it stands,
+    each repeat would count again.
+    """
+    inner = query if query.query.is_sliced else query.order_by()
+    return query.model._base_manager.filter(pk__in=inner.values("pk"))
 
 
-def _extract_django_overlapping_order(
-    order_input: Any, group_field_names: set[str]
-) -> list[str]:
-    """Extract Django order_by strings for group fields overlapping with root order."""
-    order_list = order_input if isinstance(order_input, list) else [order_input]
-    clauses: list[str] = []
+def _django_aggregates(requested: dict[str, Any]) -> dict[str, Any]:
+    from django.db.models import Avg, Count, Max, Min, Sum
 
-    for entry in order_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
-            continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            direction = getattr(field_val, col_name)
-            if direction is strawberry.UNSET or direction is None:
-                continue
-            if col_name not in group_field_names:
-                continue
-            dir_value = (
-                direction.value if hasattr(direction, "value") else str(direction)
-            )
-            if dir_value.startswith("DESC"):
-                clauses.append(f"-{col_name}")
-            else:
-                clauses.append(col_name)
-
-    return clauses
+    aggregates: dict[str, Any] = {}
+    if requested.get("count"):
+        aggregates["_count"] = Count("*")
+    for func_name, aggregate in {
+        "sum": Sum,
+        "avg": Avg,
+        "min": Min,
+        "max": Max,
+    }.items():
+        for fname in requested.get(func_name, []):
+            aggregates[f"_{func_name}_{fname}"] = aggregate(fname)
+    return aggregates
 
 
-def _build_django_order_from_input(order_input: Any) -> list[Any]:
-    """Convert an order input to Django F() ordering expressions."""
-    from django.db.models import F
+def _truncate(expr: Any, field: Any, interval: Any) -> Any:
+    """*expr* cut down to the start of its *interval*.
 
-    order_list = order_input if isinstance(order_input, list) else [order_input]
+    A datetime is cut in the current time zone, so a day or month begins
+    where the caller's does rather than where UTC's does.
+    """
+    from django.db.models import DateField, DateTimeField
+    from django.db.models.functions import Trunc
+
+    output = DateTimeField() if isinstance(field, DateTimeField) else DateField()
+    return Trunc(expr, interval.value.lower(), output_field=output)
+
+
+def _remote_name(hop: Any) -> str:
+    """How *hop*'s target model names the way back to the model it left."""
+    from django.db.models import ForeignObjectRel
+
+    field = hop.model._meta.get_field(hop.relation)
+    if isinstance(field, ForeignObjectRel):
+        return field.field.name
+    return field.related_query_name()
+
+
+def _keep_visible_links(
+    hop: Any, visible: Any, markers: dict[str, Any], keep: list[Any]
+) -> None:
+    """Drop the rows a to-many join adds for related rows the caller cannot see.
+
+    A row keeps one joined row per visible related row. A row with none keeps
+    exactly one, whichever related row comes first, which then groups as
+    ``None``; dropping them all would drop the row.
+    """
+    from django.db.models import Exists, F, OuterRef, Q, Subquery
+
+    marker = f"_m_{hop.relation}"
+    if marker in markers:
+        return
+    markers[marker] = F(f"{hop.relation}__pk")
+    own = {_remote_name(hop): OuterRef("pk")}
+    first = hop.target._base_manager.filter(**own).order_by("pk").values("pk")[:1]
+    keep.append(
+        Q(**{f"{marker}__in": visible.values("pk")})
+        | Q(**{f"{marker}__isnull": True})
+        | (~Exists(visible.filter(**own)) & Q(**{marker: Subquery(first)}))
+    )
+
+
+def _single_valued(model: type, name: str) -> bool:
+    """True when *name* reaches one value per row of *model*.
+
+    Ordering through a to-many relation would join it, repeating rows, and a
+    name the model does not have, such as an annotation, cannot be read
+    outside the query that made it.
+    """
+    from django.core.exceptions import FieldDoesNotExist
+
+    parts = name.split("__")
+    current = model
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if part == "pk" and last:
+            return True
+        try:
+            field = current._meta.get_field(part)  # type: ignore[attr-defined]
+        except FieldDoesNotExist:
+            return False
+        if not field.is_relation:
+            return last
+        if _relation_kind(field) != "one" or field.related_model is None:
+            return False
+        current = field.related_model
+    return True
+
+
+def _order_clauses(order_input: Any, prefix: str = "") -> list[Any]:
+    """The column clauses of one order input, through ``object:`` too."""
     clauses: list[Any] = []
-    for entry in order_list:
-        field_val = getattr(entry, "field", None)
-        if field_val is None or field_val is strawberry.UNSET:
+    for key in order_input.__class__.__dataclass_fields__:
+        value = getattr(order_input, key)
+        if value is strawberry.UNSET or value is None:
             continue
-        entry_fields = field_val.__class__.__dataclass_fields__
-        for col_name in entry_fields:
-            direction = getattr(field_val, col_name)
-            if direction is strawberry.UNSET or direction is None:
-                continue
-            dir_value = (
-                direction.value if hasattr(direction, "value") else str(direction)
-            )
-            if dir_value.startswith("DESC"):
-                clauses.append(F(col_name).desc())
-            else:
-                clauses.append(F(col_name).asc())
-    if not clauses:
-        clauses.append(F("pk"))
+        if key == "field":
+            clauses.extend(_build_django_order_field(value, prefix))
+        elif key == "object":
+            for relation in value.__class__.__dataclass_fields__:
+                nested = getattr(value, relation)
+                if nested is not strawberry.UNSET and nested is not None:
+                    clauses.extend(_order_clauses(nested, f"{prefix}{relation}__"))
     return clauses
+
+
+def _connection_ordering(query: Any, order_input: Any) -> list[Any]:
+    """The order the connection reads its rows in, as ``OrderBy`` clauses.
+
+    The client's ``order`` when given, else the query's own, else the model's.
+    Only clauses that read one value per row are kept; the rest cannot rank
+    groups, and a ``@order_field`` only knows how to order the query itself.
+    """
+    from django.db.models import F
+    from django.db.models.expressions import OrderBy
+
+    model = query.model
+    clauses: list[Any] = []
+    if order_input:
+        for entry in order_input if isinstance(order_input, list) else [order_input]:
+            clauses.extend(_order_clauses(entry))
+    else:
+        inner = query.query
+        terms = inner.order_by or (
+            model._meta.ordering if inner.default_ordering else ()
+        )
+        for term in terms:
+            if isinstance(term, str):
+                if term == "?":
+                    continue
+                name = term.lstrip("-+")
+                clauses.append(F(name).desc() if term[0] == "-" else F(name).asc())
+            elif isinstance(term, OrderBy):
+                clauses.append(term)
+            elif isinstance(term, F):
+                clauses.append(term.asc())
+    return [
+        clause
+        for clause in clauses
+        if isinstance(clause.expression, F)
+        and _single_valued(model, clause.expression.name)
+    ]
+
+
+def _group_ordering(clauses: list[Any]) -> tuple[dict[str, Any], list[Any]]:
+    """Order groups as their first rows come in the connection's order.
+
+    Read in that order, a group starts at its least value of each clause, or
+    its greatest for a descending one, so groups are ranked by those.
+    """
+    from django.db.models import F, Max, Min
+    from django.db.models.expressions import OrderBy
+
+    firsts: dict[str, Any] = {}
+    ordering: list[Any] = []
+    for index, clause in enumerate(clauses):
+        name = f"_o{index}"
+        firsts[name] = (Max if clause.descending else Min)(clause.expression)
+        ordering.append(
+            OrderBy(
+                F(name),
+                descending=clause.descending,
+                nulls_first=clause.nulls_first,
+                nulls_last=clause.nulls_last,
+            )
+        )
+    return firsts, ordering
