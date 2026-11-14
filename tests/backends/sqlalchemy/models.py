@@ -53,6 +53,7 @@ class Post(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.now
     )
+    word_count: Mapped[int] = mapped_column(Integer, default=0)
     author_id: Mapped[int] = mapped_column(ForeignKey("user.id"))
 
     author: Mapped[User] = relationship(back_populates="posts")

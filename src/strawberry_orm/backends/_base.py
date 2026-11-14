@@ -166,7 +166,8 @@ def _intersect(
     return cover
 
 
-_AGGREGATES = ("sum", "avg", "min", "max")
+_AGGREGATES = ("sum", "avg", "median", "min", "max")
+_DATE_TYPES = (datetime.date, datetime.datetime, datetime.time)
 
 
 def _reached_input(item: Any, reached: set[Any]) -> bool:
@@ -293,19 +294,17 @@ class AggregateMeta:
     relation_keys: dict[str, AggregateMeta] = dc_field(default_factory=dict)
     """The related model's metadata behind each relation the key nests."""
 
+    median_type: type | None = None
+
     def build_aggregates(self, row: Any, requested: dict[str, Any]) -> Any:
         """Construct an ``Aggregates`` instance from a SQL result *row*."""
         kwargs: dict[str, Any] = {}
         kwargs["count"] = getattr(row, "_count", 0) if requested.get("count") else 0
 
-        for func_name, SubType in [
-            ("sum", self.sum_type),
-            ("avg", self.avg_type),
-            ("min", self.min_type),
-            ("max", self.max_type),
-        ]:
-            col_names = requested.get(func_name, [])
-            if SubType is not None and col_names:
+        for func_name in _AGGREGATES:
+            SubType = getattr(self, f"{func_name}_type")
+            col_names = requested.get(func_name)
+            if SubType is not None and col_names is not None:
                 sub_kwargs = {}
                 for col in col_names:
                     sub_kwargs[col] = getattr(row, f"_{func_name}_{col}", None)
@@ -337,7 +336,7 @@ def _find_selection(info: Any, field_path: str) -> Any:
     ):
         inner: list[Any] = []
         for sel in selections:
-            inner.extend(getattr(sel, "selections", []))
+            inner.extend(_selected_fields(sel))
         if inner:
             selections = inner
 
@@ -349,7 +348,7 @@ def _find_selection(info: Any, field_path: str) -> Any:
                 break
         if found is None:
             return None
-        selections = found.selections if hasattr(found, "selections") else []
+        selections = _selected_fields(found)
     return found
 
 
@@ -359,31 +358,67 @@ def _selection_requests(info: Any, *path: str) -> bool:
 
 
 def requested_aggregates(
-    info: Any, field_path: str = "aggregates"
+    info: Any, field_path: str = "aggregates", meta: AggregateMeta | None = None
 ) -> dict[str, Any] | None:
     """Parse the selection set to determine which aggregates are needed.
 
     Returns a dict like::
 
-        {'count': True, 'sum': ['amount'], 'avg': [], 'min': [], 'max': []}
+        {'count': True, 'sum': ['amount_tax'], 'min': ['created_at']}
 
-    or ``None`` if the field is not in the selection set at all.
+    naming each column by its model field, or ``None`` if the field is not in
+    the selection set at all. A selected name *meta*'s aggregate types do not
+    have, such as ``__typename``, is not a column and is left out.
     """
     agg_selection = _find_selection(info, field_path)
     if agg_selection is None:
         return None
 
     result: dict[str, Any] = {}
-    for fld in agg_selection.selections:
+    for fld in _selected_fields(agg_selection):
         name = fld.name
         if name == "count":
             result["count"] = True
-        elif name in ("sum", "avg", "min", "max"):
-            sub_fields = (
-                [sf.name for sf in fld.selections] if hasattr(fld, "selections") else []
-            )
-            result[name] = sub_fields
+        elif name in _AGGREGATES:
+            # One aggregate may be selected more than once, under aliases or
+            # in fragments, each time for its own columns.
+            names = [sub.name for sub in _selected_fields(fld)]
+            found = _model_field_names(info, meta, name, names)
+            result[name] = list(dict.fromkeys([*result.get(name, []), *found]))
     return result
+
+
+def _selected_fields(selection: Any) -> list[Any]:
+    """The fields under *selection*, with its fragments' fields in place."""
+    from strawberry.types.nodes import FragmentSpread, InlineFragment
+
+    found: list[Any] = []
+    for sub in getattr(selection, "selections", None) or []:
+        if isinstance(sub, FragmentSpread | InlineFragment):
+            found.extend(_selected_fields(sub))
+        else:
+            found.append(sub)
+    return found
+
+
+def _model_field_names(
+    info: Any, meta: AggregateMeta | None, aggregate: str, names: list[str]
+) -> list[str]:
+    """The model field behind each selected GraphQL name, once each."""
+    from strawberry.utils.str_converters import to_camel_case
+
+    sub_type = getattr(meta, f"{aggregate}_type", None)
+    if sub_type is None:
+        return list(dict.fromkeys(name for name in names if not name.startswith("__")))
+    config = getattr(getattr(info, "schema", None), "config", None)
+    converter = getattr(config, "name_converter", None)
+    by_name: dict[str, str] = {}
+    for field in sub_type.__strawberry_definition__.fields:
+        by_name[field.python_name] = field.python_name
+        by_name[to_camel_case(field.python_name)] = field.python_name
+        if converter is not None:
+            by_name[converter.from_field(field)] = field.python_name
+    return list(dict.fromkeys(by_name[name] for name in names if name in by_name))
 
 
 def invoke_custom_callback(
@@ -1644,8 +1679,13 @@ class BaseBackend:
                 return None
             ann: dict[str, Any] = {}
             defs: dict[str, Any] = {}
-            for fname, _ in fields:
-                ann[fname] = float | None
+            for fname, ftype in fields:
+                # The least or greatest date is a date, not a number.
+                ann[fname] = (
+                    ftype | None
+                    if prefix in ("Min", "Max") and ftype in _DATE_TYPES
+                    else float | None
+                )
                 defs[fname] = None
             cls_name = f"{model_name}{prefix}Aggregates"
             ns = {"__annotations__": ann, **defs}
@@ -1653,6 +1693,7 @@ class BaseBackend:
 
         SumType = _make_sub_agg("Sum", numeric_fields)
         AvgType = _make_sub_agg("Avg", numeric_fields)
+        MedianType = _make_sub_agg("Median", numeric_fields)
         MinType = _make_sub_agg("Min", comparable_fields)
         MaxType = _make_sub_agg("Max", comparable_fields)
 
@@ -1661,6 +1702,7 @@ class BaseBackend:
         for label, sub_type in [
             ("sum", SumType),
             ("avg", AvgType),
+            ("median", MedianType),
             ("min", MinType),
             ("max", MaxType),
         ]:
@@ -1686,6 +1728,7 @@ class BaseBackend:
             group_key_type=GroupKeyType,
             sum_type=SumType,
             avg_type=AvgType,
+            median_type=MedianType,
             min_type=MinType,
             max_type=MaxType,
             numeric_fields=numeric_fields,

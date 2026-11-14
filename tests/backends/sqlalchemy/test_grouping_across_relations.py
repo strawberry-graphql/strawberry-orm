@@ -7,6 +7,7 @@ from sqlalchemy import select, update
 
 from strawberry_orm import StrawberryORM
 from tests.abstract.grouping_across_relations import (
+    AbstractTestAggregateSelections,
     AbstractTestFilteringThroughAToManyRelation,
     AbstractTestGroupingAcrossRelations,
     AbstractTestGroupingByDateInterval,
@@ -70,4 +71,8 @@ class TestGroupingByDateInterval(AbstractTestGroupingByDateInterval):
 
 
 class TestFilteringThroughAToManyRelation(AbstractTestFilteringThroughAToManyRelation):
+    pass
+
+
+class TestAggregateSelections(AbstractTestAggregateSelections):
     pass

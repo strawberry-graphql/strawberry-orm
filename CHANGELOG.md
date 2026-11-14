@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.28.0
+
+### Added
+
+- **`median` aggregate.** `aggregates { median { amount } }` is `percentile_cont(0.5) WITHIN GROUP (ORDER BY …)`, exposed as `<Model>MedianAggregates` for the same numeric fields as `sum` and `avg`, over the result set and per group. It is computed on PostgreSQL only; other databases raise, as date intervals do. The page-level `median` in `pageInfo` is worked out in memory and works anywhere.
+
+### Changed
+
+- **`min` and `max` of a date, datetime or time field are typed as the field**, not `Float`: a date reads `"2026-03-01"` and a datetime an ISO 8601 instant. Numeric fields are still `Float`.
+- **Groups are not ranked by a JSON, binary, hstore, full-text search vector or geometry column**, which PostgreSQL has no `MIN` of, on any database. Groups ranked only by such a column come in key order.
+- `AggregateMeta` has a `median_type` field (last, after `relation_keys`), and `requested_aggregates(info, path, meta)` takes the meta to map names to model fields.
+
+### Fixed
+
+- **`__typename` in an aggregate selection broke the request** with "Cannot resolve keyword ''". Apollo adds it to every selection. Names that are not columns are now ignored, and fragments inside `aggregates` are read.
+- **Aggregates of a two-word field failed** (`sum { amountTax }`, `min { createdAt }`) with "Cannot resolve keyword 'amountTax'", over the result set and per group. Each selected name is mapped to its model field, as filters and orders are.
+- **Ranking groups failed on PostgreSQL** with `function min(uuid) does not exist` or `function min(boolean) does not exist` when the connection was ordered by a UUID or boolean column, such as a related row's primary key. A UUID now ranks by its text and a boolean as an integer, which sort as the column does. A SQLAlchemy `TypeDecorator` is judged by what it stores on the configured dialect.
+- **An aggregate selected twice read only one selection's columns**, as with `sum { amount }` beside a fragment's `sum { tax }`, or two aliases of `max`. Both are read now. Fragments around `aggregates` (on the connection or a group) are read too.
+- `sum { __typename }` with no column returns an empty `sum` object rather than `null`.
+
+### Documentation
+
+- A date field grouped by an interval is keyed by a date (`"2026-03-01"`), not a datetime.
+- A row with no related row is keyed `{author: {id: null, name: null}}`, not `{author: null}`.
+
 ## 0.27.0
 
 ### Added

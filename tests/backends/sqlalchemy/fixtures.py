@@ -585,7 +585,12 @@ def seed(sa_session):
     sa_session.flush()
 
     p1 = SAPost(
-        id=1, title="Hello World", body="First post", is_published=True, author_id=1
+        id=1,
+        title="Hello World",
+        body="First post",
+        is_published=True,
+        author_id=1,
+        word_count=100,
     )
     p2 = SAPost(
         id=2,
@@ -593,6 +598,7 @@ def seed(sa_session):
         body="Learn GraphQL",
         is_published=True,
         author_id=1,
+        word_count=250,
     )
     p3 = SAPost(
         id=3,
@@ -600,6 +606,7 @@ def seed(sa_session):
         body="Not published yet",
         is_published=False,
         author_id=2,
+        word_count=40,
     )
     p4 = SAPost(
         id=4,
@@ -607,6 +614,7 @@ def seed(sa_session):
         body="Systems programming",
         is_published=True,
         author_id=3,
+        word_count=310,
     )
     sa_session.add_all([p1, p2, p3, p4])
     sa_session.flush()

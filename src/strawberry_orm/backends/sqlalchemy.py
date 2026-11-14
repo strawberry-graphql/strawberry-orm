@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import functools
 from collections.abc import Callable
 from contextlib import contextmanager
 from decimal import Decimal
@@ -15,6 +16,7 @@ from sqlalchemy.sql import Select
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm.backends._base import (
+    _AGGREGATES,
     _SENSITIVE_PATTERNS,
     AggregateMeta,
     BaseBackend,
@@ -34,6 +36,10 @@ from strawberry_orm.types import DateGroupByInterval
 
 #: Relation-name sets by model class; see :meth:`SQLAlchemyBackend.relation_names`.
 _RELATION_NAMES: dict[type, set[str]] = {}
+#: Column types PostgreSQL has no ``MIN`` or ``MAX`` of, even cast.
+_SA_UNRANKABLE_TYPES = frozenset(
+    {"JSON", "LargeBinary", "HSTORE", "TSVECTOR", "Geometry", "Geography", "Raster"}
+)
 
 
 class _PlannedLoad:
@@ -406,7 +412,7 @@ class SQLAlchemyBackend(BaseBackend):
     ) -> Any:
         from sqlalchemy import func, select
 
-        requested = requested_aggregates(info, "aggregates") or {}
+        requested = requested_aggregates(info, "aggregates", aggregate_meta) or {}
         if not requested and not aggregate_meta.custom_fields:
             return aggregate_meta.aggregates_type(count=0)
 
@@ -415,16 +421,15 @@ class SQLAlchemyBackend(BaseBackend):
 
         if requested.get("count"):
             agg_cols.append(func.count().label("_count"))
-        for func_name, sql_func in [
-            ("sum", func.sum),
-            ("avg", func.avg),
-            ("min", func.min),
-            ("max", func.max),
-        ]:
+        for func_name in _AGGREGATES:
             for fname in requested.get(func_name, []):
                 col = subq.c.get(fname)
                 if col is not None:
-                    agg_cols.append(sql_func(col).label(f"_{func_name}_{fname}"))
+                    agg_cols.append(
+                        _sa_aggregate(func_name, col, self._dialect).label(
+                            f"_{func_name}_{fname}"
+                        )
+                    )
 
         for field_name, handler, _rtype in aggregate_meta.custom_fields:
             expr = _invoke_aggregate_handler(handler, subq.c, info=info)
@@ -432,7 +437,7 @@ class SQLAlchemyBackend(BaseBackend):
                 agg_cols.append(expr.label(f"_custom_{field_name}"))
 
         if not agg_cols:
-            return aggregate_meta.aggregates_type(count=0)
+            return aggregate_meta.build_aggregates(None, requested)
 
         stmt = select(*agg_cols).select_from(subq)
         session = self._get_session(info)
@@ -474,18 +479,21 @@ class SQLAlchemyBackend(BaseBackend):
         from strawberry_orm.grouping import build_group
 
         model = aggregate_meta.model
-        requested = requested_aggregates(info, "groups.aggregates") or {}
+        requested = (
+            requested_aggregates(info, "groups.aggregates", aggregate_meta) or {}
+        )
         stmt, values = self._grouped_select(query, model, paths, info)
         aggregates = _build_sa_agg_cols(
             model,
             requested,
             custom_fields=aggregate_meta.custom_fields,
             info=info,
+            dialect=self._dialect,
         )
         clauses, joins = _sa_connection_ordering(query, order_input, model)
         for join in joins:
             stmt = stmt.outerjoin(join)
-        firsts, ordering = _sa_group_ordering(clauses)
+        firsts, ordering = _sa_group_ordering(clauses, self._dialect)
         keys = list(values.values())
         stmt = (
             stmt.add_columns(*aggregates, *firsts)
@@ -2684,6 +2692,7 @@ def _build_sa_agg_cols(
     *,
     custom_fields: list[tuple[str, Any, type]] | None = None,
     info: Any = None,
+    dialect: str = "postgresql",
 ) -> list[Any]:
     """Build aggregate column expressions based on requested aggregates."""
     from sqlalchemy import func
@@ -2691,16 +2700,15 @@ def _build_sa_agg_cols(
     agg_cols: list[Any] = []
     if requested.get("count"):
         agg_cols.append(func.count().label("_count"))
-    for func_name, sql_func in [
-        ("sum", func.sum),
-        ("avg", func.avg),
-        ("min", func.min),
-        ("max", func.max),
-    ]:
+    for func_name in _AGGREGATES:
         for fname in requested.get(func_name, []):
             col = getattr(model, fname, None)
             if col is not None:
-                agg_cols.append(sql_func(col).label(f"_{func_name}_{fname}"))
+                agg_cols.append(
+                    _sa_aggregate(func_name, col, dialect).label(
+                        f"_{func_name}_{fname}"
+                    )
+                )
     if custom_fields:
         columns = model.__table__.c  # type: ignore[attr-defined]
         for field_name, handler, _rtype in custom_fields:
@@ -2786,19 +2794,35 @@ def _sa_order_clauses(
                 )
 
 
-def _sa_group_ordering(clauses: list[Any]) -> tuple[list[Any], list[Any]]:
+def _sa_aggregate(name: str, column: Any, dialect: str) -> Any:
+    """The SQL aggregate *name* of *column*."""
+    from sqlalchemy import Float, func, type_coerce
+
+    if name == "median":
+        if not dialect.startswith("postgres"):
+            raise ValueError(f"median is supported on PostgreSQL, not {dialect}.")
+        return type_coerce(func.percentile_cont(0.5).within_group(column), Float)
+    return getattr(func, name)(column)
+
+
+def _sa_group_ordering(clauses: list[Any], dialect: str) -> tuple[list[Any], list[Any]]:
     """Order groups as their first rows come in the connection's order.
 
     Read in that order, a group starts at its least value of each clause, or
-    its greatest for a descending one, so groups are ranked by those.
+    its greatest for a descending one, so groups are ranked by those. A
+    clause on a column the database cannot take the least of is left out.
     """
     from sqlalchemy import func
 
     firsts: list[Any] = []
     ordering: list[Any] = []
-    for index, clause in enumerate(clauses):
+    for clause in clauses:
         expr, descending, nulls = _order_parts(clause)
-        first = (func.max if descending else func.min)(expr).label(f"_o{index}")
+        expr = _sa_rankable(expr, dialect)
+        if expr is None:
+            continue
+        name = f"_o{len(firsts)}"
+        first = (func.max if descending else func.min)(expr).label(name)
         ranked = first.desc() if descending else first.asc()
         if nulls == "first":
             ranked = ranked.nulls_first()
@@ -2807,6 +2831,43 @@ def _sa_group_ordering(clauses: list[Any]) -> tuple[list[Any], list[Any]]:
         firsts.append(first)
         ordering.append(ranked)
     return firsts, ordering
+
+
+def _sa_rankable(expr: Any, dialect: str) -> Any:
+    """*expr* as a value PostgreSQL has a ``MIN`` and ``MAX`` of, or ``None``.
+
+    PostgreSQL has neither for a UUID nor a boolean. A UUID's text sorts as
+    the UUID does, and a boolean's integer as the boolean does, false first.
+    A type is judged as it is stored on *dialect*: a ``TypeDecorator`` may
+    keep a UUID as text on one database and as a UUID on another.
+    """
+    from sqlalchemy import Integer, String, TypeDecorator, cast
+
+    column_type = expr.type.dialect_impl(_sa_dialect(dialect))
+    while isinstance(column_type, TypeDecorator):
+        column_type = column_type.impl
+    kinds = {cls.__name__ for cls in type(column_type).__mro__}
+    if "Uuid" in kinds:
+        return cast(expr, String)
+    if "Boolean" in kinds:
+        return cast(expr, Integer)
+    if kinds & _SA_UNRANKABLE_TYPES:
+        return None
+    return expr
+
+
+@functools.cache
+def _sa_dialect(name: str) -> Any:
+    """The SQLAlchemy dialect *name* configures, or a generic one."""
+    from sqlalchemy.engine import default, make_url
+    from sqlalchemy.exc import ArgumentError, NoSuchModuleError
+
+    if name.startswith("postgres"):
+        name = "postgresql"
+    try:
+        return make_url(f"{name}://").get_dialect()()
+    except (ArgumentError, NoSuchModuleError):
+        return default.DefaultDialect()
 
 
 def _build_sa_order_field(field_input: Any, model: type) -> list[Any]:

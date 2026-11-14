@@ -546,6 +546,26 @@ class TestInternalBackendCoverage:
         result = await backend.apply_aggregation(Post.filter(id=-999), info, meta)
         assert result.count == 0
 
+    @pytest.mark.asyncio
+    async def test_groups_leave_out_an_order_they_cannot_rank_by(
+        self, seed, Post, monkeypatch
+    ):
+        from strawberry_orm.backends.tortoise import _GroupedRows
+
+        monkeypatch.setattr(_GroupedRows, "rankable", lambda rows, term, field: None)
+        backend = TortoiseBackend()
+        groups = await backend.apply_grouping(
+            Post.all(),
+            [GroupPath(alias="_g0", name="author_id", column="author_id")],
+            _tortoise_info_with_aggregates(path="groups.aggregates", count=True),
+            _tortoise_aggregate_meta(Post),
+            order_input=_TortoiseAuthorOrder(
+                field=_TortoiseAuthorOrderField(author_id=Ordering.DESC)
+            ),
+        )
+        # Ranked by their keys alone, not by the descending order.
+        assert [group._orm_key_values for group in groups] == [("1",), ("2",), ("3",)]
+
 
 class TestTortoiseQueryProbe:
     """The diagnostics probe wraps the client's execute methods."""
@@ -653,3 +673,31 @@ class TestGroupedRows:
         )
         with pytest.raises(ValueError, match="not mysql"):
             _truncate(term, created, month, "mysql")
+
+    def test_postgres_ranks_a_uuid_by_its_text_and_a_boolean_by_its_integer(self):
+        from pypika_tortoise import Query
+        from pypika_tortoise.terms import Field
+        from tortoise import fields
+
+        from strawberry_orm.backends.tortoise import _GroupedRows
+
+        def rows(dialect):
+            capabilities = SimpleNamespace(dialect=dialect)
+            return SimpleNamespace(db=SimpleNamespace(capabilities=capabilities))
+
+        def sql(field, dialect="postgres"):
+            ranked = _GroupedRows.rankable(rows(dialect), Field("value"), field)
+            return str(Query.select(ranked))
+
+        assert sql(fields.UUIDField()) == 'SELECT CAST("value" AS VARCHAR)'
+        assert sql(fields.BooleanField()) == 'SELECT CAST("value" AS INTEGER)'
+        assert sql(fields.UUIDField(), "sqlite") == 'SELECT "value"'
+        assert sql(fields.IntField()) == 'SELECT "value"'
+        assert (
+            _GroupedRows.rankable(rows("sqlite"), Field("v"), fields.JSONField())
+            is None
+        )
+        median = _GroupedRows._median(rows("postgres"), Field("value"))
+        assert str(Query.select(median)) == (
+            'SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "value")'
+        )

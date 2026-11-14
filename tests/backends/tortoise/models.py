@@ -25,6 +25,7 @@ class Post(Model):
     body = fields.TextField()
     is_published = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)
+    word_count = fields.IntField(default=0)
     author = fields.ForeignKeyField("models.User", related_name="posts")
 
     tags: fields.ManyToManyRelation[Tag] = fields.ManyToManyField(

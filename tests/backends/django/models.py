@@ -26,6 +26,7 @@ class Post(models.Model):
     body = models.TextField()
     is_published = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    word_count = models.IntegerField(default=0)
     author = models.ForeignKey(User, on_delete=models.CASCADE, related_name="posts")
     tags = models.ManyToManyField(Tag, related_name="posts", blank=True)
 

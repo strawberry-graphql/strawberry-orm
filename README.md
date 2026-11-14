@@ -1485,7 +1485,11 @@ When `group` is set, the generated connection type automatically includes `aggre
 
 Aggregates are computed over the full filtered result set (before pagination). Page-level aggregates in `pageInfo` cover only the current page.
 
-Auto-generated aggregate types include `count`, `sum`, `avg`, `min`, and `max` — scoped to the numeric and comparable fields on the model.
+Auto-generated aggregate types include `count`, `sum`, `avg`, `median`, `min`, and `max` — scoped to the numeric and comparable fields on the model. Select a column by its GraphQL name (`sum { amountTax }`, `min { createdAt }`); anything else a client adds, such as Apollo's `__typename`, is ignored.
+
+- `sum`, `avg` and `median` cover numeric fields and are `Float`.
+- `min` and `max` also cover date, datetime and time fields, typed as the field: a date reads `"2026-03-01"` and a datetime an ISO 8601 instant (`"2026-03-01T10:00:00+00:00"`). Numeric fields are `Float`.
+- `median` is `percentile_cont(0.5) WITHIN GROUP (ORDER BY …)`, computed on PostgreSQL only; on other databases, asking for it over the result set or a group raises an error. The page-level `median` in `pageInfo` is worked out in memory, so it works anywhere.
 
 ### Querying groups
 
@@ -1525,6 +1529,8 @@ Each group includes:
 
 Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `order` through a to-many relation does not rank groups. Grouping does not need an `order` on the grouped column.
 
+A group's first row is found with `MIN` (or `MAX` for a descending clause) of each ordered column. PostgreSQL has neither for a UUID or a boolean, so a UUID is ranked by its text and a boolean as an integer (false before true); nulls fall where the connection's order puts them. A JSON, binary, hstore, full-text search vector or geometry column has no least value at all, so ordering by one does not rank groups, on any database: groups ranked only by it come in key order rather than edge order.
+
 ### Grouping by related rows
 
 `object:` groups by a column of a related row, through a foreign key, a reverse foreign key or a many-to-many relation. The key nests one level per relation, and you can group by any column the related type shows, not only its primary key:
@@ -1546,7 +1552,7 @@ Groups come in the order of the connection's edges, so each group's edges sit to
 ```
 
 - A relation is offered when the related model has a group-by type (`orm.group(Author)`, registered first) and the type shows the relation as stored, e.g. `author: AuthorNode | None`.
-- Grouping reads the related row through the related type's `scope_rows`. A row whose related row the caller cannot see is grouped under `null`, as the field reads on the type.
+- Grouping reads the related row through the related type's `scope_rows`. A row with no related row, or one the caller cannot see, is grouped under a key whose related values are all `null` — `{ author: { id: null, name: null } }`, not `{ author: null }` — as the field reads on the type.
 - Across a to-many relation (`tags`, or a reverse foreign key such as `author.posts`), a row is grouped once under each distinct key its visible related rows give, and once under `null` if it has none. A post tagged `python` and `rust` is counted in both groups, and in its own edge's `edgeIndices` for each. The groups' counts can therefore add up to more than `totalCount`.
 - A to-many relation can only be the first relation in a path.
 
@@ -1569,7 +1575,7 @@ Date/datetime fields support interval-based grouping:
 }
 ```
 
-Supported intervals: `DAY`, `WEEK` (starting Monday), `MONTH`, `QUARTER`, `YEAR`. The key is the start of the period in ISO 8601 (`"2026-03-01T00:00:00"`). On Django the period is cut in the current time zone when `USE_TZ` is on, and the key carries its offset (`"2026-03-01T00:00:00-05:00"`). SQLAlchemy and Tortoise cut periods on PostgreSQL (in the session's time zone) and SQLite; other databases raise an error.
+Supported intervals: `DAY`, `WEEK` (starting Monday), `MONTH`, `QUARTER`, `YEAR`. The key is the start of the period in ISO 8601: `"2026-03-01T00:00:00"` for a datetime field, `"2026-03-01"` for a date field. On Django the period is cut in the current time zone when `USE_TZ` is on, and the key carries its offset (`"2026-03-01T00:00:00-05:00"`). SQLAlchemy and Tortoise cut periods on PostgreSQL (in the session's time zone) and SQLite; other databases raise an error.
 
 ### Custom aggregates
 

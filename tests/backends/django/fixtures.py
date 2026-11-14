@@ -569,7 +569,12 @@ def seed(setup_tables):
     rust_tag = DjTag.objects.create(id=3, name="rust")
 
     p1 = DjPost.objects.create(
-        id=1, title="Hello World", body="First post", is_published=True, author=alice
+        id=1,
+        title="Hello World",
+        body="First post",
+        is_published=True,
+        author=alice,
+        word_count=100,
     )
     p2 = DjPost.objects.create(
         id=2,
@@ -577,6 +582,7 @@ def seed(setup_tables):
         body="Learn GraphQL",
         is_published=True,
         author=alice,
+        word_count=250,
     )
     p3 = DjPost.objects.create(
         id=3,
@@ -584,6 +590,7 @@ def seed(setup_tables):
         body="Not published yet",
         is_published=False,
         author=bob,
+        word_count=40,
     )
     p4 = DjPost.objects.create(
         id=4,
@@ -591,6 +598,7 @@ def seed(setup_tables):
         body="Systems programming",
         is_published=True,
         author=charlie,
+        word_count=310,
     )
 
     p1.tags.add(python_tag)

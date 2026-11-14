@@ -619,3 +619,196 @@ class AbstractTestFilteringThroughAToManyRelation:
             "Bob": (1, {"count": 1, "max": {"id": 3}}, [("False", 1)]),
             "Charlie": (1, {"count": 1, "max": {"id": 4}}, [("True", 1)]),
         }
+
+
+def _counted_schema(orm, models):
+    Post = models.Post
+
+    @orm.type(
+        Post, filters=orm.filter(Post), order=orm.order(Post), group=orm.group(Post)
+    )
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        is_published: auto
+        created_at: auto
+        word_count: auto
+
+    @strawberry.type
+    class Query:
+        posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
+#: Drafts first, each group's posts by id: post 3, then posts 1, 2 and 4.
+_BY_PUBLISHED = (
+    "groupBy: [{field: {isPublished: true}}], "
+    "order: [{field: {isPublished: ASC}}, {field: {id: ASC}}]"
+)
+
+
+def _instant(value):
+    return datetime.datetime.fromisoformat(value).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+class AbstractTestAggregateSelections:
+    """Aggregates read the columns the client names, as a client names them.
+
+    Word counts: post 1 has 100, post 2 250, post 3 (the draft) 40, post 4 310.
+    """
+
+    async def test_two_word_fields(self, orm, models, run):
+        schema = _counted_schema(orm, models)
+        selection = (
+            "sum { wordCount } avg { wordCount } min { wordCount } max { wordCount }"
+        )
+        result = await run(
+            schema,
+            f"""{{ posts({_BY_PUBLISHED}) {{ aggregates {{ {selection} }}
+                groups {{ key {{ isPublished }} aggregates {{ {selection} }} }} }} }}""",
+        )
+        assert result.errors is None, result.errors
+        posts = result.data["posts"]
+
+        def counts(aggregates):
+            return {name: value["wordCount"] for name, value in aggregates.items()}
+
+        assert counts(posts["aggregates"]) == {
+            "sum": 700,
+            "avg": 175,
+            "min": 40,
+            "max": 310,
+        }
+        assert [
+            (group["key"]["isPublished"], counts(group["aggregates"]))
+            for group in posts["groups"]
+        ] == [
+            ("False", {"sum": 40, "avg": 40, "min": 40, "max": 40}),
+            ("True", {"sum": 660, "avg": 220, "min": 100, "max": 310}),
+        ]
+
+    async def test_typename_and_fragments(self, orm, models, run):
+        """What Apollo adds to every selection is not a column."""
+        schema = _counted_schema(orm, models)
+        result = await run(
+            schema,
+            f"""{{ posts({_BY_PUBLISHED}) {{
+                aggregates {{ __typename count sum {{ __typename wordCount }} ...Mean }}
+                groups {{ aggregates {{ __typename
+                  ... on PostAggregates {{ max {{ __typename wordCount }} }} }} }} }} }}
+            fragment Mean on PostAggregates {{ avg {{ wordCount }} }}""",
+        )
+        assert result.errors is None, result.errors
+        posts = result.data["posts"]
+        assert posts["aggregates"] == {
+            "__typename": "PostAggregates",
+            "count": 4,
+            "sum": {"__typename": "PostSumAggregates", "wordCount": 700},
+            "avg": {"wordCount": 175},
+        }
+        assert [group["aggregates"] for group in posts["groups"]] == [
+            {
+                "__typename": "PostAggregates",
+                "max": {"__typename": "PostMaxAggregates", "wordCount": 40},
+            },
+            {
+                "__typename": "PostAggregates",
+                "max": {"__typename": "PostMaxAggregates", "wordCount": 310},
+            },
+        ]
+
+    async def test_an_aggregate_selected_twice_reads_both_columns(
+        self, orm, models, run
+    ):
+        """Under an alias, or once in a fragment and once outside it."""
+        schema = _counted_schema(orm, models)
+        result = await run(
+            schema,
+            f"""{{ posts({_BY_PUBLISHED}) {{ ...Totals
+                groups {{ ...GroupTotals }} }} }}
+            fragment Totals on PostConnection {{
+                aggregates {{ sum {{ wordCount }} ...Ids
+                  words: max {{ wordCount }} ids: max {{ id }} }} }}
+            fragment GroupTotals on PostGroup {{
+                aggregates {{ sum {{ __typename }} ...Ids }} }}
+            fragment Ids on PostAggregates {{ sum {{ id }} }}""",
+        )
+        assert result.errors is None, result.errors
+        posts = result.data["posts"]
+        assert posts["aggregates"] == {
+            "sum": {"wordCount": 700, "id": 10},
+            "words": {"wordCount": 310},
+            "ids": {"id": 4},
+        }
+        assert [group["aggregates"] for group in posts["groups"]] == [
+            {"sum": {"__typename": "PostSumAggregates", "id": 3}},
+            {"sum": {"__typename": "PostSumAggregates", "id": 7}},
+        ]
+
+    async def test_a_typename_alone_is_an_empty_aggregate(self, orm, models, run):
+        schema = _counted_schema(orm, models)
+        result = await run(schema, "{ posts { aggregates { sum { __typename } } } }")
+        assert result.errors is None, result.errors
+        aggregates = result.data["posts"]["aggregates"]
+        assert aggregates == {"sum": {"__typename": "PostSumAggregates"}}
+
+    async def test_the_least_and_greatest_date_are_dates(
+        self, orm, models, run, date_posts
+    ):
+        await date_posts(DATES)
+        schema = _counted_schema(orm, models)
+        for name in ("PostMinAggregates", "PostMaxAggregates"):
+            fields = schema._schema.type_map[name].fields
+            assert str(fields["createdAt"].type) == "DateTime"
+            assert str(fields["wordCount"].type) == "Float"
+        result = await run(
+            schema,
+            f"""{{ posts({_BY_PUBLISHED}, first: 2) {{
+                aggregates {{ min {{ createdAt }} max {{ createdAt }} }}
+                pageInfo {{ aggregates {{ min {{ createdAt }} max {{ createdAt }} }} }}
+                groups {{ aggregates {{ min {{ createdAt }} max {{ createdAt }} }} }}
+            }} }}""",
+        )
+        assert result.errors is None, result.errors
+        posts = result.data["posts"]
+
+        def span(aggregates):
+            return (
+                _instant(aggregates["min"]["createdAt"]),
+                _instant(aggregates["max"]["createdAt"]),
+            )
+
+        assert span(posts["aggregates"]) == (DATES[1], DATES[4])
+        # The page holds the draft and post 1.
+        assert span(posts["pageInfo"]["aggregates"]) == (DATES[1], DATES[3])
+        assert [span(group["aggregates"]) for group in posts["groups"]] == [
+            (DATES[3], DATES[3]),
+            (DATES[1], DATES[4]),
+        ]
+
+    async def test_the_median_of_a_page(self, orm, models, run):
+        schema = _counted_schema(orm, models)
+        assert "wordCount" in fields(schema, "PostMedianAggregates")
+        result = await run(
+            schema,
+            """{ posts(order: [{field: {id: ASC}}], first: 3) {
+                pageInfo { aggregates { median { wordCount } } } } }""",
+        )
+        assert result.errors is None, result.errors
+        page = result.data["posts"]["pageInfo"]["aggregates"]
+        assert page == {"median": {"wordCount": 100}}
+
+    @pytest.mark.parametrize(
+        "selection",
+        [
+            "aggregates { median { wordCount } }",
+            "groups { aggregates { median { wordCount } } }",
+        ],
+    )
+    async def test_the_median_needs_postgresql(self, orm, models, run, selection):
+        schema = _counted_schema(orm, models)
+        result = await run(schema, f"{{ posts({_BY_PUBLISHED}) {{ {selection} }} }}")
+        assert result.errors is not None
+        assert "median is supported on PostgreSQL" in result.errors[0].message

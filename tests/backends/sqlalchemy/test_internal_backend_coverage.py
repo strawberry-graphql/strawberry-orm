@@ -793,3 +793,52 @@ class TestInternalBackendCoverage:
             missing: Ordering | None = Ordering.DESC
 
         assert _build_sa_order_field(BadOrderField(), Post) == []
+
+    def test_postgres_ranks_a_uuid_by_its_text_and_a_boolean_by_its_integer(self):
+        from sqlalchemy import CHAR, JSON, Boolean, Column, TypeDecorator, Uuid
+        from sqlalchemy.dialects import postgresql
+
+        from strawberry_orm.backends.sqlalchemy import (
+            _sa_dialect,
+            _sa_group_ordering,
+            _sa_rankable,
+        )
+
+        class GUID(TypeDecorator):
+            """A UUID on PostgreSQL, text elsewhere."""
+
+            impl = CHAR
+            cache_ok = True
+
+            def load_dialect_impl(self, dialect):
+                if dialect.name == "postgresql":
+                    return dialect.type_descriptor(postgresql.UUID())
+                return dialect.type_descriptor(CHAR(32))
+
+        def sql(column_type, dialect="postgresql"):
+            ranked = _sa_rankable(Column("value", column_type), dialect)
+            return str(ranked.compile(dialect=postgresql.dialect()))
+
+        assert sql(Uuid()) == "CAST(value AS VARCHAR)"
+        assert sql(Boolean()) == "CAST(value AS INTEGER)"
+        assert sql(GUID()) == "CAST(value AS VARCHAR)"
+        assert sql(GUID(), "sqlite") == "value"
+        assert sql(postgresql.INET()) == "value"
+        assert _sa_rankable(Column("value", postgresql.JSONB()), "postgresql") is None
+        assert _sa_group_ordering([Column("value", JSON()).asc()], "sqlite") == (
+            [],
+            [],
+        )
+        assert _sa_dialect("postgres").name == "postgresql"
+        assert _sa_dialect("no such database").name == "default"
+
+    def test_the_median_is_postgres_sql(self, Post):
+        from sqlalchemy.dialects import postgresql
+
+        from strawberry_orm.backends.sqlalchemy import _sa_aggregate
+
+        median = _sa_aggregate("median", Post.word_count, "postgresql")
+        assert str(median.compile(dialect=postgresql.dialect())) == (
+            "percentile_cont(%(percentile_cont_1)s) "
+            "WITHIN GROUP (ORDER BY post.word_count)"
+        )

@@ -5,6 +5,7 @@ input CreatePostNodeInput4fa1a6dd {
   body: String
   isPublished: Boolean
   createdAt: DateTime
+  wordCount: Int
 }
 
 input CreateUserNodeInputD928c35f {
@@ -36,6 +37,7 @@ input UpdatePatchPostNodeInput4fa1a6dd {
   body: String
   isPublished: Boolean
   createdAt: DateTime
+  wordCount: Int
 }
 
 input UpdatePatchUserNodeInputD928c35f {

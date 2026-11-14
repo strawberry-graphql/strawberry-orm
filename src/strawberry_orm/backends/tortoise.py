@@ -9,9 +9,11 @@ import re
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import strawberry
+from pypika_tortoise.terms import AggregateFunction
 from strawberry.extensions import SchemaExtension
 from tortoise.models import Model
 from tortoise.queryset import QuerySet
@@ -36,6 +38,8 @@ from ._base import (
 #: Where the window puts each row's number within its group. Dropped again
 #: before the row is turned back into a model, which knows no such column.
 _ROW_NUMBER_ALIAS = "_orm_rn"
+#: Columns PostgreSQL has no ``MIN`` or ``MAX`` of, even cast.
+_UNRANKABLE_FIELDS = frozenset({"JSONField", "BinaryField", "TSVectorField"})
 
 #: Where the grouped count puts each group's total.
 _COUNT_ALIAS = "_orm_count"
@@ -661,34 +665,20 @@ class TortoiseBackend(BaseBackend):
     async def apply_aggregation(
         self, query: Any, info: Any, aggregate_meta: AggregateMeta
     ) -> Any:
-        from tortoise.functions import Avg, Count, Max, Min, Sum
-
-        requested = requested_aggregates(info, "aggregates") or {}
+        requested = requested_aggregates(info, "aggregates", aggregate_meta) or {}
         if not requested:
             return aggregate_meta.aggregates_type(count=0)
 
-        agg_kwargs: dict[str, Any] = {}
-        if requested.get("count"):
-            agg_kwargs["_count"] = Count("id")
-        _TORT_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
-        for func_name, AggCls in _TORT_AGG.items():
-            for fname in requested.get(func_name, []):
-                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
-
-        if not agg_kwargs:
-            return aggregate_meta.aggregates_type(count=0)
-
-        # Tortoise folds ordering columns into the GROUP BY of an aggregate
-        # query, which silently turns a total into a per-row count. Ordering
-        # means nothing to a single aggregate row, so drop it.
-        result = (
-            await query.order_by().annotate(**agg_kwargs).values(*agg_kwargs.keys())
+        rows = _GroupedRows(self, query, aggregate_meta.model, [], info)
+        aggregates = rows.aggregates(requested)
+        if not aggregates:
+            return aggregate_meta.build_aggregates(None, requested)
+        stmt = rows.stmt.select(
+            *(term.as_(name) for name, (term, _) in aggregates.items())
         )
-        if result:
-            row = type("Row", (), result[0])()
-        else:
-            row = type("Row", (), {k: 0 for k in agg_kwargs})()  # pragma: no cover
-        return aggregate_meta.build_aggregates(row, requested)
+        (found,) = await rows.execute(stmt)
+        values = {name: read(found[name]) for name, (_, read) in aggregates.items()}
+        return aggregate_meta.build_aggregates(SimpleNamespace(**values), requested)
 
     def relation_hop(self, model: type, relation: str) -> Any:
         from strawberry_orm.grouping import GroupHop
@@ -715,7 +705,9 @@ class TortoiseBackend(BaseBackend):
         from strawberry_orm.grouping import build_group
 
         model = aggregate_meta.model
-        requested = requested_aggregates(info, "groups.aggregates") or {}
+        requested = (
+            requested_aggregates(info, "groups.aggregates", aggregate_meta) or {}
+        )
         rows = _GroupedRows(self, query, model, paths, info)
         aggregates = rows.aggregates(requested)
         ordering = rows.ordering(query, order_input)
@@ -725,8 +717,11 @@ class TortoiseBackend(BaseBackend):
         ).groupby(*rows.values.values())
         # Read in the connection's order, a group starts at its least value of
         # each clause, or its greatest for a descending one.
-        for term, descending, nulls in ordering:
-            first = (functions.Max if descending else functions.Min)(term)
+        for term, field, descending, nulls in ordering:
+            ranked = rows.rankable(term, field)
+            if ranked is None:
+                continue
+            first = (functions.Max if descending else functions.Min)(ranked)
             stmt = _order_by(stmt, first, descending, nulls)
         for term in rows.values.values():
             stmt = stmt.orderby(term)
@@ -758,11 +753,11 @@ class TortoiseBackend(BaseBackend):
 
         rows = _GroupedRows(self, query, model, paths, info)
         window = RowNumber().over(*rows.values.values())
-        for term, descending, nulls in [
+        for term, _field, descending, nulls in [
             *rows.ordering(query, order_input),
             # Rows that tie on the order would be numbered however the
             # database likes, differently from one page to the next.
-            (rows.pk, False, None),
+            (rows.pk, None, False, None),
         ]:
             if nulls is not None:
                 window = window.orderby(_nulls_rank(term, nulls))
@@ -1956,6 +1951,17 @@ def _pypika(queryset: Any) -> Any:
     return queryset.query
 
 
+class _Median(AggregateFunction):  # type: ignore[misc]
+    """The median of a column, as PostgreSQL works it out."""
+
+    def __init__(self, term: Any) -> None:
+        super().__init__("PERCENTILE_CONT", term)
+
+    def get_function_sql(self, ctx: Any) -> str:
+        column = self.get_arg_sql(self.args[0], ctx)
+        return f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {column})"
+
+
 class _GroupedRows:
     """*query*'s rows, once per key, joined to what every group-by path reads.
 
@@ -2028,6 +2034,7 @@ class _GroupedRows:
         for name, aggregate in (
             ("sum", functions.Sum),
             ("avg", functions.Avg),
+            ("median", self._median),
             ("min", functions.Min),
             ("max", functions.Max),
         ):
@@ -2037,20 +2044,47 @@ class _GroupedRows:
                 # date or a boolean on SQLite is not what the field reads as.
                 read = (
                     _same
-                    if name == "avg"
+                    if name in ("avg", "median")
                     else meta.fields_map[field_name].to_python_value
                 )
                 found[f"_{name}_{field_name}"] = (aggregate(column), read)
         return found
 
-    def ordering(self, query: Any, order_input: Any) -> list[tuple[Any, bool, Any]]:
-        """``(term, descending, nulls)`` for the order the connection reads in.
+    def _median(self, column: Any) -> Any:
+        dialect = self.db.capabilities.dialect
+        if dialect != "postgres":
+            raise ValueError(f"median is supported on PostgreSQL, not {dialect}.")
+        return _Median(column)
+
+    def rankable(self, term: Any, field: Any) -> Any:
+        """*term* as a value the database has a ``MIN`` and ``MAX`` of, or ``None``.
+
+        PostgreSQL has neither for a UUID nor a boolean. A UUID's text sorts as
+        the UUID does, and a boolean's integer as the boolean does, false first.
+        """
+        from pypika_tortoise import functions
+
+        kinds = {cls.__name__ for cls in type(field).__mro__}
+        if kinds & _UNRANKABLE_FIELDS:
+            return None
+        if self.db.capabilities.dialect != "postgres":
+            return term
+        if "UUIDField" in kinds:
+            return functions.Cast(term, "VARCHAR")
+        if "BooleanField" in kinds:
+            return functions.Cast(term, "INTEGER")
+        return term
+
+    def ordering(
+        self, query: Any, order_input: Any
+    ) -> list[tuple[Any, Any, bool, Any]]:
+        """``(term, field, descending, nulls)`` for the order the connection reads in.
 
         The client's ``order`` when given, else the query's own. An order
         through a to-many relation is left out: its join would repeat rows.
         """
         meta = self.model._meta  # type: ignore[attr-defined]
-        found: list[tuple[Any, bool, Any]] = []
+        found: list[tuple[Any, Any, bool, Any]] = []
         if order_input:
             entries = order_input if isinstance(order_input, list) else [order_input]
             for entry in entries:
@@ -2065,7 +2099,14 @@ class _GroupedRows:
         for name, order in orderings:
             column = meta.fields_db_projection.get(name)
             if column is not None:
-                found.append((self.base.field(column), order == Order.desc, None))
+                found.append(
+                    (
+                        self.base.field(column),
+                        meta.fields_map[name],
+                        order == Order.desc,
+                        None,
+                    )
+                )
         return found
 
     def _order_entry(
@@ -2074,7 +2115,7 @@ class _GroupedRows:
         model: type,
         table: Any,
         chain: tuple[str, ...],
-        found: list[tuple[Any, bool, Any]],
+        found: list[tuple[Any, Any, bool, Any]],
     ) -> None:
         from pypika_tortoise import JoinType, Table
 
@@ -2087,7 +2128,7 @@ class _GroupedRows:
                 for name, descending, first, last in _build_tortoise_order_field(value):
                     nulls = "first" if first else "last" if last else None
                     column = table.field(meta.fields_db_projection[name])
-                    found.append((column, descending, nulls))
+                    found.append((column, meta.fields_map[name], descending, nulls))
             elif key == "object":
                 for relation in value.__class__.__dataclass_fields__:
                     nested = getattr(value, relation)

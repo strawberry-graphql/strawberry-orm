@@ -193,7 +193,11 @@ class TestRelationConnection:
         assert [e["node"]["title"] for e in windowed["posts"]["edges"]] == [
             "GraphQL Guide"
         ]
-        reads = [sql for sql in statements if "FROM post" in sql and "count" not in sql]
+        reads = [
+            sql
+            for sql in statements
+            if "FROM post" in sql and "count(" not in sql.lower()
+        ]
         assert len(reads) == 1 and "LIMIT" in reads[0], statements
 
     def test_a_lazy_connection_pages_and_counts_each_parent(self):

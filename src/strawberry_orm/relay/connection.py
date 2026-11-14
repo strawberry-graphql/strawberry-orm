@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import statistics
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -382,6 +383,7 @@ def _compute_page_aggregates(edges: list[Any], meta: Any) -> Any:
     for func_name, SubType, fields in [
         ("sum", meta.sum_type, meta.numeric_fields),
         ("avg", meta.avg_type, meta.numeric_fields),
+        ("median", meta.median_type, meta.numeric_fields),
         ("min", meta.min_type, meta.comparable_fields),
         ("max", meta.max_type, meta.comparable_fields),
     ]:
@@ -398,6 +400,8 @@ def _compute_page_aggregates(edges: list[Any], meta: Any) -> Any:
                 sub_kwargs[fname] = _coerce(sum(vals))
             elif func_name == "avg":
                 sub_kwargs[fname] = _coerce(sum(vals) / len(vals))
+            elif func_name == "median":
+                sub_kwargs[fname] = _coerce(statistics.median(vals))
             elif func_name == "min":
                 sub_kwargs[fname] = _coerce(min(vals))
             elif func_name == "max":

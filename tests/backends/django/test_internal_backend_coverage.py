@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import strawberry
@@ -810,3 +811,37 @@ class TestGroupingHelpers:
             str(OrderBy(F("title"))),
             str(F("id").asc()),
         ]
+
+    def test_postgres_ranks_a_uuid_by_its_text_and_a_boolean_by_its_integer(self, Post):
+        from django.db import models
+        from django.db.models import F
+
+        from strawberry_orm.backends.django import _group_ordering, _rankable
+
+        def model(field):
+            meta = SimpleNamespace(get_field=lambda name: field, pk=field)
+            return SimpleNamespace(_meta=meta)
+
+        def cast_to(field):
+            return _rankable(model(field), F("value")).output_field
+
+        assert isinstance(cast_to(models.UUIDField()), models.TextField)
+        assert isinstance(cast_to(models.BooleanField()), models.IntegerField)
+        assert _rankable(model(models.JSONField()), F("value")) is None
+        # A relation ranks by the column it points at.
+        assert str(_rankable(Post, F("author"))) == str(F("author"))
+        assert str(_rankable(Post, F("author__pk"))) == str(F("author__pk"))
+        assert _group_ordering([F("value").asc()], model(models.JSONField())) == (
+            {},
+            [],
+        )
+
+    def test_the_median_is_postgres_sql(self, Post):
+        from django.db import connection
+
+        from strawberry_orm.backends.django import _Median
+
+        query = Post.objects.annotate(middle=_Median("word_count")).query
+        with patch.object(connection, "vendor", "postgresql"):
+            sql = str(query)
+        assert 'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "post"."word_count")' in sql

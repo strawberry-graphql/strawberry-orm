@@ -10,7 +10,8 @@ from inspect import iscoroutinefunction
 from typing import Any
 
 import strawberry
-from django.db.models import Model, QuerySet
+from django.db import models
+from django.db.models import Aggregate, FloatField, Model, QuerySet
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
@@ -36,6 +37,17 @@ _RELATION_NAMES: dict[type, set[str]] = {}
 
 _TO_ONE_FIELDS = frozenset({"ForeignKey", "OneToOneField", "OneToOneRel"})
 _TO_MANY_FIELDS = frozenset({"ManyToManyField", "ManyToManyRel", "ManyToOneRel"})
+#: Columns PostgreSQL has no ``MIN`` or ``MAX`` of, even cast.
+_UNRANKABLE_FIELDS = frozenset(
+    {
+        "JSONField",
+        "BinaryField",
+        "HStoreField",
+        "SearchVectorField",
+        "GeometryField",
+        "RasterField",
+    }
+)
 
 
 def _relation_kind(field: Any) -> str | None:
@@ -542,22 +554,13 @@ class DjangoBackend(BaseBackend):
     def apply_aggregation(
         self, query: Any, info: Any, aggregate_meta: AggregateMeta
     ) -> Any:
-        from django.db.models import Avg, Count, Max, Min, Sum
-
-        requested = requested_aggregates(info, "aggregates") or {}
+        requested = requested_aggregates(info, "aggregates", aggregate_meta) or {}
         if not requested:
             return aggregate_meta.aggregates_type(count=0)
 
-        agg_kwargs: dict[str, Any] = {}
-        if requested.get("count"):
-            agg_kwargs["_count"] = Count("*")
-        _DJANGO_AGG = {"sum": Sum, "avg": Avg, "min": Min, "max": Max}
-        for func_name, AggCls in _DJANGO_AGG.items():
-            for fname in requested.get(func_name, []):
-                agg_kwargs[f"_{func_name}_{fname}"] = AggCls(fname)
-
+        agg_kwargs = _django_aggregates(requested)
         if not agg_kwargs:
-            return aggregate_meta.aggregates_type(count=0)
+            return aggregate_meta.build_aggregates(None, requested)
 
         def _run():
             result = _own_rows(query).aggregate(**agg_kwargs)
@@ -588,13 +591,17 @@ class DjangoBackend(BaseBackend):
     ) -> list[Any]:
         from strawberry_orm.grouping import build_group
 
-        requested = requested_aggregates(info, "groups.aggregates") or {}
+        requested = (
+            requested_aggregates(info, "groups.aggregates", aggregate_meta) or {}
+        )
         aggregates = _django_aggregates(requested)
         aliases = [path.alias for path in paths]
 
         def _run():
             rows = self._grouped_rows(query, paths, info)
-            firsts, ordering = _group_ordering(_connection_ordering(query, order_input))
+            firsts, ordering = _group_ordering(
+                _connection_ordering(query, order_input), query.model
+            )
             grouped = (
                 rows.order_by()
                 .values(*aliases)
@@ -2383,12 +2390,29 @@ def _django_aggregates(requested: dict[str, Any]) -> dict[str, Any]:
     for func_name, aggregate in {
         "sum": Sum,
         "avg": Avg,
+        "median": _Median,
         "min": Min,
         "max": Max,
     }.items():
         for fname in requested.get(func_name, []):
             aggregates[f"_{func_name}_{fname}"] = aggregate(fname)
     return aggregates
+
+
+class _Median(Aggregate):
+    """The median of a column, which PostgreSQL alone can work out."""
+
+    function = "PERCENTILE_CONT"
+    name = "Median"
+    template = "%(function)s(0.5) WITHIN GROUP (ORDER BY %(expressions)s)"
+    output_field = FloatField()
+
+    def as_sql(self, compiler: Any, connection: Any, **extra: Any) -> Any:
+        if connection.vendor != "postgresql":
+            raise ValueError(
+                f"median is supported on PostgreSQL, not {connection.vendor}."
+            )
+        return super().as_sql(compiler, connection, **extra)
 
 
 def _truncate(expr: Any, field: Any, interval: Any) -> Any:
@@ -2465,6 +2489,38 @@ def _single_valued(model: type, name: str) -> bool:
     return True
 
 
+def _rankable(model: type, expr: Any) -> Any:
+    """*expr* as a value PostgreSQL has a ``MIN`` and ``MAX`` of, or ``None``.
+
+    PostgreSQL has neither for a UUID nor a boolean. A UUID's text sorts as
+    the UUID does, and a boolean's integer as the boolean does, false first.
+    """
+    from django.db.models.functions import Cast
+
+    field = _ordered_field(model, expr.name)
+    kinds = {field.get_internal_type(), *(cls.__name__ for cls in type(field).__mro__)}
+    if "UUIDField" in kinds:
+        return Cast(expr, models.TextField())
+    if "BooleanField" in kinds:
+        return Cast(expr, models.IntegerField())
+    if kinds & _UNRANKABLE_FIELDS:
+        return None
+    return expr
+
+
+def _ordered_field(model: type, name: str) -> Any:
+    """The column *name* orders *model* by, through to-one relations."""
+    field: Any = None
+    current: Any = model
+    for part in name.split("__"):
+        field = current._meta.pk if part == "pk" else current._meta.get_field(part)
+        if field.is_relation:
+            current = field.related_model
+    while field.is_relation:
+        field = field.target_field
+    return field
+
+
 def _order_clauses(order_input: Any, prefix: str = "") -> list[Any]:
     """The column clauses of one order input, through ``object:`` too."""
     clauses: list[Any] = []
@@ -2520,20 +2576,26 @@ def _connection_ordering(query: Any, order_input: Any) -> list[Any]:
     ]
 
 
-def _group_ordering(clauses: list[Any]) -> tuple[dict[str, Any], list[Any]]:
+def _group_ordering(
+    clauses: list[Any], model: type
+) -> tuple[dict[str, Any], list[Any]]:
     """Order groups as their first rows come in the connection's order.
 
     Read in that order, a group starts at its least value of each clause, or
-    its greatest for a descending one, so groups are ranked by those.
+    its greatest for a descending one, so groups are ranked by those. A
+    clause on a column the database cannot take the least of is left out.
     """
     from django.db.models import F, Max, Min
     from django.db.models.expressions import OrderBy
 
     firsts: dict[str, Any] = {}
     ordering: list[Any] = []
-    for index, clause in enumerate(clauses):
-        name = f"_o{index}"
-        firsts[name] = (Max if clause.descending else Min)(clause.expression)
+    for clause in clauses:
+        ranked = _rankable(model, clause.expression)
+        if ranked is None:
+            continue
+        name = f"_o{len(firsts)}"
+        firsts[name] = (Max if clause.descending else Min)(ranked)
         ordering.append(
             OrderBy(
                 F(name),
