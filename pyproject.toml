@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.28.0"
+version = "0.29.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -34,28 +34,28 @@ sqlalchemy = ["sqlalchemy>=2.0"]
 tortoise = ["tortoise-orm>=0.25.0"]
 "contrib.mcp" = ["mcp>=2.3.0"]
 dev = [
-    "greenlet>=3.3.2",
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "pytest-django>=4.8",
-    "typer>=0.9",
-    "uvicorn>=0.30",
+    "greenlet>=3.5.6",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "pytest-django>=4.14.0",
+    "typer>=0.29.1",
+    "uvicorn>=0.54.0",
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.8,<0.10.0"]
+requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "greenlet>=3.3.2",
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "pytest-cov>=7.0.0",
-    "pytest-django>=4.8",
-    "starlette>=0.52.1",
-    "typer>=0.24.1",
-    "uvicorn>=0.41.0",
+    "greenlet>=3.5.6",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "pytest-cov>=7.1.0",
+    "pytest-django>=4.14.0",
+    "starlette>=1.10.0",
+    "typer>=0.29.1",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.ruff]
@@ -85,6 +85,7 @@ known-first-party = ["strawberry_orm"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "--cov=strawberry_orm",
     "--cov-report=term-missing",

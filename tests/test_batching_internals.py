@@ -9,6 +9,7 @@ returning the wrong rows.
 from types import SimpleNamespace
 
 from sqlalchemy import or_, select
+from strawberry.relay import Edge
 
 from strawberry_orm.backends._base import BaseBackend
 from strawberry_orm.backends.sqlalchemy import SQLAlchemyBackend
@@ -204,6 +205,20 @@ class TestBatchingHelpers:
         rows = [object(), object()]
         stash_parents(ctx, info, rows)
         assert ctx._orm_batch_parents == {"users": rows}
+
+    def test_only_edges_have_their_nodes_recorded(self):
+        info = SimpleNamespace(
+            path=SimpleNamespace(key="users", prev=None),
+            field_name="users",
+            python_name="users",
+        )
+        rows = [SimpleNamespace(node=1), SimpleNamespace(node=2)]
+        ctx = SimpleNamespace()
+        stash_parents(ctx, info, rows)
+        assert ctx._orm_batch_parents == {"users": rows}
+        edges = [Edge(cursor="a", node=1), Edge(cursor="b", node=2)]
+        stash_parents(ctx, info, edges)
+        assert ctx._orm_batch_parents == {"users": edges, "users.node": [1, 2]}
 
 
 class TestBatchingExtensionGuards:

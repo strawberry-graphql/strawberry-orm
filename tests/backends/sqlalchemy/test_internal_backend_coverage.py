@@ -726,7 +726,7 @@ class TestInternalBackendCoverage:
         object.__setattr__(field, "missing", StringLookup(exact="x"))
         assert _build_sa_field_clause(field, Post) is None
 
-    def test_build_sa_filter_m2m_is_null_raises(self, Post):
+    def test_build_sa_filter_m2m_is_null_asks_for_none(self, Post):
         @strawberry.input
         class TagsNull:
             is_null: bool | None = True
@@ -742,8 +742,8 @@ class TestInternalBackendCoverage:
         filt = PostFilterWithTags(
             object=PostObjectWithTags(tags=TagsNull(is_null=True))
         )
-        with pytest.raises(ValueError, match="is_null is not supported"):
-            _build_sa_filter(filt, Post)
+        clause, _ = _build_sa_filter(filt, Post)
+        assert str(clause).startswith("NOT (EXISTS (SELECT 1")
 
     def test_build_sa_filter_reverse_many_relation(self, Post):
         from tests.backends.sqlalchemy.fixtures import CommentFilter

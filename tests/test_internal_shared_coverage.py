@@ -8,7 +8,7 @@ import strawberry
 from strawberry import relay
 
 from strawberry_orm import StrawberryORM
-from strawberry_orm._async import await_maybe
+from strawberry_orm._async import await_maybe, resolver_info
 from strawberry_orm.backends._base import BaseBackend
 from strawberry_orm.core import (
     _AutoConnection,
@@ -415,3 +415,12 @@ class TestPayloadElementType:
         from strawberry_orm.payload import _element_type
 
         assert _element_type(None) is None
+
+
+def test_a_resolvers_info_is_found_under_any_name():
+    from strawberry.types.info import Info
+
+    info = Info(_raw_info=None, _field=None)
+    assert resolver_info((), {"ctx": info}) is info
+    assert resolver_info((object(), info), {}) is info
+    assert resolver_info((), {"info": "not one"}) is None

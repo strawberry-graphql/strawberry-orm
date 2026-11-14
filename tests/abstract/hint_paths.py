@@ -41,6 +41,9 @@ def _by_title(data, key):
 
 
 class AbstractTestHintPaths:
+    #: Statements for ``tags.posts.author``: the posts, then one per hop.
+    three_hop_statements = 4
+
     async def execute(self, schema, query):
         result = await self.run(schema, query)
         assert result.errors is None, result.errors
@@ -155,7 +158,7 @@ class AbstractTestHintPaths:
             "Draft Post": [],
             "Rust Adventures": ["Charlie"],
         }
-        assert self.query_count <= 4
+        assert self.query_count <= self.three_hop_statements
 
     async def test_path_under_a_nested_selection(self, orm, models):
         read = self.read

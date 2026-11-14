@@ -8,9 +8,13 @@ from sqlalchemy import select, update
 from strawberry_orm import StrawberryORM
 from tests.abstract.grouping_across_relations import (
     AbstractTestAggregateSelections,
+    AbstractTestARelationToManyRowsCanBeEmpty,
     AbstractTestFilteringThroughAToManyRelation,
     AbstractTestGroupingAcrossRelations,
     AbstractTestGroupingByDateInterval,
+    AbstractTestTheClientsOrderReplacesTheStatements,
+    AbstractTestTheRowsTogetherOnEachDatabase,
+    together_path,
 )
 from tests.backends.sqlalchemy.models import Post, Tag, User
 
@@ -75,4 +79,39 @@ class TestFilteringThroughAToManyRelation(AbstractTestFilteringThroughAToManyRel
 
 
 class TestAggregateSelections(AbstractTestAggregateSelections):
+    pass
+
+
+class TestARelationToManyRowsCanBeEmpty(AbstractTestARelationToManyRowsCanBeEmpty):
+    pass
+
+
+class TestTheClientsOrderReplacesTheStatements(
+    AbstractTestTheClientsOrderReplacesTheStatements
+):
+    pass
+
+
+@pytest.fixture
+def together_sql():
+    from sqlalchemy.dialects import postgresql
+
+    async def _sql(database):
+        dialect = {"postgres": "postgresql"}.get(database, database)
+        backend = StrawberryORM.for_sqlalchemy(
+            dialect=dialect, warn_missing_scope=False
+        ).backend
+        path = together_path(backend, Post)
+        stmt, _ = backend._grouped_select(select(Post), Post, [path], None)
+        return str(stmt.compile(dialect=postgresql.dialect()))
+
+    return _sql
+
+
+@pytest.fixture
+def together_read(orm):
+    return lambda column, interval: orm.backend.together_reader(Post, column, interval)
+
+
+class TestTheRowsTogetherOnEachDatabase(AbstractTestTheRowsTogetherOnEachDatabase):
     pass

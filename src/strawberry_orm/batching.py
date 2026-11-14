@@ -24,8 +24,9 @@ from typing import TYPE_CHECKING, Any
 
 from graphql import GraphQLList, GraphQLNonNull
 from strawberry.extensions import SchemaExtension
+from strawberry.relay import Edge
 
-from strawberry_orm._async import AwaitableOrValue
+from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.grouping import GroupPath
 from strawberry_orm.lazy_resolution import _path_field_names
 
@@ -90,7 +91,44 @@ def stash_parents(execution_context: Any, info: Any, rows: Any) -> None:
     store = _operation_store(execution_context, _PARENTS_KEY)
     if store is None:
         return
-    store[path_key(info)] = rows
+    key = path_key(info)
+    store[key] = rows
+    # A connection's edges each resolve ``node`` to one row, which is never a
+    # list to record, so what is read under ``node`` is batched across these.
+    if all(isinstance(row, Edge) for row in rows):
+        store[f"{key}.node"] = [row.node for row in rows]
+
+
+def _hand_out(
+    batched: dict[int, list[Any]],
+    attr_name: str,
+    members: list[tuple[Any, Any, Any]],
+    rows: list[Any],
+) -> None:
+    """Give each parent its rows from one batched read."""
+    from strawberry_orm.lazy_resolution import mark_rows_scoped
+    from strawberry_orm.optimizer.extension import _mark_prepared
+
+    # The read carried the type's scope and the selection's loads, so the
+    # optimizer must not check or load these again, a parent at a time.
+    _mark_prepared(rows)
+    mark_rows_scoped(rows)
+    grouped: dict[Any, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(getattr(row, attr_name), []).append(row)
+    for parent, parent_pk, _ in members:
+        batched[id(parent)] = grouped.get(parent_pk, [])
+
+
+def _own_rows(entry: Any, root: Any) -> Any:
+    """A parent's rows, or a wait for them when the batched read is pending."""
+    if isawaitable(entry):
+        return _await_own_rows(entry, id(root))
+    return entry
+
+
+async def _await_own_rows(shared: Any, parent_id: int) -> list[Any]:
+    return (await shared).get(parent_id, [])
 
 
 def _to_snake(name: str) -> str:
@@ -213,7 +251,7 @@ class BatchingExtension(SchemaExtension):
         # ``users.posts.comments`` is reached separately for each user's posts.
         # A cache miss therefore means "not batched yet", never "no rows".
         if cached is not _MISSING and id(root) in cached:
-            return cached[id(root)]
+            return _own_rows(cached[id(root)], root)
 
         parents = self._siblings(execution_context, root, key)
         if parents is None:
@@ -247,12 +285,18 @@ class BatchingExtension(SchemaExtension):
             )
             return first
 
+        if isawaitable(batched):
+            # Siblings resolve before the read finishes, so each is handed the
+            # read itself: a task, which every one of them can await.
+            shared = ensure_future(batched)
+            batched = {id(parent): shared for parent in parents}
+
         # Merge rather than replace: earlier parent groups at this path keep
         # their rows.
         merged = {} if cached is _MISSING else dict(cached)
         merged.update(batched)
         results[key] = merged
-        return merged.get(id(root), [])
+        return _own_rows(merged.get(id(root), []), root)
 
     def _siblings(
         self, execution_context: Any, root: Any, key: str
@@ -315,7 +359,7 @@ class BatchingExtension(SchemaExtension):
             groups.setdefault(signature, []).append((parent, parent_pk, remainder))
             key_names[signature] = (attr_name, key_handle)
 
-        batched: dict[int, list[Any]] = {}
+        reads: list[tuple[str, list[tuple[Any, Any, Any]], Any]] = []
         for signature, members in groups.items():
             attr_name, key_handle = key_names[signature]
             _, _, template = members[0]
@@ -327,14 +371,22 @@ class BatchingExtension(SchemaExtension):
             # nested selection, so a batched read can never see more rows than
             # the per-parent read it replaces.
             rows = backend.apply_optimizer_hints(self._store, query, info)
-            if isawaitable(rows):  # pragma: no cover - sync backends only
-                raise _Bail
+            reads.append((attr_name, members, rows))
 
-            grouped: dict[Any, list[Any]] = {}
-            for row in rows:
-                grouped.setdefault(getattr(row, attr_name), []).append(row)
-            for parent, parent_pk, _ in members:
-                batched[id(parent)] = grouped.get(parent_pk, [])
+        if any(isawaitable(rows) for _, _, rows in reads):
+            return self._hand_out_async(reads)
+        batched: dict[int, list[Any]] = {}
+        for attr_name, members, rows in reads:
+            _hand_out(batched, attr_name, members, rows)
+        return batched
+
+    @staticmethod
+    async def _hand_out_async(
+        reads: list[tuple[str, list[tuple[Any, Any, Any]], Any]],
+    ) -> dict[int, list[Any]]:
+        batched: dict[int, list[Any]] = {}
+        for attr_name, members, rows in reads:
+            _hand_out(batched, attr_name, members, await await_maybe(rows))
         return batched
 
 

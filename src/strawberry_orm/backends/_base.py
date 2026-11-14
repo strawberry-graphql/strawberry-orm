@@ -189,10 +189,11 @@ def _input_parts(item: Any) -> list[tuple[str | None, Any, Any]]:
             for label in _AGGREGATES
         ]
         parts.append((None, item.group_key_type, None))
+        parts.append(("objects", item.objects_key_type, item.group_key_type))
     else:
         parts = [
             (key, getattr(item, f"_{key}_type", None), item)
-            for key in ("field", "object")
+            for key in ("field", "object", "objects")
         ]
     return [(label, part, container) for label, part, container in parts if part]
 
@@ -295,6 +296,9 @@ class AggregateMeta:
     """The related model's metadata behind each relation the key nests."""
 
     median_type: type | None = None
+
+    objects_key_type: type | None = None
+    """The key's ``objects``: a list of related keys per to-many relation."""
 
     def build_aggregates(self, row: Any, requested: dict[str, Any]) -> Any:
         """Construct an ``Aggregates`` instance from a SQL result *row*."""
@@ -485,6 +489,9 @@ class BaseBackend:
 
     def __init__(self, **kwargs: Any) -> None:
         self._store = OptimizerStore()
+        #: ``(type name, field name) -> relation`` for every ``on=`` view the
+        #: library serves itself, so its rows are known to be the relation's.
+        self._on_views: dict[tuple[str, str], str] = {}
         self._relation_connections: dict[tuple[str, str], Any] = {}
         self._repos: dict[type, type] = {}
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
@@ -514,6 +521,7 @@ class BaseBackend:
         self._enable_optimizer: bool = kwargs.get("enable_optimizer", True)
         self._strict_hints: bool = kwargs.get("strict_hints", True)
         self._batch_relations: bool = kwargs.get("batch_relations", True)
+        self._to_query: Callable[[Any, Any], Any] | None = kwargs.get("to_query")
         self._type_excludes: dict[type, set[str]] = {}
         self._input_registry: dict[type, list[tuple[str, set[str]]]] = {}
         #: Per GraphQL type, the columns and relations it shows as they are,
@@ -523,6 +531,26 @@ class BaseBackend:
         #: Per model, every filter, order and group-by input and aggregate type
         #: built for it, so each is cut again as types arrive.
         self._model_inputs: dict[type, list[Any]] = {}
+
+    def to_query(self, result: Any, info: Any) -> Any:
+        """What an app's resolver returned, as a query if it is one of the app's.
+
+        Called on every result a field, payload or connection resolver hands
+        the library, before it decides between a query and rows, so an app
+        maps its own query objects once. ``to_query=`` supplies it; without
+        one a result is taken as it is. *info* is ``None`` when the resolver
+        does not take it.
+        """
+        convert = self._to_query
+        return result if convert is None else convert(result, info)
+
+    @property
+    def converts_queries(self) -> bool:
+        """Whether :meth:`to_query` does anything, so resolvers need wrapping."""
+        return (
+            self._to_query is not None
+            or type(self).to_query is not BaseBackend.to_query
+        )
 
     def get_repo(self, model: type) -> Any | None:
         """Return an instantiated repo for *model*, or ``None``."""
@@ -1355,6 +1383,10 @@ class BaseBackend:
         if object_type is not None:
             group_ns["__annotations__"]["object"] = object_type | None
             group_ns["object"] = strawberry.UNSET
+        objects_type = self._group_objects_arm(model, object_type, relation_models)
+        if objects_type is not None:
+            group_ns["__annotations__"]["objects"] = objects_type | None
+            group_ns["objects"] = strawberry.UNSET
         GroupByCls = type(group_type_name, (), group_ns)
         GroupByType = strawberry.input(GroupByCls, one_of=True)
         GroupByType._field_type = GroupByFieldType  # type: ignore[attr-defined]
@@ -1362,6 +1394,8 @@ class BaseBackend:
         if object_type is not None:
             GroupByType._object_type = object_type  # type: ignore[attr-defined]
             GroupByType._relation_models = relation_models  # type: ignore[attr-defined]
+        if objects_type is not None:
+            GroupByType._objects_type = objects_type  # type: ignore[attr-defined]
         self._cover_shown_fields(model, GroupByType)
 
         self._group_registry[model] = GroupByType
@@ -1401,6 +1435,47 @@ class BaseBackend:
             {"__annotations__": annotations, **defaults},
         )
         return strawberry.input(object_cls, one_of=True), relation_models
+
+    def _group_objects_arm(
+        self, model: type, object_type: type | None, relation_models: dict[str, type]
+    ) -> type | None:
+        """The ``objects:`` input: the to-many relations ``object:`` offers.
+
+        Grouped by under ``objects:``, a row's related rows make one value
+        together, rather than a value each.
+        """
+        if object_type is None:
+            return None
+        annotations = {
+            relation: object_type.__annotations__[relation]
+            for relation in relation_models
+            if self.relation_hop(model, relation).many
+        }
+        if not annotations:
+            return None
+        objects_cls = type(
+            f"{model.__name__}GroupByObjects",
+            (),
+            {
+                "__annotations__": annotations,
+                **dict.fromkeys(annotations, strawberry.UNSET),
+            },
+        )
+        return strawberry.input(objects_cls, one_of=True)
+
+    def together_reader(
+        self, model: type, column: str, interval: Any
+    ) -> Callable[[Any], Any]:
+        """What reads *column*'s value back out of the JSON ``objects:`` groups by.
+
+        It should read as the column does grouped by on its own, cut to
+        *interval* if that is set.
+        """
+        from strawberry_orm.grouping import from_json
+
+        kinds = {name: ftype for name, ftype, *_ in self._introspect_model(model)}
+        kind = kinds.get(column)
+        return lambda value: from_json(value, kind)
 
     def relation_hop(self, model: type, relation: str) -> Any:
         """The ``GroupHop`` across *model*'s *relation*: its target, and whether
@@ -1531,6 +1606,10 @@ class BaseBackend:
         if object_type is not None:
             group_ns["__annotations__"]["object"] = object_type | None
             group_ns["object"] = strawberry.UNSET
+        objects_type = self._group_objects_arm(model, object_type, relation_models)
+        if objects_type is not None:
+            group_ns["__annotations__"]["objects"] = objects_type | None
+            group_ns["objects"] = strawberry.UNSET
 
         for cname, cann in custom_group_annotations.items():
             group_ns["__annotations__"][cname] = cann
@@ -1544,6 +1623,8 @@ class BaseBackend:
         if object_type is not None:
             GroupByType._object_type = object_type  # type: ignore[attr-defined]
             GroupByType._relation_models = relation_models  # type: ignore[attr-defined]
+        if objects_type is not None:
+            GroupByType._objects_type = objects_type  # type: ignore[attr-defined]
         if custom_groups:
             GroupByType._custom_groups = custom_groups  # type: ignore[attr-defined]
         self._cover_shown_fields(model, GroupByType)
@@ -1625,11 +1706,14 @@ class BaseBackend:
             # The aggregates do not depend on how rows are grouped, and two
             # types of one name cannot share a schema.
             plain = self._build_aggregate_types(model, aggregate_cls)
-            key_type, relation_keys = self._group_key_type(
+            key_type, relation_keys, objects_key = self._group_key_type(
                 model, [fname for fname, _ftype in plain.groupable_fields], group_type
             )
             meta = dataclasses.replace(
-                plain, group_key_type=key_type, relation_keys=relation_keys
+                plain,
+                group_key_type=key_type,
+                relation_keys=relation_keys,
+                objects_key_type=objects_key,
             )
             self._cover_shown_fields(model, meta)
             self._aggregate_type_cache[cache_key] = meta
@@ -1718,7 +1802,7 @@ class BaseBackend:
         agg_ns = {"__annotations__": agg_ann, **agg_defs}
         AggregatesType = strawberry.type(type(agg_cls_name, (), agg_ns))
 
-        GroupKeyType, relation_keys = self._group_key_type(
+        GroupKeyType, relation_keys, objects_key = self._group_key_type(
             model, [fname for fname, _ftype in groupable_fields], group_type
         )
 
@@ -1736,6 +1820,7 @@ class BaseBackend:
             groupable_fields=groupable_fields,
             custom_fields=custom_agg_handlers,
             relation_keys=relation_keys,
+            objects_key_type=objects_key,
         )
         self._cover_shown_fields(model, meta)
         self._aggregate_type_cache[cache_key] = meta
@@ -1743,9 +1828,9 @@ class BaseBackend:
 
     def _group_key_type(
         self, model: type, columns: list[str], group_type: Any
-    ) -> tuple[type, dict[str, AggregateMeta]]:
-        """The ``GroupKey`` type for *group_type*, and the metadata behind each
-        relation it nests.
+    ) -> tuple[type, dict[str, AggregateMeta], type | None]:
+        """The ``GroupKey`` type for *group_type*, the metadata behind each
+        relation it nests, and the type of its ``objects``, if it has one.
 
         Shared by every connection keyed the same way: a related model's key
         reached through ``object:`` is the one its own connection reports, and
@@ -1773,6 +1858,23 @@ class BaseBackend:
         for name in custom_keys:
             key_ann[name] = str | None
             key_defs[name] = None
+        objects_key = None
+        objects_type = getattr(group_type, "_objects_type", None)
+        if objects_type is not None:
+            together = {
+                relation: list[relation_keys[relation].group_key_type] | None
+                for relation in objects_type.__annotations__
+            }
+            objects_key = strawberry.type(
+                type(
+                    f"{model.__name__}GroupKeyObjects",
+                    (),
+                    {"__annotations__": together, **dict.fromkeys(together)},
+                ),
+                description="The related rows a group's rows have, together.",
+            )
+            key_ann["objects"] = objects_key | None
+            key_defs["objects"] = None
         GroupKeyType = strawberry.type(
             type(
                 f"{model.__name__}GroupKey",
@@ -1781,10 +1883,13 @@ class BaseBackend:
             )
         )
         # A @group_field is the developer's own expression, not a column the
-        # types might hide, so the cut keeps it.
-        GroupKeyType._orm_uncut = frozenset(custom_keys)  # type: ignore[attr-defined]
-        self._group_key_cache[cache_key] = (GroupKeyType, relation_keys)
-        return GroupKeyType, relation_keys
+        # types might hide, so the cut keeps it. ``objects`` holds relations,
+        # cut in its own type and dropped with it.
+        GroupKeyType._orm_uncut = frozenset(  # type: ignore[attr-defined]
+            {*custom_keys, *(["objects"] if objects_key else [])}
+        )
+        self._group_key_cache[cache_key] = (GroupKeyType, relation_keys, objects_key)
+        return GroupKeyType, relation_keys, objects_key
 
     # -- Fields --------------------------------------------------------------
 
@@ -2250,7 +2355,12 @@ class BaseBackend:
                     if container is not None:
                         dropped.setdefault(container, set()).add(label)
         for container, labels in dropped.items():
-            names = {f.python_name for f in container.__strawberry_definition__.fields}
+            existing = cuts.get(container)
+            names = (
+                set(existing.keep)
+                if existing is not None
+                else {f.python_name for f in container.__strawberry_definition__.fields}
+            )
             cuts[container] = InputCut(
                 frozenset(names - labels), messages.get(container)
             )
@@ -2843,6 +2953,7 @@ class BaseBackend:
                 self._make_on_resolver(model, field_name, relation, return_ann),
                 type_override=field.type if field.type is not UNRESOLVED else None,
             )
+            self._on_views[(type_name, field_name)] = relation
 
     def _finalize_type(
         self,

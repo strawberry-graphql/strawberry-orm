@@ -26,7 +26,12 @@ from typing import Any
 
 import strawberry
 
-from strawberry_orm._async import in_async_context, keep_annotations, run_sync
+from strawberry_orm._async import (
+    converting_resolver,
+    in_async_context,
+    keep_annotations,
+    run_sync,
+)
 from strawberry_orm.tags import field_metadata
 
 
@@ -324,7 +329,7 @@ class PayloadFactory:
 
             fn.__annotations__ = {**fn.__annotations__, "return": payload}
             resolver = _guarded(
-                fn,
+                converting_resolver(self._orm.backend, fn),
                 policy,
                 lambda data, _info: payload(_orm_connection_rows=data, errors=None),
                 lambda exc: payload(
@@ -375,7 +380,7 @@ class PayloadFactory:
             # on the function being wrapped rather than on the wrapper.
             func.__annotations__ = {**func.__annotations__, "return": payload}
             resolver = _guarded(
-                func,
+                converting_resolver(self._orm.backend, func),
                 policy,
                 lambda data, info: payload(
                     data=self._orm.optimize(data, info, at="data"), errors=None

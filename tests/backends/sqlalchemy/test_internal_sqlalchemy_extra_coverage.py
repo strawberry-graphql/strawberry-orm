@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 import strawberry
-from sqlalchemy import Boolean, Integer, select, text
+from sqlalchemy import Boolean, Integer, String, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -34,6 +34,7 @@ class FlagModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    label: Mapped[str] = mapped_column(String(20), default="")
 
 
 @pytest_asyncio.fixture
@@ -203,13 +204,13 @@ class TestInternalSqlalchemyExtraCoverage:
 
     def test_ordering_and_regex_helper_edges(self):
         clause = _build_lookup_clauses(
-            FlagModel.enabled, RegexLookup(i_regex="x"), enable_regex=True
+            FlagModel.label, RegexLookup(i_regex="x"), enable_regex=True
         )
         assert len(clause) == 1
         assert _build_sa_ordering(MissingOrder(), FlagModel) == ([], [], None)
 
         text_clauses = _build_lookup_clauses(
-            FlagModel.id,
+            FlagModel.label,
             StringLookup(regex="^1", i_regex="^1"),
             enable_regex=True,
         )

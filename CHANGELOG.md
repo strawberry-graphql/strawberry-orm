@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.29.0
+
+This release closes the `on=` view brief and, of the thirteen SQLAlchemy backend items, **1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and 13**. Items 5 and 9 have limits, given under each.
+
+### Added
+
+- **`to_query=` (SQLAlchemy item 8).** `StrawberryORM.for_*(to_query=lambda result, info: ...)` maps what an `orm.field`, `orm.connection`, `orm.payload.query` or `orm.payload.connection` resolver returns before the library decides between a query and rows. An app's own query objects are converted once, and a connection over one filters, orders and pages in the database. Backends also have `to_query(result, info)` to override.
+- **`offload_sync_session=True` on SQLAlchemy (item 9).** Under async execution with a sync `Session`, the library's own reads (counts, a statement a resolver returned, eager loads, relation loads, aggregates and groups) run through `sync_to_async(thread_sensitive=True)`, one thread per operation, instead of on the event loop. It is opt-in: in-memory SQLite gives each thread a database of its own. **Limit:** writes (upserts, `orm.ref` lists, repo creates) still run where they are called.
+- **`field_order=` on SQLAlchemy (item 10).** `field_order(model, names)` returns the order a model's fields are listed in, for the generated types and inputs. Names it leaves out follow the ones it returns.
+- **Grouping by the set of a to-many relation's rows.** `groupBy: [{objects: {tags: {field: {name: true}}}}]` puts each row in exactly one group, keyed by all of its visible related rows together: a post tagged `graphql` and `python` is in the `[graphql, python]` group, not counted under each tag. The key reads `key { objects { tags { name } } }`, a list of the related keys, distinct and sorted, and `[]` for a row with none. It works across many-to-many relations and reverse foreign keys, takes several columns and date intervals, and combines with other group-by entries. Groups, their `items` and `edgeIndices` all work as for any other key. Built in SQL as JSON on PostgreSQL and SQLite; other databases raise. The generated types are `<Model>GroupByObjects` and `<Model>GroupKeyObjects`, and `AggregateMeta` has an `objects_key_type` field.
+
+### Changed
+
+- **A client's `order` replaces the order of the statement a resolver returned (SQLAlchemy item 4)**, as on Django and Tortoise, instead of only breaking its ties. With no `order`, the statement's own order stands; the primary-key tiebreak for paging still applies.
+- **Dependencies.** Developed and tested on the latest releases (Django 6.1, SQLAlchemy 2.1, Tortoise ORM 1.1, Strawberry 0.341, pytest 9, uv_build 0.13). The minimum versions you can install with are unchanged.
+
+### Fixed
+
+- **An `on=` view's rows are trusted as a read of its relation** (the `on=` view brief). A view named differently from its relation (`recent = orm.field.eager(on="books", scope=...)`) had its prefetched, already scoped rows scope-checked and loaded again, a parent at a time. It is now decided by the relation the field reads. A field whose resolver returns rows it read itself is still checked. On Django, a nested selection under such a view is prefetched with it, rather than per row.
+- **A batched field under a connection is batched (SQLAlchemy item 1).** A connection's edges now record their nodes as the parents of what is read under `node`, so an `on=` view or other batchable field under a connection is one statement for the page instead of one per node.
+- **The batcher's rows are not scoped and loaded again per parent (item 2).** They are marked as read with the scope and the nested selection already applied. Under async execution, one batch is shared by every parent rather than awaited once per parent.
+- **Rows a resolver hands back are loaded in their own session, and only what they lack (item 3).** SQLAlchemy's `load_relations` re-reads rows in the session they belong to, so the caller's instances get the relations, and skips relations every row already has loaded, descending into loaded ones. Rows that already hold the selection cost no statement. A detached row is filled from a copy read in the request's session. Values changed in memory survive, and so does a collection the app already loaded: it is not replaced, and the field scopes it as before. Rows from several sessions are read once per session.
+- **A scope's `ORDER BY` is kept when its to-many relation is eager-loaded (item 5).** An ordered `scope=` or `scope_rows` on a to-many relation is read as one statement for all parents with the scope's order, as Django's `Prefetch` is, instead of a `selectinload` that dropped it. Parent keys are sent 500 to a statement. **Limit:** a relation through an association table (many-to-many), on a composite key, or whose `primaryjoin` says more than the key comparison still uses `selectinload`, and the scope's order is lost.
+- **A scope check reads only keys (item 6).** `filter_scoped_pks` selects the primary key column, so loader options a `scope_rows` attaches are not run for a membership check.
+- **`SmallInteger` and `BigInteger` columns are `Int` (item 7)**, not `String`, and get `sum`/`avg` aggregates. A column type is now looked up by its class and each class it derives from, so other subclasses of a known type change too: `Double`, `DOUBLE`, `DOUBLE_PRECISION` and `REAL` become `Float`, MySQL's `TINYINT` and `MEDIUMINT` become `Int`, and `MatchType` becomes `Boolean`. This changes the generated schema for models with such columns.
+- **Date and datetime filters compare as dates (item 11).** Every value a lookup compares (`exact`, `neq`, `gt`, `gte`, `lt`, `lte`, `inList`, `notInList`, `range`) is parsed and bound in the column's own type, so PostgreSQL with psycopg 3 no longer refuses `timestamp >= varchar`. A value that is not ISO 8601 (`"2026-09"`) is now refused with an error naming it, rather than handed to the database. Tested on SQLite and by the bound types; the PostgreSQL behaviour follows from the binding.
+- **`object: {books: {isNull: true}}` works on a to-many relation (item 12)**, through a foreign key or an association table: rows with no related row the reader can see. `false` gives rows with at least one.
+- **A sync session no longer needs greenlet (item 13).** The SQLAlchemy backend looks for `AsyncSession` only once `sqlalchemy.ext.asyncio` has been imported.
+- **On Django, a date grouped by an interval through a related type with `scope_rows`** read as a datetime (`"2026-01-01T00:00:00+00:00"`), and a datetime's period did not read in the current time zone. The period is now cut outside the scope's `CASE`, so it reads as it does on the model itself.
+
 ## 0.28.0
 
 ### Added

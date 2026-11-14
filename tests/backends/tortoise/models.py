@@ -63,7 +63,7 @@ class Comment(Model):
 class Publisher(Model):
     """Related model with a non-``id`` primary key."""
 
-    publisher_code = fields.CharField(max_length=20, pk=True)
+    publisher_code = fields.CharField(max_length=20, primary_key=True)
     name = fields.CharField(max_length=100)
 
     class Meta:

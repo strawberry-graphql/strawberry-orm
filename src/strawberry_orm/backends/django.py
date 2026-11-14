@@ -569,6 +569,26 @@ class DjangoBackend(BaseBackend):
 
         return run_sync(_run, thread_sensitive=True)
 
+    def together_reader(self, model: type, column: str, interval: Any) -> Any:
+        from django.conf import settings
+        from django.utils import timezone
+
+        read = super().together_reader(model, column, interval)
+        field = model._meta.get_field(column)  # type: ignore[attr-defined]
+        if not isinstance(field, models.DateTimeField):
+            return read
+        # Read as Django reads the column: with time zones on, a datetime is
+        # stored in UTC, and a cut one is the start of its period here.
+        zone = timezone.get_current_timezone() if interval is not None else datetime.UTC
+
+        def read_datetime(value: Any) -> Any:
+            value = read(value)
+            if settings.USE_TZ and value is not None and timezone.is_naive(value):
+                return timezone.make_aware(value, zone)
+            return value
+
+        return read_datetime
+
     def relation_hop(self, model: type, relation: str) -> Any:
         from strawberry_orm.grouping import GroupHop
 
@@ -767,7 +787,33 @@ class DjangoBackend(BaseBackend):
         from functools import reduce
         from operator import and_
 
-        from django.db.models import Case, F, Q, When
+        from django.db.models import Case, F, OuterRef, Q, When
+
+        if path.through is not None:
+            hop = path.through
+            restrict = self.relation_scope(hop.model, hop.relation, info)
+            related = (
+                restrict(hop.target._default_manager.all(), info)
+                if restrict is not None
+                else hop.target._base_manager.all()
+            )
+            names = [f"_orm_c{index}" for index in range(len(path.columns))]
+            values = {
+                name: F(column)
+                if interval is None
+                else _truncate(F(column), hop.target._meta.get_field(column), interval)
+                for name, column, interval in zip(
+                    names, path.columns, path.intervals, strict=True
+                )
+            }
+            rows_together = (
+                related.filter(**{_remote_name(hop): OuterRef("pk")})
+                .annotate(**values)
+                .values(*names)
+                .distinct()
+                .order_by(*names)
+            )
+            return _Together(rows_together, names)
 
         if path.custom is not None:
             expr = invoke_custom_callback(
@@ -791,11 +837,13 @@ class DjangoBackend(BaseBackend):
             prefix = f"{prefix}{hop.relation}__"
 
         expr = F(f"{prefix}{path.column}")
-        if path.interval is not None:
-            owner = path.model or rows.model
-            expr = _truncate(expr, owner._meta.get_field(path.column), path.interval)
         if conditions:
             expr = Case(When(reduce(and_, conditions), then=expr), default=None)
+        if path.interval is not None:
+            # Cut outside the CASE: the cut converts what the database hands
+            # back (a date, an aware datetime), and inside it would not.
+            owner = path.model or rows.model
+            expr = _truncate(expr, owner._meta.get_field(path.column), path.interval)
         return expr
 
     # -- Queryset overrides --------------------------------------------------
@@ -1211,7 +1259,7 @@ class DjangoBackend(BaseBackend):
                         custom_qs = _get_nested_queryset(
                             type_name, field_name, related_model
                         )
-                        level.setdefault(
+                        view = level.setdefault(
                             f"@{field_name}",
                             _PlannedLookup(
                                 to_one=False,
@@ -1225,6 +1273,15 @@ class DjangoBackend(BaseBackend):
                                 scoped=custom_qs is not None,
                             ),
                         )
+                        if node.selection_set:
+                            _plan_selection(
+                                view.children,
+                                node.selection_set,
+                                related_model,
+                                self._child_type_name(
+                                    type_name, node.name.value, related_model, info
+                                ),
+                            )
                         continue
 
                     lookup = _planned(
@@ -1255,6 +1312,11 @@ class DjangoBackend(BaseBackend):
                         if lookup.scoped:
                             prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
                         prefetch_related.append(prefetch)
+                        # Django prefetches through the list a to_attr holds.
+                        view_path = (
+                            f"{prefix}__{lookup.to_attr}" if prefix else lookup.to_attr
+                        )
+                        _emit(lookup.children, view_path, True)
                         continue
                     path = f"{prefix}__{key}" if prefix else key
                     if lookup.queryset is not None:
@@ -2413,6 +2475,36 @@ class _Median(Aggregate):
                 f"median is supported on PostgreSQL, not {connection.vendor}."
             )
         return super().as_sql(compiler, connection, **extra)
+
+
+class _Together(models.Subquery):
+    """The rows of a correlated subquery as one JSON array, ``[]`` for none.
+
+    The subquery's columns, *names*, are put in an array per row. It hands
+    rows over distinct and sorted, so a set of rows reads as the same text
+    wherever it is read. PostgreSQL sorts again inside the aggregate, which
+    alone it promises to keep; SQLite keeps the order of an ordered subquery.
+    """
+
+    def __init__(self, queryset: Any, names: list[str]) -> None:
+        super().__init__(queryset, output_field=models.TextField())
+        self.names = names
+
+    def as_sql(self, compiler: Any, connection: Any, *args: Any, **extra: Any) -> Any:
+        rows, params = super().as_sql(compiler, connection, *args, **extra)
+        columns = ", ".join(
+            f"_orm_t.{connection.ops.quote_name(name)}" for name in self.names
+        )
+        if connection.vendor == "sqlite":
+            together = f"json_group_array(json_array({columns}))"
+        elif connection.vendor == "postgresql":
+            together = f"json_agg(json_build_array({columns}) ORDER BY {columns})::text"
+        else:
+            raise ValueError(
+                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
+                f"not {connection.vendor}."
+            )
+        return f"COALESCE((SELECT {together} FROM {rows} _orm_t), '[]')", params
 
 
 def _truncate(expr: Any, field: Any, interval: Any) -> Any:

@@ -26,6 +26,7 @@ from strawberry_orm._async import (
     AwaitableOrValue,
     await_maybe,
     await_maybe_blocking,
+    converting_resolver,
     in_async_context,
     keep_annotations,
     materialize_result,
@@ -784,6 +785,7 @@ class FieldFactory:
         deprecation_reason: str | None = None,
         metadata: Mapping[Any, Any] | None = None,
     ) -> Any:
+        fn = converting_resolver(self._backend, fn)
         wrap = getattr(self._backend, "wrap_async_safe", None)
         return strawberry.field(
             resolver=wrap(fn) if wrap is not None else fn,
@@ -994,7 +996,9 @@ class _AutoConnection:
 
             graphql_type = connection_type_for_node(node_type)
 
-        if resolver is None and model is not None:
+        if resolver is not None:
+            resolver = converting_resolver(self._backend, resolver)
+        elif model is not None:
             resolver = _make_query_resolver(
                 self._backend, model, filter_type, order_type, group_type
             )

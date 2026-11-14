@@ -1553,10 +1553,33 @@ A group's first row is found with `MIN` (or `MAX` for a descending clause) of ea
 
 - A relation is offered when the related model has a group-by type (`orm.group(Author)`, registered first) and the type shows the relation as stored, e.g. `author: AuthorNode | None`.
 - Grouping reads the related row through the related type's `scope_rows`. A row with no related row, or one the caller cannot see, is grouped under a key whose related values are all `null` — `{ author: { id: null, name: null } }`, not `{ author: null }` — as the field reads on the type.
-- Across a to-many relation (`tags`, or a reverse foreign key such as `author.posts`), a row is grouped once under each distinct key its visible related rows give, and once under `null` if it has none. A post tagged `python` and `rust` is counted in both groups, and in its own edge's `edgeIndices` for each. The groups' counts can therefore add up to more than `totalCount`.
+- Across a to-many relation (`tags`, or a reverse foreign key such as `author.posts`), a row is grouped once under each distinct key its visible related rows give, and once under `null` if it has none. A post tagged `python` and `rust` is counted in both groups, and in its own edge's `edgeIndices` for each. The groups' counts can therefore add up to more than `totalCount`. To put each row in one group, keyed by the set of its related rows, use [`objects:`](#grouping-by-a-set-of-related-rows).
 - A to-many relation can only be the first relation in a path.
 
 A relation the type shows through its own resolver (`@strawberry.field def category(self) -> CategoryNode`) is not offered, because the ORM cannot tell what the resolver returns. You can show the relation as stored (`category: CategoryNode | None`), show its foreign key column (`category_id: auto`) and group by that, or declare a `@group_field` that returns the column you want to group by.
+
+### Grouping by a set of related rows
+
+`objects:` groups a row by all of its related rows across a to-many relation at once, so each row is in exactly one group. A post tagged `graphql` and `python` falls in the `[graphql, python]` group, together with every other post tagged exactly those two. It is not counted under `graphql` and again under `python`, and the groups' counts add up to `totalCount`:
+
+```graphql
+{
+  posts(groupBy: [{ objects: { tags: { field: { name: true } } } }]) {
+    groups {
+      key { objects { tags { name } } }   # [{name: "graphql"}, {name: "python"}]
+      aggregates { count }
+      edgeIndices
+      items(first: 5) { edges { node { title } } }
+    }
+  }
+}
+```
+
+- `objects:` offers the to-many relations `object:` offers (many-to-many and reverse foreign keys) on the model itself. Under each one, `field:` names the related rows' columns the set is made of. Naming the relation in several entries adds their columns to the same set: `[{objects: {tags: {field: {id: true}}}}, {objects: {tags: {field: {name: true}}}}]` keys each group by `tags { id name }`.
+- The key's `objects { tags }` is a list of the related keys, distinct and sorted by their values. Two posts are in the same group when their related rows give the same values. A post with no tags, or only tags the caller cannot see, is in the `[]` group. Hidden rows are left out of the set, as the field reads on the type.
+- A date column takes an `interval`, as it does under `field:`. Each related row's date is cut to its period before the set is made, so two January posts make one `2026-01-01` entry.
+- The set is built in SQL as JSON, on PostgreSQL and SQLite; other databases raise, as date intervals do.
+- `objects:` can be combined with `field:`, `object:` and `@group_field` entries in the same `groupBy`.
 
 ### Grouping by date intervals
 
@@ -2074,6 +2097,22 @@ class Query:
 
 `apply_ref_list` is sync for Django/sync-SQLAlchemy and awaitable for Tortoise/async-SQLAlchemy.
 
+With a sync SQLAlchemy `Session` under async execution (subscriptions, `schema.execute`), the library's own reads run on the event loop by default. That includes counts, a statement a resolver returned, eager loads, and loading the relations of rows a resolver handed back. If your session refuses use from the loop's thread, pass `offload_sync_session=True`: those reads then go through `sync_to_async(thread_sensitive=True)`, one thread per operation, as Django's do. Leave it off for in-memory SQLite, whose connection pool gives each thread a database of its own. Writes (upserts, `orm.ref` lists, repo creates) are not moved.
+
+### Your own query objects
+
+If your resolvers return a query object of your own that wraps the ORM's, pass `to_query=` to map it once, rather than in every resolver:
+
+```python
+orm = StrawberryORM.for_sqlalchemy(
+    dialect="postgresql",
+    session_getter=...,
+    to_query=lambda result, info: result.select if isinstance(result, MyQuery) else result,
+)
+```
+
+It is called on every result an `orm.field`, `orm.connection`, `orm.payload.query` or `orm.payload.connection` resolver hands the library, before the library decides between a query and rows. A connection over the converted result then filters, orders and pages in the database. `info` is `None` when the resolver does not take it.
+
 ---
 
 ## Contrib
@@ -2178,6 +2217,7 @@ Shared options:
 | `max_filter_branches`      | `50`     | Caps `all` / `any` / `oneOf` branch count.                                                                                                                                    |
 | `max_in_list_size`         | `500`    | Caps `inList` / `notInList` size.                                                                                                                                             |
 | `enable_regex_filters`     | `False`  | Enables `regex` and `iRegex` string lookups.                                                                                                                                  |
+| `to_query`                 | `None`   | `to_query(result, info)`: turns what a field, payload or connection resolver returns into a query when it is one of your own query objects. See [Your own query objects](#your-own-query-objects). |
 
 
 Django-only:
@@ -2196,6 +2236,8 @@ SQLAlchemy-only:
 | `dialect`          | `"postgresql"` | SQLAlchemy dialect.                                     |
 | `session_getter`   | `None`         | Callable returning the session for the current request. |
 | `filter_overrides` | `{}`           | Maps Python types to custom lookup input types.         |
+| `offload_sync_session` | `False`    | Under async execution, runs the library's own reads on a sync `Session` with `sync_to_async(thread_sensitive=True)` rather than on the event loop. See [Async usage](#async-usage). |
+| `field_order`      | `None`         | `field_order(model, names)`: the order a model's fields are listed in, given its column and relation names in mapper order (columns first). Names it leaves out follow the ones it returns. |
 
 
 ---

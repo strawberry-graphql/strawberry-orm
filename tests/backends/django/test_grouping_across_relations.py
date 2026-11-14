@@ -9,9 +9,13 @@ from django.db.models import F
 from strawberry_orm import StrawberryORM
 from tests.abstract.grouping_across_relations import (
     AbstractTestAggregateSelections,
+    AbstractTestARelationToManyRowsCanBeEmpty,
     AbstractTestFilteringThroughAToManyRelation,
     AbstractTestGroupingAcrossRelations,
     AbstractTestGroupingByDateInterval,
+    AbstractTestTheClientsOrderReplacesTheStatements,
+    AbstractTestTheRowsTogetherOnEachDatabase,
+    together_path,
 )
 from tests.backends.django.models import Post, Tag, User
 
@@ -72,4 +76,36 @@ class TestFilteringThroughAToManyRelation(AbstractTestFilteringThroughAToManyRel
 
 
 class TestAggregateSelections(AbstractTestAggregateSelections):
+    pass
+
+
+class TestARelationToManyRowsCanBeEmpty(AbstractTestARelationToManyRowsCanBeEmpty):
+    pass
+
+
+class TestTheClientsOrderReplacesTheStatements(
+    AbstractTestTheClientsOrderReplacesTheStatements
+):
+    pass
+
+
+@pytest.fixture
+def together_sql(orm, monkeypatch):
+    from django.db import connections
+
+    async def _sql(database):
+        vendor = {"postgres": "postgresql"}.get(database, database)
+        monkeypatch.setattr(type(connections["default"]), "vendor", vendor)
+        path = together_path(orm.backend, Post)
+        return str(orm.backend._grouped_rows(Post.objects.all(), [path], None).query)
+
+    return _sql
+
+
+@pytest.fixture
+def together_read(orm):
+    return lambda column, interval: orm.backend.together_reader(Post, column, interval)
+
+
+class TestTheRowsTogetherOnEachDatabase(AbstractTestTheRowsTogetherOnEachDatabase):
     pass

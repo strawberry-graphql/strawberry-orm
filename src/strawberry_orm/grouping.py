@@ -1,8 +1,9 @@
 """What a ``groupBy`` asks for, worked out once for every backend.
 
 A group-by entry names a column of the model (``field:``), a column of a
-related model reached through ``object:``, or a ``@group_field`` method. Each
-becomes a :class:`GroupPath`. The backends turn paths into expressions and
+related model reached through ``object:``, the set of a to-many relation's
+rows (``objects:``), or a ``@group_field`` method. Each becomes a
+:class:`GroupPath`. The backends turn paths into expressions and
 hand back one value per path; the key a group reports, and the edges it
 claims, are built from those values here.
 """
@@ -10,8 +11,11 @@ claims, are built from those values here.
 from __future__ import annotations
 
 import datetime
+import json
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Any
 
 import strawberry
@@ -25,6 +29,7 @@ __all__ = [
     "assign_edge_indices",
     "build_group",
     "format_group_value",
+    "from_json",
     "group_paths",
     "key_tuple",
     "needs_database_membership",
@@ -69,6 +74,13 @@ class GroupPath:
     #: The ``@group_field`` method's input instance and the value it was given.
     owner: Any = None
     value: Any = None
+    #: Under ``objects:``, the to-many relation whose rows are grouped by
+    #: together, and the columns of theirs the key holds, with the interval
+    #: each date is cut to and what reads each value back out of JSON.
+    through: GroupHop | None = None
+    columns: tuple[str, ...] = ()
+    intervals: tuple[DateGroupByInterval | None, ...] = ()
+    readers: tuple[Callable[[Any], Any], ...] = ()
 
     @property
     def key_path(self) -> tuple[str, ...]:
@@ -138,6 +150,11 @@ def _collect(
                         f"can only be grouped by directly on the model."
                     )
                 _collect(backend, hop.target, nested, (*hops, hop), found)
+        elif key == "objects":
+            for relation in value.__class__.__dataclass_fields__:
+                nested = getattr(value, relation)
+                if _is_set(nested):
+                    _collect_together(backend, model, relation, nested, hops, found)
         elif key in custom:
             if hops:
                 raise ValueError(
@@ -154,6 +171,101 @@ def _collect(
             found.setdefault(path.key_path, path)
 
 
+def _collect_together(
+    backend: Any,
+    model: type,
+    relation: str,
+    entry: Any,
+    hops: tuple[GroupHop, ...],
+    found: dict[tuple[str, ...], GroupPath],
+) -> None:
+    """The path ``objects: {relation: entry}`` groups *model* by.
+
+    Every column *entry* names goes into one value, so a row's related rows
+    are told apart by all of them at once. Naming the relation again adds
+    columns to the same value.
+    """
+    hop = backend.relation_hop(model, relation)
+    where = f"objects: {{{relation}}} on {model.__name__}"
+    if hops or not hop.many:
+        raise ValueError(
+            f"Cannot group by {where}: objects: groups a model by the rows of "
+            f"one of its own to-many relations."
+        )
+    path = found.get(("objects", relation))
+    columns: dict[str, DateGroupByInterval | None] = (
+        dict(zip(path.columns, path.intervals, strict=True)) if path else {}
+    )
+    for key in entry.__class__.__dataclass_fields__:
+        value = getattr(entry, key)
+        if not _is_set(value):
+            continue
+        if key != "field":
+            raise ValueError(
+                f"Cannot group by {where} through {key}: the related rows are "
+                f"grouped by their own columns, under field:."
+            )
+        for column in value.__class__.__dataclass_fields__:
+            option = getattr(value, column)
+            if _is_set(option):
+                columns.setdefault(column, getattr(option, "interval", None))
+    if not columns:
+        return
+    found[("objects", relation)] = GroupPath(
+        alias="",
+        name=relation,
+        through=hop,
+        columns=tuple(columns),
+        intervals=tuple(columns.values()),
+        readers=tuple(
+            backend.together_reader(hop.target, column, interval)
+            for column, interval in columns.items()
+        ),
+    )
+
+
+def from_json(value: Any, kind: Any) -> Any:
+    """*value*, as JSON gave it, read as the column's grouped value reads.
+
+    JSON has no dates, UUIDs or booleans of its own: each database writes
+    them as it stores them, a string or a number.
+    """
+    if value is None or kind is None:
+        return value
+    if kind is bool:
+        return bool(value)
+    if kind in (float, int) and not isinstance(value, str):
+        return kind(value)
+    if not isinstance(value, str):
+        return value
+    if kind is uuid.UUID:
+        return uuid.UUID(value)
+    if kind is datetime.datetime:
+        return datetime.datetime.fromisoformat(value)
+    if kind is datetime.date:
+        # A date cut to its interval may come back as the instant it starts.
+        return datetime.datetime.fromisoformat(value).date()
+    if kind is datetime.time:
+        return datetime.time.fromisoformat(value)
+    return value
+
+
+def _together_key(meta: Any, path: GroupPath, value: str) -> list[Any]:
+    """The related keys *value*, a JSON array of column values per row, holds."""
+    key_type = meta.relation_keys[path.name].group_key_type
+    return [
+        key_type(
+            **{
+                column: format_group_value(read(item), interval)
+                for column, read, interval, item in zip(
+                    path.columns, path.readers, path.intervals, row, strict=True
+                )
+            }
+        )
+        for row in json.loads(value, parse_float=Decimal)
+    ]
+
+
 def format_group_value(value: Any, interval: DateGroupByInterval | None) -> Any:
     """A key value as the client reads it: a string, or ``None``.
 
@@ -167,18 +279,34 @@ def format_group_value(value: Any, interval: DateGroupByInterval | None) -> Any:
 
 
 def key_tuple(paths: Iterable[GroupPath], values: Mapping[str, Any]) -> tuple:
-    """The formatted values *values* holds for *paths*, in path order."""
-    return tuple(format_group_value(values[p.alias], p.interval) for p in paths)
+    """The formatted values *values* holds for *paths*, in path order.
+
+    The rows ``objects:`` groups by together are told apart by the JSON text
+    the database wrote for them, ``[]`` for none.
+    """
+    return tuple(
+        (values[p.alias] or "[]")
+        if p.through is not None
+        else format_group_value(values[p.alias], p.interval)
+        for p in paths
+    )
 
 
 def _build_key(meta: Any, paths: list[GroupPath], formatted: tuple) -> Any:
     tree: dict[str, Any] = {}
+    together: dict[str, list[Any]] = {}
     for path, value in zip(paths, formatted, strict=True):
+        if path.through is not None:
+            together[path.name] = _together_key(meta, path, value)
+            continue
         node = tree
         for hop in path.hops:
             node = node.setdefault(hop.relation, {})
         node[path.name] = value
-    return _instantiate(meta, tree)
+    key = _instantiate(meta, tree)
+    if together:
+        key.objects = meta.objects_key_type(**together)
+    return key
 
 
 def _instantiate(meta: Any, tree: dict[str, Any]) -> Any:
@@ -222,10 +350,11 @@ def build_group(
 def needs_database_membership(paths: list[GroupPath]) -> bool:
     """True when an edge's own attributes cannot say which groups it is in.
 
-    A related column, a truncated date and a ``@group_field`` are worked out
-    by the database, so the database is asked for each edge's keys.
+    A related column, a truncated date, a ``@group_field`` and rows grouped
+    by together are worked out by the database, so the database is asked for
+    each edge's keys.
     """
-    return any(p.hops or p.interval is not None or p.custom for p in paths)
+    return any(p.hops or p.interval is not None or p.custom or p.through for p in paths)
 
 
 def own_key_values(node: Any, paths: list[GroupPath]) -> tuple:

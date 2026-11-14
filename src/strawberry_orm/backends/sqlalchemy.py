@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import datetime
 import functools
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
@@ -15,6 +16,7 @@ from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.sql import Select
 from strawberry.extensions import SchemaExtension
 
+from strawberry_orm._async import run_orm_work
 from strawberry_orm.backends._base import (
     _AGGREGATES,
     _SENSITIVE_PATTERNS,
@@ -42,17 +44,180 @@ _SA_UNRANKABLE_TYPES = frozenset(
 )
 
 
-class _PlannedLoad:
-    """One relation in a query's load plan, with the relations under it."""
+Steps = Generator[Any, Any, Any]
 
-    __slots__ = ("attr", "uselist", "mapper", "criteria", "children")
+
+class _PlannedLoad:
+    """One relation in a query's load plan, with the relations under it.
+
+    A to-many relation keyed on the related row has ``keys`` (the parent's key
+    attribute, the related row's column, and that column's attribute) and can
+    be read by a statement of its own: ``scope`` narrowed to the parents'
+    keys. One whose scope orders (``ordered``) is always read that way.
+    """
+
+    __slots__ = (
+        "attr",
+        "uselist",
+        "mapper",
+        "criteria",
+        "scope",
+        "ordered",
+        "keys",
+        "children",
+    )
 
     def __init__(self, attr: Any, uselist: bool, mapper: Any, criteria: Any) -> None:
         self.attr = attr
         self.uselist = uselist
         self.mapper = mapper
         self.criteria = criteria
+        self.scope: Callable[[Any], Any] | None = None
+        self.ordered = False
+        self.keys: tuple[str, Any, str] | None = None
         self.children: dict[str, _PlannedLoad] = {}
+
+    @property
+    def scoped(self) -> bool:
+        return self.criteria is not None or self.scope is not None
+
+
+def _loader_options(level: dict[str, _PlannedLoad], parent: Any = None) -> list[Any]:
+    """One loader option per leaf; siblings branch from the same parent loader.
+
+    A relation read by a statement of its own gets none, nor does what is
+    below it: that statement carries those.
+    """
+    from sqlalchemy.orm import joinedload, selectinload
+
+    chains: list[Any] = []
+    for load in level.values():
+        if load.ordered:
+            continue
+        attr = load.attr if load.criteria is None else load.attr.and_(load.criteria)
+        if parent is None:
+            loader = (selectinload if load.uselist else joinedload)(attr)
+        else:
+            loader = (parent.selectinload if load.uselist else parent.joinedload)(attr)
+        chains.extend(_loader_options(load.children, loader) or [loader])
+    return chains
+
+
+_KEYS_PER_STATEMENT = 500
+
+
+def _keyed_pair(rel: Any) -> tuple[Any, Any] | None:
+    """The ``(local, remote)`` columns a to-many relation joins on, if that is all.
+
+    A relation whose join says more (``viewonly`` with a filter in its
+    ``primaryjoin``) is left to a loader, which reads the whole join.
+    """
+    pairs = list(rel.local_remote_pairs or ())
+    if not rel.uselist or rel.secondary is not None or len(pairs) != 1:
+        return None
+    local, remote = pairs[0]
+    join = rel.primaryjoin
+    if (local == remote).compare(join) or (remote == local).compare(join):
+        return local, remote
+    return None
+
+
+def _orders_below(level: dict[str, _PlannedLoad]) -> bool:
+    return any(load.ordered or _orders_below(load.children) for load in level.values())
+
+
+def _related_rows(rows: list[Any], name: str) -> list[Any]:
+    """The rows *name* holds on each of *rows*, without loading anything."""
+    found: list[Any] = []
+    seen: set[int] = set()
+    for row in rows:
+        value = sa_inspect(row).dict.get(name)
+        items = value if isinstance(value, (list, set, tuple)) else [value]
+        for item in items:
+            if item is not None and id(item) not in seen:
+                seen.add(id(item))
+                found.append(item)
+    return found
+
+
+def _holds(rows: list[Any], name: str, load: _PlannedLoad) -> bool:
+    """Whether every row has *name* loaded, by a scoped load if it needs one."""
+    from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+
+    return all(
+        name not in sa_inspect(row).unloaded
+        and (not load.scoped or relation_cache_is_scoped(row, name))
+        for row in rows
+    )
+
+
+def _unloaded_levels(
+    model: type, rows: list[Any], level: dict[str, _PlannedLoad]
+) -> list[tuple[type, list[Any], dict[str, _PlannedLoad]]]:
+    """Cut *level* down to what *rows* do not hold: ``(model, rows, level)``.
+
+    A relation every row holds is dropped, and what is under it is asked of
+    the rows it holds, so only a missing level is read. Parents come first.
+    """
+    missing: dict[str, _PlannedLoad] = {}
+    below: list[tuple[type, list[Any], dict[str, _PlannedLoad]]] = []
+    for name, load in level.items():
+        if not _holds(rows, name, load):
+            missing[name] = load
+            continue
+        children = _related_rows(rows, name)
+        if children and load.children:
+            below.extend(_unloaded_levels(load.mapper.class_, children, load.children))
+    if missing:
+        return [(model, rows, missing), *below]
+    return below
+
+
+def _adopt(rows: list[Any], read: list[Any], pk_name: str, names: Any) -> None:
+    """Give rows in no session the relations a re-read loaded onto copies.
+
+    A row in the session that re-read it is the very object read, so only a
+    detached row differs from what came back.
+    """
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    by_pk = {getattr(copy, pk_name): copy for copy in read}
+    for row in rows:
+        copy = by_pk.get(getattr(row, pk_name))
+        if copy is None or copy is row:
+            continue
+        loaded = sa_inspect(copy).dict
+        for name in names:
+            value = loaded.get(name)
+            set_committed_value(
+                row, name, list(value) if isinstance(value, list) else value
+            )
+
+
+def _drive(steps: Steps) -> Any:
+    """Run *steps* to the end, awaiting only once a step is awaitable."""
+    from inspect import isawaitable
+
+    value = None
+    try:
+        while True:
+            effect = steps.send(value)
+            if isawaitable(effect):
+                return _drive_async(steps, effect)
+            value = effect
+    except StopIteration as stop:
+        return stop.value
+
+
+async def _drive_async(steps: Steps, effect: Any) -> Any:
+    from strawberry_orm._async import await_maybe
+
+    value = await effect
+    try:
+        while True:
+            value = await await_maybe(steps.send(value))
+    except StopIteration as stop:
+        return stop.value
 
 
 def _primary_key(value: Any) -> Any:
@@ -88,12 +253,16 @@ class SQLAlchemyBackend(BaseBackend):
         max_filter_branches: int = 50,
         enable_regex_filters: bool = False,
         max_in_list_size: int = 500,
+        offload_sync_session: bool = False,
+        field_order: Callable[[type, list[str]], Iterable[str]] | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs["filter_overrides"] = filter_overrides or {}
         super().__init__(**kwargs)
         self._dialect = dialect
         self._session_getter = session_getter
+        self._offload_sync_session = offload_sync_session
+        self._field_order = field_order
         self._max_filter_depth = max_filter_depth
         self._max_filter_branches = max_filter_branches
         self._enable_regex_filters = enable_regex_filters
@@ -105,8 +274,21 @@ class SQLAlchemyBackend(BaseBackend):
         self, model: type
     ) -> list[tuple[str, type, bool, type | None]]:
         """Return (field_name, python_type, is_relation, related_model) for each
-        column and relationship on an SQLAlchemy mapped class."""
-        return _introspect_sa_model(model)
+        column and relationship on an SQLAlchemy mapped class.
+
+        Columns come first, then relations, unless ``field_order=`` reorders
+        them; any name it leaves out follows the ones it lists.
+        """
+        fields = _introspect_sa_model(model)
+        if self._field_order is None:
+            return fields
+        by_name = {field[0]: field for field in fields}
+        ordered = [
+            by_name.pop(name)
+            for name in self._field_order(model, list(by_name))
+            if name in by_name
+        ]
+        return ordered + list(by_name.values())
 
     def _get_pk_names(self, model: type) -> set[str]:
         from sqlalchemy import inspect as sa_inspect
@@ -140,11 +322,7 @@ class SQLAlchemyBackend(BaseBackend):
 
             col_types: dict[str, type] = {}
             for col in mapper.columns:
-                col_type_name = type(col.type).__name__.upper()
-                py_type = _SA_TYPE_MAP.get(col_type_name, str)
-                if hasattr(col.type, "impl"):
-                    impl_name = type(col.type.impl).__name__.upper()
-                    py_type = _SA_TYPE_MAP.get(impl_name, py_type)
+                py_type = _sa_python_type(col.type)
                 if col.nullable:
                     py_type = py_type | None
                 col_types[col.key] = py_type
@@ -389,6 +567,10 @@ class SQLAlchemyBackend(BaseBackend):
         order_list = order_input if isinstance(order_input, list) else [order_input]
         clauses: list[Any] = []
         joins: list[Any] = []
+        # The client's order replaces the statement's own, as a Django or
+        # Tortoise ``order_by()`` does; SQLAlchemy's appends to it.
+        own_order = query._order_by_clauses
+        query = query.order_by(None)
         for entry in order_list:
             entry_clauses, entry_joins, query = _build_sa_ordering(
                 entry, model, query=query, backend=self
@@ -403,6 +585,8 @@ class SQLAlchemyBackend(BaseBackend):
                 query = query.join(join_prop, isouter=True)
         if clauses:
             query = query.order_by(*clauses)
+        elif not query._order_by_clauses:
+            query = query.order_by(*own_order)
         return query
 
     # -- Grouping / aggregation -----------------------------------------------
@@ -445,9 +629,13 @@ class SQLAlchemyBackend(BaseBackend):
             return self._apply_aggregation_async(
                 session, stmt, aggregate_meta, requested
             )
-        result = session.execute(stmt)
-        row = result.one()
-        return aggregate_meta.build_aggregates(row, requested)
+
+        def aggregate() -> Any:
+            return aggregate_meta.build_aggregates(
+                session.execute(stmt).one(), requested
+            )
+
+        return self._run_sync(aggregate)
 
     async def _apply_aggregation_async(
         self, session: Any, stmt: Any, meta: AggregateMeta, requested: dict
@@ -587,7 +775,7 @@ class SQLAlchemyBackend(BaseBackend):
                 return finish(await session.execute(stmt))
 
             return run()
-        return finish(session.execute(stmt))
+        return self._run_sync(lambda: finish(session.execute(stmt)))
 
     def _grouped_select(
         self, query: Any, model: type, paths: list[Any], info: Any
@@ -615,7 +803,9 @@ class SQLAlchemyBackend(BaseBackend):
                 if chain not in joined:
                     joined[chain], stmt = self._join_hop(stmt, entity, hop, info)
                 entity = joined[chain]
-            if path.custom is not None:
+            if path.through is not None:
+                expr = self._together(model, path, info)
+            elif path.custom is not None:
                 expr = invoke_custom_callback(
                     path.custom, path.owner, query=query, value=path.value, info=info
                 )
@@ -637,6 +827,88 @@ class SQLAlchemyBackend(BaseBackend):
             stmt = select().select_from(model).join(pairs, pairs.c._orm_pk == pk)
             values = {alias: pairs.c[alias] for alias in values}
         return stmt.add_columns(*values.values()), values
+
+    def _together(self, model: type, path: Any, info: Any) -> Any:
+        """The related rows *path* reads of each row of *model*, as JSON text.
+
+        The rows the caller may see, their columns in an array each, distinct
+        and sorted so a set of rows reads as the same text wherever it is
+        read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
+        which alone it promises to keep; SQLite keeps an ordered subquery's.
+        """
+        from sqlalchemy import Text, and_, cast, func, literal_column, select
+        from sqlalchemy.dialects.postgresql import aggregate_order_by
+        from sqlalchemy.orm import aliased
+
+        hop = path.through
+        restrict = self.relation_scope(hop.model, hop.relation, info)
+        rows = select(hop.target)
+        if restrict is not None:
+            rows = restrict(rows, info)
+        visible = aliased(hop.target, rows.subquery())
+        target = sa_inspect(hop.target)
+        columns = [
+            (
+                getattr(visible, column)
+                if interval is None
+                else _truncate(getattr(visible, column), interval, self._dialect)
+            ).label(f"_orm_c{index}")
+            for index, (column, interval) in enumerate(
+                zip(path.columns, path.intervals, strict=True)
+            )
+        ]
+
+        def on_visible(column: Any) -> Any:
+            return getattr(visible, target.get_property_by_column(column).key)
+
+        prop = sa_inspect(hop.model).relationships[hop.relation]
+        if prop.secondary is None:
+            linked = select(*columns).where(
+                *(
+                    on_visible(remote) == local
+                    for local, remote in prop.local_remote_pairs
+                )
+            )
+        else:
+            link = prop.secondary.alias()
+            linked = (
+                select(*columns)
+                .select_from(visible)
+                .join(
+                    link,
+                    and_(
+                        *(
+                            on_visible(column) == link.c[secondary.key]
+                            for column, secondary in prop.secondary_synchronize_pairs
+                        )
+                    ),
+                )
+                .where(
+                    *(
+                        link.c[secondary.key] == parent
+                        for parent, secondary in prop.synchronize_pairs
+                    )
+                )
+            )
+        found = linked.distinct().order_by(*columns).correlate(model).subquery("_orm_t")
+        if self._dialect == "sqlite":
+            together = func.json_group_array(func.json_array(*found.c))
+        elif self._dialect == "postgresql":
+            together = cast(
+                func.json_agg(
+                    aggregate_order_by(func.json_build_array(*found.c), *found.c)
+                ),
+                Text,
+            )
+        else:
+            raise ValueError(
+                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
+                f"not {self._dialect}."
+            )
+        return func.coalesce(
+            select(together).select_from(found).scalar_subquery(),
+            literal_column("'[]'"),
+        )
 
     def _join_hop(self, stmt: Any, entity: Any, hop: Any, info: Any) -> Any:
         """Outer-join *hop*'s related rows the caller may see onto *stmt*."""
@@ -744,17 +1016,22 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy import select
 
         pk_column = sa_inspect(model).primary_key[0]
-        stmt = self.apply_type_scope(
+        scoped = self.apply_type_scope(
             select(model).where(pk_column.in_(pks)), model, info
         )
-        rows = self._execute_stmt(stmt, info)
-        if isawaitable(rows):
+        # Only the keys: as a subquery, the loader options a scope may attach
+        # to load what a selection reads are not run for a membership check.
+        stmt = select(pk_column).where(
+            pk_column.in_(scoped.with_only_columns(pk_column).scalar_subquery())
+        )
+        keys = self._execute_stmt(stmt, info)
+        if isawaitable(keys):
 
             async def _await_pks() -> set[Any]:
-                return {self.instance_pk(row) for row in await rows}
+                return set(await keys)
 
             return _await_pks()
-        return {self.instance_pk(row) for row in rows}
+        return set(keys)
 
     def split_parent_predicate(
         self, query: Any, parent_pk: Any
@@ -866,7 +1143,7 @@ class SQLAlchemyBackend(BaseBackend):
         session = self._get_session(info)
         if self._is_async_session(session):
             return self._scalar_async(session, stmt)
-        return session.execute(stmt).scalar_one()
+        return self._run_sync(lambda: session.execute(stmt).scalar_one())
 
     async def _scalar_async(self, session: Any, stmt: Any) -> Any:
         return (await session.execute(stmt)).scalar_one()
@@ -935,7 +1212,7 @@ class SQLAlchemyBackend(BaseBackend):
         session = self._get_session(info)
         if self._is_async_session(session):
             return self._group_counts_async(session, stmt)
-        return dict(session.execute(stmt).all())
+        return self._run_sync(lambda: dict(session.execute(stmt).all()))
 
     async def _group_counts_async(self, session: Any, stmt: Any) -> dict[Any, int]:
         return dict((await session.execute(stmt)).all())
@@ -997,16 +1274,16 @@ class SQLAlchemyBackend(BaseBackend):
 
         return stmt
 
-    def _apply_relation_loads(
-        self, store: Any, query: Any, entity: type, info: Any
-    ) -> Any:
-        """Attach eager-load options for the current selection to *query*.
+    def _plan_relation_loads(
+        self, store: Any, entity: type, info: Any
+    ) -> tuple[dict[str, _PlannedLoad], list[tuple[type, str]]]:
+        """Plan the relations the current selection reads below *entity*.
 
         Shared by query optimization and by loading relations onto instances
-        the caller already holds, so both apply the same row scoping.
+        the caller already holds, so both apply the same row scoping. Returns
+        the plan and the relations it loads scoped.
         """
         from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy.orm import joinedload, selectinload
 
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
@@ -1030,61 +1307,51 @@ class SQLAlchemyBackend(BaseBackend):
             type_name: str | None,
             field_name: str,
             related_entity: type,
-        ) -> Any:
-            """Extract WHERE criteria from a scope callable / nested scope_rows."""
+        ) -> tuple[Any, Callable[[Any], Any] | None, bool]:
+            """The WHERE criteria of a scope and nested scope_rows.
+
+            A loader option keeps only that, so the scopes come back whole
+            too, to be run as a statement of their own, with whether they
+            order.
+            """
             from sqlalchemy import select as sa_select
 
             criteria_parts: list[Any] = []
+            ordered = False
 
             get_qs = self._type_querysets.get(related_entity)
             if get_qs is not None:
                 temp_stmt = get_qs(sa_select(related_entity), info)
                 if temp_stmt.whereclause is not None:
                     criteria_parts.append(temp_stmt.whereclause)
+                ordered = ordered or bool(temp_stmt._order_by_clauses)
 
+            field_scope = None
             if type_name and store:
                 hints = store.get(type_name, field_name)
                 if hints and hints.scope is not None:
-                    temp_stmt = call_scope(hints.scope, sa_select(related_entity), info)
+                    field_scope = hints.scope
+                    temp_stmt = call_scope(field_scope, sa_select(related_entity), info)
                     if temp_stmt.whereclause is not None:
                         criteria_parts.append(temp_stmt.whereclause)
+                    ordered = ordered or bool(temp_stmt._order_by_clauses)
 
+            def scope(stmt: Any) -> Any:
+                if get_qs is not None:
+                    stmt = get_qs(stmt, info)
+                if field_scope is not None:
+                    stmt = call_scope(field_scope, stmt, info)
+                return stmt
+
+            whole = scope if get_qs is not None or field_scope is not None else None
             if not criteria_parts:
-                return None
-
+                return None, whole, ordered
             if len(criteria_parts) == 1:
-                return criteria_parts[0]
+                return criteria_parts[0], whole, ordered
 
             from sqlalchemy import and_ as sa_and
 
-            return sa_and(*criteria_parts)
-
-        def _make_loader(rel_attr: Any, uselist: bool, criteria: Any) -> Any:
-            """Build a joinedload or selectinload, optionally with criteria."""
-            if uselist:
-                if criteria is not None:
-                    return selectinload(rel_attr.and_(criteria))
-                return selectinload(rel_attr)
-            else:
-                if criteria is not None:
-                    return joinedload(rel_attr.and_(criteria))
-                return joinedload(rel_attr)
-
-        def _make_chained_loader(
-            parent_loader: Any,
-            rel_attr: Any,
-            uselist: bool,
-            criteria: Any,
-        ) -> Any:
-            """Chain a nested loader onto parent_loader, optionally with criteria."""
-            if uselist:
-                if criteria is not None:
-                    return parent_loader.selectinload(rel_attr.and_(criteria))
-                return parent_loader.selectinload(rel_attr)
-            else:
-                if criteria is not None:
-                    return parent_loader.joinedload(rel_attr.and_(criteria))
-                return parent_loader.joinedload(rel_attr)
+            return sa_and(*criteria_parts), whole, ordered
 
         # A relation reached both by the selection and by a ``using=`` path
         # must be loaded once, with one set of criteria. Two loaders on one
@@ -1100,7 +1367,9 @@ class SQLAlchemyBackend(BaseBackend):
             load = level.get(rel_name)
             if load is None:
                 rel = current_mapper.relationships[rel_name]
-                criteria = _get_nested_criteria(type_name, rel_name, rel.mapper.class_)
+                criteria, whole, ordered = _get_nested_criteria(
+                    type_name, rel_name, rel.mapper.class_
+                )
                 if criteria is not None:
                     scoped_edges.append((current_mapper.class_, rel_name))
                 load = level[rel_name] = _PlannedLoad(
@@ -1109,6 +1378,18 @@ class SQLAlchemyBackend(BaseBackend):
                     mapper=rel.mapper,
                     criteria=criteria,
                 )
+                load.scope = whole
+                pair = _keyed_pair(rel)
+                # Through an association table there is no key on the related
+                # row to narrow by, so a loader reads it and its order is lost.
+                if pair is not None:
+                    local, remote = pair
+                    load.ordered = ordered
+                    load.keys = (
+                        current_mapper.get_property_by_column(local).key,
+                        remote,
+                        rel.mapper.get_property_by_column(remote).key,
+                    )
             return load
 
         def _plan_hints(
@@ -1161,35 +1442,71 @@ class SQLAlchemyBackend(BaseBackend):
                         load.children, node.selection_set, load.mapper, child_type
                     )
 
-        def _loader_chains(parent: Any, level: dict[str, _PlannedLoad]) -> list[Any]:
-            """One option per leaf; siblings branch from the same parent loader."""
-            chains: list[Any] = []
-            for load in level.values():
-                if parent is None:
-                    loader = _make_loader(load.attr, load.uselist, load.criteria)
-                else:
-                    loader = _make_chained_loader(
-                        parent, load.attr, load.uselist, load.criteria
-                    )
-                chains.extend(_loader_chains(loader, load.children) or [loader])
-            return chains
-
         root_type_name = self._selection_type_name(entity, info)
         for field_node in field_nodes_from_info(info):
             if field_node.selection_set is not None:
                 _plan_selection(plan, field_node.selection_set, mapper, root_type_name)
-        for loader in _loader_chains(None, plan):
-            query = query.options(loader)
-        from strawberry_orm.lazy_resolution import remember_scoped_edges
+        return plan, scoped_edges
 
-        remember_scoped_edges(query, scoped_edges)
-        return query
+    def _keyed_loads(
+        self,
+        session: Any,
+        rows: list[Any],
+        level: dict[str, _PlannedLoad],
+        *,
+        every: bool = False,
+    ) -> Steps:
+        """Read relations by a statement of their own, for every row at once.
+
+        A loader option orders only by ``relationship(order_by=...)``, so a
+        relation whose scope orders is read as Django's ``Prefetch`` reads it:
+        the scope's own statement, narrowed to the rows' keys, then handed to
+        each row. With *every*, so is each to-many relation keyed on the
+        related row, which then needs no statement re-reading the rows.
+
+        Only rows whose relation is unloaded are filled: a collection the app
+        already holds may carry changes the database has not seen.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+        for name, load in level.items():
+            if not rows:
+                return
+            if not (load.ordered or (every and load.keys is not None)):
+                if _orders_below(load.children):
+                    yield from self._keyed_loads(
+                        session, _related_rows(rows, name), load.children
+                    )
+                continue
+            missing = [row for row in rows if name in sa_inspect(row).unloaded]
+            local_key, remote, remote_key = load.keys
+            keys = list(dict.fromkeys(getattr(row, local_key) for row in missing))
+            order_by = load.attr.property.order_by
+            options = _loader_options(load.children)
+            children: list[Any] = []
+            for start in range(0, len(keys), _KEYS_PER_STATEMENT):
+                chunk = keys[start : start + _KEYS_PER_STATEMENT]
+                stmt = select(load.mapper.class_).where(remote.in_(chunk))
+                if load.scope is not None:
+                    stmt = load.scope(stmt)
+                if not load.ordered and order_by:
+                    stmt = stmt.order_by(*order_by)
+                if options:
+                    stmt = stmt.options(*options)
+                children.extend((yield self._execute_in(session, stmt)))
+            grouped: dict[Any, list[Any]] = {}
+            for child in children:
+                grouped.setdefault(getattr(child, remote_key), []).append(child)
+            for row in missing:
+                set_committed_value(row, name, grouped.get(getattr(row, local_key), []))
+            if load.scoped:
+                mark_relations_scoped(missing, [name])
+            yield from self._keyed_loads(session, children, load.children)
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
-        from inspect import isawaitable
-
-        from strawberry_orm.lazy_resolution import take_scoped_edges
-
         try:
             entity = query.column_descriptions[0]["entity"]
         except (AttributeError, IndexError, KeyError):
@@ -1200,96 +1517,111 @@ class SQLAlchemyBackend(BaseBackend):
         # those caches as trusted; the resolver re-checks them.
         caller_had_options = bool(getattr(query, "_with_options", ()))
         query = self.apply_type_scope(query, entity, info)
-        loaded = self._apply_relation_loads(store, query, entity, info)
-        edges = take_scoped_edges(loaded)
-        if caller_had_options or not edges:
-            return self._execute_stmt(loaded, info)
-
+        plan, edges = self._plan_relation_loads(store, entity, info)
+        options = _loader_options(plan)
+        loaded = query.options(*options) if options else query
         session = self._get_session(info)
-        before = self._unloaded_snapshot(session, [])
-        rows = self._execute_stmt(loaded, info)
+        trusted = edges if not caller_had_options else []
+        before = self._unloaded_snapshot(session, []) if trusted else {}
 
-        def mark(result: Any) -> Any:
-            self._mark_scoped_edges(result, edges, before=before)
-            return result
+        def steps() -> Steps:
+            rows = yield self._execute_in(session, loaded)
+            yield from self._keyed_loads(session, rows, plan)
+            self._mark_scoped_edges(rows, trusted, before=before)
+            return rows
 
-        if isawaitable(rows):
-
-            async def _mark_async() -> Any:
-                return mark(await rows)
-
-            return _mark_async()
-        return mark(rows)
+        return _drive(steps())
 
     def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
         """Eager-load the selected relations onto instances already in memory.
 
-        Re-selecting the same primary keys populates the relations through the
-        session's identity map, which hands back the very objects the caller
-        passed in. Scalars already loaded on them are left alone, so values
-        fresher than the database survive.
+        Each row is re-selected in its own session, whose identity map hands
+        back the very object, so its unloaded relations fill in place. Scalars
+        already loaded are left alone, so values fresher than the database
+        survive. A relation every row already holds is not read again, unless
+        something under it is missing; then only that is read.
 
-        Returns the rows it actually loaded onto, which is empty when the
-        selection named no relations.
-        """
-        from strawberry_orm.lazy_resolution import take_scoped_edges
-
-        plans = self._relation_load_statements(store, instances, info)
-        if not plans:
-            return []
-
-        session = self._get_session(info)
-        loaded = [row for _stmt, rows in plans for row in rows]
-        before = self._unloaded_snapshot(session, loaded)
-        edges: list[tuple[type, str]] = []
-        for stmt, _rows in plans:
-            edges.extend(take_scoped_edges(stmt))
-
-        def mark() -> list[Any]:
-            self._mark_scoped_edges(loaded, edges, before=before)
-            return loaded
-
-        if self._is_async_session(session):
-
-            async def _load_async() -> list[Any]:
-                for stmt, _rows in plans:
-                    await self._execute_stmt_async(session, stmt)
-                return mark()
-
-            return _load_async()
-
-        for stmt, _rows in plans:
-            self._execute_stmt_sync(session, stmt)
-        return mark()
-
-    def _relation_load_statements(
-        self, store: Any, instances: list[Any], info: Any
-    ) -> list[tuple[Any, list[Any]]]:
-        """Pair each model's re-select with the rows it will load onto.
-
-        A statement is only worth running when the selection asked for
-        relations; ``options()`` returns a new statement, so one that came back
-        unchanged means re-selecting the rows would buy nothing.
+        Returns the rows the selection planned loads for, which is empty when
+        it named no relations.
         """
         from sqlalchemy import inspect as sa_inspect
-        from sqlalchemy import select as sa_select
+        from sqlalchemy import select
 
-        by_model: dict[type, list[Any]] = {}
+        planned, groups, edges = self._relation_load_groups(store, instances, info)
+        if not planned:
+            return []
+
+        before: dict[int, set[str]] = {}
+        sessions = {id(session): session for session, _model, _rows, _level in groups}
+        for session in sessions.values():
+            before.update(self._unloaded_snapshot(session, planned))
+
+        def steps() -> Steps:
+            for session, model, rows, level in groups:
+                reread = {
+                    name: load for name, load in level.items() if load.keys is None
+                }
+                options = _loader_options(reread)
+                if options:
+                    mapper = sa_inspect(model)
+                    pk_column = mapper.primary_key[0]
+                    pk_name = mapper.get_property_by_column(pk_column).key
+                    stmt = select(model).where(
+                        pk_column.in_([getattr(row, pk_name) for row in rows])
+                    )
+                    copies = yield self._execute_in(session, stmt.options(*options))
+                    _adopt(rows, copies, pk_name, reread)
+                yield from self._keyed_loads(session, rows, level, every=True)
+            self._mark_scoped_edges(planned, edges, before=before)
+            return planned
+
+        return _drive(steps())
+
+    def _relation_load_groups(
+        self, store: Any, instances: list[Any], info: Any
+    ) -> tuple[list[Any], list[tuple[Any, type, list[Any], Any]], list[Any]]:
+        """What each session's rows still need loaded.
+
+        Rows are grouped by the session they belong to; only rows in none fall
+        back to the request's. Each group's plan is cut down to the relations
+        some row has not loaded, so a group whose rows hold everything already
+        costs nothing.
+        """
+        fallback: list[Any] = []
+        by_session: dict[tuple[int, type], tuple[Any, list[Any]]] = {}
         for instance in instances:
-            by_model.setdefault(type(instance), []).append(instance)
+            session = self._row_session(instance)
+            if session is None:
+                if not fallback:
+                    fallback.append(self._get_session(info))
+                session = fallback[0]
+            key = (id(session), type(instance))
+            by_session.setdefault(key, (session, []))[1].append(instance)
 
-        plans: list[tuple[Any, list[Any]]] = []
-        for model, rows in by_model.items():
-            mapper = sa_inspect(model)
-            pk_column = mapper.primary_key[0]
-            pk_name = mapper.get_property_by_column(pk_column).key
-            stmt = sa_select(model).where(
-                pk_column.in_([getattr(row, pk_name) for row in rows])
-            )
-            with_loads = self._apply_relation_loads(store, stmt, model, info)
-            if with_loads is not stmt:
-                plans.append((with_loads, rows))
-        return plans
+        planned: list[Any] = []
+        groups: list[tuple[Any, type, list[Any], Any]] = []
+        edges: list[Any] = []
+        for (_session_id, model), (session, rows) in by_session.items():
+            plan, scoped = self._plan_relation_loads(store, model, info)
+            if not plan:
+                continue
+            planned.extend(rows)
+            edges.extend(scoped)
+            for level_model, level_rows, level in _unloaded_levels(model, rows, plan):
+                groups.append((session, level_model, level_rows, level))
+        return planned, groups, edges
+
+    def _row_session(self, row: Any) -> Any:
+        """The session *row* belongs to, as the caller holds it, or ``None``."""
+        from sqlalchemy.orm import object_session
+
+        session = object_session(row)
+        if session is None:
+            return None
+        asyncio_module = sys.modules.get("sqlalchemy.ext.asyncio")
+        if asyncio_module is None:
+            return session
+        return asyncio_module.async_object_session(row) or session
 
     def _unloaded_snapshot(self, session: Any, extra: list[Any]) -> dict[int, set[str]]:
         """Relations still unloaded, so a later load can see what it filled.
@@ -1404,16 +1736,32 @@ class SQLAlchemyBackend(BaseBackend):
         )
 
     def _is_async_session(self, session: Any) -> bool:
-        from sqlalchemy.ext.asyncio import AsyncSession
-
-        return isinstance(session, AsyncSession)
+        # Importing sqlalchemy.ext.asyncio needs greenlet, which a sync-only
+        # app may not have; an AsyncSession exists only once it is imported.
+        asyncio_module = sys.modules.get("sqlalchemy.ext.asyncio")
+        if asyncio_module is None:
+            return False
+        return isinstance(session, asyncio_module.AsyncSession)
 
     def _execute_stmt(self, stmt: Any, info: Any) -> Any:
-        session = self._get_session(info)
+        return self._execute_in(self._get_session(info), stmt)
+
+    def _execute_in(self, session: Any, stmt: Any) -> Any:
         if self._is_async_session(session):
             return self._execute_stmt_async(session, stmt)
+        return self._run_sync(self._execute_stmt_sync, session, stmt)
 
-        return self._execute_stmt_sync(session, stmt)
+    def _run_sync(self, work: Callable[..., Any], *args: Any) -> Any:
+        """Run *work* on a sync session, off the event loop if asked to.
+
+        Offloaded, every statement runs on one worker thread
+        (``thread_sensitive``) and an awaitable comes back, as from an
+        ``AsyncSession``. It is opt-in: a pool that keeps a connection per
+        thread, as in-memory SQLite's does, would find another database there.
+        """
+        if self._offload_sync_session:
+            return run_orm_work(work, *args)
+        return work(*args)
 
     def _execute_stmt_sync(self, session: Any, stmt: Any) -> list[Any]:
         from sqlalchemy.exc import OperationalError, ProgrammingError
@@ -2067,6 +2415,21 @@ _SA_TYPE_MAP: dict[str, type] = {
 }
 
 
+def _sa_python_type(column_type: Any) -> type:
+    """The Python type a column of *column_type* shows as.
+
+    A type is looked up by its class and each class it derives from, so the
+    generic ``SmallInteger`` and ``BigInteger`` read as ``Integer`` does. A
+    type that wraps another (``impl``) is read as the type it wraps.
+    """
+    for candidate in (getattr(column_type, "impl", None), column_type):
+        for cls in type(candidate).__mro__:
+            found = _SA_TYPE_MAP.get(cls.__name__.upper())
+            if found is not None:
+                return found
+    return str
+
+
 def _get_sa_pk_names(model: type) -> set[str]:
     """Return the set of primary-key column attribute names for an SA model."""
     from sqlalchemy import inspect as sa_inspect
@@ -2159,12 +2522,7 @@ def _introspect_sa_model(
     result: list[tuple[str, type, bool, type | None]] = []
 
     for col in mapper.columns:
-        col_type_name = type(col.type).__name__.upper()
-        py_type = _SA_TYPE_MAP.get(col_type_name, str)
-
-        if hasattr(col.type, "impl"):
-            impl_name = type(col.type.impl).__name__.upper()
-            py_type = _SA_TYPE_MAP.get(impl_name, py_type)
+        py_type = _sa_python_type(col.type)
 
         fk_target = None
         if col.foreign_keys:
@@ -2297,11 +2655,13 @@ def _build_sa_filter(
                 is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
                 if is_null_val is not strawberry.UNSET and is_null_val is not None:
                     if relationship_prop.property.uselist:
-                        raise ValueError(
-                            f"is_null is not supported for many-relation "
-                            f"'{rel_name}'. Use a custom @filter_field for M2M "
-                            "presence."
+                        # "Has none" must mean "has none the caller can see".
+                        present = (
+                            relationship_prop.any()
+                            if scope_criteria is None
+                            else relationship_prop.any(scope_criteria)
                         )
+                        return (not_(present) if is_null_val else present), query
                     if scope_criteria is not None:
                         # "Has a related row" must mean "has a *visible* one".
                         present = relationship_prop.has(scope_criteria)
@@ -2562,12 +2922,17 @@ def _build_lookup_clauses(
                     f"in_list/not_in_list has {len(val)} items; "
                     f"maximum is {max_in_list_size}"
                 )
+            values = [_column_value(column, item) for item in val]
             if op_name == "in_list":
-                clauses.append(column.in_(val))
+                clauses.append(column.in_(values))
             else:
-                clauses.append(column.notin_(val))
+                clauses.append(column.notin_(values))
         elif op_name == "range":
-            clauses.append(column.between(val.start, val.end))
+            clauses.append(
+                column.between(
+                    _column_value(column, val.start), _column_value(column, val.end)
+                )
+            )
         elif op_name == "contains":
             clauses.append(column.contains(val, autoescape=True))
         elif op_name == "i_contains":
@@ -2594,9 +2959,37 @@ def _build_lookup_clauses(
             clauses.append(column.regexp_match(val, flags="i"))
         elif op_name in ("exact", "neq", "gt", "gte", "lt", "lte"):
             sa_op = _LOOKUP_TO_SA_OP[op_name]
-            clauses.append(getattr(column, sa_op)(val))
+            clauses.append(getattr(column, sa_op)(_column_value(column, val)))
 
     return clauses
+
+
+def _column_value(column: Any, value: Any) -> Any:
+    """*value* as *column* holds it.
+
+    Date and time lookups take ISO 8601 text. Compared as text, the value is
+    bound as ``VARCHAR``, which PostgreSQL will not compare with a date; read
+    as a ``date``, ``datetime`` or ``time``, it is bound in the column's type.
+    """
+    column_type = getattr(column, "type", None)
+    if not isinstance(value, str) or column_type is None:
+        return value
+    python_type = _sa_python_type(column_type)
+    try:
+        if python_type is datetime.datetime:
+            return datetime.datetime.fromisoformat(value)
+        if python_type is datetime.date:
+            try:
+                return datetime.date.fromisoformat(value)
+            except ValueError:
+                return datetime.datetime.fromisoformat(value).date()
+        if python_type is datetime.time:
+            return datetime.time.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"{value!r} is not an ISO 8601 {python_type.__name__}."
+        ) from None
+    return value
 
 
 # ---------------------------------------------------------------------------

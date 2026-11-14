@@ -30,6 +30,8 @@ EXCLUDED_FILES = {
     "test_mutation_meta_ops.py",
     # Column-only relationships, which only SQLAlchemy has.
     "test_insert_only_upserts_sqlalchemy.py",
+    # Sessions, column types and statements only SQLAlchemy has.
+    "test_sqlalchemy_specifics.py",
 }
 
 EXCLUDED_METHODS = {

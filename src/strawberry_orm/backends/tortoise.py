@@ -691,6 +691,16 @@ class TortoiseBackend(BaseBackend):
             many=type(field).__name__ in _TO_MANY_REL_TYPES,
         )
 
+    def together_reader(self, model: type, column: str, interval: Any) -> Any:
+        # Read as a grouped column is: through the field, which puts a
+        # datetime in the configured time zone, unless cut to a period, which
+        # is read as the driver hands it over, in UTC on PostgreSQL.
+        read = super().together_reader(model, column, interval)
+        if interval is not None:
+            return lambda value: _in_utc(read(value))
+        field = model._meta.fields_map[column]  # type: ignore[attr-defined]
+        return lambda value: field.to_python_value(read(value))
+
     async def apply_grouping(
         self,
         query: Any,
@@ -701,6 +711,7 @@ class TortoiseBackend(BaseBackend):
         order_input: Any | None = None,
     ) -> list[Any]:
         from pypika_tortoise import functions
+        from pypika_tortoise.terms import Field
 
         from strawberry_orm.grouping import build_group
 
@@ -711,10 +722,13 @@ class TortoiseBackend(BaseBackend):
         rows = _GroupedRows(self, query, model, paths, info)
         aggregates = rows.aggregates(requested)
         ordering = rows.ordering(query, order_input)
+        # Grouped and sorted by alias: PostgreSQL does not see an expression
+        # written out again, with its bound values bound again, as the same one.
+        aliases = [Field(alias) for alias in rows.values]
         stmt = rows.stmt.select(
             *rows.selected(),
             *(term.as_(name) for name, (term, _) in aggregates.items()),
-        ).groupby(*rows.values.values())
+        ).groupby(*aliases)
         # Read in the connection's order, a group starts at its least value of
         # each clause, or its greatest for a descending one.
         for term, field, descending, nulls in ordering:
@@ -723,8 +737,8 @@ class TortoiseBackend(BaseBackend):
                 continue
             first = (functions.Max if descending else functions.Min)(ranked)
             stmt = _order_by(stmt, first, descending, nulls)
-        for term in rows.values.values():
-            stmt = stmt.orderby(term)
+        for alias in aliases:
+            stmt = stmt.orderby(alias)
 
         groups = []
         for found in await rows.execute(stmt):
@@ -1468,6 +1482,29 @@ def _tortoise_relation_scope_q(
     return Q(**{f"{prefix}{relation}__{pk_attr}__in": Subquery(scoped.values(pk_attr))})
 
 
+def _tortoise_has_related(
+    backend: Any, model: type, relation: str, info: Any, prefix: str
+) -> Any:
+    """``Q`` for rows of *model* with a related row through a to-many *relation*.
+
+    Tested on the row's key, so the join a to-many relation needs does not
+    repeat rows, and a related row the related type hides does not count.
+    """
+    from tortoise.expressions import Q, Subquery
+
+    pk_attr = model._meta.pk_attr  # type: ignore[attr-defined]
+    related = backend._relation_target_model(model, relation)
+    related_pk = related._meta.pk_attr
+    get_qs = backend.relation_scope(model, relation, info)
+    if get_qs is None:
+        having = {f"{relation}__{related_pk}__isnull": False}
+    else:
+        visible = get_qs(related.all(), info).values(related_pk)
+        having = {f"{relation}__{related_pk}__in": Subquery(visible)}
+    owners = model.filter(**having).values(pk_attr)  # type: ignore[attr-defined]
+    return Q(**{f"{prefix}{pk_attr}__in": Subquery(owners)})
+
+
 def _build_tortoise_filter(
     filter_input: Any,
     *,
@@ -1536,6 +1573,19 @@ def _build_tortoise_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
+                is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
+                if (
+                    is_null_val is not strawberry.UNSET
+                    and is_null_val is not None
+                    and backend is not None
+                    and model is not None
+                    and type(model._meta.fields_map.get(rel_name)).__name__  # type: ignore[attr-defined]
+                    in _TO_MANY_REL_TYPES
+                ):
+                    present = _tortoise_has_related(
+                        backend, model, rel_name, info, _prefix
+                    )
+                    return (~present if is_null_val else present), query
                 # Traversal joins straight to the related table, so the related
                 # type's row scoping has to be re-applied or it is bypassed.
                 scope_q = _tortoise_relation_scope_q(
@@ -2161,7 +2211,9 @@ class _GroupedRows:
             if chain not in self._joined:
                 self._joined[chain] = self._join(entity, hop)
             entity, owner = self._joined[chain], hop.target
-        if path.custom is not None:
+        if path.through is not None:
+            term, read = self._together(path), _same
+        elif path.custom is not None:
             term, read = self._custom(path), _same
         else:
             field = owner._meta.fields_map[path.column]
@@ -2219,6 +2271,83 @@ class _GroupedRows:
         self.stmt = self.stmt.join(joined, how=JoinType.left).on(on)
         return joined
 
+    def _together(self, path: Any) -> Any:
+        """The related rows *path* reads of each row, as JSON text.
+
+        The rows the caller may see, their columns in an array each, distinct
+        and sorted so a set of rows reads as the same text wherever it is
+        read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
+        which alone it promises to keep; SQLite keeps an ordered subquery's.
+        """
+        from pypika_tortoise import Table
+        from pypika_tortoise.functions import Cast, Coalesce, Function
+        from pypika_tortoise.terms import Bracket, Field, LiteralValue
+
+        hop = path.through
+        alias = f"_orm_t{path.alias}"
+        restrict = self.backend.relation_scope(hop.model, hop.relation, self.info)
+        rows = hop.target.all()
+        if restrict is not None:
+            rows = restrict(rows, self.info)
+        visible = _pypika(rows).as_(f"{alias}_rows")
+        field = hop.model._meta.fields_map[hop.relation]
+        parent, target = hop.model._meta, hop.target._meta
+        names = [f"_orm_c{index}" for index in range(len(path.columns))]
+        dialect = self.db.capabilities.dialect
+        columns = []
+        for column, interval, name in zip(
+            path.columns, path.intervals, names, strict=True
+        ):
+            term = visible.field(target.fields_db_projection[column])
+            if interval is not None:
+                term = _truncate(term, target.fields_map[column], interval, dialect)
+            columns.append(term.as_(name))
+        if type(field).__name__ == "ManyToManyFieldInstance":
+            through = Table(field.through).as_(f"{alias}_link")
+            linked = (
+                self.query_class.from_(visible)
+                .join(through)
+                .on(
+                    through.field(field.forward_key)
+                    == visible.field(target.db_pk_column)
+                )
+                .where(
+                    through.field(field.backward_key)
+                    == self.base.field(parent.db_pk_column)
+                )
+            )
+        else:
+            to_name = field.to_field_instance.model_field_name
+            linked = self.query_class.from_(visible).where(
+                visible.field(target.fields_db_projection[field.relation_field])
+                == self.base.field(parent.fields_db_projection[to_name])
+            )
+        found = linked.select(*columns).distinct()
+        for name in names:
+            found = found.orderby(Field(name))
+        found = found.as_(alias)
+        values = [found.field(name) for name in names]
+        if dialect == "sqlite":
+            together = Function("JSON_GROUP_ARRAY", Function("JSON_ARRAY", *values))
+        elif dialect == "postgres":
+            in_order = ", ".join(f'"{alias}"."{name}"' for name in names)
+            together = Cast(
+                LiteralValue(
+                    f"JSON_AGG(JSON_BUILD_ARRAY({in_order}) ORDER BY {in_order})"
+                ),
+                "TEXT",
+            )
+        else:
+            raise ValueError(
+                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
+                f"not {dialect}."
+            )
+        # Bracketed: pypika drops a subquery's own brackets in GROUP BY.
+        return Coalesce(
+            Bracket(self.query_class.from_(found).select(together)),
+            LiteralValue("'[]'"),
+        )
+
     def _custom(self, path: Any) -> Any:
         """The term a ``@group_field`` method groups by.
 
@@ -2252,6 +2381,13 @@ class _GroupedRows:
 
 
 def _same(value: Any) -> Any:
+    return value
+
+
+def _in_utc(value: Any) -> Any:
+    """*value* moved to UTC, if it is a datetime that knows its offset."""
+    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+        return value.astimezone(datetime.UTC)
     return value
 
 

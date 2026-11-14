@@ -27,6 +27,10 @@ def models(tortoise_db):
 
 
 class TestHintPaths(AbstractTestHintPaths):
+    # Tortoise 1.1.9 prefetches a many-to-many relation in two statements,
+    # the through table and then the related rows; 1.1.6 joined them.
+    three_hop_statements = 6
+
     @pytest.fixture(autouse=True)
     def _seed(self, orm, seed):
         self.backend = orm.backend

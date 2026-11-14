@@ -8,8 +8,6 @@ from strawberry_orm.lazy_resolution import (
     mark_query_scoped,
     mark_relations_scoped,
     query_is_scoped,
-    remember_scoped_edges,
-    take_scoped_edges,
 )
 from strawberry_orm.optimizer.extension import (
     OptimizerExtension,
@@ -35,9 +33,6 @@ def test_query_scope_markers_survive_objects_that_reject_attributes():
     assert query_is_scoped([]) is False
     mark_query_scoped([])
     assert query_is_scoped([]) is False
-    remember_scoped_edges([], [(_Slotted, "title")])
-    assert take_scoped_edges([]) == []
-    remember_scoped_edges(slotted, [])
 
 
 def test_row_scope_extension_detection_and_rejected_singletons():

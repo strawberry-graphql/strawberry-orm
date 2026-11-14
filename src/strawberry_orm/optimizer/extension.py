@@ -12,6 +12,7 @@ from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import await_maybe
 from strawberry_orm.batching import stash_parents
+from strawberry_orm.optimizer.selections import graphql_resolve_info
 
 if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
@@ -107,15 +108,20 @@ def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     return name is not None and name in registry
 
 
-#: Cached ``(model class, field name) -> reads a relation`` verdicts. The
-#: verdict depends only on the model's relation names, which are fixed by the
-#: time rows are being resolved, so it is computed once rather than once per
-#: field per row (the regex below is measurably hot on large pages).
-_RELATION_VERDICTS: dict[tuple[type, str], bool] = {}
+#: Cached ``(model class, relation, named by on=) -> reads a relation``
+#: verdicts. The verdict depends only on the model's relation names, which are
+#: fixed by the time rows are being resolved, so it is computed once rather
+#: than once per field per row (the regex below is measurably hot on large
+#: pages).
+_RELATION_VERDICTS: dict[tuple[type, str, bool], bool] = {}
 
 
 def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> bool:
-    """True when this field is a relation hanging off an in-memory parent row."""
+    """True when this field is a relation hanging off an in-memory parent row.
+
+    An ``on=`` view the library serves reads the relation it names, under a
+    name of its own; a field the app resolves is judged by its name.
+    """
     if root is None or not backend.is_model_instance(root):
         return False
 
@@ -123,12 +129,18 @@ def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> b
     if not name:
         return False  # pragma: no cover - Info always carries one of the two
 
-    key = (type(root), name)
+    on_views = getattr(backend, "_on_views", None)
+    relation = None
+    if on_views:
+        parent_type = getattr(graphql_resolve_info(info), "parent_type", None)
+        relation = on_views.get((getattr(parent_type, "name", None), name))
+    key = (type(root), relation or name, relation is not None)
     verdict = _RELATION_VERDICTS.get(key)
     if verdict is None:
-        snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+        if relation is None:
+            relation = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
         try:
-            verdict = snake in backend.relation_names(type(root))
+            verdict = relation in backend.relation_names(type(root))
         except Exception:  # pragma: no cover - defensive; unmapped roots
             return False
         _RELATION_VERDICTS[key] = verdict

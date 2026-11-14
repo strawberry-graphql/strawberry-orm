@@ -35,8 +35,9 @@ import strawberry
 from strawberry import relay
 
 from strawberry_orm import group_field
+from strawberry_orm.grouping import GroupPath
 from strawberry_orm.relay import ORMListConnection
-from strawberry_orm.types import auto
+from strawberry_orm.types import DateGroupByInterval, auto
 
 
 def cursor(offset: int) -> str:
@@ -114,6 +115,10 @@ def _summary(result, key=lambda key: key):
         (key(group["key"]), group["aggregates"]["count"], group["edgeIndices"])
         for group in data["groups"]
     ]
+
+
+def _tag_names(key):
+    return [tag["name"] for tag in key["objects"]["tags"]]
 
 
 def _titles(result):
@@ -371,6 +376,146 @@ class AbstractTestGroupingAcrossRelations:
             ({"id": "3", "name": "rust"}, 1, [3]),
         ]
 
+    async def test_objects_offers_the_to_many_relations_the_type_shows(
+        self, orm, models, hide
+    ):
+        schema = _posts_schema(orm, models, hide)
+        assert fields(schema, "PostGroupByObjects") == {"tags"}
+        assert fields(schema, "PostGroupKeyObjects") == {"tags"}
+        assert "objects" in fields(schema, "PostGroupKey")
+        tags = schema._schema.type_map["PostGroupKeyObjects"].fields["tags"]
+        assert str(tags.type) == "[TagGroupKey!]"
+
+    async def test_groups_by_the_rows_of_a_many_to_many_together(
+        self, orm, models, hide, run
+    ):
+        """Post 2, tagged graphql and python, is in one group of its own."""
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        query = _posts(
+            "[{objects: {tags: {field: {name: true}}}}]",
+            groups="key { objects { tags { name } } } items { edges { node { title } } }",
+        )
+        result = await run(schema, query)
+        assert _summary(result, _tag_names) == [
+            (["python"], 1, [0]),
+            (["graphql", "python"], 1, [1]),
+            ([], 1, [2]),
+            (["rust"], 1, [3]),
+        ]
+        items = [
+            [edge["node"]["title"] for edge in group["items"]["edges"]]
+            for group in result.data["posts"]["groups"]
+        ]
+        assert items == [
+            ["Hello World"],
+            ["GraphQL Guide"],
+            ["Draft Post"],
+            ["Rust Adventures"],
+        ]
+
+    async def test_rows_the_type_hides_are_left_out_of_the_set(
+        self, orm, models, hide, run
+    ):
+        """Without its hidden graphql tag, post 2 shares post 1's group."""
+        schema = _posts_schema(orm, models, hide)
+        query = _posts(
+            "[{objects: {tags: {field: {name: true}}}}]",
+            groups="key { objects { tags { name } } }",
+        )
+        assert _summary(await run(schema, query), _tag_names) == [
+            (["python"], 2, [0, 1]),
+            ([], 1, [2]),
+            (["rust"], 1, [3]),
+        ]
+
+    async def test_a_set_of_rows_beside_a_column_and_with_two_columns(
+        self, orm, models, hide, run
+    ):
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        query = _posts(
+            "[{field: {isPublished: true}}, {objects: {tags: {field: {id: true}}}}, "
+            "{objects: {tags: {field: {name: true}}}}]",
+            groups="key { isPublished objects { tags { id name } } }",
+        )
+        assert _summary(
+            await run(schema, query),
+            lambda key: (key["isPublished"], key["objects"]["tags"]),
+        ) == [
+            (("True", [{"id": "1", "name": "python"}]), 1, [0]),
+            (
+                (
+                    "True",
+                    [{"id": "1", "name": "python"}, {"id": "2", "name": "graphql"}],
+                ),
+                1,
+                [1],
+            ),
+            (("False", []), 1, [2]),
+            (("True", [{"id": "3", "name": "rust"}]), 1, [3]),
+        ]
+
+    async def test_groups_by_the_rows_of_a_reverse_foreign_key_together(
+        self, orm, models, run
+    ):
+        """Alice's two published posts read as one published post."""
+        schema = _users_schema(orm, models)
+        result = await run(
+            schema,
+            """{ users(order: [{field: {id: ASC}}],
+                groupBy: [{objects: {posts: {field: {isPublished: true}}}}]) {
+                edges { node { name } }
+                groups { key { objects { posts { isPublished } } }
+                  aggregates { count } edgeIndices } } }""",
+        )
+        assert result.errors is None, result.errors
+        groups = [
+            (
+                [p["isPublished"] for p in g["key"]["objects"]["posts"]],
+                g["aggregates"]["count"],
+                g["edgeIndices"],
+            )
+            for g in result.data["users"]["groups"]
+        ]
+        assert groups == [(["True"], 2, [0, 2]), (["False"], 1, [1])], groups
+
+    async def test_a_group_type_offers_objects_for_its_to_many_relations(
+        self, orm, models, hide, run
+    ):
+        Post = models.Post
+        orm.group(models.User)
+        orm.group(models.Tag)
+
+        @orm.group_type(Post)
+        class PostGroupBy:
+            is_published: auto
+            author: auto
+            tags: auto
+
+        schema = _posts_schema(orm, models, hide, group=PostGroupBy)
+        assert fields(schema, "PostGroupByObjects") == {"tags"}
+        query = _posts(
+            "[{objects: {tags: {field: {name: true}}}}]",
+            groups="key { objects { tags { name } } }",
+        )
+        assert [
+            key for key, _, _ in _summary(await run(schema, query), _tag_names)
+        ] == [
+            ["python"],
+            [],
+            ["rust"],
+        ]
+
+    async def test_objects_naming_no_column_groups_by_nothing(
+        self, orm, models, hide, run
+    ):
+        schema = _posts_schema(orm, models, hide)
+        query = _posts(
+            "[{objects: {tags: {field: {name: false}}}}]", groups="edgeIndices"
+        )
+        result = await run(schema, query)
+        assert result.errors is None, result.errors
+        assert result.data["posts"]["groups"] == []
+
     async def test_an_order_through_a_to_many_relation_does_not_rank_groups(
         self, orm, models, hide, run
     ):
@@ -501,6 +646,64 @@ class AbstractTestGroupingByDateInterval:
         assert [count for _, count, _ in groups] == [
             len(indices) for _, indices in INTERVALS[interval]
         ]
+
+    @pytest.mark.parametrize(
+        ("interval", "periods"),
+        [
+            (
+                "MONTH",
+                [
+                    (["2026-01-01T00:00:00"], [0]),
+                    (["2026-05-01T00:00:00"], [1]),
+                    (["2027-03-01T00:00:00"], [2]),
+                ],
+            ),
+            (
+                "YEAR",
+                [
+                    (["2026-01-01T00:00:00"], [0, 1]),
+                    (["2027-01-01T00:00:00"], [2]),
+                ],
+            ),
+        ],
+    )
+    async def test_objects_cuts_each_related_date_to_its_period(
+        self, orm, models, run, date_posts, interval, periods
+    ):
+        """Alice's two January posts are one period; Bob shares 2026 with her."""
+        await date_posts(DATES)
+        User, Post = models.User, models.Post
+
+        @orm.type(Post, group=orm.group(Post))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            created_at: auto
+
+        @orm.type(User, order=orm.order(User), group=orm.group(User))
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+        @strawberry.type
+        class Query:
+            users: ORMListConnection[UserNode] = orm.connection.eager()
+
+        result = await run(
+            orm.schema(query=Query),
+            f"""{{ users(order: [{{field: {{id: ASC}}}}], groupBy: [{{objects: {{posts:
+                {{field: {{createdAt: {{interval: {interval}}}}}}}}}}}]) {{
+                edges {{ node {{ id }} }}
+                groups {{ key {{ objects {{ posts {{ createdAt }} }} }} edgeIndices }} }} }}""",
+        )
+        assert result.errors is None, result.errors
+        groups = [
+            (
+                [post["createdAt"] for post in group["key"]["objects"]["posts"]],
+                group["edgeIndices"],
+            )
+            for group in result.data["users"]["groups"]
+        ]
+        assert groups == periods, groups
 
     async def test_groups_follow_a_descending_order(
         self, orm, models, hide, run, date_posts
@@ -812,3 +1015,218 @@ class AbstractTestAggregateSelections:
         result = await run(schema, f"{{ posts({_BY_PUBLISHED}) {{ {selection} }} }}")
         assert result.errors is not None
         assert "median is supported on PostgreSQL" in result.errors[0].message
+
+
+def _tagged_schema(orm, models, hide):
+    """Posts and their tags, ``rust`` hidden: post 4's only tag."""
+    User, Post, Tag = models.User, models.Post, models.Tag
+
+    @orm.type(Tag, filters=orm.filter(Tag))
+    class TagNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+        @classmethod
+        def scope_rows(cls, qs, info):
+            return hide(Tag, "rust", qs)
+
+    @orm.type(User, filters=orm.filter(User))
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    @orm.type(Post, filters=orm.filter(Post), order=orm.order(Post))
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        tags: list[TagNode]
+        author: UserNode | None
+
+    @orm.type(User, filters=orm.filter(User), order=orm.order(User))
+    class AuthorNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+    @strawberry.type
+    class Query:
+        posts: ORMListConnection[PostNode] = orm.connection.eager()
+        authors: ORMListConnection[AuthorNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
+@pytest.mark.asyncio
+class AbstractTestARelationToManyRowsCanBeEmpty:
+    """``object: {tags: {isNull: true}}`` asks for rows with none the reader sees.
+
+    Post 3 has no tag, post 4 only ``rust``, which the tag type hides.
+    """
+
+    @pytest.mark.parametrize(
+        ("is_null", "titles"),
+        [
+            ("true", ["Draft Post", "Rust Adventures"]),
+            ("false", ["Hello World", "GraphQL Guide"]),
+        ],
+    )
+    async def test_through_a_many_to_many_relation(
+        self, orm, models, hide, run, is_null, titles
+    ):
+        schema = _tagged_schema(orm, models, hide)
+        result = await run(
+            schema,
+            f"""{{ posts(filter: {{object: {{tags: {{isNull: {is_null}}}}}}},
+                order: [{{field: {{id: ASC}}}}]) {{ edges {{ node {{ title }} }} }} }}""",
+        )
+        assert result.errors is None, result.errors
+        assert _titles(result) == titles
+
+    @pytest.mark.parametrize(
+        ("is_null", "names"),
+        [("true", []), ("false", ["Alice", "Bob", "Charlie"])],
+    )
+    async def test_through_a_reverse_foreign_key(
+        self, orm, models, hide, run, is_null, names
+    ):
+        schema = _tagged_schema(orm, models, hide)
+        result = await run(
+            schema,
+            f"""{{ authors(filter: {{object: {{posts: {{isNull: {is_null}}}}}}},
+                order: [{{field: {{id: ASC}}}}]) {{ edges {{ node {{ name }} }} }} }}""",
+        )
+        assert result.errors is None, result.errors
+        found = [edge["node"]["name"] for edge in result.data["authors"]["edges"]]
+        assert found == names
+
+
+def _ordered_schema(orm, models, by_title):
+    """Posts over a statement already ordered by title."""
+    User, Post = models.User, models.Post
+
+    @orm.type(User)
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    orm.order(User)
+
+    @orm.type(Post, order=orm.order(Post))
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        author: UserNode | None
+
+    def resolve_posts(info: strawberry.types.Info) -> list[PostNode]:
+        return by_title(Post)
+
+    @strawberry.type
+    class Query:
+        posts = orm.connection(ORMListConnection[PostNode], resolver=resolve_posts)
+
+        @orm.field.lazy(order=orm.order(Post))
+        def post_list(self, info: strawberry.types.Info) -> list[PostNode]:
+            return by_title(Post)
+
+    return orm.schema(query=Query)
+
+
+#: Posts 4 to 1, by id descending.
+_NEWEST_FIRST = ["Rust Adventures", "Draft Post", "GraphQL Guide", "Hello World"]
+
+
+@pytest.mark.asyncio
+class AbstractTestTheClientsOrderReplacesTheStatements:
+    """A resolver's statement orders by title; the client's ``order`` wins."""
+
+    async def test_a_connection(self, orm, models, by_title, run):
+        schema = _ordered_schema(orm, models, by_title)
+        result = await run(
+            schema,
+            "{ posts(order: [{field: {id: DESC}}]) { edges { node { title } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert _titles(result) == _NEWEST_FIRST
+
+    async def test_without_an_order_the_statements_holds(
+        self, orm, models, by_title, run
+    ):
+        schema = _ordered_schema(orm, models, by_title)
+        result = await run(schema, "{ posts { edges { node { title } } } }")
+        assert result.errors is None, result.errors
+        assert _titles(result) == sorted(_NEWEST_FIRST)
+
+    async def test_a_list(self, orm, models, by_title, run):
+        schema = _ordered_schema(orm, models, by_title)
+        result = await run(
+            schema, "{ postList(order: [{field: {id: DESC}}]) { title } }"
+        )
+        assert result.errors is None, result.errors
+        assert [post["title"] for post in result.data["postList"]] == _NEWEST_FIRST
+
+    async def test_by_a_related_column(self, orm, models, by_title, run):
+        schema = _ordered_schema(orm, models, by_title)
+        result = await run(
+            schema,
+            """{ posts(order: [{object: {author: {field: {name: DESC}}}},
+                {field: {id: ASC}}]) { edges { node { title } } } }""",
+        )
+        assert result.errors is None, result.errors
+        assert _titles(result) == [
+            "Rust Adventures",
+            "Draft Post",
+            "Hello World",
+            "GraphQL Guide",
+        ]
+
+    async def test_pages_are_disjoint_and_complete(self, orm, models, by_title, run):
+        schema = _ordered_schema(orm, models, by_title)
+        pages = []
+        after = ""
+        for _ in range(2):
+            result = await run(
+                schema,
+                f"""{{ posts(order: [{{field: {{id: DESC}}}}], first: 2{after}) {{
+                    edges {{ node {{ title }} }} pageInfo {{ endCursor }} }} }}""",
+            )
+            assert result.errors is None, result.errors
+            pages.append(_titles(result))
+            after = f', after: "{result.data["posts"]["pageInfo"]["endCursor"]}"'
+        assert pages == [_NEWEST_FIRST[:2], _NEWEST_FIRST[2:]]
+
+
+def together_path(backend, Post):
+    """The path ``objects: {tags: {field: {name: true}}}`` groups posts by."""
+    return GroupPath(
+        alias="_g0",
+        name="tags",
+        through=backend.relation_hop(Post, "tags"),
+        columns=("name",),
+        intervals=(None,),
+        readers=(str,),
+    )
+
+
+@pytest.mark.asyncio
+class AbstractTestTheRowsTogetherOnEachDatabase:
+    """``objects:`` writes each row's related rows as JSON in SQL of its own.
+
+    Backends supply ``together_sql(database)``: awaitable SQL grouping posts by
+    their tags' names together, written for ``"postgres"`` or ``"mysql"``
+    without running it, and ``together_read(column, interval)``: what reads
+    one of a post's columns back out of that JSON.
+    """
+
+    async def test_postgresql_sorts_inside_the_aggregate(self, together_sql):
+        sql = (await together_sql("postgres")).lower()
+        assert "json_agg(json_build_array(" in sql, sql
+        assert "order by" in sql.split("json_agg(", 1)[1], sql
+
+    async def test_another_database_is_refused(self, together_sql):
+        with pytest.raises(ValueError, match="supported on PostgreSQL and SQLite"):
+            await together_sql("mysql")
+
+    async def test_a_datetime_cut_to_a_period_keeps_its_instant(self, together_read):
+        read = together_read("created_at", DateGroupByInterval.DAY)
+        value = read("2026-01-15T00:00:00-08:00")
+        assert value == datetime.datetime(2026, 1, 15, 8, tzinfo=datetime.UTC), value

@@ -27,7 +27,6 @@ _SCOPED_RELATIONS = "_strawberry_orm_scoped_relations"
 _ROW_SCOPED = "_strawberry_orm_row_scoped"
 _QUERY_SCOPED = "_strawberry_orm_type_scoped"
 _SCOPED_QUERIES: WeakKeyDictionary[Any, None] = WeakKeyDictionary()
-_SCOPED_EDGES: WeakKeyDictionary[Any, list[tuple[type, str]]] = WeakKeyDictionary()
 
 
 def mark_relations_scoped(instances: Iterable[Any], names: Iterable[str]) -> None:
@@ -77,24 +76,6 @@ def query_is_scoped(query: Any) -> bool:
         return True
     # WeakKeyDictionary treats an unhashable query as absent.
     return query in _SCOPED_QUERIES
-
-
-def remember_scoped_edges(query: Any, edges: list[tuple[type, str]]) -> None:
-    """Attach the scoped relations a loader just added to *query*."""
-    if not edges:
-        return
-    try:
-        _SCOPED_EDGES[query] = list(edges)
-    except TypeError:
-        return
-
-
-def take_scoped_edges(query: Any) -> list[tuple[type, str]]:
-    """Return and forget the scoped relations recorded for *query*."""
-    try:
-        return _SCOPED_EDGES.pop(query, [])
-    except TypeError:
-        return []
 
 
 def extensions_include_lazy_resolution(extensions: list[Any]) -> bool:

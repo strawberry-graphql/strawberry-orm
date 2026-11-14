@@ -27,6 +27,36 @@ def keep_annotations(wrapper: Any, wrapped: Any) -> Any:
     return wrapper
 
 
+def resolver_info(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """The ``Info`` a resolver was called with, or ``None`` if it takes none."""
+    from strawberry.types.info import Info
+
+    return next(
+        (arg for arg in (*kwargs.values(), *args) if isinstance(arg, Info)), None
+    )
+
+
+def converting_resolver(backend: Any, func: Callable[..., Any]) -> Callable[..., Any]:
+    """Hand what *func* returns to ``backend.to_query`` before anything reads it."""
+    if not backend.converts_queries:
+        return func
+    to_query = backend.to_query
+
+    if iscoroutinefunction(func):
+
+        @wraps(func)
+        async def converted(*args: Any, **kwargs: Any) -> Any:
+            return to_query(await func(*args, **kwargs), resolver_info(args, kwargs))
+
+    else:
+
+        @wraps(func)
+        def converted(*args: Any, **kwargs: Any) -> Any:
+            return to_query(func(*args, **kwargs), resolver_info(args, kwargs))
+
+    return keep_annotations(converted, func)
+
+
 def in_async_context() -> bool:
     """Return ``True`` when called from a running event loop."""
     try:

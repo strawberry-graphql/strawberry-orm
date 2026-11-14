@@ -9,9 +9,13 @@ from tortoise.expressions import F
 from strawberry_orm import StrawberryORM
 from tests.abstract.grouping_across_relations import (
     AbstractTestAggregateSelections,
+    AbstractTestARelationToManyRowsCanBeEmpty,
     AbstractTestFilteringThroughAToManyRelation,
     AbstractTestGroupingAcrossRelations,
     AbstractTestGroupingByDateInterval,
+    AbstractTestTheClientsOrderReplacesTheStatements,
+    AbstractTestTheRowsTogetherOnEachDatabase,
+    together_path,
 )
 from tests.backends.tortoise.models import Post, Tag, User
 
@@ -72,4 +76,40 @@ class TestFilteringThroughAToManyRelation(AbstractTestFilteringThroughAToManyRel
 
 
 class TestAggregateSelections(AbstractTestAggregateSelections):
+    pass
+
+
+class TestARelationToManyRowsCanBeEmpty(AbstractTestARelationToManyRowsCanBeEmpty):
+    pass
+
+
+class TestTheClientsOrderReplacesTheStatements(
+    AbstractTestTheClientsOrderReplacesTheStatements
+):
+    pass
+
+
+@pytest.fixture
+def together_sql(orm, models, monkeypatch):
+    from strawberry_orm.backends.tortoise import _GroupedRows
+
+    async def _sql(database):
+        query = Post.all()
+        query._choose_db_if_not_chosen()
+        monkeypatch.setattr(
+            query._db, "capabilities", SimpleNamespace(dialect=database)
+        )
+        path = together_path(orm.backend, Post)
+        rows = _GroupedRows(orm.backend, query, Post, [path], None)
+        return rows.stmt.select(*rows.selected()).get_sql()
+
+    return _sql
+
+
+@pytest.fixture
+def together_read(orm, models):
+    return lambda column, interval: orm.backend.together_reader(Post, column, interval)
+
+
+class TestTheRowsTogetherOnEachDatabase(AbstractTestTheRowsTogetherOnEachDatabase):
     pass
