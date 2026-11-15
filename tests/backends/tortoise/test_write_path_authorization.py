@@ -6,6 +6,7 @@ import pytest_asyncio
 from strawberry_orm import StrawberryORM
 from tests.abstract.write_path_authorization import (
     AbstractTestAuthorizeKeepsTheRepo,
+    AbstractTestAuthorizeSeesTheKey,
     AbstractTestLinkChecks,
     AbstractTestNodeInputsFollowTypeExclude,
     AbstractTestOnReplaceDelete,
@@ -97,4 +98,8 @@ class TestRefListDeleteUsesTheRepo(AbstractTestRefListDeleteUsesTheRepo):
 
 
 class TestOnReplaceDelete(AbstractTestOnReplaceDelete):
+    pass
+
+
+class TestAuthorizeSeesTheKey(AbstractTestAuthorizeSeesTheKey):
     pass

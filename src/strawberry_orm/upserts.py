@@ -601,10 +601,10 @@ class UpsertWriter:
             repo.on_after_create(child, self._info)
         elif operation == "update":
             data = input_to_dict(value)
-            raw_id = data.pop("id")
-            if not (yield from self._authorized("update", model, raw_id)):
+            pk = self._pk(data.pop("id"), model)
+            if not (yield from self._authorized("update", model, pk)):
                 return
-            child = yield self._ops.get(repo, model, self._pk(raw_id, model))
+            child = yield self._ops.get(repo, model, pk)
             if child is None:
                 return
             data = repo.on_before_update(child, data, self._info)
@@ -616,9 +616,9 @@ class UpsertWriter:
                 yield self._ops.save(repo, child)
                 repo.on_after_update(child, self._info)
         else:
-            if not (yield from self._authorized(operation, model, value.id)):
-                return
             pk = self._pk(value.id, model)
+            if not (yield from self._authorized(operation, model, pk)):
+                return
             yield from self._remove_member(parent, operation, pk, model)
             return
         yield self._ops.link(parent.instance, parent.spec, child)

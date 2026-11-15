@@ -14,6 +14,7 @@ from strawberry_orm import StrawberryORM
 from strawberry_orm.repo import _get_sa_pk_column
 from tests.abstract.write_path_authorization import (
     AbstractTestAuthorizeKeepsTheRepo,
+    AbstractTestAuthorizeSeesTheKey,
     AbstractTestLinkChecks,
     AbstractTestNodeInputsFollowTypeExclude,
     AbstractTestOnReplaceDelete,
@@ -143,4 +144,8 @@ class TestRefListDeleteUsesTheRepo(AbstractTestRefListDeleteUsesTheRepo):
 
 
 class TestOnReplaceDelete(AbstractTestOnReplaceDelete):
+    pass
+
+
+class TestAuthorizeSeesTheKey(AbstractTestAuthorizeSeesTheKey):
     pass

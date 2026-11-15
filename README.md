@@ -1849,7 +1849,7 @@ All list mutations use **patch semantics**: only the items you mention are affec
 
 Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. The list is one unit of work, the same as [an upsert's](#applying-an-upsert), so a refusal part-way through leaves nothing written. `unlink` and `delete` act only on rows currently in `parent`'s relation; any other id raises `UpsertNotFoundError`, and unlinking from a relation whose foreign key is not nullable is a validation error. A `delete` goes through the repo's `_delete`, so a soft-delete override is honoured.
 
-An optional `authorize` callback `(action, model, obj_id, info) -> bool` adds a per-item check on top of the model's repo: an item it denies is skipped, and an item it allows must still pass the repo's `scope_query` and `can_*` hooks. An `update` that takes a row from another parent asks that parent's `can_unlink` as well as this one's `can_link`.
+An optional `authorize` callback `(action, model, obj_id, info) -> bool` adds a per-item check on top of the model's repo. `obj_id` is the row's primary key as the model stores it (`1`, never `"01"` or a Relay global ID), or `None` for a `create`. An item it denies is skipped, and an item it allows must still pass the repo's `scope_query` and `can_*` hooks. An `update` that takes a row from another parent asks that parent's `can_unlink` as well as this one's `can_link`.
 
 ```graphql
 mutation {

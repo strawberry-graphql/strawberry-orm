@@ -416,6 +416,42 @@ class AbstractTestAuthorizeKeepsTheRepo(Blog):
         assert await names(writes, blog.hello, "tags") == ["python", "go"]
 
 
+class AbstractTestAuthorizeSeesTheKey(Blog):
+    """``authorize`` is asked about the row an item names, not the text sent."""
+
+    @pytest.mark.parametrize("sent", ["01", "global"])
+    @pytest.mark.parametrize("operation", ["update", "unlink", "delete"])
+    async def test_a_ref_list_item_is_authorized_by_its_key(
+        self, writes, blog, operation, sent
+    ):
+        orm = writes.new_orm()
+
+        @orm.type(writes.m.Tag)
+        class TagNode:
+            id: auto
+            name: auto
+
+        seen = []
+
+        def not_python(action, model, pk, info):
+            seen.append(pk)
+            return pk != 1
+
+        raw = "01" if sent == "01" else str(relay.GlobalID("TagNode", "1"))
+        ref = orm.ref(writes.m.Tag, update=TagUpdate, unlink=True, delete=True)
+        values = {"name": "pwned"} if operation == "update" else {}
+        await writes.refs(
+            orm,
+            blog.hello,
+            "tags",
+            [item(ref, operation, id=raw, **values)],
+            authorize=not_python,
+        )
+        assert seen == [1]
+        assert await tag_names(writes) == ["python", "rust", "go"]
+        assert await names(writes, blog.hello, "tags") == ["python", "go"]
+
+
 # -- Permission checks that are coroutines, or not booleans --------------------------
 
 
