@@ -110,6 +110,63 @@ class AbstractTestOnViews:
         assert nodes[-1]["recent"] == [{"title": "Book 9", "tags": []}]
         assert self.query_count == three, (three, self.query_count)
 
+    async def test_a_view_named_in_several_words_is_read_once(self, orm, models):
+        """GraphQL calls it ``recentPosts``; it is still the view, so its scoped
+        rows are not checked again a parent at a time."""
+        hide, newest_first = self.hide, self.newest_first
+        Post = models.Post
+
+        def recent_scope(qs, info):
+            return newest_first(hide(qs, Post, "is_published", False), Post)
+
+        @orm.type(models.Tag)
+        class TagType:
+            id: auto
+            name: auto
+
+        @orm.type(Post)
+        class PostType:
+            id: auto
+            title: auto
+            tags: list[TagType]
+
+            @classmethod
+            def scope_rows(cls, qs, info):
+                return hide(qs, Post, "title", "Hello World")
+
+        @orm.type(models.User)
+        class AuthorType(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            recent_posts: list[PostType] = orm.field.eager(
+                on="posts", scope=recent_scope
+            )
+
+        @strawberry.type
+        class Query:
+            authors: ORMListConnection[AuthorType] = orm.connection.eager()
+
+        schema = orm.schema(query=Query)
+        query = "{ authors { edges { node { name recentPosts { title tags { name } } } } } }"
+
+        data = await self.execute(schema, query)
+        assert [node["recentPosts"] for node in _names(data)] == [
+            [
+                {
+                    "title": "GraphQL Guide",
+                    "tags": [{"name": "python"}, {"name": "graphql"}],
+                }
+            ],
+            [],
+            [{"title": "Rust Adventures", "tags": [{"name": "rust"}]}],
+        ]
+        first = self.query_count
+        assert first == self.view_statements, first
+
+        await self.add_authors(9)
+        await self.execute(schema, query)
+        assert self.query_count == first, (first, self.query_count)
+
     async def test_two_views_of_one_relation_keep_their_own_scopes(self, orm, models):
         schema = self.authors_schema(orm, models)
         data = await self.execute(
@@ -143,9 +200,9 @@ class AbstractTestOnViews:
 
 
 class AbstractTestASelfReadFieldIsChecked:
-    """A field named after no relation, resolved by the app, is still scoped."""
+    """A field the app resolves is still scoped, whatever it is called."""
 
-    async def test_rows_it_read_itself_are_scope_checked(self, orm, models):
+    def _authors(self, orm, models, field_name, decorator):
         own_posts, hide = self.own_posts, self.hide
         Post = models.Post
 
@@ -158,24 +215,43 @@ class AbstractTestASelfReadFieldIsChecked:
             def scope_rows(cls, qs, info):
                 return hide(qs, Post, "title", "Hello World")
 
-        @orm.type(models.User)
-        class AuthorType:
-            id: auto
-            name: auto
+        def resolver(self, info: strawberry.Info) -> list[PostType]:
+            return own_posts(self, info)
 
-            @strawberry.field
-            def writing(self, info: strawberry.Info) -> list[PostType]:
-                return own_posts(self, info)
+        resolver.__name__ = field_name
+        namespace = {
+            "__annotations__": {"id": auto, "name": auto},
+            field_name: decorator(orm)(resolver),
+        }
+        AuthorType = orm.type(models.User)(type("AuthorType", (), namespace))
 
         @strawberry.type
         class Query:
             authors: list[AuthorType] = orm.field.eager()
 
+        return orm.schema(query=Query)
+
+    async def _assert_scoped(self, schema, field_name):
         result = await self.run(
-            orm.schema(query=Query), "{ authors { name writing { title } } }"
+            schema, f"{{ authors {{ name {field_name} {{ title }} }} }}"
         )
         assert result.errors is None, result.errors
         assert result.data["authors"][0] == {
             "name": "Alice",
-            "writing": [{"title": "GraphQL Guide"}],
+            field_name: [{"title": "GraphQL Guide"}],
         }
+
+    async def test_rows_it_read_itself_are_scope_checked(self, orm, models):
+        schema = self._authors(orm, models, "writing", lambda orm: strawberry.field)
+        await self._assert_scoped(schema, "writing")
+
+    async def test_named_after_a_relation_it_is_checked_all_the_same(self, orm, models):
+        """Only a relation the library reads itself was scoped with the parent."""
+        schema = self._authors(orm, models, "posts", lambda orm: strawberry.field)
+        await self._assert_scoped(schema, "posts")
+
+    async def test_a_lazy_field_named_after_a_relation_is_checked_too(
+        self, orm, models
+    ):
+        schema = self._authors(orm, models, "posts", lambda orm: orm.field.lazy)
+        await self._assert_scoped(schema, "posts")

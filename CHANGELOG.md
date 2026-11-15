@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.30.0
+
+### Security
+
+Each of these let a request read rows its type's `scope_rows` hides, in 0.29.0.
+
+- **A resolver named after a relation was trusted as the library's read of it.** A field named like a relation of its model, such as an app's own `@orm.field.lazy def posts(...)`, skipped the related type's `scope_rows`, so it returned every row its resolver found. Only the library's own relation resolvers and `on=` views are trusted now, whatever they are named. That also stops a view named in several words (`recent_posts`) being checked again a parent at a time.
+- **A query `scope_rows` handed back unchanged was marked as scoped.** An admin's request, whose scope returns the query as it is, marked a query kept between requests (a module-level `select()` or queryset) as already scoped, and every later request read all its rows. Only a query the scope narrowed is marked now.
+- **What one request learned about scoping was trusted by the next.** Rows, relation caches and queries stayed marked as scoped, so rows that outlive a request (cached by the app, or in a SQLAlchemy session shared by several requests) skipped `scope_rows` from then on. After an admin's request, the next user read the admin's rows and relations. A mark now holds only for the execution that made it, and each subscription event is an execution of its own.
+- **Rows `scope_rows` rejected were removed from the resolver's own list.** The list a resolver returned was filtered in place, so a list the app keeps lost those rows for every later request, including those allowed to see them. They are dropped from a copy now.
+- **Connection state was kept on `info.context`.** Groups and aggregates read the connection's query from there, by the field's path, so a server that shares one context object between requests could hand one request's query, and its scope, to another's. Wherever the optimizer extension runs, as under `orm.schema()`, the state is kept for the execution instead.
+
+### Added
+
+- **Ordering by the set of a to-many relation's rows.** `order: [{objects: {tags: {field: {name: ASC}}}}]` sorts each row by all of its visible related rows together, by the same value `objects:` grouping keys a group by. Rows with the same set sit together, so grouped by the set too, each group's edges are one run, its `items` follow the order, and groups are ranked by their least (or greatest) set. Naming the relation in several entries makes one set of all their columns. The entries must agree on the direction, and the nulls variants sort as plain `ASC`/`DESC`, since a row with no related rows has `[]`. The set is compared as JSON text: on SQLite that is byte order, which puts `[graphql, python]` before `[graphql]` and `[]` last. On PostgreSQL it follows the database's collation. PostgreSQL and SQLite only; other databases raise. The generated type is `<Model>OrderObjects`.
+
+### Changed
+
+Faster on every backend. `benchmarks/kitchen_sink` runs 12 workloads (nested connections, `on=` views, filters across several relations, groups and aggregates) over 500 users, 5,000 posts and 25,000 comments on SQLite. All of them are faster on all five backend variants, with identical results.
+
+- **The library's schema extensions skip plain column fields.** Under `orm.schema()`, a scalar or enum field that reads a column straight off a row, Relay's default `id` when it reads a column, and the plain fields of the library's own connection, edge and page-info types are no longer wrapped by the optimizer, batching, connection, lazy-resolution and row-scope `resolve` hooks, none of which act on them. Any other field keeps them: a property can load a relation, which lazy resolution is there to report. An app's own `resolve` extensions still run on every field, as does a subclass of a library extension that overrides `resolve`. A schema built with `strawberry.Schema` directly is unchanged.
+- **Django under async execution reads what is loaded on the event loop.** A loaded column, a relation the library prefetched and scoped, a loaded foreign key and Relay's default `id` are read in place instead of through `sync_to_async`, a thread hop per field. A deferred column, a relation given a `filter` or `order`, and a prefetched relation the library did not scope itself, when its type has `scope_rows`, still go to the worker thread. A resolver is no longer wrapped in `sync_to_async` twice. Async Django was about 6.5× faster across the workloads.
+- **On Django, a plain column has no generated resolver**, so Strawberry reads it as an attribute rather than building an `Info` per value. A column whose descriptor changes the value it stores (a `FileField`, for one) keeps its resolver, and a row whose class (a proxy or subclass) puts a property or another descriptor over the column is read through it.
+- **SQLAlchemy: a filter through a scoped relation uses the scope's WHERE clause** when the scope only filters the related table's own columns. It was embedded as `pk IN (SELECT ...)` inside a correlated `EXISTS`, which SQLite runs again for every outer row. A scope with joins, limits, grouping, nested selects, raw SQL, loader options or `with_loader_criteria`, one that selects another entity, one over a class that shares its parent's table, or one over a relation back to the same table, is still embedded whole.
+- **SQLAlchemy: counts, aggregates and group counts drop the statement's `ORDER BY`**, unless it has a limit or offset, or a PostgreSQL `DISTINCT ON`, that the order decides.
+- **Tortoise: a filterable relation reads the rows the optimizer prefetched**, rather than querying again per parent, when it is given no `filter` or `order`. A cache the library did not scope is still queried when the related type has `scope_rows`.
+- **A group's `items` are not scope-checked again per group.** They are read from the connection's already scoped query.
+
+### Fixed
+
+- **Tortoise: `orm.order()` and `orm.group()` before `Tortoise.init`** no longer fail on a reverse or many-to-many relation known only by its annotation (`posts: fields.ManyToManyRelation["Post"]`). Before init, the annotation tells whether the relation is to-many.
+- **`auto` honours `null=True` on Django and Tortoise.** A nullable column was typed non-null, so a row holding NULL failed with "Cannot return null for non-nullable field". It is typed nullable now, as on SQLAlchemy. This changes the generated schema for such columns.
+- **Groups and aggregates work without a `context_value`.** A connection executed with no context returned `null` for both. Under `orm.schema()`, their state is now kept for the execution instead.
+- **`orm.connection.lazy(resolver=fn)` on an `@orm.type`** was removed by the decorator, leaving a field with no `first`, `filter` or `order` arguments. The keyword form now builds the same field as the decorator form.
+- **A generated connection applies its `filter` and `order` once**, not twice.
+
 ## 0.29.0
 
 This release closes the `on=` view brief and, of the thirteen SQLAlchemy backend items, **1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 and 13**. Items 5 and 9 have limits, given under each.

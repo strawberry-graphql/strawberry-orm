@@ -158,6 +158,32 @@ class TestLazyResolutionRuntime:
         )
         assert "fix: return a QuerySet instead of list" in str(result.errors[0].message)
 
+    def test_a_property_read_off_the_row_is_still_watched(self, seed, monkeypatch):
+        """A column skips the library's hooks under orm.schema(); a property,
+        which can load a relation, does not."""
+        monkeypatch.setattr(
+            DjPost, "byline", property(lambda post: post.author.name), raising=False
+        )
+        orm = StrawberryORM.for_django(lazy_resolution="warn")
+
+        @orm.type(DjPost)
+        class PostType:
+            id: auto
+            title: auto
+            byline: str
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def posts(self) -> list[PostType]:
+                return list(DjPost.objects.order_by("id"))
+
+        schema = orm.schema(query=Query)
+        with pytest.warns(UserWarning, match="byline"):
+            result = schema.execute_sync("{ posts { title byline } }", context_value={})
+        assert result.errors is None, result.errors
+        assert result.data["posts"][0] == {"title": "Hello World", "byline": "Alice"}
+
     def test_runtime_no_warning_when_optimizer_prefetches(self, seed):
         orm = StrawberryORM.for_django(lazy_resolution="off")
 

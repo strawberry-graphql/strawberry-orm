@@ -33,6 +33,7 @@ from strawberry_orm.backends.filter_pk_shortcut import (
 )
 from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
 from strawberry_orm.types import DateGroupByInterval
 
@@ -564,16 +565,20 @@ class SQLAlchemyBackend(BaseBackend):
     def apply_ordering(
         self, query: Any, order_input: Any, model: type, info: Any = None
     ) -> Any:
-        order_list = order_input if isinstance(order_input, list) else [order_input]
+        from strawberry_orm.grouping import SetOrder, order_terms
+
         clauses: list[Any] = []
         joins: list[Any] = []
         # The client's order replaces the statement's own, as a Django or
         # Tortoise ``order_by()`` does; SQLAlchemy's appends to it.
         own_order = query._order_by_clauses
         query = query.order_by(None)
-        for entry in order_list:
+        for term in order_terms(self, model, order_input):
+            if isinstance(term, SetOrder):
+                clauses.append(self._set_order(model, term, info))
+                continue
             entry_clauses, entry_joins, query = _build_sa_ordering(
-                entry, model, query=query, backend=self
+                term, model, query=query, backend=self
             )
             clauses.extend(entry_clauses)
             joins.extend(entry_joins)
@@ -600,7 +605,7 @@ class SQLAlchemyBackend(BaseBackend):
         if not requested and not aggregate_meta.custom_fields:
             return aggregate_meta.aggregates_type(count=0)
 
-        subq = query.subquery()
+        subq = _unordered(query).subquery()
         agg_cols: list[Any] = []
 
         if requested.get("count"):
@@ -678,7 +683,9 @@ class SQLAlchemyBackend(BaseBackend):
             info=info,
             dialect=self._dialect,
         )
-        clauses, joins = _sa_connection_ordering(query, order_input, model)
+        clauses, joins = _sa_connection_ordering(
+            query, order_input, model, backend=self, info=info
+        )
         for join in joins:
             stmt = stmt.outerjoin(join)
         firsts, ordering = _sa_group_ordering(clauses, self._dialect)
@@ -716,7 +723,9 @@ class SQLAlchemyBackend(BaseBackend):
         from strawberry_orm.grouping import key_tuple
 
         stmt, values = self._grouped_select(query, model, paths, info)
-        clauses, joins = _sa_connection_ordering(query, order_input, model)
+        clauses, joins = _sa_connection_ordering(
+            query, order_input, model, backend=self, info=info
+        )
         for join in joins:
             stmt = stmt.outerjoin(join)
         clauses += _missing_pk(clauses, model)
@@ -902,13 +911,18 @@ class SQLAlchemyBackend(BaseBackend):
             )
         else:
             raise ValueError(
-                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
-                f"not {self._dialect}."
+                f"Grouping or ordering by objects: is supported on PostgreSQL "
+                f"and SQLite, not {self._dialect}."
             )
         return func.coalesce(
             select(together).select_from(found).scalar_subquery(),
             literal_column("'[]'"),
         )
+
+    def _set_order(self, model: type, by_set: Any, info: Any) -> Any:
+        """The clause a ``SetOrder`` orders by: the text its set groups under."""
+        together = self._together(model, by_set.path, info)
+        return together.desc() if by_set.descending else together.asc()
 
     def _join_hop(self, stmt: Any, entity: Any, hop: Any, info: Any) -> Any:
         """Outer-join *hop*'s related rows the caller may see onto *stmt*."""
@@ -970,6 +984,11 @@ class SQLAlchemyBackend(BaseBackend):
         return isinstance(value, Select)
 
     def is_model_instance(self, value: Any) -> bool:
+        # Where default instrumentation keeps an instance's state; a mapped
+        # class has no such key. Custom instrumentation can keep it elsewhere,
+        # and a row taken for something else would skip its scope check.
+        if "_sa_instance_state" in getattr(value, "__dict__", ()):
+            return True
         if isinstance(value, type):
             return False
         return isinstance(sa_inspect(value, raiseerr=False), InstanceState)
@@ -1129,7 +1148,7 @@ class SQLAlchemyBackend(BaseBackend):
     def count_query(self, query: Any, info: Any) -> Any:
         from sqlalchemy import func, select
 
-        subq = query.subquery()
+        subq = _unordered(query).subquery()
         counted: Any = subq
         if _may_repeat_rows(query):
             # Rows are read with .unique(), so a join that repeats an entity
@@ -1206,7 +1225,7 @@ class SQLAlchemyBackend(BaseBackend):
     def group_counts(self, query: Any, key_field: str, info: Any) -> Any:
         from sqlalchemy import func, select
 
-        subq = query.subquery()
+        subq = _unordered(query).subquery()
         key_col = subq.c[key_field]
         stmt = select(key_col, func.count()).select_from(subq).group_by(key_col)
         session = self._get_session(info)
@@ -1681,19 +1700,21 @@ class SQLAlchemyBackend(BaseBackend):
                 return
             seen.add(id(obj))
             state = sa_inspect(obj)
+            # Computed afresh on every read, so read once per object.
+            unloaded = state.unloaded
             names = by_model.get(type(obj), set())
             was = before.get(id(obj))
             if was is None:
-                loaded = [name for name in names if name not in state.unloaded]
+                loaded = [name for name in names if name not in unloaded]
             else:
                 loaded = [
-                    name for name in names if name in was and name not in state.unloaded
+                    name for name in names if name in was and name not in unloaded
                 ]
             if loaded:
                 mark_relations_scoped([obj], loaded)
             # Iterating this namespace yields relationship objects, not names.
             for name in state.mapper.relationships.keys():  # noqa: SIM118
-                if name in state.unloaded:
+                if name in unloaded:
                     continue
                 value = state.dict.get(name)
                 if isinstance(value, list):
@@ -2304,7 +2325,7 @@ def _make_sa_plain_rel_resolver(
         "info": strawberry.types.Info,
         "return": return_ann,
     }
-    return strawberry.field(resolver=resolver)
+    return strawberry.field(resolver=reads_relation(resolver, fname))
 
 
 def _make_sa_rel_resolver(
@@ -2391,7 +2412,7 @@ def _make_sa_rel_resolver(
             "order": list[order_type] | None,
         }
 
-    return strawberry.field(resolver=resolver)
+    return strawberry.field(resolver=reads_relation(resolver, fname))
 
 
 _SA_TYPE_MAP: dict[str, type] = {
@@ -2568,10 +2589,11 @@ def _sa_relation_scope_criteria(
 ) -> Any | None:
     """Criteria limiting *relation* to the rows its type's scope allows.
 
-    The whole scoped statement is embedded as a subquery over primary keys
-    rather than lifting its WHERE clause, so joins, limits and anything else
-    ``scope_rows`` adds are carried across intact. Any ``scope=`` on this
-    edge is applied too, so a filter cannot reach rows the read path hides.
+    A scope that only filters the related table's own columns is applied as
+    its WHERE clause. Any other is embedded whole as a subquery over primary
+    keys, so joins, limits and anything else ``scope_rows`` adds are carried
+    across intact. Any ``scope=`` on this edge is applied too, so a filter
+    cannot reach rows the read path hides.
     """
     if backend is None:
         return None
@@ -2584,8 +2606,78 @@ def _sa_relation_scope_criteria(
 
     related = backend._relation_target_model(model, relation)
     scoped = get_qs(sa_select(related), info)
+    lifted = _liftable_criteria(scoped, related, model)
+    if lifted is not None:
+        return lifted
     pk_col = sa_inspect(related).primary_key[0]
     return pk_col.in_(scoped.with_only_columns(pk_col).scalar_subquery())
+
+
+def _unordered(query: Any) -> Any:
+    """*query* without its ORDER BY, when the order cannot change which rows it has.
+
+    It can with a limit, and with PostgreSQL's ``DISTINCT ON``, which keeps the
+    first row of each group in that order.
+    """
+    if (
+        query._limit_clause is not None
+        or query._offset_clause is not None
+        or query._fetch_clause is not None
+        or query._distinct_on
+    ):
+        return query
+    return query.order_by(None)
+
+
+def _liftable_criteria(scoped: Any, related: type, model: type) -> Any | None:
+    """The scope's WHERE clause, when it can stand in for the whole statement.
+
+    Inside a correlated EXISTS, ``pk IN (SELECT pk ... WHERE scope)`` is
+    re-evaluated for every outer row on SQLite. A scope that only filters the
+    related table's own columns means the same thing as its WHERE clause, so
+    that is used instead. Anything more - joins, limits, grouping, nested
+    selects, raw SQL, a relation back to the same table, or criteria the WHERE
+    clause does not hold - keeps the subquery.
+    """
+    from sqlalchemy import Select
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.sql import visitors
+    from sqlalchemy.sql.elements import TextClause
+    from sqlalchemy.sql.selectable import SelectBase
+
+    if not isinstance(scoped, Select):
+        return None
+    mapper = sa_inspect(related)
+    table = mapper.local_table
+    if table is sa_inspect(model).local_table:
+        return None
+    if (
+        scoped._limit_clause is not None
+        or scoped._offset_clause is not None
+        or scoped._group_by_clauses
+        or scoped._having_criteria
+        or scoped._distinct
+        or scoped._setup_joins
+        or scoped._from_obj
+        or scoped.get_final_froms() != [table]
+        # Criteria added when the ORM compiles the statement, not in its WHERE
+        # clause: with_loader_criteria and other options, and the
+        # discriminator of a class sharing its table with others.
+        or scoped._with_options
+        or mapper.single
+        or [d.get("entity") for d in scoped.column_descriptions] != [related]
+    ):
+        return None
+    where = scoped.whereclause
+    if where is None:
+        return None
+    for element in visitors.iterate(where):
+        if (
+            isinstance(element, (SelectBase, TextClause))
+            or getattr(element, "table", table) is not table
+        ):
+            return None
+    return where
 
 
 def _build_sa_filter(
@@ -3135,15 +3227,23 @@ def _order_parts(clause: Any) -> tuple[Any, bool, str | None]:
 
 
 def _sa_connection_ordering(
-    query: Any, order_input: Any, model: type
+    query: Any,
+    order_input: Any,
+    model: type,
+    *,
+    backend: Any = None,
+    info: Any = None,
 ) -> tuple[list[Any], list[Any]]:
     """The order the connection reads its rows in, and the joins it needs.
 
     The client's ``order`` when given, else the query's own. An order through
-    a to-many relation is left out: its join would repeat rows. A query's own
+    a to-many relation is left out: its join would repeat rows. The set an
+    ``objects:`` reads is one value per row, and stays. A query's own
     clauses are kept only when they read the model's table, the one thing a
     select over the model's rows is sure to have.
     """
+    from strawberry_orm.grouping import SetOrder, order_terms
+
     if not order_input:
         table = model.__table__  # type: ignore[attr-defined]
         return [
@@ -3153,8 +3253,11 @@ def _sa_connection_ordering(
         ], []
     clauses: list[Any] = []
     joins: list[Any] = []
-    for entry in order_input if isinstance(order_input, list) else [order_input]:
-        _sa_order_clauses(entry, model, (), clauses, joins)
+    for term in order_terms(backend, model, order_input):
+        if isinstance(term, SetOrder):
+            clauses.append(backend._set_order(model, term, info))
+        else:
+            _sa_order_clauses(term, model, (), clauses, joins)
     return clauses, joins
 
 

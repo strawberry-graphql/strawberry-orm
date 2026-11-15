@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 from collections.abc import Awaitable, Callable
 from functools import partial, wraps
 from inspect import isawaitable, iscoroutinefunction
 from typing import Any, TypeVar
+from weakref import WeakSet
 
 T = TypeVar("T")
 
@@ -128,8 +130,11 @@ def run_orm_work_blocking[T](
         return func(*args, **kwargs)
 
     call = partial(func, *args, **kwargs)
+    # A raw thread starts with an empty context; the work belongs to the
+    # execution that asked for it, as it does under sync_to_async.
+    context = contextvars.copy_context()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(call).result()
+        return pool.submit(context.run, call).result()
 
 
 async def await_maybe[T](value: AwaitableOrValue[T]) -> T:
@@ -157,18 +162,29 @@ def await_maybe_blocking[T](value: AwaitableOrValue[T]) -> T:
     return run_orm_work_blocking(finish)
 
 
+#: Wrappers made below. Wrapping one again would hop to the worker thread
+#: before its own ``in_memory`` check could keep the read on the event loop.
+#: Held by identity: ``functools.wraps`` copies attributes onto other wrappers.
+_ASYNC_SAFE: WeakSet[Callable[..., Any]] = WeakSet()
+
+
 def async_safe_resolver(
     func: Callable[..., Any],
     *,
     materialize: bool = True,
     thread_sensitive: bool = True,
+    in_memory: Callable[..., bool] | None = None,
 ) -> Callable[..., Any]:
     """Wrap a sync resolver so ORM access runs off the event loop in async GraphQL.
 
     The wrapper stays a **sync** function so ``execute_sync`` keeps working; in an
     async context it returns an awaitable produced by :func:`run_sync`.
+
+    ``in_memory`` is asked with the resolver's own arguments whether everything
+    it reads is already loaded. When it is, the resolver runs on the event loop:
+    a hop to the worker thread costs far more than reading a loaded value.
     """
-    if iscoroutinefunction(func):
+    if iscoroutinefunction(func) or func in _ASYNC_SAFE:
         return func
 
     @wraps(func)
@@ -190,6 +206,9 @@ def async_safe_resolver(
             # iterated on the event loop; under sync execution it would just
             # deny the optimizer and the batcher a query object to work with.
             return func(*args, **kwargs)
+        if in_memory is not None and in_memory(*args, **kwargs):
+            return run()
         return run_sync(run, thread_sensitive=thread_sensitive)
 
+    _ASYNC_SAFE.add(wrapper)
     return wrapper

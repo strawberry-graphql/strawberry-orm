@@ -2,12 +2,20 @@
 
 from types import SimpleNamespace
 
+from graphql import OperationType
+
 from strawberry_orm import StrawberryORM
 from strawberry_orm.backends._base import BaseBackend
 from strawberry_orm.lazy_resolution import (
+    current_execution,
+    execution_scope,
     mark_query_scoped,
     mark_relations_scoped,
+    mark_rows_scoped,
+    open_subscription_event,
     query_is_scoped,
+    relation_cache_is_scoped,
+    row_is_scoped,
 )
 from strawberry_orm.optimizer.extension import (
     OptimizerExtension,
@@ -22,9 +30,10 @@ class _Slotted:
 
 
 def test_query_scope_markers_survive_objects_that_reject_attributes():
-    mark_relations_scoped([], ["title"])
-    mark_relations_scoped([None, object()], [])
-    mark_relations_scoped([None], ["title"])
+    with execution_scope():
+        mark_relations_scoped([], ["title"])
+        mark_relations_scoped([None, object()], [])
+        mark_relations_scoped([None], ["title"])
 
     slotted = _Slotted()
     mark_query_scoped(slotted)
@@ -33,6 +42,69 @@ def test_query_scope_markers_survive_objects_that_reject_attributes():
     assert query_is_scoped([]) is False
     mark_query_scoped([])
     assert query_is_scoped([]) is False
+
+
+class _Row:
+    pass
+
+
+def test_row_and_relation_marks_hold_for_their_execution_only():
+    row = _Row()
+    # With no execution open there is nothing for a mark to expire with.
+    mark_rows_scoped([row])
+    mark_relations_scoped([row], ["posts"])
+    assert not row_is_scoped(row)
+    assert not relation_cache_is_scoped(row, "posts")
+
+    with execution_scope():
+        mark_rows_scoped([row])
+        mark_relations_scoped([row], ["posts"])
+        assert row_is_scoped(row)
+        assert relation_cache_is_scoped(row, "posts")
+        assert not relation_cache_is_scoped(row, "tags")
+        with execution_scope():
+            assert not row_is_scoped(row)
+            assert not relation_cache_is_scoped(row, "posts")
+        assert row_is_scoped(row)
+    assert not row_is_scoped(row)
+    assert not relation_cache_is_scoped(row, "posts")
+
+
+def test_query_marks_hold_for_their_execution_only():
+    outside, inside, slotted = _Row(), _Row(), _Slotted()
+    mark_query_scoped(outside)
+    with execution_scope():
+        mark_query_scoped(inside)
+        mark_query_scoped(slotted)
+        assert query_is_scoped(inside)
+        assert query_is_scoped(slotted)
+        assert not query_is_scoped(outside)
+    with execution_scope():
+        assert not query_is_scoped(inside)
+        assert not query_is_scoped(slotted)
+    assert query_is_scoped(outside)
+    assert not query_is_scoped(inside)
+
+
+def test_only_a_subscription_root_opens_an_execution():
+    query = SimpleNamespace(operation=SimpleNamespace(operation=OperationType.QUERY))
+    open_subscription_event(query)
+    assert current_execution() is None
+    with execution_scope():
+        opened = current_execution()
+        subscription = SimpleNamespace(
+            operation=SimpleNamespace(operation=OperationType.SUBSCRIPTION)
+        )
+        open_subscription_event(subscription)
+        assert current_execution() not in (None, opened)
+
+
+def test_a_rejected_row_leaves_the_resolvers_list_alone():
+    kept, dropped = _Row(), _Row()
+    returned = [kept, dropped]
+    filtered, to_load = _without_rejected(returned, returned, [kept])
+    assert filtered == to_load == [kept]
+    assert returned == [kept, dropped]
 
 
 def test_row_scope_extension_detection_and_rejected_singletons():

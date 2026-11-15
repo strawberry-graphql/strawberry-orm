@@ -217,11 +217,13 @@ class _AutoFilterOrderExtension(FieldExtension):
         filters: Any | None = None,
         order: Any | None = None,
         group: Any | None = None,
+        forward_inputs: bool = True,
     ) -> None:
         self._backend = backend
         self._filters = filters
         self._order = order
         self._group = group
+        self._forward_inputs = forward_inputs
         self._model: type | None = None
         self._output_type: Any | None = None
         self._resolver_accepts_filter = False
@@ -249,7 +251,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             self._group = inferred_group
 
         params = ()
-        if field.base_resolver is not None:
+        if field.base_resolver is not None and self._forward_inputs:
             params = field.base_resolver.signature.parameters.values()
 
         self._resolver_accepts_filter = any(
@@ -323,9 +325,13 @@ class _AutoFilterOrderExtension(FieldExtension):
         rows that were fetched, so the type's row scoping has to be applied
         here. The optimizer applies it on the read path, which runs later.
         """
-        from strawberry_orm.relay.connection import ConnectionState, stash_state
+        from strawberry_orm.relay.connection import (
+            ConnectionState,
+            connection_states,
+            stash_state,
+        )
 
-        if info.context is None:
+        if connection_states(info) is None:
             return
         base_query = self._backend.apply_type_scope(base_query, self._model, info)
         stash_state(
@@ -935,11 +941,13 @@ class _AutoConnection:
         field = self._build_field(graphql_type, self._resolver)
         if field is None:
             return
-        field._orm_auto_field = True  # type: ignore[attr-defined]
         if self._resolver is None:
             # __set_name__ runs before @orm.type knows the model, so a
             # connection over a relation cannot be built yet. Carry the
-            # declaration through for the type loop to finish.
+            # declaration through for the type loop to finish. A supplied
+            # resolver needs no rebuilding, and @orm.type removes an auto
+            # field it does not rebuild, so only this one is marked.
+            field._orm_auto_field = True  # type: ignore[attr-defined]
             field._orm_pending_connection = self  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
@@ -996,6 +1004,7 @@ class _AutoConnection:
 
             graphql_type = connection_type_for_node(node_type)
 
+        generated_resolver = resolver is None and model is not None
         if resolver is not None:
             resolver = converting_resolver(self._backend, resolver)
         elif model is not None:
@@ -1057,6 +1066,9 @@ class _AutoConnection:
                 filters=filter_type,
                 order=order_type,
                 group=group_type,
+                # The extension filters and orders the generated resolver's
+                # query itself; handing it the inputs as well applies them twice.
+                forward_inputs=not generated_resolver,
             )
         )
         field = relay.connection(
@@ -1659,6 +1671,9 @@ class StrawberryORM:
 
         self._backend.check_scoped_order_traversal()
 
+        from strawberry_orm.leaf_fields import leaf_skipping_schema_class
+
+        schema_class = leaf_skipping_schema_class(schema_class, self._backend)
         if tags is not None:
             schema_class = tagged_schema_class(schema_class, tags)
         schema = schema_class(extensions=list(extensions), **kwargs)

@@ -604,7 +604,10 @@ class TestScopedRelationHelpers:
             _scoped_related_queryset,
             _strip_conflicting_select_related,
         )
-        from strawberry_orm.lazy_resolution import mark_relations_scoped
+        from strawberry_orm.lazy_resolution import (
+            execution_scope,
+            mark_relations_scoped,
+        )
 
         orm = StrawberryORM.for_django(warn_missing_scope=False)
 
@@ -683,12 +686,17 @@ class TestScopedRelationHelpers:
         assert _django_related_children([missing], "nope") == []
 
         _clear_django_relation_cache(alice, "not_a_field")
-        mark_relations_scoped([post], ["author"])
         post.author = alice
-        assert _scoped_related_instance(orm._backend, post, "author", info) is alice
+        with execution_scope():
+            mark_relations_scoped([post], ["author"])
+            assert _scoped_related_instance(orm._backend, post, "author", info) is alice
+        # Out of the execution that marked it, the cache is read again.
+        reread = _scoped_related_instance(orm._backend, post, "author", info)
+        assert reread == alice
+        assert reread is not alice
 
     def test_an_already_checked_row_is_not_filtered_out(self, seed, Post):
-        from strawberry_orm.lazy_resolution import mark_rows_scoped
+        from strawberry_orm.lazy_resolution import execution_scope, mark_rows_scoped
 
         orm = StrawberryORM.for_django(warn_missing_scope=False)
 
@@ -702,9 +710,14 @@ class TestScopedRelationHelpers:
 
         published = Post.objects.get(title="Hello World")
         draft = Post.objects.get(title="Draft Post")
-        mark_rows_scoped([draft])
-        kept = orm._backend.scope_instances([published, draft], SimpleNamespace())
-        assert kept == [published, draft]
+        with execution_scope():
+            mark_rows_scoped([draft])
+            kept = orm._backend.scope_instances([published, draft], SimpleNamespace())
+            assert kept == [published, draft]
+        # Another execution, or none, does not take the mark on trust.
+        with execution_scope():
+            kept = orm._backend.scope_instances([published, draft], SimpleNamespace())
+        assert kept == [published]
 
     def test_a_cached_null_to_one_reads_as_absent(self, seed, Comment):
         from strawberry_orm.backends.django import _scoped_related_instance

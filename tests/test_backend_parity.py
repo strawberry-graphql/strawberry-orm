@@ -32,6 +32,9 @@ EXCLUDED_FILES = {
     "test_insert_only_upserts_sqlalchemy.py",
     # Sessions, column types and statements only SQLAlchemy has.
     "test_sqlalchemy_specifics.py",
+    # Only Django runs sync ORM reads from async resolvers, so only it has a
+    # worker thread to keep loaded reads out of.
+    "test_async_inline_reads.py",
 }
 
 EXCLUDED_METHODS = {
@@ -103,6 +106,9 @@ TORT_EXCLUDED_FILES = {
     # A connection over a relation is refused on Tortoise, so its file asserts
     # that rather than the behaviour the other two share.
     "test_relation_connection.py",
+    # The prefetch cache checks of Tortoise's filterable relation resolver,
+    # which the other two backends do not share.
+    "test_prefetched_relations.py",
     # Tortoise only executes asynchronously, so it has no second variant to
     # pair with the sync and async classes the other two run.
     "test_relay_connection_pagination.py",

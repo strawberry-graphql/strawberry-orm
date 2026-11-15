@@ -75,7 +75,46 @@ class AbstractTestConnectionCustomResolver:
 
         return orm.schema(query=Query)
 
+    def keyword_on_a_type_schema(self, orm, User, Post, posts_by_author):
+        """A lazy connection declared on a type, its resolver passed by keyword."""
+
+        @orm.type(Post, filters=orm.filter(Post), order=orm.order(Post))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        def resolve_posts(self, info: strawberry.types.Info) -> Iterable[PostNode]:
+            return posts_by_author(Post, self, info)
+
+        @orm.type(User, order=orm.order(User))
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            writing: ORMListConnection[PostNode] = orm.connection.lazy(
+                resolver=resolve_posts
+            )
+
+        @strawberry.type
+        class Query:
+            users: ORMListConnection[UserNode] = orm.connection()
+
+        return orm.schema(query=Query)
+
     # -- assertions shared by the sync and async variants --------------------
+
+    def _assert_keyword_on_a_type(self, result):
+        assert result.errors is None, result.errors
+        assert [
+            (edge["node"]["name"], edge["node"]["writing"])
+            for edge in result.data["users"]["edges"]
+        ] == [
+            (
+                "Alice",
+                {"totalCount": 1, "edges": [{"node": {"title": "GraphQL Guide"}}]},
+            ),
+            ("Bob", {"totalCount": 0, "edges": []}),
+            ("Charlie", {"totalCount": 0, "edges": []}),
+        ]
 
     def _assert_returns_all_rows(self, result):
         assert result.errors is None, result.errors
@@ -144,8 +183,32 @@ class AbstractTestConnectionCustomResolver:
     ARGUMENT_QUERY = """
         { users(first: 10, name: "Alice") { edges { node { name } } } }
     """
+    KEYWORD_ON_A_TYPE_QUERY = """
+        {
+          users(first: 10, order: [{ field: { name: ASC } }]) {
+            edges {
+              node {
+                name
+                writing(first: 5, filter: { field: { title: { contains: "Guide" } } }) {
+                  totalCount
+                  edges { node { title } }
+                }
+              }
+            }
+          }
+        }
+    """
 
     # -- tests ---------------------------------------------------------------
+
+    def test_keyword_resolver_on_a_type_gets_the_generated_arguments(
+        self, orm, seed, User, Post, posts_by_author, schema_execute
+    ):
+        """``@orm.type`` used to drop the field, leaving a plain attribute."""
+        schema = self.keyword_on_a_type_schema(orm, User, Post, posts_by_author)
+        self._assert_keyword_on_a_type(
+            schema_execute(schema, self.KEYWORD_ON_A_TYPE_QUERY)
+        )
 
     def test_keyword_resolver_supplies_the_rows(
         self, orm, seed, User, users_query, schema_execute
@@ -183,6 +246,14 @@ class AbstractTestConnectionCustomResolver:
 
 class AbstractTestConnectionCustomResolverAsync(AbstractTestConnectionCustomResolver):
     """Async backends (e.g. Tortoise) await execution."""
+
+    async def test_keyword_resolver_on_a_type_gets_the_generated_arguments(
+        self, orm, seed, User, Post, posts_by_author, schema_execute
+    ):
+        schema = self.keyword_on_a_type_schema(orm, User, Post, posts_by_author)
+        self._assert_keyword_on_a_type(
+            await schema_execute(schema, self.KEYWORD_ON_A_TYPE_QUERY)
+        )
 
     async def test_keyword_resolver_supplies_the_rows(
         self, orm, seed, User, users_query, schema_execute

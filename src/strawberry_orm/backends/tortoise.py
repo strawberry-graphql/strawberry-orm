@@ -23,6 +23,7 @@ from strawberry_orm.backends.filter_pk_shortcut import (
 )
 from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
@@ -75,6 +76,9 @@ _REL_FIELD_TYPES = _MANY_REL_TYPES | _FORWARD_REL_TYPES
 #: Relations a row can have many of. A reverse one-to-one is in
 #: ``_MANY_REL_TYPES`` for loading, but never repeats a row when joined.
 _TO_MANY_REL_TYPES = frozenset({"BackwardFKRelation", "ManyToManyFieldInstance"})
+
+#: How a to-many relation is annotated, the one sign of it before init.
+_TO_MANY_ANNOTATIONS = ("ReverseRelation", "ManyToManyRelation")
 
 _Ordering = tuple[str, bool, bool | None, bool | None]
 
@@ -332,6 +336,9 @@ class TortoiseBackend(BaseBackend):
                 if is_relation:
                     rel_fields[fname] = {"model": rel_model}
                 else:
+                    column = model._meta.fields_map.get(fname)  # type: ignore[attr-defined]
+                    if getattr(column, "null", False):
+                        ftype = ftype | None  # type: ignore[assignment]
                     col_types[fname] = ftype
 
             type_name = self._process_type_annotations(
@@ -432,7 +439,9 @@ class TortoiseBackend(BaseBackend):
                             "info": strawberry.types.Info,
                             "return": return_ann,
                         }
-                        return strawberry.field(resolver=resolver)
+                        return strawberry.field(
+                            resolver=reads_relation(resolver, fname)
+                        )
 
                     setattr(
                         cls,
@@ -475,12 +484,23 @@ class TortoiseBackend(BaseBackend):
     def apply_ordering(
         self, query: Any, order_input: Any, model: type, info: Any = None
     ) -> Any:
-        order_list = order_input if isinstance(order_input, list) else [order_input]
+        from strawberry_orm.grouping import SetOrder, order_terms
+
         clauses: list[str] = []
         python_orderings: list[tuple[str, bool, bool | None, bool | None]] = []
-        for entry in order_list:
+        for term in order_terms(self, model, order_input):
+            if isinstance(term, SetOrder):
+                # Annotated, so the rows carry it for an order kept in Python.
+                name = f"_orm{term.path.alias}"
+                query._choose_db_if_not_chosen()
+                base = model._meta.basetable  # type: ignore[attr-defined]
+                together = _together(self, query._db, base, term.path, info)
+                query = query.annotate(**{name: together})
+                python_orderings.append((name, term.descending, None, None))
+                clauses.append(f"-{name}" if term.descending else name)
+                continue
             entry_orderings, query = _build_tortoise_ordering(
-                entry, query=query, model=model, info=info, backend=self
+                term, query=query, model=model, info=info, backend=self
             )
             for (
                 col_name,
@@ -683,7 +703,24 @@ class TortoiseBackend(BaseBackend):
     def relation_hop(self, model: type, relation: str) -> Any:
         from strawberry_orm.grouping import GroupHop
 
-        field = model._meta.fields_map[relation]  # type: ignore[attr-defined]
+        field = model._meta.fields_map.get(relation)  # type: ignore[attr-defined]
+        if field is None:
+            # Before Tortoise.init, a reverse relation is only its annotation.
+            annotation = str(model.__annotations__.get(relation, ""))
+            target = next(
+                (
+                    rel
+                    for name, _, _, rel in self._introspect_model(model)
+                    if name == relation
+                ),
+                None,
+            )
+            return GroupHop(
+                relation=relation,
+                model=model,
+                target=target,
+                many=any(f"{kind}[" in annotation for kind in _TO_MANY_ANNOTATIONS),
+            )
         return GroupHop(
             relation=relation,
             model=model,
@@ -1364,7 +1401,7 @@ def _make_tortoise_to_one_resolver(
         "info": strawberry.types.Info,
         "return": return_ann,
     }
-    return strawberry.field(resolver=resolver)
+    return strawberry.field(resolver=reads_relation(resolver, fname))
 
 
 def _make_tortoise_rel_resolver(
@@ -1377,6 +1414,19 @@ def _make_tortoise_rel_resolver(
     """Create a Strawberry field for a Tortoise relation with filter/order."""
 
     info_type = strawberry.types.Info
+
+    def _prefetched(self: Any, info: Any) -> list[Any] | None:
+        """The rows the optimizer already loaded and scoped, if it did."""
+        from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+
+        rel_value = getattr(self, fname, None)
+        if not getattr(rel_value, "_fetched", False):
+            return None
+        if not relation_cache_is_scoped(self, fname) and (
+            backend.relation_scope(type(self), fname, info) is not None
+        ):
+            return None
+        return list(rel_value.related_objects)
 
     def _build_qs(self: Any, info: Any) -> Any:
         rel_value = getattr(self, fname)
@@ -1392,6 +1442,10 @@ def _make_tortoise_rel_resolver(
         async def resolver(
             self: Any, info: Any, filter: Any = None, order: Any = None
         ) -> Any:
+            if filter is None and order is None:
+                cached = _prefetched(self, info)
+                if cached is not None:
+                    return cached
             qs = _build_qs(self, info)
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
@@ -1410,6 +1464,10 @@ def _make_tortoise_rel_resolver(
     elif filter_type:
 
         async def resolver(self: Any, info: Any, filter: Any = None) -> Any:
+            if filter is None:
+                cached = _prefetched(self, info)
+                if cached is not None:
+                    return cached
             qs = _build_qs(self, info)
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
@@ -1425,6 +1483,10 @@ def _make_tortoise_rel_resolver(
     else:
 
         async def resolver(self: Any, info: Any, order: Any = None) -> Any:
+            if order is None:
+                cached = _prefetched(self, info)
+                if cached is not None:
+                    return cached
             qs = _build_qs(self, info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model, info=info)
@@ -1438,7 +1500,7 @@ def _make_tortoise_rel_resolver(
             "order": list[order_type] | None,
         }
 
-    return strawberry.field(resolver=resolver)
+    return strawberry.field(resolver=reads_relation(resolver, fname))
 
 
 # ---------------------------------------------------------------------------
@@ -2111,9 +2173,12 @@ class _GroupedRows:
 
         PostgreSQL has neither for a UUID nor a boolean. A UUID's text sorts as
         the UUID does, and a boolean's integer as the boolean does, false first.
+        A term with no *field*, the set an ``objects:`` reads, is text.
         """
         from pypika_tortoise import functions
 
+        if field is None:
+            return term
         kinds = {cls.__name__ for cls in type(field).__mro__}
         if kinds & _UNRANKABLE_FIELDS:
             return None
@@ -2132,13 +2197,20 @@ class _GroupedRows:
 
         The client's ``order`` when given, else the query's own. An order
         through a to-many relation is left out: its join would repeat rows.
+        The set an ``objects:`` reads is one value per row, and stays.
         """
+        from strawberry_orm.grouping import SetOrder, order_terms
+
         meta = self.model._meta  # type: ignore[attr-defined]
         found: list[tuple[Any, Any, bool, Any]] = []
         if order_input:
-            entries = order_input if isinstance(order_input, list) else [order_input]
-            for entry in entries:
-                self._order_entry(entry, self.model, self.base, (), found)
+            for term in order_terms(self.backend, self.model, order_input):
+                if isinstance(term, SetOrder):
+                    found.append(
+                        (self._together(term.path), None, term.descending, None)
+                    )
+                else:
+                    self._order_entry(term, self.model, self.base, (), found)
             return found
         from pypika_tortoise import Order
 
@@ -2272,81 +2344,7 @@ class _GroupedRows:
         return joined
 
     def _together(self, path: Any) -> Any:
-        """The related rows *path* reads of each row, as JSON text.
-
-        The rows the caller may see, their columns in an array each, distinct
-        and sorted so a set of rows reads as the same text wherever it is
-        read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
-        which alone it promises to keep; SQLite keeps an ordered subquery's.
-        """
-        from pypika_tortoise import Table
-        from pypika_tortoise.functions import Cast, Coalesce, Function
-        from pypika_tortoise.terms import Bracket, Field, LiteralValue
-
-        hop = path.through
-        alias = f"_orm_t{path.alias}"
-        restrict = self.backend.relation_scope(hop.model, hop.relation, self.info)
-        rows = hop.target.all()
-        if restrict is not None:
-            rows = restrict(rows, self.info)
-        visible = _pypika(rows).as_(f"{alias}_rows")
-        field = hop.model._meta.fields_map[hop.relation]
-        parent, target = hop.model._meta, hop.target._meta
-        names = [f"_orm_c{index}" for index in range(len(path.columns))]
-        dialect = self.db.capabilities.dialect
-        columns = []
-        for column, interval, name in zip(
-            path.columns, path.intervals, names, strict=True
-        ):
-            term = visible.field(target.fields_db_projection[column])
-            if interval is not None:
-                term = _truncate(term, target.fields_map[column], interval, dialect)
-            columns.append(term.as_(name))
-        if type(field).__name__ == "ManyToManyFieldInstance":
-            through = Table(field.through).as_(f"{alias}_link")
-            linked = (
-                self.query_class.from_(visible)
-                .join(through)
-                .on(
-                    through.field(field.forward_key)
-                    == visible.field(target.db_pk_column)
-                )
-                .where(
-                    through.field(field.backward_key)
-                    == self.base.field(parent.db_pk_column)
-                )
-            )
-        else:
-            to_name = field.to_field_instance.model_field_name
-            linked = self.query_class.from_(visible).where(
-                visible.field(target.fields_db_projection[field.relation_field])
-                == self.base.field(parent.fields_db_projection[to_name])
-            )
-        found = linked.select(*columns).distinct()
-        for name in names:
-            found = found.orderby(Field(name))
-        found = found.as_(alias)
-        values = [found.field(name) for name in names]
-        if dialect == "sqlite":
-            together = Function("JSON_GROUP_ARRAY", Function("JSON_ARRAY", *values))
-        elif dialect == "postgres":
-            in_order = ", ".join(f'"{alias}"."{name}"' for name in names)
-            together = Cast(
-                LiteralValue(
-                    f"JSON_AGG(JSON_BUILD_ARRAY({in_order}) ORDER BY {in_order})"
-                ),
-                "TEXT",
-            )
-        else:
-            raise ValueError(
-                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
-                f"not {dialect}."
-            )
-        # Bracketed: pypika drops a subquery's own brackets in GROUP BY.
-        return Coalesce(
-            Bracket(self.query_class.from_(found).select(together)),
-            LiteralValue("'[]'"),
-        )
+        return _together(self.backend, self.db, self.base, path, self.info)
 
     def _custom(self, path: Any) -> Any:
         """The term a ``@group_field`` method groups by.
@@ -2378,6 +2376,74 @@ class _GroupedRows:
         for table, criterion in resolved.joins:
             self.stmt = self.stmt.join(table, how=JoinType.left).on(criterion)
         return resolved.term
+
+
+def _together(backend: Any, db: Any, base: Any, path: Any, info: Any) -> Any:
+    """The related rows *path* reads of each row of *base*, as JSON text.
+
+    The rows the caller may see, their columns in an array each, distinct
+    and sorted so a set of rows reads as the same text wherever it is
+    read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
+    which alone it promises to keep; SQLite keeps an ordered subquery's.
+    """
+    from pypika_tortoise import Table
+    from pypika_tortoise.functions import Cast, Coalesce, Function
+    from pypika_tortoise.terms import Bracket, Field, LiteralValue
+
+    hop = path.through
+    alias = f"_orm_t{path.alias}"
+    restrict = backend.relation_scope(hop.model, hop.relation, info)
+    rows = hop.target.all()
+    if restrict is not None:
+        rows = restrict(rows, info)
+    visible = _pypika(rows).as_(f"{alias}_rows")
+    field = hop.model._meta.fields_map[hop.relation]
+    parent, target = hop.model._meta, hop.target._meta
+    names = [f"_orm_c{index}" for index in range(len(path.columns))]
+    dialect = db.capabilities.dialect
+    columns = []
+    for column, interval, name in zip(path.columns, path.intervals, names, strict=True):
+        term = visible.field(target.fields_db_projection[column])
+        if interval is not None:
+            term = _truncate(term, target.fields_map[column], interval, dialect)
+        columns.append(term.as_(name))
+    if type(field).__name__ == "ManyToManyFieldInstance":
+        through = Table(field.through).as_(f"{alias}_link")
+        linked = (
+            db.query_class.from_(visible)
+            .join(through)
+            .on(through.field(field.forward_key) == visible.field(target.db_pk_column))
+            .where(through.field(field.backward_key) == base.field(parent.db_pk_column))
+        )
+    else:
+        to_name = field.to_field_instance.model_field_name
+        linked = db.query_class.from_(visible).where(
+            visible.field(target.fields_db_projection[field.relation_field])
+            == base.field(parent.fields_db_projection[to_name])
+        )
+    found = linked.select(*columns).distinct()
+    for name in names:
+        found = found.orderby(Field(name))
+    found = found.as_(alias)
+    values = [found.field(name) for name in names]
+    if dialect == "sqlite":
+        together = Function("JSON_GROUP_ARRAY", Function("JSON_ARRAY", *values))
+    elif dialect == "postgres":
+        in_order = ", ".join(f'"{alias}"."{name}"' for name in names)
+        together = Cast(
+            LiteralValue(f"JSON_AGG(JSON_BUILD_ARRAY({in_order}) ORDER BY {in_order})"),
+            "TEXT",
+        )
+    else:
+        raise ValueError(
+            f"Grouping or ordering by objects: is supported on PostgreSQL and "
+            f"SQLite, not {dialect}."
+        )
+    # Bracketed: pypika drops a subquery's own brackets in GROUP BY.
+    return Coalesce(
+        Bracket(db.query_class.from_(found).select(together)),
+        LiteralValue("'[]'"),
+    )
 
 
 def _same(value: Any) -> Any:

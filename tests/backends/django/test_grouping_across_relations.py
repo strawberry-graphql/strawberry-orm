@@ -13,6 +13,7 @@ from tests.abstract.grouping_across_relations import (
     AbstractTestFilteringThroughAToManyRelation,
     AbstractTestGroupingAcrossRelations,
     AbstractTestGroupingByDateInterval,
+    AbstractTestOrderingByASetOfRelatedRows,
     AbstractTestTheClientsOrderReplacesTheStatements,
     AbstractTestTheRowsTogetherOnEachDatabase,
     together_path,
@@ -63,6 +64,28 @@ def date_posts(seed):
     return _date_posts
 
 
+@pytest.fixture
+def add_posts(seed):
+    @sync_to_async
+    def _add_posts(posts):
+        for pk, (title, author_id, tags) in posts.items():
+            post = Post.objects.create(
+                id=pk, title=title, body="", is_published=True, author_id=author_id
+            )
+            post.tags.add(*Tag.objects.filter(name__in=tags))
+
+    return _add_posts
+
+
+@pytest.fixture
+def add_tag(seed):
+    @sync_to_async
+    def _add_tag(post_id, name):
+        Post.objects.get(pk=post_id).tags.add(Tag.objects.get(name=name))
+
+    return _add_tag
+
+
 class TestGroupingAcrossRelations(AbstractTestGroupingAcrossRelations):
     pass
 
@@ -86,6 +109,10 @@ class TestARelationToManyRowsCanBeEmpty(AbstractTestARelationToManyRowsCanBeEmpt
 class TestTheClientsOrderReplacesTheStatements(
     AbstractTestTheClientsOrderReplacesTheStatements
 ):
+    pass
+
+
+class TestOrderingByASetOfRelatedRows(AbstractTestOrderingByASetOfRelatedRows):
     pass
 
 

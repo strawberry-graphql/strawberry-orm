@@ -20,6 +20,8 @@ from strawberry_orm.backends.filter_pk_shortcut import (
 )
 from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.lazy_resolution import reads_relation
+from strawberry_orm.leaf_fields import is_default_relay_id
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
@@ -252,6 +254,8 @@ class DjangoBackend(BaseBackend):
                         col_types[attname] = fk_type
                     continue
                 py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
+                if getattr(field_obj, "null", False):
+                    py_type = py_type | None  # type: ignore[assignment]
                 col_types[field_obj.name] = py_type
 
             type_name = self._process_type_annotations(
@@ -312,8 +316,12 @@ class DjangoBackend(BaseBackend):
                                 "info": strawberry.types.Info,
                                 "return": return_ann,
                             }
+                            reads_relation(resolver, fname)
                             if backend._django_async_safe:
-                                resolver = async_safe_resolver(resolver)
+                                resolver = async_safe_resolver(
+                                    resolver,
+                                    in_memory=_relation_in_memory(backend, fname),
+                                )
                             return strawberry.field(resolver=resolver)
 
                         setattr(cls, field_name, _make_resolver(field_name, ann, self))
@@ -330,10 +338,12 @@ class DjangoBackend(BaseBackend):
                             "info": strawberry.types.Info,
                             "return": return_ann,
                         }
+                        reads_relation(resolver, fname)
                         if backend._django_async_safe:
                             resolver = async_safe_resolver(
                                 resolver,
                                 materialize=False,
+                                in_memory=_relation_in_memory(backend, fname),
                             )
                         return strawberry.field(resolver=resolver)
 
@@ -343,7 +353,7 @@ class DjangoBackend(BaseBackend):
             self._check_lazy_relation_fields(cls, model, annotations)
             graphql_type = self._finalize_type(cls, model, type_name, name)
             if self._django_async_safe:
-                graphql_type = self._post_process_strawberry_fields(graphql_type)
+                graphql_type = self._post_process_strawberry_fields(graphql_type, model)
             return graphql_type
 
         return decorator
@@ -538,11 +548,15 @@ class DjangoBackend(BaseBackend):
     def apply_ordering(
         self, query: Any, order_input: Any, model: type, info: Any = None
     ) -> Any:
-        order_list = order_input if isinstance(order_input, list) else [order_input]
+        from strawberry_orm.grouping import SetOrder, order_terms
+
         clauses: list[Any] = []
-        for entry in order_list:
+        for term in order_terms(self, model, order_input):
+            if isinstance(term, SetOrder):
+                clauses.append(self._set_order(term, info))
+                continue
             entry_clauses, query = _build_django_ordering(
-                entry, query=query, model=model, info=info, backend=self
+                term, query=query, model=model, info=info, backend=self
             )
             clauses.extend(entry_clauses)
         if clauses:
@@ -620,7 +634,8 @@ class DjangoBackend(BaseBackend):
         def _run():
             rows = self._grouped_rows(query, paths, info)
             firsts, ordering = _group_ordering(
-                _connection_ordering(query, order_input), query.model
+                _connection_ordering(query, order_input, backend=self, info=info),
+                query.model,
             )
             grouped = (
                 rows.order_by()
@@ -652,7 +667,7 @@ class DjangoBackend(BaseBackend):
 
         from strawberry_orm.grouping import key_tuple
 
-        ordering = _connection_ordering(query, order_input)
+        ordering = _connection_ordering(query, order_input, backend=self, info=info)
         tiebreak = _pk_tiebreak(ordering, model)
         if tiebreak is not None:
             ordering = [*ordering, F(tiebreak).asc()]
@@ -787,33 +802,10 @@ class DjangoBackend(BaseBackend):
         from functools import reduce
         from operator import and_
 
-        from django.db.models import Case, F, OuterRef, Q, When
+        from django.db.models import Case, F, Q, When
 
         if path.through is not None:
-            hop = path.through
-            restrict = self.relation_scope(hop.model, hop.relation, info)
-            related = (
-                restrict(hop.target._default_manager.all(), info)
-                if restrict is not None
-                else hop.target._base_manager.all()
-            )
-            names = [f"_orm_c{index}" for index in range(len(path.columns))]
-            values = {
-                name: F(column)
-                if interval is None
-                else _truncate(F(column), hop.target._meta.get_field(column), interval)
-                for name, column, interval in zip(
-                    names, path.columns, path.intervals, strict=True
-                )
-            }
-            rows_together = (
-                related.filter(**{_remote_name(hop): OuterRef("pk")})
-                .annotate(**values)
-                .values(*names)
-                .distinct()
-                .order_by(*names)
-            )
-            return _Together(rows_together, names)
+            return self._together(path, info)
 
         if path.custom is not None:
             expr = invoke_custom_callback(
@@ -845,6 +837,43 @@ class DjangoBackend(BaseBackend):
             owner = path.model or rows.model
             expr = _truncate(expr, owner._meta.get_field(path.column), path.interval)
         return expr
+
+    def _together(self, path: Any, info: Any) -> Any:
+        """The related rows *path* reads of each row, as ``_Together`` JSON text.
+
+        Only the rows the caller may see, as the field reads on the type.
+        """
+        from django.db.models import F, OuterRef
+
+        hop = path.through
+        restrict = self.relation_scope(hop.model, hop.relation, info)
+        related = (
+            restrict(hop.target._default_manager.all(), info)
+            if restrict is not None
+            else hop.target._base_manager.all()
+        )
+        names = [f"_orm_c{index}" for index in range(len(path.columns))]
+        values = {
+            name: F(column)
+            if interval is None
+            else _truncate(F(column), hop.target._meta.get_field(column), interval)
+            for name, column, interval in zip(
+                names, path.columns, path.intervals, strict=True
+            )
+        }
+        rows_together = (
+            related.filter(**{_remote_name(hop): OuterRef("pk")})
+            .annotate(**values)
+            .values(*names)
+            .distinct()
+            .order_by(*names)
+        )
+        return _Together(rows_together, names)
+
+    def _set_order(self, by_set: Any, info: Any) -> Any:
+        """The clause a ``SetOrder`` orders by: the text its set groups under."""
+        together = self._together(by_set.path, info)
+        return together.desc() if by_set.descending else together.asc()
 
     # -- Queryset overrides --------------------------------------------------
 
@@ -1001,7 +1030,9 @@ class DjangoBackend(BaseBackend):
     ) -> Any:
         return _make_on_resolver(self, field_name, relation, return_ann)
 
-    def _post_process_strawberry_fields(self, graphql_type: type) -> type:
+    def _post_process_strawberry_fields(
+        self, graphql_type: type, model: type | None = None
+    ) -> type:
         if not self._django_async_safe:
             return graphql_type
 
@@ -1016,7 +1047,13 @@ class DjangoBackend(BaseBackend):
             if resolver is not None:
                 wrapped = resolver.wrapped_func
                 if wrapped is not None and not iscoroutinefunction(wrapped):
-                    resolver.wrapped_func = async_safe_resolver(wrapped)
+                    in_memory = None
+                    if model is not None and is_default_relay_id(graphql_type, wrapped):
+                        in_memory = _relay_id_in_memory(model, graphql_type)
+                        field._orm_relay_id = True  # type: ignore[attr-defined]
+                    resolver.wrapped_func = async_safe_resolver(
+                        wrapped, in_memory=in_memory
+                    )
                 continue
 
             python_name = field.python_name
@@ -1034,13 +1071,28 @@ class DjangoBackend(BaseBackend):
                     value = bound_field.default_resolver(root, bound_name)
                     return materialize_result(self, value, None, sync=False)
 
-                return async_safe_resolver(_resolve_basic, materialize=False)
+                return async_safe_resolver(
+                    _resolve_basic,
+                    materialize=False,
+                    in_memory=model and _column_in_memory(model, bound_name),
+                )
+
+            attname = model and _column_attname(model, python_name, stored_as_read=True)
+            if attname and not field.extensions:
+                # Left without a resolver, so Strawberry keeps its fast path
+                # for plain attributes; only an unloaded column goes the long way.
+                field.__class__ = _column_field_class(type(field))
+                field._orm_attname = attname  # type: ignore[attr-defined]
+                field._orm_plain_reads = {}  # type: ignore[attr-defined]
+                field._orm_unloaded_read = _make_resolve_basic()  # type: ignore[attr-defined]
+                continue
 
             field_type = field.type
             field.base_resolver = StrawberryResolver(
                 _make_resolve_basic(),
                 type_override=field_type if field_type is not UNRESOLVED else None,
             )
+            field._orm_basic_resolver = True  # type: ignore[attr-defined]
 
         return graphql_type
 
@@ -1812,9 +1864,146 @@ def _make_dj_rel_resolver(
             "order": list[order_type] | None,
         }
 
+    reads_relation(resolver, fname)
     if getattr(backend, "_django_async_safe", False):
-        resolver = async_safe_resolver(resolver)
+        resolver = async_safe_resolver(
+            resolver, in_memory=_relation_in_memory(backend, fname)
+        )
     return strawberry.field(resolver=resolver)
+
+
+def _resolver_instance_and_info(args: tuple, kwargs: dict) -> tuple[Any, Any]:
+    instance = args[0] if args else kwargs.get("self")
+    info = kwargs.get("info", args[1] if len(args) > 1 else None)
+    return instance, info
+
+
+def _relation_in_memory(backend: Any, field_name: str) -> Any:
+    """Whether a relation resolver would only read a cache this library scoped."""
+    from strawberry_orm.lazy_resolution import (
+        _django_relation_prefetched,
+        relation_cache_is_scoped,
+    )
+
+    def check(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("filter") is not None or kwargs.get("order") is not None:
+            return False
+        instance, info = _resolver_instance_and_info(args, kwargs)
+        if instance is None or not _django_relation_prefetched(instance, field_name):
+            return False
+        return (
+            relation_cache_is_scoped(instance, field_name)
+            or backend.relation_scope(type(instance), field_name, info) is None
+        )
+
+    return check
+
+
+def _relay_id_in_memory(model: type, graphql_type: Any) -> Any:
+    """Whether the column Relay's default ``resolve_id`` reads is loaded.
+
+    The column is only known once the type's annotations resolve, which a
+    forward reference can put off until the schema is built.
+    """
+    checks: list[Any] = []
+
+    def check(root: Any, *args: Any, **kwargs: Any) -> bool:
+        if not checks:
+            checks.append(_column_in_memory(model, graphql_type.resolve_id_attr()))
+        return checks[0] is not None and checks[0](root)
+
+    return check
+
+
+def _column_attname(
+    model: type, name: str, *, stored_as_read: bool = False
+) -> str | None:
+    """Where a plain column's value sits on the row, or ``None`` if *name* is not one.
+
+    ``stored_as_read`` also requires the stored value to be what reading the
+    attribute returns; a file field, for one, wraps it on the way out.
+    """
+    from django.db.models.query_utils import DeferredAttribute
+
+    try:
+        field = model._meta.get_field(name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not getattr(field, "concrete", False) or field.is_relation:
+        return None
+    if stored_as_read and field.descriptor_class is not DeferredAttribute:
+        return None
+    return field.attname
+
+
+def _column_descriptor(cls: type, attname: str) -> Any:
+    """What reading *attname* off a *cls* row goes through.
+
+    A proxy or subclass can put a property over a column, and the row's class
+    need not be the model the type was declared on.
+    """
+    from inspect import getattr_static
+
+    return getattr_static(cls, attname, None)
+
+
+def _column_in_memory(model: type, name: str) -> Any:
+    """Whether a plain column is loaded on the row, so reading it runs no query."""
+    from django.db.models.query_utils import DeferredAttribute
+
+    attname = _column_attname(model, name)
+    if attname is None:
+        return None
+    by_class: dict[type, bool] = {}
+
+    def check(root: Any, *args: Any, **kwargs: Any) -> bool:
+        cls = type(root)
+        through_django = by_class.get(cls)
+        if through_django is None:
+            # Django's descriptor reads a loaded column without a query,
+            # whatever a subclass of it does to the value on the way out.
+            through_django = by_class[cls] = isinstance(
+                _column_descriptor(cls, attname), DeferredAttribute
+            )
+        return through_django and attname in root.__dict__
+
+    return check
+
+
+_COLUMN_FIELD_CLASSES: dict[type, type] = {}
+
+
+def _column_field_class(base: type) -> type:
+    """*base*, reading a loaded column straight off the row.
+
+    A deferred column would query on read, which async code may not do on the
+    event loop, so that read goes through the async-safe resolver instead.
+    """
+    from django.db.models.query_utils import DeferredAttribute
+
+    cls = _COLUMN_FIELD_CLASSES.get(base)
+    if cls is None:
+
+        def get_result(
+            self: Any, source: Any, info: Any, args: list[Any], kwargs: Any
+        ) -> Any:
+            row_class = type(source)
+            plain = self._orm_plain_reads.get(row_class)
+            if plain is None:
+                plain = self._orm_plain_reads[row_class] = (
+                    type(_column_descriptor(row_class, self._orm_attname))
+                    is DeferredAttribute
+                )
+            if plain:
+                try:
+                    return source.__dict__[self._orm_attname]
+                except KeyError:
+                    pass
+            return self._orm_unloaded_read(source)
+
+        cls = type(base.__name__, (base,), {"get_result": get_result})
+        _COLUMN_FIELD_CLASSES[base] = cls
+    return cls
 
 
 class _DjangoUpsertOps:
@@ -2501,8 +2690,8 @@ class _Together(models.Subquery):
             together = f"json_agg(json_build_array({columns}) ORDER BY {columns})::text"
         else:
             raise ValueError(
-                f"Grouping by objects: is supported on PostgreSQL and SQLite, "
-                f"not {connection.vendor}."
+                f"Grouping or ordering by objects: is supported on PostgreSQL "
+                f"and SQLite, not {connection.vendor}."
             )
         return f"COALESCE((SELECT {together} FROM {rows} _orm_t), '[]')", params
 
@@ -2586,9 +2775,12 @@ def _rankable(model: type, expr: Any) -> Any:
 
     PostgreSQL has neither for a UUID nor a boolean. A UUID's text sorts as
     the UUID does, and a boolean's integer as the boolean does, false first.
+    The set an ``objects:`` reads is text already.
     """
     from django.db.models.functions import Cast
 
+    if isinstance(expr, _Together):
+        return expr
     field = _ordered_field(model, expr.name)
     kinds = {field.get_internal_type(), *(cls.__name__ for cls in type(field).__mro__)}
     if "UUIDField" in kinds:
@@ -2630,21 +2822,29 @@ def _order_clauses(order_input: Any, prefix: str = "") -> list[Any]:
     return clauses
 
 
-def _connection_ordering(query: Any, order_input: Any) -> list[Any]:
+def _connection_ordering(
+    query: Any, order_input: Any, *, backend: Any = None, info: Any = None
+) -> list[Any]:
     """The order the connection reads its rows in, as ``OrderBy`` clauses.
 
     The client's ``order`` when given, else the query's own, else the model's.
-    Only clauses that read one value per row are kept; the rest cannot rank
-    groups, and a ``@order_field`` only knows how to order the query itself.
+    Only clauses that read one value per row are kept, the set of an
+    ``objects:`` among them; the rest cannot rank groups, and a
+    ``@order_field`` only knows how to order the query itself.
     """
     from django.db.models import F
     from django.db.models.expressions import OrderBy
 
+    from strawberry_orm.grouping import SetOrder, order_terms
+
     model = query.model
     clauses: list[Any] = []
     if order_input:
-        for entry in order_input if isinstance(order_input, list) else [order_input]:
-            clauses.extend(_order_clauses(entry))
+        for term in order_terms(backend, model, order_input):
+            if isinstance(term, SetOrder):
+                clauses.append(backend._set_order(term, info))
+            else:
+                clauses.extend(_order_clauses(term))
     else:
         inner = query.query
         terms = inner.order_by or (
@@ -2663,8 +2863,11 @@ def _connection_ordering(query: Any, order_input: Any) -> list[Any]:
     return [
         clause
         for clause in clauses
-        if isinstance(clause.expression, F)
-        and _single_valued(model, clause.expression.name)
+        if isinstance(clause.expression, _Together)
+        or (
+            isinstance(clause.expression, F)
+            and _single_valued(model, clause.expression.name)
+        )
     ]
 
 

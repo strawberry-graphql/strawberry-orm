@@ -6,13 +6,15 @@ import logging
 import re
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Iterator
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
+from graphql import OperationType
 from strawberry.extensions import SchemaExtension
 
 if TYPE_CHECKING:
@@ -26,56 +28,159 @@ logger = logging.getLogger("strawberry_orm.lazy_query")
 _SCOPED_RELATIONS = "_strawberry_orm_scoped_relations"
 _ROW_SCOPED = "_strawberry_orm_row_scoped"
 _QUERY_SCOPED = "_strawberry_orm_type_scoped"
-_SCOPED_QUERIES: WeakKeyDictionary[Any, None] = WeakKeyDictionary()
+_SCOPED_QUERIES: WeakKeyDictionary[Any, object] = WeakKeyDictionary()
+
+
+class _Execution:
+    """One execution of a schema, opened by the library's schema extensions.
+
+    The marks below hold only for the execution that made them. Rows, relation
+    caches and queries can outlive a request (an identity map shared between
+    requests, a model instance or statement kept at module level), and a mark
+    from one request's scope says nothing about the next request's.
+    """
+
+    __slots__ = ("connection_states", "mark")
+
+    def __init__(self) -> None:
+        self.connection_states: dict[tuple, Any] = {}
+        self.mark = object()
+
+
+_EXECUTION: ContextVar[_Execution | None] = ContextVar(
+    "strawberry_orm_execution", default=None
+)
+#: Query marks made with no execution open. A query is only marked once
+#: scoping built it, so it is not shared the way a row can be.
+_OUTSIDE_AN_EXECUTION = object()
+
+
+@contextmanager
+def execution_scope() -> Iterator[None]:
+    """Open an execution for the marks and connection states made inside it."""
+    token = _EXECUTION.set(_Execution())
+    try:
+        yield
+    finally:
+        _EXECUTION.reset(token)
+
+
+def open_subscription_event(info: Any) -> None:
+    """Open an execution for a subscription event, from its root field.
+
+    ``on_execute`` covers only setting a subscription up; each event resolves
+    after it, in the task delivering the events. The event's one root field
+    opens a fresh execution there, so no mark carries over from the event
+    before. Nothing closes it: the next event replaces it.
+    """
+    operation = getattr(info, "operation", None)
+    if getattr(operation, "operation", None) is OperationType.SUBSCRIPTION:
+        _EXECUTION.set(_Execution())
+
+
+def current_execution() -> _Execution | None:
+    return _EXECUTION.get()
+
+
+def execution_mark() -> object | None:
+    """What marks made in the open execution hold, or ``None`` outside one."""
+    execution = _EXECUTION.get()
+    return None if execution is None else execution.mark
+
+
+#: On a resolver the library builds for a relation field: the relation it
+#: reads, scoped. ``functools.wraps`` carries it onto wrappers around it.
+_READS_RELATION = "_orm_reads_relation"
+
+
+def reads_relation[F: Callable[..., Any]](resolver: F, relation: str) -> F:
+    """Mark *resolver* as the library's own scoped read of *relation*."""
+    setattr(resolver, _READS_RELATION, relation)
+    return resolver
+
+
+def relation_read_by(info: Any) -> str | None:
+    """The relation the field *info* resolves reads, if the library resolves it.
+
+    Judged by the resolver, not the field's name: an app's resolver called
+    ``posts`` can return any rows at all.
+    """
+    definition = getattr(info, "_field", None)
+    if definition is None:
+        fields = getattr(getattr(info, "parent_type", None), "fields", None) or {}
+        graphql_field = fields.get(getattr(info, "field_name", None))
+        extensions = getattr(graphql_field, "extensions", None) or {}
+        definition = extensions.get("strawberry-definition")
+    resolver = getattr(getattr(definition, "base_resolver", None), "wrapped_func", None)
+    return getattr(resolver, _READS_RELATION, None)
 
 
 def mark_relations_scoped(instances: Iterable[Any], names: Iterable[str]) -> None:
     """Record that *names* on each instance were loaded with row scoping."""
+    mark = execution_mark()
     adding = set(names)
-    if not adding:
+    if mark is None or not adding:
         return
     for instance in instances:
         if instance is None:
             continue
         current = getattr(instance, _SCOPED_RELATIONS, None)
-        if not isinstance(current, set):
-            current = set()
+        if not isinstance(current, dict):
+            current = {}
             setattr(instance, _SCOPED_RELATIONS, current)
-        current.update(adding)
+        current.update(dict.fromkeys(adding, mark))
 
 
 def relation_cache_is_scoped(instance: Any, field_name: str) -> bool:
-    """Whether *field_name*'s loaded value was produced by a scoped load."""
+    """Whether *field_name*'s loaded value came from a scoped load in this execution."""
+    mark = execution_mark()
     current = getattr(instance, _SCOPED_RELATIONS, None)
-    return isinstance(current, set) and field_name in current
+    return (
+        mark is not None
+        and isinstance(current, dict)
+        and current.get(field_name) is mark
+    )
 
 
 def mark_rows_scoped(instances: Iterable[Any]) -> None:
     """Record that these instances already came from a scoped query."""
+    mark = execution_mark()
+    if mark is None:
+        return
     for instance in instances:
         with suppress(Exception):
-            setattr(instance, _ROW_SCOPED, True)
+            setattr(instance, _ROW_SCOPED, mark)
 
 
 def row_is_scoped(instance: Any) -> bool:
-    """Whether *instance* was loaded by a query that already applied scope_rows."""
-    return getattr(instance, _ROW_SCOPED, False) is True
+    """Whether *instance* was read by a query that applied scope_rows in this execution."""
+    mark = execution_mark()
+    return mark is not None and getattr(instance, _ROW_SCOPED, None) is mark
+
+
+def _query_mark() -> object:
+    return execution_mark() or _OUTSIDE_AN_EXECUTION
 
 
 def mark_query_scoped(query: Any) -> None:
     """Remember that ``scope_rows`` has already been applied to *query*."""
+    mark = _query_mark()
     with suppress(Exception):
-        setattr(query, _QUERY_SCOPED, True)
+        setattr(query, _QUERY_SCOPED, mark)
     with suppress(TypeError):
-        _SCOPED_QUERIES[query] = None
+        _SCOPED_QUERIES[query] = mark
 
 
 def query_is_scoped(query: Any) -> bool:
     """Return whether *query* was already passed through ``scope_rows``."""
-    if getattr(query, _QUERY_SCOPED, False):
+    mark = _query_mark()
+    if getattr(query, _QUERY_SCOPED, None) is mark:
         return True
     # WeakKeyDictionary treats an unhashable query as absent.
-    return query in _SCOPED_QUERIES
+    try:
+        return _SCOPED_QUERIES.get(query) is mark
+    except TypeError:
+        return False
 
 
 def extensions_include_lazy_resolution(extensions: list[Any]) -> bool:

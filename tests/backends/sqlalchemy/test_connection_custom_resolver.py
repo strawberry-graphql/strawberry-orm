@@ -1,6 +1,7 @@
 """Connections with a caller-supplied select (SQLAlchemy)."""
 
 import pytest
+from sqlalchemy import select
 
 from tests.abstract.connection_custom_resolver import (
     AbstractTestConnectionCustomResolver,
@@ -15,6 +16,14 @@ def users_query(orm):
         return orm.get_default_queryset(model)
 
     return _users_query
+
+
+@pytest.fixture
+def posts_by_author():
+    def _posts_by_author(Post, user, info):
+        return select(Post).where(Post.author_id == user.id)
+
+    return _posts_by_author
 
 
 @pytest.fixture

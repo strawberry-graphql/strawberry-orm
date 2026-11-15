@@ -9,7 +9,14 @@ from typing import Any
 import pytest
 import strawberry
 
-from strawberry_orm.grouping import GroupHop, from_json, group_paths
+from strawberry_orm.grouping import (
+    GroupHop,
+    SetOrder,
+    from_json,
+    group_paths,
+    order_terms,
+)
+from strawberry_orm.types import Ordering
 
 
 class _Tag:
@@ -35,6 +42,7 @@ class _Field:
 @dataclasses.dataclass
 class _Objects:
     tags: Any = strawberry.UNSET
+    comments: Any = strawberry.UNSET
 
 
 @dataclasses.dataclass
@@ -74,6 +82,57 @@ def test_the_related_rows_are_grouped_by_their_own_columns():
     entry = _GroupBy(objects=_Objects(tags=nested))
     with pytest.raises(ValueError, match="through object"):
         group_paths(_Backend(), _Tag, entry)
+
+
+@dataclasses.dataclass
+class _Columns:
+    id: Any = strawberry.UNSET
+    name: Any = strawberry.UNSET
+
+
+def _order_by_tags(**columns: Ordering) -> _GroupBy:
+    return _GroupBy(objects=_Objects(tags=_GroupBy(field=_Columns(**columns))))
+
+
+def test_a_relation_ordered_by_twice_is_one_set_where_it_is_first_named():
+    title = _GroupBy(field=_Field(name=Ordering.ASC))
+    by_id = _order_by_tags(id=Ordering.DESC)
+    by_name = _order_by_tags(name=Ordering.DESC_NULLS_LAST)
+    first, by_set, *entries = order_terms(_Backend(), _Tag, [title, by_id, by_name])
+    assert first is title
+    assert isinstance(by_set, SetOrder)
+    assert by_set.descending
+    path = by_set.path
+    assert (path.alias, path.name, path.columns) == ("_s0", "tags", ("id", "name"))
+    assert entries == [by_id, by_name]
+
+
+def test_an_order_without_objects_is_left_as_it_is():
+    entry = _GroupBy(field=_Field(name=Ordering.ASC))
+    assert order_terms(_Backend(), _Tag, entry) == [entry]
+
+
+def test_a_set_is_ordered_one_way():
+    entries = [_order_by_tags(id=Ordering.ASC), _order_by_tags(name=Ordering.DESC)]
+    with pytest.raises(ValueError, match="both ascending and descending"):
+        order_terms(_Backend(), _Tag, entries)
+
+
+def test_ordering_by_objects_needs_a_to_many_relation():
+    with pytest.raises(ValueError, match="rows of one of its own to-many"):
+        order_terms(_Backend(many=False), _Tag, _order_by_tags(name=Ordering.ASC))
+
+
+def test_ordering_by_objects_cannot_be_reached_through_object():
+    entry = _GroupBy(object=_Object(author=_order_by_tags(name=Ordering.ASC)))
+    with pytest.raises(ValueError, match=r"objects: \{tags\} through author"):
+        order_terms(_Backend(), _Tag, [entry])
+
+
+def test_the_related_rows_are_ordered_by_their_own_columns():
+    nested = _GroupBy(object=_Object(author=_GroupBy(field=_Field(name=Ordering.ASC))))
+    with pytest.raises(ValueError, match="through object"):
+        order_terms(_Backend(), _Tag, _GroupBy(objects=_Objects(tags=nested)))
 
 
 @pytest.mark.parametrize(

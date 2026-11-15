@@ -713,6 +713,8 @@ class PostOrder:
 
 `allow_scoped_ordering` only lifts the ordering restriction for the relations you name, on that one order input. `scope_rows` keeps scoping reads and filter traversal exactly as before, and another order input over the same model is unaffected. Naming a relation the order input cannot sort through is an error, so typos fail loudly.
 
+An [`objects:`](#order-by-a-set-of-related-rows) order is not checked. The set it sorts by leaves out the rows the caller cannot see, so a row's place shows no more than its relation field does. The same order input still offers `object:` through that relation, and that is checked.
+
 Pass `allow_scoped_ordering=True` to allow every relation that order input can sort through. Naming them one by one is the better habit — it keeps the decision visible per relation — but the names only exist once the type is built, so a schema generating its order inputs in a loop cannot list them. Reach for it when you have decided the rule holds across the model: every readable parent implies a readable child.
 
 If you build with `strawberry.Schema` directly instead of `orm.schema()`, the build-time check does not run; the offending query is rejected at execution instead.
@@ -1163,7 +1165,7 @@ Projected filters are cached internally and do not overwrite the global filter r
 UserOrder = orm.order(User)
 ```
 
-Each order entry is a `@oneOf` input with a `field` key (for scalar columns) or an `object` key (for related models). Position in the list determines tie-break priority:
+Each order entry is a `@oneOf` input with a `field` key (for scalar columns), an `object` key (for related models) or an `objects` key (for [the set of a to-many relation's rows](#order-by-a-set-of-related-rows)). Position in the list determines tie-break priority:
 
 ```graphql
 {
@@ -1192,6 +1194,28 @@ When order types are registered for related models, the generated order gains an
 ```
 
 Registration order matters: define related orders *before* the parent (e.g. `orm.order(User)` before `orm.order(Post)`).
+
+#### Order by a set of related rows
+
+`objects:` sorts a row by all of its related rows across a to-many relation at once. The value is the one [`objects:` grouping](#grouping-by-a-set-of-related-rows) keys a group by, so rows with the same set sit together, and when a connection is grouped by the set too, each group's edges are one run:
+
+```graphql
+{
+  posts(
+    order: [{ objects: { tags: { field: { name: ASC } } } }, { field: { createdAt: DESC } }]
+    groupBy: [{ objects: { tags: { field: { name: true } } } }]
+  ) {
+    edges { node { title tags { name } } }
+    groups { key { objects { tags { name } } } aggregates { count } edgeIndices }
+  }
+}
+```
+
+- The set is compared as its JSON text, such as `[["graphql"],["python"]]`. On SQLite that is byte order: ascending puts a set before a shorter set it starts with (`[graphql, python]` before `[graphql]`), and the empty set `[]` last. On PostgreSQL it follows the database's collation. Rows with the same set always sit together, which is what grouping needs. For an order people read down, sort by a column.
+- Naming the relation in several entries makes one set from all their columns, in the order the entries name them, at the place of the first: `[{objects: {tags: {field: {id: ASC}}}}, {objects: {tags: {field: {name: ASC}}}}]` sorts by the set of each tag's `id` and `name`. A set sorts one way, so the entries must all be ascending or all descending. The `_NULLS_FIRST` and `_NULLS_LAST` values sort as plain `ASC` and `DESC`: a row with no related rows has `[]`, never `null`.
+- Related rows the caller cannot see (the related type's `scope_rows`, and a relation's `scope=`) are left out of the set, so a post whose only tags are hidden sorts with the untagged posts.
+- `objects:` offers the model's own to-many relations, not ones reached through `object:`. Order inputs take no date `interval`, so a set grouped by date periods is ordered by its full dates, and its groups' edges need not sit together.
+- The set is built in SQL as JSON, on PostgreSQL and SQLite; other databases raise.
 
 ---
 
@@ -1527,7 +1551,7 @@ Each group includes:
 - `edgeIndices` — indices into the parent connection's `edges` array. A `null` key matches only rows whose value is null.
 - `items` — a nested cursor-paginated connection of items in that group, in the connection's order
 
-Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `order` through a to-many relation does not rank groups. Grouping does not need an `order` on the grouped column.
+Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `object:` order through a to-many relation does not rank groups. An `objects:` order does, by each group's least (or greatest) set, since a row has one set. Grouping does not need an `order` on the grouped column.
 
 A group's first row is found with `MIN` (or `MAX` for a descending clause) of each ordered column. PostgreSQL has neither for a UUID or a boolean, so a UUID is ranked by its text and a boolean as an integer (false before true); nulls fall where the connection's order puts them. A JSON, binary, hstore, full-text search vector or geometry column has no least value at all, so ordering by one does not rank groups, on any database: groups ranked only by it come in key order rather than edge order.
 
@@ -1580,6 +1604,7 @@ A relation the type shows through its own resolver (`@strawberry.field def categ
 - A date column takes an `interval`, as it does under `field:`. Each related row's date is cut to its period before the set is made, so two January posts make one `2026-01-01` entry.
 - The set is built in SQL as JSON, on PostgreSQL and SQLite; other databases raise, as date intervals do.
 - `objects:` can be combined with `field:`, `object:` and `@group_field` entries in the same `groupBy`.
+- To keep each group's edges together, [order by the same set](#order-by-a-set-of-related-rows): `order: [{objects: {tags: {field: {name: ASC}}}}]`. Each row then sorts by its group's key, and a group's `items` come in that order.
 
 ### Grouping by date intervals
 

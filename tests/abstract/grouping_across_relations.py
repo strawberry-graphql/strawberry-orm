@@ -21,6 +21,9 @@ Backends supply:
                                     posts by their author's key
 ``date_posts(dates)``               awaitable; sets each post's ``created_at``
                                     from ``{post id: datetime}``
+``add_posts(posts)``                awaitable; adds a published post for each
+                                    ``{id: (title, author id, [tag names])}``
+``add_tag(post id, tag name)``      awaitable; tags a post with a seeded tag
 
 The seed: Alice wrote posts 1 and 2, Bob post 3 (a draft), Charlie post 4.
 Post 1 is tagged python; post 2 python and graphql; post 3 nothing; post 4
@@ -1230,3 +1233,271 @@ class AbstractTestTheRowsTogetherOnEachDatabase:
         read = together_read("created_at", DateGroupByInterval.DAY)
         value = read("2026-01-15T00:00:00-08:00")
         assert value == datetime.datetime(2026, 1, 15, 8, tzinfo=datetime.UTC), value
+
+
+#: Posts added to the seed so that sets repeat, by ``{id: (title, author, tags)}``.
+SET_POSTS = {
+    5: ("Python Tips", 2, ["python"]),
+    6: ("Polyglot", 3, ["python", "rust"]),
+    7: ("Schema Design", 2, ["graphql"]),
+}
+
+#: Every post under ``objects: {tags: {field: {name: ASC}}}``, then by id.
+#: SQLite compares the JSON text byte by byte: ``,`` and ``[`` sort before
+#: ``]``, so a set comes before the sets it starts and ``[]`` comes last.
+BY_SET = [
+    ("GraphQL Guide", ["graphql", "python"]),
+    ("Schema Design", ["graphql"]),
+    ("Polyglot", ["python", "rust"]),
+    ("Hello World", ["python"]),
+    ("Python Tips", ["python"]),
+    ("Rust Adventures", ["rust"]),
+    ("Draft Post", []),
+]
+
+_SET = "objects: {tags: {field: {name: %s}}}"
+_AUTHOR = "object: {author: {field: {name: %s}}}"
+
+
+def _set_query(order, group_by=None, page=""):
+    """Posts in *order*, with their tags and authors, and groups by *group_by*."""
+    arguments, groups = f"order: {order}{page}", ""
+    if group_by:
+        arguments += f", groupBy: {group_by}"
+        groups = """groups { key { objects { tags { name } } author { name } }
+            aggregates { count } edgeIndices }"""
+    return f"""{{ posts({arguments}) {{ totalCount {groups}
+        edges {{ node {{ title tags {{ name }} author {{ name }} }} }}
+        pageInfo {{ endCursor hasNextPage }} }} }}"""
+
+
+def _edges(result):
+    assert result.errors is None, result.errors
+    return [
+        (edge["node"]["title"], sorted(tag["name"] for tag in edge["node"]["tags"]))
+        for edge in result.data["posts"]["edges"]
+    ]
+
+
+@pytest.mark.asyncio
+class AbstractTestOrderingByASetOfRelatedRows:
+    """``order: [{objects: {tags: ...}}]`` orders rows by what ``objects:`` groups by.
+
+    A row's value is the JSON text its ``objects:`` group is keyed by, so the
+    edges sit group by group and the groups are ranked in the edges' order.
+    """
+
+    async def test_the_order_offers_the_to_many_relations(self, orm, models, hide):
+        schema = _posts_schema(orm, models, hide)
+        assert "objects" in fields(schema, "PostOrder")
+        assert fields(schema, "PostOrderObjects") == {"tags"}
+        tags = schema._schema.type_map["PostOrderObjects"].fields["tags"]
+        assert str(tags.type) == "TagOrder"
+
+    @pytest.mark.parametrize(
+        ("direction", "expected"),
+        [
+            ("ASC", BY_SET),
+            (
+                "DESC",
+                [
+                    ("Draft Post", []),
+                    ("Rust Adventures", ["rust"]),
+                    ("Hello World", ["python"]),
+                    ("Python Tips", ["python"]),
+                    ("Polyglot", ["python", "rust"]),
+                    ("Schema Design", ["graphql"]),
+                    ("GraphQL Guide", ["graphql", "python"]),
+                ],
+            ),
+        ],
+    )
+    async def test_rows_with_one_set_sit_together(
+        self, orm, models, hide, run, add_posts, direction, expected
+    ):
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        order = f"[{{{_SET % direction}}}, {{field: {{id: ASC}}}}]"
+        assert _edges(await run(schema, _set_query(order))) == expected
+
+    @pytest.mark.parametrize("direction", ["ASC", "DESC"])
+    @pytest.mark.parametrize(
+        "levels",
+        [[_SET], [_SET, _AUTHOR], [_AUTHOR, _SET]],
+        ids=["set", "set-then-author", "author-then-set"],
+    )
+    async def test_the_groups_counts_give_each_groups_edges(
+        self, orm, models, hide, run, add_posts, direction, levels
+    ):
+        """What a client reading a page by position relies on.
+
+        Group *n*'s rows are the edges from ``sum(count[:n])`` to
+        ``sum(count[:n + 1])``, checked on a page cut across several groups.
+        """
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        order = ", ".join(f"{{{level % direction}}}" for level in levels)
+        group_by = ", ".join(f"{{{level % 'true'}}}" for level in levels)
+        start = 2
+        result = await run(
+            schema,
+            _set_query(
+                f"[{order}, {{field: {{id: ASC}}}}]",
+                f"[{group_by}]",
+                page=f', first: 4, after: "{cursor(start - 1)}"',
+            ),
+        )
+        edges = _edges(result)
+        data = result.data["posts"]
+        counts = [group["aggregates"]["count"] for group in data["groups"]]
+        assert sum(counts) == data["totalCount"] == 7
+        page = range(start, start + len(edges))
+        on_page = []
+        for n, group in enumerate(data["groups"]):
+            first = sum(counts[:n])
+            mine = [i - start for i in range(first, first + counts[n]) if i in page]
+            assert group["edgeIndices"] == mine, (n, data["groups"], edges)
+            for i in mine:
+                assert edges[i][1] == _tag_names(group["key"])
+                if _AUTHOR in levels:
+                    author = data["edges"][i]["node"]["author"]["name"]
+                    assert author == group["key"]["author"]["name"]
+            on_page.append(bool(mine))
+        assert sum(on_page) >= 3, data["groups"]
+
+    async def test_a_row_whose_only_tags_are_hidden_sorts_with_the_untagged(
+        self, orm, models, hide, run, add_posts
+    ):
+        """``graphql`` is hidden: post 2 reads as ``[python]``, post 7 as ``[]``."""
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide)
+        result = await run(
+            schema,
+            _set_query(
+                f"[{{{_SET % 'ASC'}}}, {{field: {{id: ASC}}}}]",
+                f"[{{{_SET % 'true'}}}]",
+            ),
+        )
+        assert [title for title, _ in _edges(result)] == [
+            "Polyglot",
+            "Hello World",
+            "GraphQL Guide",
+            "Python Tips",
+            "Rust Adventures",
+            "Draft Post",
+            "Schema Design",
+        ]
+        assert _summary(result, _tag_names) == [
+            (["python", "rust"], 1, [0]),
+            (["python"], 3, [1, 2, 3]),
+            (["rust"], 1, [4]),
+            ([], 2, [5, 6]),
+        ]
+
+    async def test_a_tag_added_to_a_row_moves_it_to_its_new_set(
+        self, orm, models, hide, run, add_posts, add_tag
+    ):
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        query = _set_query(
+            f"[{{{_SET % 'ASC'}}}, {{field: {{id: ASC}}}}]", f"[{{{_SET % 'true'}}}]"
+        )
+        assert _edges(await run(schema, query)) == BY_SET
+        await add_tag(3, "rust")
+        result = await run(schema, query)
+        assert _edges(result) == [*BY_SET[:5], ("Draft Post", ["rust"]), BY_SET[5]]
+        assert _summary(result, _tag_names)[-1] == (["rust"], 2, [5, 6])
+
+    async def test_pages_across_groups_neither_repeat_nor_skip_a_row(
+        self, orm, models, hide, run, add_posts
+    ):
+        """Rows of one set are told apart by the primary key, page after page."""
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        order = f"[{{{_SET % 'ASC'}}}]"
+        group_by = f"[{{{_SET % 'true'}}}]"
+        pages, after = [], ""
+        while True:
+            result = await run(
+                schema, _set_query(order, group_by, f", first: 2{after}")
+            )
+            pages.append(_edges(result))
+            info = result.data["posts"]["pageInfo"]
+            if not info["hasNextPage"]:
+                break
+            after = f', after: "{info["endCursor"]}"'
+        assert [len(page) for page in pages] == [2, 2, 2, 1]
+        assert [edge for page in pages for edge in page] == BY_SET
+
+    async def test_a_set_of_two_columns_is_named_over_two_entries(
+        self, orm, models, hide, run, add_posts
+    ):
+        """Ordered and grouped by ``tags { id name }``; python is 1, graphql 2."""
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        by_id, by_name = (
+            "objects: {tags: {field: {id: %s}}}",
+            "objects: {tags: {field: {name: %s}}}",
+        )
+        result = await run(
+            schema,
+            _set_query(
+                f"[{{{by_id % 'ASC'}}}, {{{by_name % 'ASC'}}}, {{field: {{id: ASC}}}}]",
+                f"[{{{by_id % 'true'}}}, {{{by_name % 'true'}}}]",
+            ),
+        )
+        assert [title for title, _ in _edges(result)] == [
+            "GraphQL Guide",
+            "Polyglot",
+            "Hello World",
+            "Python Tips",
+            "Schema Design",
+            "Rust Adventures",
+            "Draft Post",
+        ]
+        groups = _summary(result, _tag_names)
+        assert [indices for _, _, indices in groups] == [
+            [0],
+            [1],
+            [2, 3],
+            [4],
+            [5],
+            [6],
+        ]
+
+    async def test_a_set_sorts_one_way(self, orm, models, hide, run):
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        result = await run(
+            schema,
+            """{ posts(order: [{objects: {tags: {field: {id: ASC}}}},
+                {objects: {tags: {field: {name: DESC}}}}]) {
+                edges { node { title } } } }""",
+        )
+        assert result.errors is not None
+        assert "both ascending and descending" in result.errors[0].message
+
+    async def test_groups_ranked_by_their_least_set_and_items_in_set_order(
+        self, orm, models, hide, run, add_posts
+    ):
+        """Grouped by author, each author's group starts at its first set."""
+        await add_posts(SET_POSTS)
+        schema = _posts_schema(orm, models, hide, scoped=False)
+        result = await run(
+            schema,
+            f"""{{ posts(order: [{{{_SET % "ASC"}}}, {{field: {{id: ASC}}}}],
+                groupBy: [{{{_AUTHOR % "true"}}}]) {{
+                groups {{ key {{ author {{ name }} }}
+                  items(first: 5) {{ edges {{ node {{ title }} }} }} }} }} }}""",
+        )
+        assert result.errors is None, result.errors
+        assert [
+            (
+                group["key"]["author"]["name"],
+                [edge["node"]["title"] for edge in group["items"]["edges"]],
+            )
+            for group in result.data["posts"]["groups"]
+        ] == [
+            ("Alice", ["GraphQL Guide", "Hello World"]),
+            ("Bob", ["Schema Design", "Python Tips", "Draft Post"]),
+            ("Charlie", ["Polyglot", "Rust Adventures"]),
+        ]

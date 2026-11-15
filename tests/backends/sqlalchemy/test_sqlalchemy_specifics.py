@@ -28,6 +28,8 @@ from sqlalchemy import (
     create_engine,
     event,
     select,
+    text,
+    union,
 )
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import (
@@ -38,12 +40,18 @@ from sqlalchemy.orm import (
     relationship,
     selectinload,
     sessionmaker,
+    with_loader_criteria,
 )
 from strawberry import relay
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm._async import in_async_context
-from strawberry_orm.backends.sqlalchemy import SQLAlchemyBackend, _column_value
+from strawberry_orm.backends.sqlalchemy import (
+    SQLAlchemyBackend,
+    _column_value,
+    _liftable_criteria,
+    _unordered,
+)
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
 from tests.abstract.payload import policy as payload_policy
@@ -310,6 +318,8 @@ class TestASyncSessionUnderAsyncExecution:
         # page, short enough to be its own count.
         assert len(threads) == 4
         threads.clear()
+        # Relations the first execution loaded are not trusted by the second.
+        sa_session.expunge_all()
         synced = await asyncio.to_thread(
             schema.execute_sync, query, context_value={"session": sa_session}
         )
@@ -1033,6 +1043,167 @@ def test_a_scope_check_reads_only_keys(sa_session, seed):
     assert len(checks) == 1, statements.sql
     assert checks[0].startswith("SELECT post.id \nFROM post")
     assert "post_tag" not in checks[0]
+
+
+class _SharedTableBase(DeclarativeBase):
+    pass
+
+
+class _Owner(_SharedTableBase):
+    __tablename__ = "lifting_owner"
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+
+class _Item(_SharedTableBase):
+    __tablename__ = "lifting_item"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("lifting_owner.id"))
+    kind: Mapped[str] = mapped_column(String(10))
+    name: Mapped[str] = mapped_column(String(10))
+    __mapper_args__ = {"polymorphic_on": "kind", "polymorphic_identity": "item"}
+
+
+class _SpecialItem(_Item):
+    """Shares its parent's table; the ORM adds ``kind = 'special'`` itself."""
+
+    __mapper_args__ = {"polymorphic_identity": "special"}
+
+
+class TestScopeLifting:
+    """A scope over a relation's own columns is applied as its WHERE clause.
+
+    Embedded whole, it would be ``pk IN (SELECT ...)`` inside a correlated
+    EXISTS, which SQLite runs again for every outer row.
+    """
+
+    def test_a_base_class_sharing_its_table_is_lifted(self):
+        named = _Item.name == "x"
+        lifted = _liftable_criteria(select(_Item).where(named), _Item, _Owner)
+        assert str(lifted) == str(named)
+
+    def test_a_scope_over_its_own_columns_is_its_where_clause(self):
+        published = Post.is_published.is_(True)
+        lifted = _liftable_criteria(select(Post).where(published), Post, User)
+        assert str(lifted) == str(published)
+
+    @pytest.mark.parametrize(
+        ("scoped", "related", "parent"),
+        [
+            pytest.param(
+                union(select(Post.id), select(Post.id)), Post, User, id="a union"
+            ),
+            pytest.param(
+                select(Comment).where(Comment.body != ""),
+                Comment,
+                Comment,
+                id="a relation back to the same table",
+            ),
+            pytest.param(select(Post), Post, User, id="no where clause"),
+            pytest.param(
+                select(Post).where(
+                    Post.author_id.in_(select(User.id).where(User.name == "Alice"))
+                ),
+                Post,
+                User,
+                id="a nested select",
+            ),
+            pytest.param(
+                select(Post).join(Post.author).where(User.name == "Alice"),
+                Post,
+                User,
+                id="a join",
+            ),
+            pytest.param(
+                select(Post).where(Post.is_published.is_(True)).limit(1),
+                Post,
+                User,
+                id="a limit",
+            ),
+            pytest.param(
+                select(Post)
+                .where(Post.is_published.is_(True))
+                .options(with_loader_criteria(Post, Post.title != "Draft Post")),
+                Post,
+                User,
+                id="loader criteria",
+            ),
+            pytest.param(
+                select(Post).where(text("is_published = 1")),
+                Post,
+                User,
+                id="raw sql",
+            ),
+            pytest.param(
+                select(_SpecialItem).where(_SpecialItem.name == "x"),
+                _SpecialItem,
+                _Owner,
+                id="a class sharing its parent's table",
+            ),
+            pytest.param(
+                select(_SpecialItem).where(_SpecialItem.name == "x"),
+                _Item,
+                _Owner,
+                id="another entity than the relation's",
+            ),
+        ],
+    )
+    def test_any_other_scope_is_kept_whole(self, scoped, related, parent):
+        assert _liftable_criteria(scoped, related, parent) is None
+
+    def test_a_count_keeps_the_order_distinct_on_picks_rows_by(self):
+        ordered = select(Post).order_by(Post.author_id, Post.id.desc())
+        assert not _unordered(ordered)._order_by_clauses
+        first_per_author = ordered.distinct(Post.author_id)
+        assert _unordered(first_per_author)._order_by_clauses
+
+    @pytest.mark.parametrize(
+        ("scope", "kept_whole"),
+        [
+            pytest.param(
+                lambda q: q.where(User.name == "Alice"), False, id="own columns"
+            ),
+            pytest.param(
+                lambda q: q.join(User.posts).where(Post.is_published.is_(True)),
+                True,
+                id="a join",
+            ),
+        ],
+    )
+    def test_a_filter_through_a_scoped_relation(
+        self, sa_session, seed, scope, kept_whole
+    ):
+        orm = _orm()
+
+        @orm.type(User, filters=orm.filter(User))
+        class UserNode:
+            id: auto
+            name: auto
+
+            @classmethod
+            def scope_rows(cls, query, info):
+                return scope(query)
+
+        @orm.type(Post, filters=orm.filter(Post))
+        class PostNode:
+            id: auto
+            title: auto
+            author: UserNode
+
+        @strawberry.type
+        class Query:
+            posts: list[PostNode] = orm.field.auto()
+
+        schema = orm.schema(query=Query)
+        with _Statements(sa_session) as statements:
+            result = schema.execute_sync(
+                '{ posts(filter: { object: { author: { field: { name: { exact: "Bob" } } } } })'
+                " { title } }",
+                context_value={"session": sa_session},
+            )
+
+        assert result.errors is None, result.errors
+        assert result.data == {"posts": []}
+        assert ("IN (SELECT" in statements.sql[0]) is kept_whole, statements.sql[0]
 
 
 def test_a_relation_fields_order_replaces_its_scopes(sa_session, seed):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import copy
 from contextlib import suppress
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
@@ -12,6 +12,12 @@ from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import await_maybe
 from strawberry_orm.batching import stash_parents
+from strawberry_orm.lazy_resolution import (
+    execution_mark,
+    execution_scope,
+    open_subscription_event,
+    relation_read_by,
+)
 from strawberry_orm.optimizer.selections import graphql_resolve_info
 
 if TYPE_CHECKING:
@@ -75,14 +81,18 @@ def _without_rejected(
 ) -> tuple[Any, list[Any]]:
     """Remove *candidates* that ``scope_rows`` did not keep.
 
-    A list is filtered in place so a ``PreslicedRows`` subclass, and the total
-    it carries, survive. A single rejected instance becomes ``None``.
+    A list is filtered in a copy of its own type, so a ``PreslicedRows``
+    subclass, and the total it carries, survive. Not in place: the list is the
+    app's, which may hand the same one to the next request, whose scope can
+    allow more. A single rejected instance becomes ``None``.
     """
     kept_ids = {id(row) for row in kept}
     dropped = {id(row) for row in candidates if id(row) not in kept_ids}
     if isinstance(result, list):
         if dropped:
-            result[:] = [row for row in result if id(row) not in dropped]
+            filtered = copy.copy(result)
+            filtered[:] = [row for row in result if id(row) not in dropped]
+            result = filtered
         return result, [row for row in result if id(row) in kept_ids]
     if dropped:
         return None, []
@@ -108,37 +118,27 @@ def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     return name is not None and name in registry
 
 
-#: Cached ``(model class, relation, named by on=) -> reads a relation``
-#: verdicts. The verdict depends only on the model's relation names, which are
-#: fixed by the time rows are being resolved, so it is computed once rather
-#: than once per field per row (the regex below is measurably hot on large
-#: pages).
-_RELATION_VERDICTS: dict[tuple[type, str, bool], bool] = {}
+#: Cached ``(model class, relation) -> is one of its relations`` verdicts. The
+#: model's relation names are fixed by the time rows are being resolved, so
+#: this is computed once rather than once per field per row.
+_RELATION_VERDICTS: dict[tuple[type, str], bool] = {}
 
 
 def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> bool:
-    """True when this field is a relation hanging off an in-memory parent row.
+    """True when the library's own resolver read this relation off a loaded row.
 
-    An ``on=`` view the library serves reads the relation it names, under a
-    name of its own; a field the app resolves is judged by its name.
+    That resolver applied the scope itself, an ``on=`` view under a name of its
+    own included. A field the app resolves is never taken on trust, whatever
+    it is called: its rows can come from anywhere.
     """
     if root is None or not backend.is_model_instance(root):
         return False
-
-    name = getattr(info, "python_name", None) or getattr(info, "field_name", "")
-    if not name:
-        return False  # pragma: no cover - Info always carries one of the two
-
-    on_views = getattr(backend, "_on_views", None)
-    relation = None
-    if on_views:
-        parent_type = getattr(graphql_resolve_info(info), "parent_type", None)
-        relation = on_views.get((getattr(parent_type, "name", None), name))
-    key = (type(root), relation or name, relation is not None)
+    relation = relation_read_by(graphql_resolve_info(info))
+    if relation is None:
+        return False
+    key = (type(root), relation)
     verdict = _RELATION_VERDICTS.get(key)
     if verdict is None:
-        if relation is None:
-            relation = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
         try:
             verdict = relation in backend.relation_names(type(root))
         except Exception:  # pragma: no cover - defensive; unmapped roots
@@ -161,6 +161,9 @@ def _unwrap_single(result: Any, singular: bool) -> Any:
 # A row reached twice in one operation under different selections is marked
 # from the first, so the second falls back to loading relations as it reads
 # them. That is slower, not wrong: the lazy path applies the same row scoping.
+#
+# A prepared row is not scope-checked again, so the mark holds only for the
+# execution that made it, like the scope marks in ``lazy_resolution``.
 _PREPARED = "_strawberry_orm_relations_loaded"
 
 #: Exact types a resolved value can have that no branch below ``resolve``
@@ -172,14 +175,18 @@ _SCALAR_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
 
 
 def _mark_prepared(rows: Any) -> None:
+    mark = execution_mark()
+    if mark is None:
+        return
     for row in rows if isinstance(rows, list) else [rows]:
         # Immutable or slotted rows simply go unmarked and take the slow path.
         with suppress(Exception):
-            setattr(row, _PREPARED, True)
+            setattr(row, _PREPARED, mark)
 
 
 def _is_prepared(row: Any) -> bool:
-    return getattr(row, _PREPARED, False) is True
+    mark = execution_mark()
+    return mark is not None and getattr(row, _PREPARED, None) is mark
 
 
 def optimize_query_nodes(nodes: Any, info: Any) -> Any:
@@ -227,7 +234,8 @@ class OptimizerExtension(SchemaExtension):
         )
 
     def on_execute(self) -> Any:
-        yield
+        with execution_scope():
+            yield
 
     def resolve(
         self,
@@ -237,6 +245,8 @@ class OptimizerExtension(SchemaExtension):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        if info.path.prev is None:
+            open_subscription_event(info)
         result = _next(root, info, *args, **kwargs)
         if type(result) in _SCALAR_LEAF_TYPES:
             # Scalar leaves fall through every branch below unchanged.
@@ -393,6 +403,10 @@ class RowScopeExtension(SchemaExtension):
             {"_backend": backend},
         )
 
+    def on_execute(self) -> Any:
+        with execution_scope():
+            yield
+
     def resolve(
         self,
         _next: Any,
@@ -401,6 +415,8 @@ class RowScopeExtension(SchemaExtension):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        if info.path.prev is None:
+            open_subscription_event(info)
         result = _next(root, info, *args, **kwargs)
         if type(result) in _SCALAR_LEAF_TYPES:
             return result

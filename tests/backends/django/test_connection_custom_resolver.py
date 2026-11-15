@@ -16,6 +16,14 @@ def users_query(orm):
 
 
 @pytest.fixture
+def posts_by_author():
+    def _posts_by_author(Post, user, info):
+        return Post.objects.filter(author_id=user.pk).order_by("id")
+
+    return _posts_by_author
+
+
+@pytest.fixture
 def narrow_by_name():
     def _narrow(queryset, name):
         return queryset.filter(name=name)

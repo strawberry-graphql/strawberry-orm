@@ -1260,6 +1260,7 @@ class TestMiscCoverage:
         info = SimpleNamespace(
             context={"session": sa_session},
             field_nodes=[SimpleNamespace(selection_set=None)],
+            path=SimpleNamespace(prev=None),
         )
 
         stmt = backend.get_default_queryset(SAUser)

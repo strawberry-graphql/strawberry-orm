@@ -6,6 +6,10 @@ rows (``objects:``), or a ``@group_field`` method. Each becomes a
 :class:`GroupPath`. The backends turn paths into expressions and
 hand back one value per path; the key a group reports, and the edges it
 claims, are built from those values here.
+
+An order entry can name the set of a to-many relation's rows too. It becomes
+a :class:`SetOrder` over the path ``objects:`` grouping reads, so a row sorts
+by the value its group is keyed by.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ __all__ = [
     "SQLITE_PERIOD_START",
     "GroupHop",
     "GroupPath",
+    "SetOrder",
     "assign_edge_indices",
     "build_group",
     "format_group_value",
@@ -33,6 +38,7 @@ __all__ = [
     "group_paths",
     "key_tuple",
     "needs_database_membership",
+    "order_terms",
 ]
 
 #: SQLite date modifiers that move a value to the start of its period. A
@@ -222,6 +228,118 @@ def _collect_together(
             for column, interval in columns.items()
         ),
     )
+
+
+@dataclass(frozen=True)
+class SetOrder:
+    """An ``objects:`` order clause: rows by the set of their related rows.
+
+    *path* is read as ``objects:`` grouping reads it, into the same JSON
+    text. That text is never null, ``[]`` for a row with none, so of the
+    ordering only its direction counts.
+    """
+
+    path: GroupPath
+    descending: bool
+
+
+def order_terms(backend: Any, model: type, order_input: Any) -> list[Any]:
+    """*order_input*'s entries, each after the ``objects:`` clauses it starts.
+
+    The entries are ordered by as they always were: an entry's ``objects:``
+    is left to its :class:`SetOrder`. A relation named in several entries
+    is ordered by once, where it is first named, by every column they name,
+    in the order they name them: the set a ``groupBy`` naming those columns
+    keys groups by.
+    """
+    entries = order_input if isinstance(order_input, list) else [order_input]
+    sets: dict[str, SetOrder] = {}
+    columns: dict[str, list[str]] = {}
+    starts: dict[int, list[str]] = {}
+    for index, entry in enumerate(entries):
+        _refuse_sets_through(entry, ())
+        objects = getattr(entry, "objects", None)
+        if not _is_set(objects):
+            continue
+        for relation in objects.__class__.__dataclass_fields__:
+            nested = getattr(objects, relation)
+            if not _is_set(nested):
+                continue
+            hop = backend.relation_hop(model, relation)
+            where = f"objects: {{{relation}}} on {model.__name__}"
+            if not hop.many:
+                raise ValueError(
+                    f"Cannot order by {where}: objects: orders a model by the "
+                    f"rows of one of its own to-many relations."
+                )
+            for column, desc in _set_columns(where, nested):
+                if relation not in sets:
+                    path = GroupPath(alias=f"_s{len(sets)}", name=relation, through=hop)
+                    sets[relation] = SetOrder(path, desc)
+                    columns[relation] = []
+                    starts.setdefault(index, []).append(relation)
+                elif sets[relation].descending != desc:
+                    raise ValueError(
+                        f"Cannot order by {where} both ascending and "
+                        f"descending: its rows make one value, which sorts one "
+                        f"way."
+                    )
+                if column not in columns[relation]:
+                    columns[relation].append(column)
+    terms: list[Any] = []
+    for index, entry in enumerate(entries):
+        for relation in starts.get(index, ()):
+            named = tuple(columns[relation])
+            path = replace(
+                sets[relation].path, columns=named, intervals=(None,) * len(named)
+            )
+            terms.append(replace(sets[relation], path=path))
+        terms.append(entry)
+    return terms
+
+
+def _set_columns(where: str, entry: Any) -> list[tuple[str, bool]]:
+    """The columns *entry* names under ``objects:``, each with its direction."""
+    found: list[tuple[str, bool]] = []
+    for key in entry.__class__.__dataclass_fields__:
+        value = getattr(entry, key)
+        if not _is_set(value):
+            continue
+        if key != "field":
+            raise ValueError(
+                f"Cannot order by {where} through {key}: the related rows are "
+                f"ordered by their own columns, under field:."
+            )
+        for column in value.__class__.__dataclass_fields__:
+            direction = getattr(value, column)
+            if _is_set(direction):
+                name = getattr(direction, "value", str(direction))
+                found.append((column, name.startswith("DESC")))
+    return found
+
+
+def _refuse_sets_through(entry: Any, hops: tuple[str, ...]) -> None:
+    """Refuse ``objects:`` reached through ``object:``, as grouping does."""
+    for key in entry.__class__.__dataclass_fields__:
+        value = getattr(entry, key)
+        if not _is_set(value):
+            continue
+        if key == "objects" and hops:
+            relations = [
+                relation
+                for relation in value.__class__.__dataclass_fields__
+                if _is_set(getattr(value, relation))
+            ]
+            raise ValueError(
+                f"Cannot order by objects: {{{', '.join(relations)}}} through "
+                f"{'.'.join(hops)}: objects: orders a model by the rows of one "
+                f"of its own to-many relations."
+            )
+        if key == "object":
+            for relation in value.__class__.__dataclass_fields__:
+                nested = getattr(value, relation)
+                if _is_set(nested):
+                    _refuse_sets_through(nested, (*hops, relation))
 
 
 def from_json(value: Any, kind: Any) -> Any:

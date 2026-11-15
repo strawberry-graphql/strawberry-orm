@@ -1289,3 +1289,28 @@ class TestCustomAggregation:
         agg = data["orders"]["aggregates"]
         assert agg["count"] == 9
         assert agg["totalRevenue"] > 0
+
+
+class TestAListOfAGroupedType:
+    def test_filter_and_order_apply(self, session, seed):
+        @strawberry.type
+        class ListQuery:
+            orders: list[OrderType] = orm.field.auto()
+
+        list_schema = strawberry.Schema(
+            query=ListQuery, extensions=[orm.optimizer_extension()]
+        )
+        result = list_schema.execute_sync(
+            """{ orders(
+                filter: { field: { status: { exact: "pending" } } },
+                order: [{ field: { amount: DESC } }]
+            ) { amount } }""",
+            context_value={"session": session},
+        )
+
+        pending = sorted(
+            (order.amount for order in seed if order.status == "pending"), reverse=True
+        )
+        assert len(pending) > 1
+        assert result.errors is None, result.errors
+        assert [row["amount"] for row in result.data["orders"]] == pending

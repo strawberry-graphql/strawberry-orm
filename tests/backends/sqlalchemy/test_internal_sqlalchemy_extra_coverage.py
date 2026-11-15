@@ -423,7 +423,7 @@ class TestInternalSqlalchemyExtraCoverage:
 def test_scoped_edge_marks_walk_loaded_collections(sa_session, seed):
     from sqlalchemy.orm import selectinload
 
-    from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+    from strawberry_orm.lazy_resolution import execution_scope, relation_cache_is_scoped
     from tests.backends.sqlalchemy.models import User
 
     sa_session.expunge_all()
@@ -431,6 +431,8 @@ def test_scoped_edge_marks_walk_loaded_collections(sa_session, seed):
         select(User).options(selectinload(User.posts)).order_by(User.id)
     ).first()
     backend = SQLAlchemyBackend(dialect="sqlite")
-    backend._mark_scoped_edges([user], [(User, "posts")], before={})
-    assert relation_cache_is_scoped(user, "posts")
+    with execution_scope():
+        backend._mark_scoped_edges([user], [(User, "posts")], before={})
+        assert relation_cache_is_scoped(user, "posts")
+    assert not relation_cache_is_scoped(user, "posts")
     assert user.posts

@@ -314,7 +314,22 @@ class ConnectionState:
 _STATE_KEY = "_orm_connections"
 
 
-def _states(context: Any) -> dict[tuple, ConnectionState]:
+def connection_states(info: Any) -> dict[tuple, ConnectionState] | None:
+    """Where the execution *info* belongs to keeps its connection states.
+
+    Under the library's schema extensions that is the execution itself: a
+    context can be missing, or shared by several executions (one module-level
+    object, or every operation on a websocket), and a path stashed by one would
+    answer another's aggregates and groups.
+    """
+    from strawberry_orm.lazy_resolution import current_execution
+
+    execution = current_execution()
+    if execution is not None:
+        return execution.connection_states
+    context = info.context
+    if context is None:
+        return None
     if isinstance(context, dict):
         return context.setdefault(_STATE_KEY, {})
     states = getattr(context, _STATE_KEY, None)
@@ -332,15 +347,17 @@ def stash_state(info: Any, state: ConnectionState) -> None:
     whichever parent stashed last.
     """
     path = getattr(info, "path", None)
-    if path is not None:
-        _states(info.context)[tuple(path.as_list())] = state
+    states = connection_states(info) if path is not None else None
+    if states is not None:
+        states[tuple(path.as_list())] = state
 
 
 def connection_state(info: Any) -> ConnectionState | None:
     path = getattr(info, "path", None)
-    if info.context is None or path is None:
+    states = connection_states(info) if path is not None else None
+    if states is None:
         return None
-    return _states(info.context).get(tuple(path.as_list()))
+    return states.get(tuple(path.as_list()))
 
 
 def _edge_memberships(
@@ -783,6 +800,7 @@ class ORMListConnection(ORMConnection[NodeType]):
         cls, connection, groups, items_by_key, items_offset, memberships
     ):
         from strawberry_orm.grouping import assign_edge_indices
+        from strawberry_orm.lazy_resolution import mark_rows_scoped
 
         if memberships is not None:
             assign_edge_indices(groups, memberships)
@@ -790,6 +808,8 @@ class ORMListConnection(ORMConnection[NodeType]):
             if items_by_key is not None:
                 grp._items_nodes = items_by_key.get(grp._orm_key_values, [])
                 grp._items_offset = items_offset
+                # Read from the scoped base query, so not re-checked per group.
+                mark_rows_scoped(grp._items_nodes)
 
         connection.groups = groups
 

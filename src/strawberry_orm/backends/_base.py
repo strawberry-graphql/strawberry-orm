@@ -30,6 +30,7 @@ from strawberry_orm.filters import (
     StringLookup,
     StringLookupNoRegex,
 )
+from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
 from strawberry_orm.types import DateGroupByOption, Ordering
@@ -179,7 +180,8 @@ def _reached_input(item: Any, reached: set[Any]) -> bool:
 def _input_parts(item: Any) -> list[tuple[str | None, Any, Any]]:
     """Each part an input is cut in, as ``(field on its container, part, container)``.
 
-    A filter or order is cut in its ``field`` and ``object`` parts. Aggregates
+    A filter or order is cut in its ``field``, ``object`` and ``objects``
+    parts. Aggregates
     are cut in each sub-aggregate and in the group key, which has no container
     to drop it from: a connection that groups needs one.
     """
@@ -211,7 +213,7 @@ _LEGACY_ROW_SCOPE_HOOK = "get_queryset"
 
 
 _KNOWN_FILTER_KEYS = frozenset({"field", "object", "all", "any", "not_", "one_of"})
-_KNOWN_ORDER_KEYS = frozenset({"field", "object"})
+_KNOWN_ORDER_KEYS = frozenset({"field", "object", "objects"})
 
 
 def _set_scoped_ordering_allowance(order_type: type, model: type, allowed: Any) -> None:
@@ -489,9 +491,6 @@ class BaseBackend:
 
     def __init__(self, **kwargs: Any) -> None:
         self._store = OptimizerStore()
-        #: ``(type name, field name) -> relation`` for every ``on=`` view the
-        #: library serves itself, so its rows are known to be the relation's.
-        self._on_views: dict[tuple[str, str], str] = {}
         self._relation_connections: dict[tuple[str, str], Any] = {}
         self._repos: dict[type, type] = {}
         self._filter_overrides: dict[type, type] = kwargs.get("filter_overrides") or {}
@@ -982,6 +981,12 @@ class BaseBackend:
             OrderObjectType = strawberry.input(obj_cls, one_of=True)
             OrderCls.__annotations__["object"] = OrderObjectType | None
             OrderCls.object = strawberry.UNSET
+        objects_type = self._objects_arm(
+            model, f"{model.__name__}OrderObjects", object_annotations, relation_models
+        )
+        if objects_type is not None:
+            OrderCls.__annotations__["objects"] = objects_type | None
+            OrderCls.objects = strawberry.UNSET
 
         OrderType = strawberry.input(OrderCls, one_of=True)
         OrderType._field_type = OrderFieldType  # type: ignore[attr-defined]
@@ -989,6 +994,8 @@ class BaseBackend:
         if object_annotations:
             OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        if objects_type is not None:
+            OrderType._objects_type = objects_type  # type: ignore[attr-defined]
         _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
         self._cover_shown_fields(model, OrderType)
         self._order_registry[model] = OrderType
@@ -1201,7 +1208,8 @@ class BaseBackend:
 
         ``auto`` annotations are expanded to ``Ordering | None``.
         Methods decorated with ``@order_field`` become additional top-level
-        keys on the order input alongside ``field`` and ``object``.
+        keys on the order input alongside ``field``, ``object`` and
+        ``objects``.
 
         ``allow_scoped_ordering`` names relations that may be ordered through
         even though the type on the far side defines ``scope_rows``. See
@@ -1300,6 +1308,12 @@ class BaseBackend:
             OrderObjectType = strawberry.input(obj_cls, one_of=True)
             order_ns["__annotations__"]["object"] = OrderObjectType | None
             order_ns["object"] = strawberry.UNSET
+        objects_type = self._objects_arm(
+            model, f"{model.__name__}OrderObjects", object_annotations, relation_models
+        )
+        if objects_type is not None:
+            order_ns["__annotations__"]["objects"] = objects_type | None
+            order_ns["objects"] = strawberry.UNSET
 
         for cname, cann in custom_order_annotations.items():
             order_ns["__annotations__"][cname] = cann
@@ -1313,6 +1327,8 @@ class BaseBackend:
         if object_annotations:
             OrderType._object_type = OrderObjectType  # type: ignore[attr-defined]
             OrderType._relation_models = relation_models  # type: ignore[attr-defined]
+        if objects_type is not None:
+            OrderType._objects_type = objects_type  # type: ignore[attr-defined]
         if custom_orders:
             OrderType._custom_orders = custom_orders  # type: ignore[attr-defined]
         _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
@@ -1383,7 +1399,12 @@ class BaseBackend:
         if object_type is not None:
             group_ns["__annotations__"]["object"] = object_type | None
             group_ns["object"] = strawberry.UNSET
-        objects_type = self._group_objects_arm(model, object_type, relation_models)
+        objects_type = self._objects_arm(
+            model,
+            f"{model.__name__}GroupByObjects",
+            getattr(object_type, "__annotations__", {}),
+            relation_models,
+        )
         if objects_type is not None:
             group_ns["__annotations__"]["objects"] = objects_type | None
             group_ns["objects"] = strawberry.UNSET
@@ -1436,25 +1457,28 @@ class BaseBackend:
         )
         return strawberry.input(object_cls, one_of=True), relation_models
 
-    def _group_objects_arm(
-        self, model: type, object_type: type | None, relation_models: dict[str, type]
+    def _objects_arm(
+        self,
+        model: type,
+        type_name: str,
+        object_annotations: dict[str, Any],
+        relation_models: dict[str, type],
     ) -> type | None:
         """The ``objects:`` input: the to-many relations ``object:`` offers.
 
-        Grouped by under ``objects:``, a row's related rows make one value
-        together, rather than a value each.
+        Grouped or ordered by under ``objects:``, a row's related rows make
+        one value together, rather than a value each. Each relation takes the
+        input ``object:`` gives it.
         """
-        if object_type is None:
-            return None
         annotations = {
-            relation: object_type.__annotations__[relation]
+            relation: object_annotations[relation]
             for relation in relation_models
             if self.relation_hop(model, relation).many
         }
         if not annotations:
             return None
         objects_cls = type(
-            f"{model.__name__}GroupByObjects",
+            type_name,
             (),
             {
                 "__annotations__": annotations,
@@ -1606,7 +1630,12 @@ class BaseBackend:
         if object_type is not None:
             group_ns["__annotations__"]["object"] = object_type | None
             group_ns["object"] = strawberry.UNSET
-        objects_type = self._group_objects_arm(model, object_type, relation_models)
+        objects_type = self._objects_arm(
+            model,
+            f"{model.__name__}GroupByObjects",
+            getattr(object_type, "__annotations__", {}),
+            relation_models,
+        )
         if objects_type is not None:
             group_ns["__annotations__"]["objects"] = objects_type | None
             group_ns["objects"] = strawberry.UNSET
@@ -1975,7 +2004,12 @@ class BaseBackend:
         if get_qs is None:
             return query
         scoped = get_qs(query, info)
-        mark_query_scoped(scoped)
+        # A scope that hands back what it was given (everything, for an admin)
+        # leaves the caller's own object, which a module-level statement can
+        # share with requests the scope would narrow. Scoping it again costs
+        # nothing, so only a query scoping built is marked.
+        if scoped is not query:
+            mark_query_scoped(scoped)
         return scoped
 
     def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
@@ -2090,13 +2124,16 @@ class BaseBackend:
         def restrict(query: Any, resolver_info: Any) -> Any:
             from strawberry_orm.lazy_resolution import mark_query_scoped
 
+            given = query
             if get_qs is not None:
                 query = get_qs(query, resolver_info)
             if field_scope is not None:
                 query = call_scope(field_scope, query, resolver_info)
             # The query is scoped, so a later apply_type_scope must not apply
-            # scope_rows a second time.
-            mark_query_scoped(query)
+            # scope_rows a second time. One the scopes handed back unchanged
+            # is the caller's, as in apply_type_scope.
+            if query is not given:
+                mark_query_scoped(query)
             return query
 
         return restrict
@@ -2950,10 +2987,12 @@ class BaseBackend:
 
             return_ann = getattr(graphql_type, "__annotations__", {})[field_name]
             field.base_resolver = StrawberryResolver(
-                self._make_on_resolver(model, field_name, relation, return_ann),
+                reads_relation(
+                    self._make_on_resolver(model, field_name, relation, return_ann),
+                    relation,
+                ),
                 type_override=field.type if field.type is not UNRESOLVED else None,
             )
-            self._on_views[(type_name, field_name)] = relation
 
     def _finalize_type(
         self,
