@@ -644,8 +644,9 @@ class SQLAlchemyBackend(BaseBackend):
     async def _apply_aggregation_async(
         self, session: Any, stmt: Any, meta: AggregateMeta, requested: dict
     ) -> Any:
-        result = await session.execute(stmt)
-        row = result.one()
+        with _database_errors():
+            result = await session.execute(stmt)
+            row = result.one()
         return meta.build_aggregates(row, requested)
 
     def relation_hop(self, model: type, relation: str) -> Any:
@@ -668,7 +669,7 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         order_input: Any | None = None,
     ) -> Any:
-        from strawberry_orm.grouping import build_group
+        from strawberry_orm.grouping import build_group, within_max_groups
 
         model = aggregate_meta.model
         requested = (
@@ -693,13 +694,20 @@ class SQLAlchemyBackend(BaseBackend):
             stmt.add_columns(*aggregates, *firsts)
             .group_by(*keys)
             .order_by(*ordering, *keys)
+            .limit(self._max_groups + 1)
         )
         return self._execute_then(
             info,
             stmt,
             lambda result: [
-                build_group(aggregate_meta, paths, row._mapping, requested)
-                for row in result.all()
+                build_group(
+                    aggregate_meta,
+                    paths,
+                    row._mapping,
+                    requested,
+                    max_key_rows=self._max_group_key_rows,
+                )
+                for row in within_max_groups(result.all(), self._max_groups)
             ],
         )
 
@@ -780,7 +788,8 @@ class SQLAlchemyBackend(BaseBackend):
         if self._is_async_session(session):
 
             async def run() -> Any:
-                return finish(await session.execute(stmt))
+                with _database_errors():
+                    return finish(await session.execute(stmt))
 
             return run()
         return self._run_sync(lambda: finish(session.execute(stmt)))
@@ -971,11 +980,11 @@ class SQLAlchemyBackend(BaseBackend):
 
     # -- Queryset overrides --------------------------------------------------
 
-    def get_default_queryset(self, model: type) -> Any:
+    def get_default_queryset(self, model: type, *, limited: bool = True) -> Any:
         from sqlalchemy import select
 
         stmt = select(model)
-        if self._default_query_limit is not None:
+        if limited and self._default_query_limit is not None:
             stmt = stmt.limit(self._default_query_limit)
         return stmt
 
@@ -1164,18 +1173,23 @@ class SQLAlchemyBackend(BaseBackend):
         return self._run_sync(lambda: session.execute(stmt).scalar_one())
 
     async def _scalar_async(self, session: Any, stmt: Any) -> Any:
-        return (await session.execute(stmt)).scalar_one()
+        with _database_errors():
+            return (await session.execute(stmt)).scalar_one()
 
     def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
         from sqlalchemy.exc import CompileError
 
-        if _may_repeat_rows(query) or query._fetch_clause is not None:
+        if query._fetch_clause is not None:
             return None
         try:
             prior_offset, prior_limit = query._offset or 0, query._limit
         except CompileError:
             # A limit or offset given as an expression cannot be composed.
             return None
+        if _may_repeat_rows(query):
+            if prior_offset or prior_limit is not None:
+                return None
+            return _first_appearances_page(query, offset, limit)
         if prior_limit is not None:
             limit = max(0, min(limit, prior_limit - offset))
         missing = _missing_pk(query._order_by_clauses, self.query_model(query))
@@ -1233,7 +1247,8 @@ class SQLAlchemyBackend(BaseBackend):
         return self._run_sync(lambda: dict(session.execute(stmt).all()))
 
     async def _group_counts_async(self, session: Any, stmt: Any) -> dict[Any, int]:
-        return dict((await session.execute(stmt)).all())
+        with _database_errors():
+            return dict((await session.execute(stmt)).all())
 
     def _relation_connection_spec(
         self, model: type, field_name: str, relation: str
@@ -1780,28 +1795,17 @@ class SQLAlchemyBackend(BaseBackend):
         thread, as in-memory SQLite's does, would find another database there.
         """
         if self._offload_sync_session:
-            return run_orm_work(work, *args)
-        return work(*args)
+            return run_orm_work(_sanitizing, work, *args)
+        return _sanitizing(work, *args)
 
     def _execute_stmt_sync(self, session: Any, stmt: Any) -> list[Any]:
-        from sqlalchemy.exc import OperationalError, ProgrammingError
-
-        try:
-            result = session.execute(stmt)
-        except (OperationalError, ProgrammingError) as exc:
-            raise _sanitized(exc) from exc
-
-        return list(result.scalars().unique().all())
+        with _database_errors():
+            return list(session.execute(stmt).scalars().unique().all())
 
     async def _execute_stmt_async(self, session: Any, stmt: Any) -> list[Any]:
-        from sqlalchemy.exc import OperationalError, ProgrammingError
-
-        try:
+        with _database_errors():
             result = await session.execute(stmt)
-        except (OperationalError, ProgrammingError) as exc:
-            raise _sanitized(exc) from exc
-
-        return list(result.scalars().unique().all())
+            return list(result.scalars().unique().all())
 
     def _apply_ref_list_sync(
         self,
@@ -2312,9 +2316,93 @@ def _sanitized(exc: Any) -> Exception:
     statement can be a bad filter: a refused connection ("too many clients")
     carries no statement, and a dropped one is invalidated.
     """
-    if exc.statement is None or exc.connection_invalidated:
+    if exc.statement is None or getattr(exc, "connection_invalidated", False):
         return ConnectionError("Database connection failed")
     return ValueError("Invalid filter expression")
+
+
+@contextmanager
+def _database_errors() -> Generator[None]:
+    """Raise what a client may see in place of an error running a statement.
+
+    ``StatementError`` covers the driver's errors and SQLAlchemy's own, such
+    as a value the column's type cannot bind; each carries the statement.
+    """
+    from sqlalchemy.exc import StatementError
+
+    try:
+        yield
+    except StatementError as exc:
+        raise _sanitized(exc) from exc
+
+
+def _sanitizing(work: Callable[..., Any], *args: Any) -> Any:
+    with _database_errors():
+        return work(*args)
+
+
+def _first_appearances_page(query: Any, offset: int, limit: int) -> Any | None:
+    """A page of the entities a join to many rows repeats, cut by the database.
+
+    Rows are read with ``.unique()``, which keeps each entity where its first
+    row is. Each entity is numbered by that row, so the page counts entities,
+    not the rows the join makes of them. ``None`` for a statement whose
+    entities cannot be numbered this way: one with a second FROM, more than
+    one entity, or loader options that may lean on the join.
+    """
+    from sqlalchemy import and_, func, select
+
+    from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+
+    entity = query.column_descriptions[0]["entity"]
+    mapper = getattr(sa_inspect(entity, raiseerr=False), "mapper", None)
+    if (
+        mapper is None
+        or len(query.column_descriptions) != 1
+        or len(query.get_final_froms()) != 1
+        or query._with_options
+    ):
+        return None
+    keys = [
+        getattr(entity, mapper.get_property_by_column(column).key)
+        for column in mapper.primary_key
+    ]
+    order = [*query._order_by_clauses, *_missing_pk(query._order_by_clauses, entity)]
+    labels = [f"_orm_key{i}" for i in range(len(keys))]
+    numbered = (
+        query.with_only_columns(
+            *(key.label(label) for key, label in zip(keys, labels, strict=True)),
+            func.row_number().over(order_by=order).label("_orm_row"),
+        )
+        .order_by(None)
+        .subquery()
+    )
+    firsts = (
+        select(
+            *(numbered.c[label] for label in labels),
+            func.min(numbered.c._orm_row).label("_orm_first"),
+        )
+        .group_by(*(numbered.c[label] for label in labels))
+        .subquery()
+    )
+    page = (
+        select(entity)
+        .join(
+            firsts,
+            and_(
+                *(
+                    key == firsts.c[label]
+                    for key, label in zip(keys, labels, strict=True)
+                )
+            ),
+        )
+        .order_by(firsts.c._orm_first)
+        .offset(offset)
+        .limit(limit)
+    )
+    if query_is_scoped(query):
+        mark_query_scoped(page)
+    return page
 
 
 def _may_repeat_rows(stmt: Any) -> bool:
@@ -2492,7 +2580,7 @@ def _build_sa_filter(
     backend: Any = None,
     max_depth: int = 10,
     max_branches: int = 50,
-    enable_regex: bool = True,
+    enable_regex: bool = False,
     max_in_list_size: int = 500,
     _depth: int = 0,
 ) -> tuple[Any, Any]:
@@ -2657,7 +2745,7 @@ def _build_sa_field_clause(
     field_input: Any,
     model: type,
     *,
-    enable_regex: bool = True,
+    enable_regex: bool = False,
     max_in_list_size: int = 500,
 ) -> Any:
     """Translate a *Field input (e.g. UserField) into column-level conditions."""
@@ -2748,7 +2836,7 @@ def _build_sa_reference_field_clause(
     field_input: Any,
     *,
     local_col: Any,
-    enable_regex: bool = True,
+    enable_regex: bool = False,
     max_in_list_size: int = 500,
 ) -> Any:
     from sqlalchemy import and_
@@ -2790,7 +2878,7 @@ def _build_lookup_clauses(
     column: Any,
     lookup: Any,
     *,
-    enable_regex: bool = True,
+    enable_regex: bool = False,
     max_in_list_size: int = 500,
 ) -> list[Any]:
     """Translate a single lookup object (e.g. StringLookup) into clauses."""

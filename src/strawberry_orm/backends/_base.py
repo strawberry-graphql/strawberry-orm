@@ -30,6 +30,12 @@ from strawberry_orm.filters import (
     StringLookup,
     StringLookupNoRegex,
 )
+from strawberry_orm.grouping import (
+    MAX_GROUP_BY_ENTRIES,
+    MAX_GROUP_KEY_ROWS,
+    MAX_GROUPS,
+    MAX_ORDER_ENTRIES,
+)
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
@@ -517,6 +523,16 @@ class BaseBackend:
             )
         self._lazy_resolution: LazyResolutionMode = lazy_resolution
         self._default_query_limit: int | None = kwargs.get("default_query_limit")
+        self._max_order_entries: int = kwargs.get(
+            "max_order_entries", MAX_ORDER_ENTRIES
+        )
+        self._max_group_by_entries: int = kwargs.get(
+            "max_group_by_entries", MAX_GROUP_BY_ENTRIES
+        )
+        self._max_groups: int = kwargs.get("max_groups", MAX_GROUPS)
+        self._max_group_key_rows: int = kwargs.get(
+            "max_group_key_rows", MAX_GROUP_KEY_ROWS
+        )
         self._enable_optimizer: bool = kwargs.get("enable_optimizer", True)
         self._strict_hints: bool = kwargs.get("strict_hints", True)
         self._batch_relations: bool = kwargs.get("batch_relations", True)

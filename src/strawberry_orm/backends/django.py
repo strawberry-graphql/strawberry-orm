@@ -523,7 +523,7 @@ class DjangoBackend(BaseBackend):
         *,
         order_input: Any | None = None,
     ) -> list[Any]:
-        from strawberry_orm.grouping import build_group
+        from strawberry_orm.grouping import build_group, within_max_groups
 
         requested = (
             requested_aggregates(info, "groups.aggregates", aggregate_meta) or {}
@@ -544,7 +544,16 @@ class DjangoBackend(BaseBackend):
                 .order_by(*ordering, *aliases)
             )
             return [
-                build_group(aggregate_meta, paths, row, requested) for row in grouped
+                build_group(
+                    aggregate_meta,
+                    paths,
+                    row,
+                    requested,
+                    max_key_rows=self._max_group_key_rows,
+                )
+                for row in within_max_groups(
+                    list(grouped[: self._max_groups + 1]), self._max_groups
+                )
             ]
 
         return run_sync(_run, thread_sensitive=True)
@@ -777,9 +786,9 @@ class DjangoBackend(BaseBackend):
 
     # -- Queryset overrides --------------------------------------------------
 
-    def get_default_queryset(self, model: type) -> Any:
+    def get_default_queryset(self, model: type, *, limited: bool = True) -> Any:
         qs = model.objects.all()
-        if self._default_query_limit is not None:
+        if limited and self._default_query_limit is not None:
             qs = qs[: self._default_query_limit]
         return qs
 

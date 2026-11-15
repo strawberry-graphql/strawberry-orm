@@ -21,8 +21,11 @@ from graphql import (
     print_schema,
     validate,
 )
-from graphql.language import Node, Visitor, visit
+from graphql.language import BREAK, Node, Visitor, visit
 from strawberry.types.graphql import OperationType
+
+#: The meta fields that describe the schema an operation runs on.
+_INTROSPECTION = frozenset({"__schema", "__type"})
 
 
 def exposed_schema(
@@ -96,6 +99,16 @@ class _StripDescriptions(Visitor):
         return None
 
 
+class _FindIntrospection(Visitor):
+    found = False
+
+    def enter_field(self, node: FieldNode, *_: Any) -> Any:
+        if node.name.value in _INTROSPECTION:
+            self.found = True
+            return BREAK
+        return None
+
+
 def check_operation(
     schema: GraphQLSchema,
     query: str,
@@ -103,7 +116,11 @@ def check_operation(
     allowed: set[OperationType],
     max_depth: int,
 ) -> tuple[list[str], OperationType | None]:
-    """Errors that stop ``query`` from running, and the kind of operation it is."""
+    """Errors that stop ``query`` from running, and the kind of operation it is.
+
+    The operation runs on the whole schema, so ``__schema`` and ``__type``
+    are refused: they would describe what *schema* leaves out.
+    """
     try:
         document = parse(query)
     except GraphQLError as error:
@@ -124,6 +141,12 @@ def check_operation(
     depth = _depth(operations[0].selection_set, fragments, frozenset())
     if depth > max_depth:
         return [f"The query is {depth} levels deep; the limit is {max_depth}."], kind
+    finder = _FindIntrospection()
+    visit(document, finder)
+    if finder.found:
+        return [
+            "Introspection is not available here; call graphql_schema for the schema."
+        ], kind
     return [e.message for e in validate(schema, document)], kind
 
 

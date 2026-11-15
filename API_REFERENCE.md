@@ -47,10 +47,14 @@ Accepted by all three constructors.
 | `enable_optimizer` | `True` | Mount the optimizer extension from `orm.schema()`. |
 | `strict_hints` | `True` | Raise at schema build when `using=` names a missing relation, or `scope=` sits on a non-relation. |
 | `batch_relations` | `True` | Collapse per-parent relation resolvers into one query per shape. |
-| `default_query_limit` | `None` | Cap rows returned by generated list fields. |
+| `default_query_limit` | `None` | Cap each connection page (its size when `first`/`last` are not given) and each generated root list, after its filter, order and scope. Nested relation lists are not capped. |
 | `max_filter_depth` | `10` | Cap recursive filter nesting. |
 | `max_filter_branches` | `50` | Cap `all` / `any` / `oneOf` branch count. |
 | `max_in_list_size` | `500` | Cap `inList` / `notInList` size. |
+| `max_order_entries` | `10` | Cap the entries in an `order` list. |
+| `max_group_by_entries` | `10` | Cap the entries in a `groupBy` list. |
+| `max_groups` | `100` | Refuse a connection whose `groupBy` makes more groups. |
+| `max_group_key_rows` | `100` | Refuse an `objects:` group key holding more related rows. |
 | `enable_regex_filters` | `False` | Enable the `regex` and `iRegex` string lookups. |
 | `filter_overrides` | `{}` | `{python_type: lookup_type}` to change the generated lookup for a column type. |
 
@@ -421,7 +425,7 @@ orm.apply_ordering(query, order_input, model, info=None) -> query
 orm.apply_ref_list(instance, field, refs, info, *, authorize=None)
 ```
 
-`apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input as one unit of work, the same as `apply_upsert`, honouring the model's repo whether or not `authorize` is passed. `unlink` and `delete` must name rows already in the relation, or `UpsertNotFoundError` is raised. Items carrying an `upsert` arm built by `orm.mutations` are validated and applied like [`apply_upsert`](#mutations).
+`get_default_queryset` is cut to `default_query_limit`, when one is set; the backend's `get_default_queryset(model, limited=False)` is every row. `apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input as one unit of work, the same as `apply_upsert`, honouring the model's repo whether or not `authorize` is passed. `unlink` and `delete` must name rows already in the relation, or `UpsertNotFoundError` is raised. Items carrying an `upsert` arm built by `orm.mutations` are validated and applied like [`apply_upsert`](#mutations).
 
 ---
 

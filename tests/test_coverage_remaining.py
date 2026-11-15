@@ -470,6 +470,16 @@ class TestLazyResolutionCoverage:
 # ---------------------------------------------------------------------------
 
 
+def _connection_info(selected_fields):
+    """An ``info`` with what ``resolve_connection`` reads to hold the page to
+    ``max_results``: the schema's config and a context."""
+    return SimpleNamespace(
+        selected_fields=selected_fields,
+        schema=SimpleNamespace(config=SimpleNamespace(relay_max_results=100)),
+        context={},
+    )
+
+
 class TestConnectionCoverage:
     def test_compute_page_aggregates_numeric_fields(self):
         @strawberry.type
@@ -517,7 +527,7 @@ class TestConnectionCoverage:
             "resolve_connection",
             side_effect=pending_connection,
         ):
-            info = SimpleNamespace(selected_fields=[])
+            info = _connection_info([])
             result = ORMListConnection.resolve_connection([], info=info)
             assert asyncio.iscoroutine(result)
             resolved = await result
@@ -528,7 +538,7 @@ class TestConnectionCoverage:
         async def pending_connection(*_args, **_kwargs):
             return SimpleNamespace(edges=[], page_info=SimpleNamespace())
 
-        info = SimpleNamespace(selected_fields=[])
+        info = _connection_info([])
         with (
             patch.object(
                 ORMListConnection.__mro__[2],
@@ -573,8 +583,8 @@ class TestConnectionCoverage:
         async def count_coro():
             return 3
 
-        info = SimpleNamespace(
-            selected_fields=[
+        info = _connection_info(
+            [
                 SimpleNamespace(
                     name="usersConnection",
                     selections=[
@@ -607,8 +617,8 @@ class TestConnectionCoverage:
         async def count_coro():
             return 99
 
-        info = SimpleNamespace(
-            selected_fields=[
+        info = _connection_info(
+            [
                 SimpleNamespace(
                     name="usersConnection",
                     selections=[

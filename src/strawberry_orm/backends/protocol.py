@@ -234,8 +234,8 @@ class Backend(Protocol):
 
     # -- Queryset overrides --------------------------------------------------
 
-    def get_default_queryset(self, model: type) -> Any:
-        """Return the default queryset for *model*."""
+    def get_default_queryset(self, model: type, *, limited: bool = True) -> Any:
+        """Every row of *model*, cut to ``default_query_limit`` unless not *limited*."""
         ...
 
     def is_query_object(self, value: Any) -> bool:
