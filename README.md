@@ -678,7 +678,12 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 | Column exposure  | inputs follow the type's fields | `exclude=[...]` on `@orm.type`, or `orm.field.eager(permission_classes=…)`                                                                |
 | Query size       | page size, `order`/`groupBy` length, group count | `default_query_limit` for root lists; a query budget (Strawberry's `MaxAliasesLimiter`, `MaxTokensLimiter`, `QueryDepthLimiter`)              |
 | Mutations        | —                             | auth in resolvers; `authorize` callback on `apply_ref_list`                                                                              |
+| Write access     | a repo's `scope_query` and `can_*` hooks on every generated write | a repo per writable model whose `scope_query` mirrors its `scope_rows` — [writes do not apply `scope_rows`](#writes-do-not-apply-scope_rows) |
 | Custom resolvers | —                             | same as hand-written DB access — you own scoping                                                                                         |
+
+#### Writes do not apply `scope_rows`
+
+`scope_rows` narrows what a caller reads. `orm.apply_upsert()` and `orm.apply_ref_list()` find the rows they write through the model's repo instead, so a model clients can write needs an `AbstractRepo` whose `scope_query` narrows the query as its `scope_rows` does. Without one, a caller can update, link or re-point any row by its ID: taking another user's post into their own `posts` list makes it theirs, and readable. An upsert's match on `where` answers too, telling a caller whether a hidden row with those values exists.
 
 
 ### Ordering into a scoped type

@@ -391,7 +391,7 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | Hook | Signature |
 | --- | --- |
 | `model` | class attribute naming the model |
-| `scope_query` | `(query, info) -> query` |
+| `scope_query` | `(query, info) -> query`; every row a write finds goes through it. Writes do not apply `scope_rows`, so mirror it here |
 | `can_create` | `(data, info) -> bool` |
 | `can_update` | `(instance, data, info) -> bool` |
 | `can_delete` | `(instance, info) -> bool` |
@@ -451,7 +451,7 @@ def scope_rows(cls, select, info):
     return select.where(Post.is_published.is_(True))
 ```
 
-Row-level access control. Applied wherever this model's rows load — as a root query, through a relation, during filter traversal, and when relations are read off rows already in memory. One per model. See [`scope_rows`](README.md#scope_rows--one-model-one-type).
+Row-level access control. Applied wherever this model's rows load — as a root query, through a relation, during filter traversal, and when relations are read off rows already in memory. One per model. See [`scope_rows`](README.md#scope_rows--one-model-one-type). Reads only: `apply_upsert` and `apply_ref_list` find rows through the model's repo, so give a writable model an `AbstractRepo` whose `scope_query` does the same. See [Writes do not apply `scope_rows`](README.md#writes-do-not-apply-scope_rows).
 
 ```python
 @classmethod
