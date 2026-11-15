@@ -55,6 +55,10 @@ _FILTER_RELATION_PRESENCE_ERROR = (
 
 _NOT_FILTERING: Any = object()
 
+#: What a client is told when the database refuses a statement a write runs.
+#: Its own error names tables and columns, and can carry the row's values.
+WRITE_REFUSED = "The database refused the write"
+
 #: While a filter is built, the name of the type its rows are read as; ``None``
 #: past an ``object:`` hop, where the type of the rows reached is not known.
 _filter_rows_type: ContextVar[Any] = ContextVar(

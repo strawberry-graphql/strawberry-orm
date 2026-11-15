@@ -10,7 +10,21 @@ def _sort_tags(data):
     return data
 
 
+REFUSED_INSERT = """
+    mutation {
+        setPostTags(postId: 1, tags: [{ create: { name: "python" } }]) { title }
+    }
+"""
+
+
 class TestMutationRefList:
+    def test_a_refused_insert_does_not_reveal_the_table(self, execute_result, seed):
+        result = execute_result(REFUSED_INSERT)
+        assert [error.message for error in result.errors] == [
+            "The database refused the write"
+        ]
+        assert result.errors[0].original_error.__cause__ is not None
+
     def test_link_existing_tags(self, execute, seed):
         data = execute("""
             mutation {

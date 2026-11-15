@@ -655,6 +655,11 @@ def execute(seed):
 
 
 @pytest.fixture
+def execute_result(seed):
+    return _make_result_executor(main_schema)
+
+
+@pytest.fixture
 def node_execute(seed):
     return _make_executor(node_mutation_schema)
 

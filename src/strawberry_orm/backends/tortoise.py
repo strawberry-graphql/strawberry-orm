@@ -28,6 +28,7 @@ from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
+    WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
     extract_element_type,
@@ -562,8 +563,9 @@ class TortoiseBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        async with in_transaction(type(instance)._meta.default_connection):
-            await run_async(writer.apply_refs(instance, spec, refs))
+        with _write_errors():
+            async with in_transaction(type(instance)._meta.default_connection):
+                await run_async(writer.apply_refs(instance, spec, refs))
 
     # -- Upserts -------------------------------------------------------------
 
@@ -577,8 +579,9 @@ class TortoiseBackend(BaseBackend):
         writer = self._upsert_writer(info, authorize)
         writer.validate_root(payload)
         model = type(payload).__orm_model__
-        async with in_transaction(model._meta.default_connection):
-            return await run_async(writer.apply_root(payload))
+        with _write_errors():
+            async with in_transaction(model._meta.default_connection):
+                return await run_async(writer.apply_root(payload))
 
     def _upsert_ops(self, info: Any) -> Any:
         return _TortoiseUpsertOps(info)
@@ -2579,3 +2582,20 @@ def _ordered_to_the_row(query: Any) -> Any:
     ordered = query._clone()
     ordered._orderings = [*orderings, (meta.pk_attr, Order.asc)]
     return ordered
+
+
+@contextmanager
+def _write_errors() -> Any:
+    """Raise what a client may see in place of the database refusing a write.
+
+    The driver's error names the table and column, and on PostgreSQL the
+    row's values, so it is kept only as the cause, for the server log.
+    """
+    from tortoise.exceptions import DBConnectionError, OperationalError
+
+    try:
+        yield
+    except DBConnectionError as exc:
+        raise ConnectionError("Database connection failed") from exc
+    except OperationalError as exc:
+        raise ValueError(WRITE_REFUSED) from exc

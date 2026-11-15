@@ -21,6 +21,7 @@ from strawberry_orm._async import run_orm_work
 from strawberry_orm.backends._base import (
     _AGGREGATES,
     _SENSITIVE_PATTERNS,
+    WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
     extract_element_type,
@@ -540,14 +541,14 @@ class SQLAlchemyBackend(BaseBackend):
         if self._is_async_session(session):
             return self._apply_upsert_async(session, writer, payload)
         writer.validate_root(payload)
-        with _database_errors(_WRITE_REFUSED), session.begin_nested():
+        with _database_errors(WRITE_REFUSED), session.begin_nested():
             return run_sync(writer.apply_root(payload))
 
     async def _apply_upsert_async(self, session: Any, writer: Any, payload: Any) -> Any:
         from strawberry_orm.upserts import run_async
 
         writer.validate_root(payload)
-        with _database_errors(_WRITE_REFUSED):
+        with _database_errors(WRITE_REFUSED):
             async with session.begin_nested():
                 return await run_async(writer.apply_root(payload))
 
@@ -1960,7 +1961,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        with _database_errors(_WRITE_REFUSED), session.begin_nested():
+        with _database_errors(WRITE_REFUSED), session.begin_nested():
             run_sync(writer.apply_refs(instance, spec, refs))
 
     async def _apply_ref_list_async(
@@ -1977,7 +1978,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        with _database_errors(_WRITE_REFUSED):
+        with _database_errors(WRITE_REFUSED):
             async with session.begin_nested():
                 await run_async(writer.apply_refs(instance, spec, refs))
 
@@ -2477,9 +2478,6 @@ def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
 
 #: What a client is told when a statement run by a read fails.
 _READ_REFUSED = "Invalid filter expression"
-
-#: What a client is told when a statement run by a write fails.
-_WRITE_REFUSED = "The database refused the write"
 
 
 def _sanitized(exc: Any, refused: str = _READ_REFUSED) -> Exception:

@@ -11,7 +11,38 @@ def _sort_tags(data):
     return data
 
 
+def test_a_connection_lost_during_a_write_does_not_name_the_host():
+    from tortoise.exceptions import DBConnectionError
+
+    from strawberry_orm.backends.tortoise import _write_errors
+
+    lost = DBConnectionError("could not connect to db.internal:5432")
+    with (
+        pytest.raises(ConnectionError, match="^Database connection failed$") as caught,
+        _write_errors(),
+    ):
+        raise lost
+    assert isinstance(caught.value.__cause__, DBConnectionError)
+
+
+REFUSED_INSERT = """
+    mutation {
+        setPostTags(postId: 1, tags: [{ create: { name: "python" } }]) { title }
+    }
+"""
+
+
 class TestMutationRefList:
+    @pytest.mark.asyncio
+    async def test_a_refused_insert_does_not_reveal_the_table(
+        self, execute_result, seed
+    ):
+        result = await execute_result(REFUSED_INSERT)
+        assert [error.message for error in result.errors] == [
+            "The database refused the write"
+        ]
+        assert result.errors[0].original_error.__cause__ is not None
+
     @pytest.mark.asyncio
     async def test_link_existing_tags(self, execute, seed):
         data = await execute(

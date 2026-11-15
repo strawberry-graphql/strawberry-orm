@@ -26,6 +26,7 @@ from strawberry_orm.leaf_fields import is_default_relay_id
 from strawberry_orm.optimizer import OptimizerExtension
 
 from ._base import (
+    WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
     extract_element_type,
@@ -386,7 +387,7 @@ class DjangoBackend(BaseBackend):
         def apply() -> None:
             writer = self._ref_list_writer(instance, field, refs, info, authorize)
             spec = self._upsert_relation_spec(type(instance), field)
-            with transaction.atomic(using=instance._state.db):
+            with _write_errors(), transaction.atomic(using=instance._state.db):
                 run_steps(writer.apply_refs(instance, spec, refs))
 
         return run_sync(apply, thread_sensitive=True)
@@ -404,7 +405,7 @@ class DjangoBackend(BaseBackend):
             writer = self._upsert_writer(info, authorize)
             writer.validate_root(payload)
             model = type(payload).__orm_model__
-            with transaction.atomic(using=router.db_for_write(model)):
+            with _write_errors(), transaction.atomic(using=router.db_for_write(model)):
                 return run_steps(writer.apply_root(payload))
 
         return run_sync(apply, thread_sensitive=True)
@@ -2949,3 +2950,18 @@ def _group_ordering(
             )
         )
     return firsts, ordering
+
+
+@contextmanager
+def _write_errors() -> Any:
+    """Raise what a client may see in place of the database refusing a write.
+
+    Django's error names the table and column, and on PostgreSQL the row's
+    values, so it is kept only as the cause, for the server log.
+    """
+    from django.db import Error
+
+    try:
+        yield
+    except Error as exc:
+        raise ValueError(WRITE_REFUSED) from exc

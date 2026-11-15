@@ -603,6 +603,11 @@ async def execute(seed):
 
 
 @pytest_asyncio.fixture
+async def execute_result(seed):
+    return _make_result_executor(main_schema)
+
+
+@pytest_asyncio.fixture
 async def node_execute(seed):
     return _make_executor(_build_node_mutation_schema())
 
