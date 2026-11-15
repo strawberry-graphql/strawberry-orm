@@ -8,7 +8,13 @@ and ``select(Contract)`` reads only contracts. Both are documents, so
 import pytest
 import strawberry
 from sqlalchemy import ForeignKey, String, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+)
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
@@ -25,8 +31,18 @@ class Document(Base):
     title: Mapped[str] = mapped_column(String(100))
     owner_id: Mapped[int]
     kind: Mapped[str] = mapped_column(String(20))
+    notes: Mapped[list["Note"]] = relationship(order_by="Note.id")
 
     __mapper_args__ = {"polymorphic_on": "kind", "polymorphic_identity": "document"}
+
+
+class Note(Base):
+    __tablename__ = "note"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("document.id"))
+    body: Mapped[str] = mapped_column(String(100))
+    is_private: Mapped[bool] = mapped_column(default=False)
 
 
 class Contract(Document):
@@ -63,6 +79,9 @@ def session():
                 Contract(id=4, title="their contract", owner_id=99),
                 Invoice(id=5, title="my invoice", owner_id=ME, amount=1),
                 Invoice(id=6, title="their invoice", owner_id=99, amount=2),
+                Note(id=1, document_id=3, body="contract terms"),
+                Note(id=2, document_id=3, body="contract secret", is_private=True),
+                Note(id=3, document_id=5, body="invoice secret", is_private=True),
             ]
         )
         session.commit()
@@ -179,3 +198,54 @@ def test_a_subclass_type_without_a_scope_takes_its_bases(session):
     data = run(schema, session, "{ invoices { title } }")
     assert titles(data["invoices"]) == ["my invoice"]
     assert run(schema, session, "{ invoice(id: 6) { title } }") == {"invoice": None}
+
+
+def public_notes(stmt, info):
+    return stmt.where(Note.is_private.is_(False))
+
+
+def build_with_a_relation_scope():
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+
+    @orm.type(Note)
+    class NoteType:
+        id: auto
+        body: auto
+
+    @orm.type(Document)
+    class DocumentType:
+        id: auto
+        title: auto
+        notes: list[NoteType] = orm.field.auto(scope=public_notes)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def rows(self, info: strawberry.Info, kind: str) -> list[DocumentType]:
+            model = {"contract": Contract, "invoice": Invoice}[kind]
+            return list(info.context["session"].scalars(select(model).order_by("id")))
+
+        @orm.field.lazy
+        def query(self, info: strawberry.Info, kind: str) -> list[DocumentType]:
+            model = {"contract": Contract, "invoice": Invoice}[kind]
+            return select(model).order_by(model.id)
+
+    return orm.schema(query=Query)
+
+
+@pytest.mark.parametrize(
+    ("kind", "notes"),
+    [
+        ("contract", {"my contract": ["contract terms"], "their contract": []}),
+        ("invoice", {"my invoice": [], "their invoice": []}),
+    ],
+)
+def test_a_subclass_rows_relation_keeps_the_scope_its_type_gives_it(
+    session, kind, notes
+):
+    schema = build_with_a_relation_scope()
+    for field in ("rows", "query"):
+        query = f'{{ {field}(kind: "{kind}") {{ title notes {{ body }} }} }}'
+        rows = run(schema, session, query)[field]
+        found = {row["title"]: [n["body"] for n in row["notes"]] for row in rows}
+        assert found == notes, field

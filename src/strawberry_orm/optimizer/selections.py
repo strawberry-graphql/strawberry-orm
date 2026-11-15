@@ -125,6 +125,19 @@ def _unwrap_named_type(graphql_type: Any) -> Any:
     return graphql_type
 
 
+def reads_rows_of(registered: Any, model: Any) -> bool:
+    """Whether a type over *registered* reads rows of *model*.
+
+    A row of a subclass - an inherited mapping, a proxy, a multi-table child -
+    is a row of its base too, and the base's type reads it as one.
+    """
+    return registered is model or (
+        isinstance(registered, type)
+        and isinstance(model, type)
+        and issubclass(model, registered)
+    )
+
+
 def registered_type_name(
     graphql_type: Any, model: type, registry: dict[str, type]
 ) -> str | None:
@@ -146,11 +159,9 @@ def registered_type_name(
     frontier = [current]
     seen = {current}
     for _ in range(4):
-        matches = {
-            named.name
-            for named in frontier
-            if getattr(named, "name", None) is not None
-            and registry.get(named.name) is model
+        names = [n.name for n in frontier if getattr(n, "name", None) is not None]
+        matches = {name for name in names if registry.get(name) is model} or {
+            name for name in names if reads_rows_of(registry.get(name), model)
         }
         if matches:
             return matches.pop() if len(matches) == 1 else None

@@ -12,10 +12,16 @@ from django.db import connection, models
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
-from tests.backends.django.models import Post
+from tests.backends.django.models import Post, User
 
 
 class FeaturedPost(Post):
+    class Meta:
+        proxy = True
+        app_label = "testapp"
+
+
+class FeaturedUser(User):
     class Meta:
         proxy = True
         app_label = "testapp"
@@ -101,6 +107,37 @@ def build():
     return orm.schema(query=Query)
 
 
+def build_with_a_relation_scope():
+    orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+    @orm.type(Post, filters=orm.filter(Post))
+    class PostType:
+        id: auto
+        title: auto
+
+    @orm.type(User, filters=orm.filter(User))
+    class UserType:
+        id: auto
+        name: auto
+        posts: list[PostType] = orm.field.auto(scope=published_only)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def featured_users(self) -> list[UserType]:
+            return list(FeaturedUser.objects.order_by("id"))
+
+        @orm.field.lazy
+        def featured_user_query(self, info: strawberry.Info) -> list[UserType]:
+            return FeaturedUser.objects.order_by("id")
+
+        @orm.field.auto()
+        def featured_user_filter(self) -> list[UserType]:
+            return FeaturedUser.objects.order_by("id")
+
+    return orm.schema(query=Query)
+
+
 def run(schema, query):
     result = schema.execute_sync(query)
     assert result.errors is None, result.errors
@@ -127,3 +164,26 @@ def test_a_multi_table_child_is_scoped_by_its_parents_type(articles):
     }
     data = run(schema, "{ pinnedQuery { title } }")
     assert titles(data["pinnedQuery"]) == ["Pinned article"]
+
+
+def test_a_proxy_rows_relation_keeps_the_scope_its_type_gives_it(seed):
+    schema = build_with_a_relation_scope()
+    for field in ("featuredUsers", "featuredUserQuery"):
+        users = run(schema, f"{{ {field} {{ name posts {{ title }} }} }}")[field]
+        assert {user["name"]: titles(user["posts"]) for user in users} == {
+            "Alice": ["GraphQL Guide", "Hello World"],
+            "Bob": [],
+            "Charlie": ["Rust Adventures"],
+        }, field
+
+
+def test_a_filter_over_proxy_rows_keeps_the_relation_scope(seed):
+    schema = build_with_a_relation_scope()
+    by_title = (
+        '{ featuredUserFilter(filter: {object: {posts: {field: {title: {exact: "%s"}}}}})'
+        " { name } }"
+    )
+    assert run(schema, by_title % "Draft Post") == {"featuredUserFilter": []}
+    assert run(schema, by_title % "Hello World") == {
+        "featuredUserFilter": [{"name": "Alice"}]
+    }

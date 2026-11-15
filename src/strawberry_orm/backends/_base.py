@@ -2163,10 +2163,14 @@ class BaseBackend:
         and each one's ``scope=`` applies, so a filter or group reaches only
         the rows all of them allow.
         """
+        from strawberry_orm.optimizer.selections import reads_rows_of
+
         rows_type = _filter_rows_type.get()
         if rows_type is _NOT_FILTERING:
             type_names = self._reading_type_names(model, info)
-        elif rows_type is not None and self._type_registry.get(rows_type) is model:
+        elif rows_type is not None and reads_rows_of(
+            self._type_registry.get(rows_type), model
+        ):
             type_names = [rows_type]
         else:
             type_names = self._type_names_of(model)
@@ -2194,18 +2198,29 @@ class BaseBackend:
         On a relation that is the type the field is resolved on; for the rows
         a field returns, as when grouping them, it is that field's type.
         """
-        from strawberry_orm.optimizer.selections import graphql_resolve_info
+        from strawberry_orm.optimizer.selections import (
+            graphql_resolve_info,
+            reads_rows_of,
+        )
 
         if info is not None:
             parent_type = getattr(graphql_resolve_info(info), "parent_type", None)
             name = getattr(parent_type, "name", None)
-            if name is not None and self._type_registry.get(name) is model:
+            if name is not None and reads_rows_of(self._type_registry.get(name), model):
                 return [name]
         returned = self._returned_type_name(model, info)
         return [returned] if returned is not None else self._type_names_of(model)
 
     def _type_names_of(self, model: type) -> list[str]:
-        return [name for name, m in self._type_registry.items() if m is model]
+        """Every type that may read *model*'s rows, those over *model* first.
+
+        A subclass row is read by its own types and by those of every class it
+        inherits, so all of them are candidates.
+        """
+        names: list[str] = []
+        for cls in getattr(model, "__mro__", (model,)):
+            names += [name for name, m in self._type_registry.items() if m is cls]
+        return names
 
     def _returned_type_name(self, model: type, info: Any) -> str | None:
         """Name of *model*'s type the current field returns rows of, if just one.
@@ -2760,7 +2775,9 @@ class BaseBackend:
 
         return_type = getattr(graphql_resolve_info(info), "return_type", None)
         name = registered_type_name(return_type, model, self._type_registry)
-        return name if name is not None else self._type_name_for_model(model)
+        return (
+            name if name is not None else next(iter(self._type_names_of(model)), None)
+        )
 
     def _child_type_name(
         self,
@@ -2783,7 +2800,10 @@ class BaseBackend:
 
     def _resolved_type_name(self, model: type, info: Any) -> str | None:
         """Name of *model*'s type that the current field is being resolved on."""
-        from strawberry_orm.optimizer.selections import graphql_resolve_info
+        from strawberry_orm.optimizer.selections import (
+            graphql_resolve_info,
+            reads_rows_of,
+        )
 
         parent_type = (
             getattr(graphql_resolve_info(info), "parent_type", None)
@@ -2791,9 +2811,9 @@ class BaseBackend:
             else None
         )
         name = getattr(parent_type, "name", None)
-        if name is not None and self._type_registry.get(name) is model:
+        if name is not None and reads_rows_of(self._type_registry.get(name), model):
             return name
-        return self._type_name_for_model(model)
+        return next(iter(self._type_names_of(model)), None)
 
     def _relation_type_from_annotation(self, ann: Any) -> Any | None:
         import typing as _typing
