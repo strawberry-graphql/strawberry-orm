@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A connection could be made to read a whole table.** `first` and `last` were capped at `max_results`, but `before` alone paged up to its cursor however far that was, `last: 0` returned every row after the cursor, and a forged cursor before the first row (`after: "arrayconnection:-5000"`) read every row with no `LIMIT` to slice them in Python. `before` alone now reads one page from the start, as no arguments do. `last: 0` returns an empty page at the end of the result. A cursor before the first row is refused with `Argument 'after' cannot point before the first item.`
+- **`groupBy` answered with any number of groups.** Grouping by a column with many values, such as `id`, built a group per value even for `first: 1`, and an `objects:` key held every related row of its group. A connection now refuses more than `max_groups` groups (default 100), and an `objects:` key holding more than `max_group_key_rows` related rows (default 100). Either one is an error, not a truncated answer.
+- **`order` and `groupBy` took any number of entries.** 5,000 entries made 5,000 `ORDER BY` terms. A list longer than `max_order_entries` or `max_group_by_entries` (default 10 each) is refused before any SQL is built.
+- **On SQLAlchemy, a page ordered through a to-many relation read every joined row.** `order: [{object: {tags: …}}]` repeats a row once per related row, so the page was read whole and sliced in Python: `first: 1` read 12,000 rows. The page is now cut in SQL, each row counted once at its first appearance, as `.unique()` reads it. A join the resolver already cut with a `LIMIT` or `OFFSET` is still read whole, since that limit counts joined rows.
+- **On SQLAlchemy, a database error reached the client with its SQL.** Only `OperationalError` and `ProgrammingError` on reads were replaced. A value the column type refused, such as a malformed UUID in `filter: {field: {id: {exact: "not-a-uuid"}}}`, returned the statement for edges, `totalCount`, aggregates and groups: the table name, columns the API leaves out and the `scope_rows` predicate, and on PostgreSQL the bound parameters. Every statement the library runs, including eager loads, counts and relation counts, sync, async and offloaded, now reports `Invalid filter expression`, or `Database connection failed` when the connection is lost. The original is kept as the exception's cause, for the server log.
+- **The MCP `graphql` tool answered `__schema` and `__type`.** `root_fields` hid fields, types and mutations from `graphql_schema`, but an operation asking for `__schema` or `__type` was answered from the whole schema and listed them all. Such an operation is now refused, with or without `root_fields`; `graphql_schema` describes what the tool may use. `__typename` still works.
+- **The SQLAlchemy filter helpers defaulted to allowing regex.** `_build_lookup_clauses`, `_build_sa_field_clause`, `_build_sa_filter` and their callers took `enable_regex=True` unless told otherwise. Every caller passed the configured value, so nothing reached them, but a new caller would have enabled regex without `enable_regex_filters`. They default to `False` now.
+- **The release workflow ran actions by tag and put the tag name in its script.** Every action in the workflows is pinned to a commit SHA, and `github.ref_name` reaches the release script through `env:` rather than being written into it.
+
+### Added
+
+- **`max_groups`** (default 100) and **`max_group_key_rows`** (default 100) on every backend: the groups one connection may answer with, and the related rows one `objects:` key may hold.
+- **`max_order_entries`** and **`max_group_by_entries`** (default 10 each) on every backend: the longest `order` and `groupBy` lists accepted.
+- **`get_default_queryset(model, limited=False)`** on a backend reads every row of the model, without `default_query_limit`. `orm.get_default_queryset(Model)` still applies it.
+
+### Changed
+
+- **Paging diverges from Strawberry's `ListConnection` in three requests** that it answers by slicing a Python list: `before` without `first` or `last` reads one page (`max_results`, or `default_query_limit` when that is smaller) from the start, not every row up to the cursor. `last: 0` returns no edges, with `hasPreviousPage` true when rows follow the cursor. A cursor before the first row is an error, where Strawberry counted it from the end of the list.
+- **`default_query_limit` caps each read, not the rows a connection pages through.** It cut the query a generated connection was built on, so `totalCount` stopped at the limit and no page went past it. Now a connection's page is at most `default_query_limit` rows, `first` and `last` included, and its default when neither is given, and every page is reachable. A generated root list (`users: list[UserType] = orm.field.eager()`) is cut to the limit after its filter, order and `scope_rows`. On Django it was cut first, so a `filter` or `order` on it failed with "Cannot filter a query once a slice has been taken." A nested relation list is not limited; cap the root it hangs from, or make it a connection.
+- **SQLAlchemy: a join that repeats rows is paged in the database.** See the security note above. `README.md#connection-fields` lists what is still read whole.
+
 ## 0.30.0
 
 ### Security

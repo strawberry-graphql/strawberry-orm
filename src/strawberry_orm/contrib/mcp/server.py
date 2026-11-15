@@ -35,7 +35,9 @@ class GraphQLTool:
     Only queries run unless ``allow_mutations``. ``root_fields`` limits the
     root fields it may use, and the schema shows only those and the types
     they reach. An operation must be a single operation within
-    ``max_depth`` levels that passes validation. ``descriptions=False``
+    ``max_depth`` levels that passes validation, and may not ask for
+    ``__schema`` or ``__type``: ``graphql_schema`` describes what it may
+    use. ``descriptions=False``
     leaves the schema's descriptions out of ``graphql_schema``.
     """
 

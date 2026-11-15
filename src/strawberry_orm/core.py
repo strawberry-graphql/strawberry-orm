@@ -116,15 +116,24 @@ def _make_query_resolver(
     filter_type: Any,
     order_type: Any,
     group_type: Any = None,
+    *,
+    limit: int | None = None,
 ) -> Any:
     """Build a resolver function with the correct parameter signature so
     Strawberry exposes ``filter``, ``order``, and optionally ``groupBy``
-    as GraphQL arguments."""
+    as GraphQL arguments.
+
+    With *limit*, the query is cut to that many rows once it is filtered,
+    ordered and scoped, as a list field's ``default_query_limit``; a
+    connection cuts each page itself."""
 
     info_type = strawberry.types.Info
 
     def scoped(query: Any, info: Any) -> Any:
-        return backend.apply_type_scope(query, model, info)
+        query = backend.apply_type_scope(query, model, info)
+        if limit is None:
+            return query
+        return backend.apply_page(query, 0, limit)
 
     if group_type:
 
@@ -135,7 +144,7 @@ def _make_query_resolver(
             order: Any = None,
             group_by: Any = None,
         ) -> Any:
-            query = backend.get_default_queryset(model)
+            query = backend.get_default_queryset(model, limited=False)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
@@ -160,7 +169,7 @@ def _make_query_resolver(
         def resolver(
             self: Any, info: Any, filter: Any = None, order: Any = None
         ) -> Any:
-            query = backend.get_default_queryset(model)
+            query = backend.get_default_queryset(model, limited=False)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model, info=info)
             if order is not None:
@@ -175,7 +184,7 @@ def _make_query_resolver(
     elif filter_type:
 
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
-            query = backend.get_default_queryset(model)
+            query = backend.get_default_queryset(model, limited=False)
             if filter is not None:
                 query = backend.apply_filters(query, filter, model, info=info)
             return scoped(query, info)
@@ -187,7 +196,7 @@ def _make_query_resolver(
     elif order_type:
 
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
-            query = backend.get_default_queryset(model)
+            query = backend.get_default_queryset(model, limited=False)
             if order is not None:
                 query = backend.apply_ordering(query, order, model, info=info)
             return scoped(query, info)
@@ -199,7 +208,7 @@ def _make_query_resolver(
     else:
 
         def resolver(self: Any, info: Any) -> Any:
-            return scoped(backend.get_default_queryset(model), info)
+            return scoped(backend.get_default_queryset(model, limited=False), info)
 
         resolver.__annotations__ = {"info": info_type}
 
@@ -850,7 +859,14 @@ class _AutoField:
         if model is None:
             return
 
-        resolver = _make_query_resolver(self._backend, model, f_type, o_type, g_type)
+        resolver = _make_query_resolver(
+            self._backend,
+            model,
+            f_type,
+            o_type,
+            g_type,
+            limit=getattr(self._backend, "_default_query_limit", None),
+        )
         field = strawberry.field(
             resolver=resolver,
             description=self._description,
@@ -1232,6 +1248,10 @@ def _build_grouped_connection(
         # None when the arguments were refused: nothing was read for them.
         nodes = getattr(self, "_items_nodes", None) or []
         cast_nodes = [strawberry_cast(_items_node_type, n) for n in nodes]
+        if first is None and last is None:
+            # Strawberry holds only first and last to max_results; before
+            # alone would page to its cursor, past what the window read.
+            first = info.schema.config.relay_max_results
         return _items_conn_cls.resolve_connection(
             # The window started at the page, so it is handed over at its place.
             _PageRows(cast_nodes, getattr(self, "_items_offset", 0)),

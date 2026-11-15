@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
@@ -27,6 +27,10 @@ import strawberry
 from strawberry_orm.types import DateGroupByInterval
 
 __all__ = [
+    "MAX_GROUPS",
+    "MAX_GROUP_BY_ENTRIES",
+    "MAX_GROUP_KEY_ROWS",
+    "MAX_ORDER_ENTRIES",
     "SQLITE_PERIOD_START",
     "GroupHop",
     "GroupPath",
@@ -39,7 +43,18 @@ __all__ = [
     "key_tuple",
     "needs_database_membership",
     "order_terms",
+    "within_max_groups",
 ]
+
+#: The defaults of ``max_order_entries`` and ``max_group_by_entries``: how many
+#: entries an ``order`` or ``groupBy`` list may have.
+MAX_ORDER_ENTRIES = 10
+MAX_GROUP_BY_ENTRIES = 10
+#: The default of ``max_groups``: how many groups one connection reports.
+MAX_GROUPS = 100
+#: The default of ``max_group_key_rows``: how many related rows one
+#: ``objects:`` group key may hold.
+MAX_GROUP_KEY_ROWS = 100
 
 #: SQLite date modifiers that move a value to the start of its period. A
 #: quarter needs the month read first, so each backend builds its own.
@@ -102,6 +117,18 @@ def _is_set(value: Any) -> bool:
     return value is not strawberry.UNSET and value is not None and value is not False
 
 
+def _entries(argument: str, given: Any, maximum: int) -> list[Any]:
+    """The entries of the *argument* list *given*, refused past *maximum*.
+
+    Each entry becomes a clause, and a join for each relation it crosses, so
+    the length is checked before any of them is built.
+    """
+    entries = given if isinstance(given, list) else [given]
+    if len(entries) > maximum:
+        raise ValueError(f"{argument} has {len(entries)} entries; maximum is {maximum}")
+    return entries
+
+
 def group_paths(backend: Any, model: type, group_by: Any) -> list[GroupPath]:
     """Every value *group_by* groups *model* by, in the order it names them.
 
@@ -109,7 +136,11 @@ def group_paths(backend: Any, model: type, group_by: Any) -> list[GroupPath]:
     the first hop of a path: past a to-one hop it would multiply rows the
     database has no single row to collapse them back into.
     """
-    entries = group_by if isinstance(group_by, list) else [group_by]
+    entries = _entries(
+        "groupBy",
+        group_by,
+        getattr(backend, "_max_group_by_entries", MAX_GROUP_BY_ENTRIES),
+    )
     found: dict[tuple[str, ...], GroupPath] = {}
     for entry in entries:
         _collect(backend, model, entry, (), found)
@@ -252,7 +283,11 @@ def order_terms(backend: Any, model: type, order_input: Any) -> list[Any]:
     in the order they name them: the set a ``groupBy`` naming those columns
     keys groups by.
     """
-    entries = order_input if isinstance(order_input, list) else [order_input]
+    entries = _entries(
+        "order",
+        order_input,
+        getattr(backend, "_max_order_entries", MAX_ORDER_ENTRIES),
+    )
     sets: dict[str, SetOrder] = {}
     columns: dict[str, list[str]] = {}
     starts: dict[int, list[str]] = {}
@@ -368,9 +403,14 @@ def from_json(value: Any, kind: Any) -> Any:
     return value
 
 
-def _together_key(meta: Any, path: GroupPath, value: str) -> list[Any]:
+def _together_key(meta: Any, path: GroupPath, value: str, max_rows: int) -> list[Any]:
     """The related keys *value*, a JSON array of column values per row, holds."""
     key_type = meta.relation_keys[path.name].group_key_type
+    rows = json.loads(value, parse_float=Decimal)
+    if len(rows) > max_rows:
+        raise ValueError(
+            f"objects: puts more than {max_rows} related rows in one group key"
+        )
     return [
         key_type(
             **{
@@ -380,7 +420,7 @@ def _together_key(meta: Any, path: GroupPath, value: str) -> list[Any]:
                 )
             }
         )
-        for row in json.loads(value, parse_float=Decimal)
+        for row in rows
     ]
 
 
@@ -410,12 +450,14 @@ def key_tuple(paths: Iterable[GroupPath], values: Mapping[str, Any]) -> tuple:
     )
 
 
-def _build_key(meta: Any, paths: list[GroupPath], formatted: tuple) -> Any:
+def _build_key(
+    meta: Any, paths: list[GroupPath], formatted: tuple, max_key_rows: int
+) -> Any:
     tree: dict[str, Any] = {}
     together: dict[str, list[Any]] = {}
     for path, value in zip(paths, formatted, strict=True):
         if path.through is not None:
-            together[path.name] = _together_key(meta, path, value)
+            together[path.name] = _together_key(meta, path, value, max_key_rows)
             continue
         node = tree
         for hop in path.hops:
@@ -454,15 +496,35 @@ def build_group(
     paths: list[GroupPath],
     values: Mapping[str, Any],
     requested: dict[str, Any],
+    *,
+    max_key_rows: int = MAX_GROUP_KEY_ROWS,
 ) -> Group:
-    """A group from one row of the grouped query, read through *values*."""
+    """A group from one row of the grouped query, read through *values*.
+
+    An ``objects:`` key holding more than *max_key_rows* related rows is
+    refused.
+    """
     formatted = key_tuple(paths, values)
     row = type("Row", (), dict(values))()
     return Group(
-        _build_key(meta, paths, formatted),
+        _build_key(meta, paths, formatted, max_key_rows),
         meta.build_aggregates(row, requested),
         formatted,
     )
+
+
+def within_max_groups[T](rows: Sequence[T], max_groups: int) -> Sequence[T]:
+    """*rows*, one per group, refused when there are more than *max_groups*.
+
+    The grouped query asks for one row past the cap, so a grouping over it
+    is found without reading every group.
+    """
+    if len(rows) > max_groups:
+        raise ValueError(
+            f"groupBy makes more than {max_groups} groups; filter the "
+            f"connection or group by fewer values"
+        )
+    return rows
 
 
 def needs_database_membership(paths: list[GroupPath]) -> bool:

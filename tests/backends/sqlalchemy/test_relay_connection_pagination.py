@@ -206,8 +206,9 @@ def _posts_by_author_schema(orm, query):
 class TestJoins:
     """``.unique()`` folds repeated rows together after they are read.
 
-    Cutting a join that can repeat a row would count the repeats against the
-    page, so such a join is still read whole. A join to one row per row is not.
+    A join that can repeat a row is cut by each row's first appearance, so the
+    repeats do not count against the page. A join to one row per row is cut as
+    it is.
     """
 
     def test_a_join_that_repeats_rows_pages_as_before(self, orm, sa_session, seed):
@@ -237,3 +238,45 @@ class TestJoins:
         ]
         assert len(query_counter) == 1
         assert "LIMIT" in query_counter[0].upper(), query_counter[0]
+
+
+# Alice has two published posts, so a LIMIT of two joined rows holds only her.
+# Its LIMIT counts joined rows, which a page of users cannot compose, so the
+# join is read whole.
+_ALICE_TWICE = (
+    select(SAUser)
+    .join(SAUser.posts)
+    .where(SAPost.is_published.is_(True))
+    .order_by(SAUser.id)
+    .limit(2)
+)
+
+
+def test_a_join_already_cut_is_read_whole(orm, sa_session, seed):
+    schema = _users_schema(orm, SAUser, lambda User, info: _ALICE_TWICE, None, SAPost)
+    for shape in ["first: 1", "last: 1"]:
+        query = page_query(shape)
+        result = schema.execute_sync(query, context_value={"session": sa_session})
+        assert outcome(result) == reference(query, ["Alice"]), shape
+
+
+async def test_a_join_already_cut_is_read_whole_on_an_async_session(orm, async_session):
+    alice = SAUser(id=1, name="Alice", email="alice@example.com")
+    charlie = SAUser(id=3, name="Charlie", email="charlie@test.org")
+    async_session.add_all(
+        [
+            alice,
+            charlie,
+            SAPost(
+                id=1, title="Hello World", body="b", is_published=True, author=alice
+            ),
+            SAPost(id=2, title="GraphQL", body="b", is_published=True, author=alice),
+            SAPost(id=4, title="Rust", body="b", is_published=True, author=charlie),
+        ]
+    )
+    await async_session.commit()
+    schema = _users_schema(orm, SAUser, lambda User, info: _ALICE_TWICE, None, SAPost)
+    for shape in ["first: 1", "last: 1"]:
+        query = page_query(shape)
+        result = await schema.execute(query, context_value={"session": async_session})
+        assert outcome(result) == reference(query, ["Alice"]), shape

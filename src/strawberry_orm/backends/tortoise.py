@@ -750,7 +750,7 @@ class TortoiseBackend(BaseBackend):
         from pypika_tortoise import functions
         from pypika_tortoise.terms import Field
 
-        from strawberry_orm.grouping import build_group
+        from strawberry_orm.grouping import build_group, within_max_groups
 
         model = aggregate_meta.model
         requested = (
@@ -776,13 +776,24 @@ class TortoiseBackend(BaseBackend):
             stmt = _order_by(stmt, first, descending, nulls)
         for alias in aliases:
             stmt = stmt.orderby(alias)
+        stmt = stmt.limit(self._max_groups + 1)
 
         groups = []
-        for found in await rows.execute(stmt):
+        for found in within_max_groups(
+            list(await rows.execute(stmt)), self._max_groups
+        ):
             values = rows.read(found)
             for name, (_term, read) in aggregates.items():
                 values[name] = read(found[name])
-            groups.append(build_group(aggregate_meta, paths, values, requested))
+            groups.append(
+                build_group(
+                    aggregate_meta,
+                    paths,
+                    values,
+                    requested,
+                    max_key_rows=self._max_group_key_rows,
+                )
+            )
         return groups
 
     async def batch_group_items(
@@ -877,9 +888,9 @@ class TortoiseBackend(BaseBackend):
 
     # -- Queryset overrides --------------------------------------------------
 
-    def get_default_queryset(self, model: type) -> Any:
+    def get_default_queryset(self, model: type, *, limited: bool = True) -> Any:
         qs = model.all()
-        if self._default_query_limit is not None:
+        if limited and self._default_query_limit is not None:
             qs = qs.limit(self._default_query_limit)
         return qs
 

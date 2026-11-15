@@ -652,6 +652,9 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 - `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
 - String regex filters are disabled by default
 - Filter depth, branch count, and `inList` size are capped
+- A connection reads at most one page: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
+- `order` and `groupBy` lists, the groups a connection answers with, and the related rows in an `objects:` group key are capped (`max_order_entries`, `max_group_by_entries`, `max_groups`, `max_group_key_rows`)
+- On SQLAlchemy, an error running a statement reaches the client as `Invalid filter expression` (or `Database connection failed`), never with its SQL or parameters; the original is the exception's `__cause__`, for your logs
 - `orm.ref()` provides explicit `unlink` and `delete` operations — both opt-in via `unlink=True` and `delete=True`
 - When you use `orm.schema()` (optimizer enabled by default), nested relation loads honor each type's `scope_rows` — but **only for types where you define it** (the ORM warns at type registration when `scope_rows` is missing)
 - Filters, ordering, group-by and aggregates cover only the columns and relations the GraphQL types they serve show — through `object:`, the type the relation returns. A column those types leave out, or show through a resolver of your own, `on=`, `compute=` or permission classes, cannot be filtered on, sorted by, grouped by, or read through `min`/`max` — any of which would reveal it. `orm.schema()` works this out for the types each schema reaches, and a kept field carries the tags of the type field it mirrors, so a tagged schema drops both together
@@ -667,7 +670,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 | Authentication   | —                             | middleware, `info.context`, permission classes                                                                                           |
 | Row access       | `scope_rows` per exposed type | define on **every** model type clients can reach — [parent scoping does not flow to children](#parent-scoping-does-not-flow-to-children) |
 | Column exposure  | inputs follow the type's fields | `exclude=[...]` on `@orm.type`, or `orm.field.eager(permission_classes=…)`                                                                |
-| Query size       | —                             | `default_query_limit`                                                                                                                    |
+| Query size       | page size, `order`/`groupBy` length, group count | `default_query_limit` for root lists; a query budget (Strawberry's `MaxAliasesLimiter`, `MaxTokensLimiter`, `QueryDepthLimiter`)              |
 | Mutations        | —                             | auth in resolvers; `authorize` callback on `apply_ref_list`                                                                              |
 | Custom resolvers | —                             | same as hand-written DB access — you own scoping                                                                                         |
 
@@ -774,10 +777,16 @@ orm = StrawberryORM.for_sqlalchemy(
     max_filter_depth=8,
     max_filter_branches=25,
     max_in_list_size=200,
+    max_order_entries=5,
+    max_group_by_entries=3,
+    max_groups=100,
+    max_group_key_rows=50,
 )
 
 schema = orm.schema(query=Query)  # optimizer on by default
 ```
+
+`default_query_limit` caps every connection page and every generated root list. A nested relation list (`posts: list[PostType]` under each user) is not limited: it returns all of a parent's visible rows, so bound it from the root, or make it a connection.
 
 ---
 
@@ -1178,6 +1187,8 @@ Each order entry is a `@oneOf` input with a `field` key (for scalar columns), an
 
 Supported values: `ASC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST`.
 
+An `order` list longer than `max_order_entries` (default 10) is refused before any SQL is built: `order has 11 entries; maximum is 10`.
+
 #### Order by related object
 
 When order types are registered for related models, the generated order gains an `object` key that lets you sort by fields on related objects — mirroring the [filter object traversal](#object-traversal) structure:
@@ -1553,6 +1564,8 @@ Each group includes:
 
 Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `object:` order through a to-many relation does not rank groups. An `objects:` order does, by each group's least (or greatest) set, since a row has one set. Grouping does not need an `order` on the grouped column.
 
+Grouping is bounded on three counts, each an error rather than a cut answer. A `groupBy` list longer than `max_group_by_entries` (default 10) is refused before any SQL is built. A connection whose rows make more than `max_groups` groups (default 100) is refused with `groupBy makes more than 100 groups; filter the connection or group by fewer values`; the groups are read with a `LIMIT` one past the cap, so no more are read. An [`objects:`](#grouping-by-a-set-of-related-rows) key holding more than `max_group_key_rows` related rows (default 100) is refused too.
+
 A group's first row is found with `MIN` (or `MAX` for a descending clause) of each ordered column. PostgreSQL has neither for a UUID or a boolean, so a UUID is ranked by its text and a boolean as an integer (false before true); nulls fall where the connection's order puts them. A JSON, binary, hstore, full-text search vector or geometry column has no least value at all, so ordering by one does not rank groups, on any database: groups ranked only by it come in key order rather than edge order.
 
 ### Grouping by related rows
@@ -1604,6 +1617,7 @@ A relation the type shows through its own resolver (`@strawberry.field def categ
 - A date column takes an `interval`, as it does under `field:`. Each related row's date is cut to its period before the set is made, so two January posts make one `2026-01-01` entry.
 - The set is built in SQL as JSON, on PostgreSQL and SQLite; other databases raise, as date intervals do.
 - `objects:` can be combined with `field:`, `object:` and `@group_field` entries in the same `groupBy`.
+- A key holding more than `max_group_key_rows` related rows (default 100) is refused: `objects: puts more than 100 related rows in one group key`. The database builds the key before it is counted, so the cap bounds the answer, not the work.
 - To keep each group's edges together, [order by the same set](#order-by-a-set-of-related-rows): `order: [{objects: {tags: {field: {name: ASC}}}}]`. Each row then sorts by its group's key, and a group's `items` come in that order.
 
 ### Grouping by date intervals
@@ -2061,7 +2075,17 @@ Filters and ordering are applied *before* pagination, so the connection always s
 
 The page is cut in the database, not in Python. `first: 50` reads 51 rows (the extra one answers `hasNextPage`), `after` becomes an `OFFSET`, and `totalCount` is a separate count sent only when it is selected — and not even then when the page comes back short, because a short page is the end of the result. `last` without `before` counts first, to find where the window starts. Cursors are the same either way. Each page is its own query, and a database may break ties in a non-unique order differently from one query to the next, so a row could land on two pages and another on none. The cut therefore ends every order — the client's, the resolver's or the model's — with the primary key, unless it already includes it; with no order at all, the primary key alone orders the pages. Rows that do not tie keep their order. A Django queryset the resolver already sliced, or ordered with `.extra(order_by=...)`, is cut in the order it has.
 
-A few requests are still read whole and sliced in Python: a resolver that returns rows rather than a query, `last: 0` (which Relay defines as every row after the cursor), and, on SQLAlchemy, a join that can repeat a row — to a collection, or through a second `FROM` — without `.distinct()`. SQLAlchemy folds those repeats together with `.unique()` after reading, so a `LIMIT` would count them against the page.
+On SQLAlchemy, a join to a collection repeats a row once per related row, and `.unique()` folds the repeats together after reading, keeping each row where it first appears. The page is cut the same way in SQL: each row is numbered by its first appearance, so `first: 1` reads one row however many related rows it has, and ordering through a to-many relation pages in the database too.
+
+A few requests are still read whole and sliced in Python: a resolver that returns rows rather than a query and, on SQLAlchemy, a join that can repeat a row (one without `.distinct()`) when it also selects more than one entity, has a second `FROM` or loader options, or was already cut with a `LIMIT` or `OFFSET`, which count joined rows.
+
+Every page is held to one page's worth of rows. `first` and `last` are capped at `max_results` (100 by default, set per field or with Strawberry's `relay_max_results`) and at `default_query_limit` when that is smaller, which is also the page size when neither is given. Three requests are answered differently from Strawberry's `ListConnection`, which slices a Python list:
+
+- `before` without `first` or `last` reads one page from the start, not every row up to the cursor.
+- `last: 0` returns no edges, at the end of the result: `hasPreviousPage` is true when rows follow the cursor (or, with none, when there are any rows), `hasNextPage` false.
+- A cursor before the first row is refused (`Argument 'after' cannot point before the first item.`). Strawberry counted it from the end of the list.
+
+`default_query_limit` caps each page, not the rows paged through, so `totalCount` counts every row and every page is reachable. A connection resolver returning `orm.get_default_queryset(Model)` is the exception: that query is already cut to the limit.
 
 `orm.connection.eager()` accepts the same keyword arguments as `relay.connection()` — `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`.
 
@@ -2215,6 +2239,7 @@ server = mcp_server(
 
 - **Queries only, unless you opt in.** `graphql` runs only queries, and `graphql_schema` shows no mutations. `allow_mutations=True` shows and allows them, and marks `graphql` destructive.
 - **Checked before it runs.** An operation must be a single operation within `max_depth` levels (default 10) that passes validation. Depth does not bound width, so give the schema Strawberry's `MaxAliasesLimiter` or `MaxTokensLimiter` to cap that; they apply here as to any request.
+- **No introspection.** An operation asking for `__schema` or `__type` is refused, since it would describe the whole schema, mutations and fields `root_fields` leaves out included. `graphql_schema` describes what `graphql` may use; `__typename` still works.
 - **`root_fields`** limits the root fields `graphql` may use, and `graphql_schema` shows only those and the types they reach. `descriptions=False` leaves the schema's descriptions out of `graphql_schema`. To expose only part of the schema in the first place, build it with `orm.schema(query=Query, tags="mcp")`.
 
 To try it locally, `python cli.py mcp` serves a few operations on the seeded SQLAlchemy test schema at `http://localhost:8421/mcp`. Add `--graphql-tool` for the `graphql` and `graphql_schema` tools, and `--allow-mutations` to let `graphql` run mutations.
@@ -2230,7 +2255,7 @@ Shared options:
 
 | Option                     | Default  | Meaning                                                                                                                                                                       |
 | -------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `default_query_limit`      | `None`   | Default limit for auto-generated list queries.                                                                                                                                |
+| `default_query_limit`      | `None`   | Caps each connection page (and is its size when `first`/`last` are not given) and each generated root list, after its filter, order and `scope_rows`. Nested relation lists are not limited. |
 | `exclude_sensitive_fields` | `True`   | Excludes sensitive-looking fields from generated input/filter/order types.                                                                                                    |
 | `warn_sensitive`           | `True`   | Warns when sensitive-looking fields are exposed on output types.                                                                                                              |
 | `warn_missing_scope`       | `True`   | Warns when an `@orm.type` class has no `scope_rows` classmethod.                                                                                                              |
@@ -2241,6 +2266,10 @@ Shared options:
 | `max_filter_depth`         | `10`     | Caps recursive filter nesting.                                                                                                                                                |
 | `max_filter_branches`      | `50`     | Caps `all` / `any` / `oneOf` branch count.                                                                                                                                    |
 | `max_in_list_size`         | `500`    | Caps `inList` / `notInList` size.                                                                                                                                             |
+| `max_order_entries`        | `10`     | Caps the entries in an `order` list.                                                                                                                                          |
+| `max_group_by_entries`     | `10`     | Caps the entries in a `groupBy` list.                                                                                                                                         |
+| `max_groups`               | `100`    | Refuses a connection whose `groupBy` makes more groups than this.                                                                                                             |
+| `max_group_key_rows`       | `100`    | Refuses an `objects:` group key holding more related rows than this.                                                                                                          |
 | `enable_regex_filters`     | `False`  | Enables `regex` and `iRegex` string lookups.                                                                                                                                  |
 | `to_query`                 | `None`   | `to_query(result, info)`: turns what a field, payload or connection resolver returns into a query when it is one of your own query objects. See [Your own query objects](#your-own-query-objects). |
 

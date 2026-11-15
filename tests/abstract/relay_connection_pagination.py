@@ -45,6 +45,9 @@ def page_query(args: str) -> str:
 
 
 #: Every shape of request the Relay arguments allow, over a 12-row table.
+#: ``last: 0`` and a cursor before the first row are left out: Strawberry
+#: answers them with every row, and ``pagination_limits`` checks what an ORM
+#: connection answers instead.
 PAGE_SHAPES = [
     "",
     "first: 3",
@@ -60,20 +63,15 @@ PAGE_SHAPES = [
     f'last: 3, after: "{cursor(4)}"',
     f'last: 20, after: "{cursor(8)}"',
     f'last: 3, after: "{cursor(40)}"',
-    "last: 0",
     f'before: "{cursor(5)}"',
     f'before: "{cursor(5)}", last: 2',
     f'before: "{cursor(5)}", first: 2',
     f'first: 4, last: 2, after: "{cursor(1)}"',
     f'after: "{cursor(5)}", before: "{cursor(3)}"',
-    # Cursors are the client's to forge: positions no database can address,
-    # and negative ones, which slice a Python list from its end.
+    # Cursors are the client's to forge: positions no database can address.
     f'first: 3, after: "{cursor(2**64)}"',
     f'last: 2, after: "{cursor(2**64)}"',
     f'before: "{cursor(2**64)}"',
-    f'first: 3, after: "{cursor(-5)}"',
-    f'last: 2, after: "{cursor(-5)}"',
-    f'before: "{cursor(-3)}"',
 ]
 
 #: Requests Strawberry rejects; the rejection must not change either.

@@ -53,6 +53,14 @@ def _then[T](value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
     return _chained()
 
 
+def _at_the_end(connection: Any) -> Any:
+    """*connection*, a page of none, moved from its cursor to the end."""
+    page_info = connection.page_info
+    page_info.has_previous_page = page_info.has_next_page
+    page_info.has_next_page = False
+    return connection
+
+
 def _should_await_nodes(nodes: Any, info: Info) -> bool:
     """Return whether *nodes* should be awaited before pagination.
 
@@ -492,6 +500,61 @@ class ORMListConnection(ORMConnection[NodeType]):
         info,
         **kwargs,
     ) -> AwaitableOrValue:
+        kwargs = cls._held_to_one_page(info, **kwargs)
+        if (
+            kwargs.get("last") == 0
+            and kwargs.get("first") is None
+            and not kwargs.get("before")
+        ):
+            # Relay's empty page at the end. Strawberry slices ``[-0:]``, every
+            # row after the cursor; the rows the end follows are the rows a
+            # page of none at the cursor has after it.
+            return _then(
+                cls._resolve(nodes, info=info, **{**kwargs, "first": 0, "last": None}),
+                _at_the_end,
+            )
+        return cls._resolve(nodes, info=info, **kwargs)
+
+    @classmethod
+    def _held_to_one_page(cls, info: Any, **kwargs: Any) -> dict[str, Any]:
+        """*kwargs*, with the page held to ``max_results`` and ``default_query_limit``.
+
+        Strawberry holds only ``first`` and ``last`` to ``max_results``, so
+        ``before`` alone would page to its cursor, however far that is; it
+        reads one page from the start instead, as no arguments do. A cursor
+        before the first row is refused: Strawberry slices a Python list from
+        its end there, which only reading every row repeats.
+        """
+        max_results = kwargs.get("max_results")
+        if max_results is None:
+            max_results = info.schema.config.relay_max_results
+        window = SliceMetadata.from_arguments(
+            info,
+            before=kwargs.get("before"),
+            after=kwargs.get("after"),
+            first=kwargs.get("first"),
+            last=kwargs.get("last"),
+            max_results=max_results,
+            prefix=cls._edge_type().CURSOR_PREFIX,
+        )
+        for argument, position in (("after", window.start), ("before", window.end)):
+            if position < 0:
+                raise ValueError(
+                    f"Argument '{argument}' cannot point before the first item."
+                )
+        limit = getattr(_orm_backend_from_info(info), "_default_query_limit", None)
+        size = max_results if limit is None else min(max_results, limit)
+        first, last = kwargs.get("first"), kwargs.get("last")
+        if first is None and last is None:
+            first = size
+        return {
+            **kwargs,
+            "first": None if first is None else min(first, size),
+            "last": None if last is None else min(last, size),
+        }
+
+    @classmethod
+    def _resolve(cls, nodes: Any, *, info: Any, **kwargs: Any) -> AwaitableOrValue:
         backend, store = get_configured_optimizer(info)
         if backend is not None and store is not None and backend.is_query_object(nodes):
             paged = cls._resolve_query_page(backend, nodes, info=info, **kwargs)
@@ -528,10 +591,6 @@ class ORMListConnection(ORMConnection[NodeType]):
             max_results=max_results,
             prefix=prefix,
         )
-        # Cursors are the client's to forge. A negative position slices a
-        # Python list from its end, which only reading the whole list repeats.
-        if window.start < 0 or window.end < 0:
-            return None
         query = backend.apply_type_scope(query, backend.query_model(query), info)
         want_total = _selection_requests(info, "totalCount")
         args = {
@@ -575,10 +634,7 @@ class ORMListConnection(ORMConnection[NodeType]):
             return _then(optimize_query_nodes(page, info), finish)
 
         # ``last`` without ``before`` counts back from the end, so the total
-        # locates the window. ``last: 0`` is Strawberry's ``[-0:]``: every row
-        # after the cursor, which is a full read either way.
-        if not last:
-            return None
+        # locates the window.
         return _then(
             backend.count_query(query, info),
             lambda total: cls._cut_tail(
@@ -871,14 +927,18 @@ def _items_window(info: Any) -> tuple[int, int] | None:
 
     Strawberry's own arithmetic for the ``items`` arguments. ``None`` when it
     would refuse them, or for a cursor before the first row: the field then
-    reports the arguments itself, and nothing is read for it.
+    reports the arguments itself, and nothing is read for it. ``before``
+    alone reads one page, as the field then answers it.
     """
+    first, last = _extract_items_first(info), _get_items_arg(info, "last")
+    if first is None and last is None:
+        first = info.schema.config.relay_max_results
     try:
         window = SliceMetadata.from_arguments(
             info,
-            first=_extract_items_first(info),
+            first=first,
             after=_extract_items_after(info),
-            last=_get_items_arg(info, "last"),
+            last=last,
             before=_get_items_arg(info, "before"),
         )
     except (TypeError, ValueError):
