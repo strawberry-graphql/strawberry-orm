@@ -1184,7 +1184,13 @@ def _build_grouped_connection(
     import types as _types_mod
 
     from strawberry_orm.backends._base import AggregateMeta
-    from strawberry_orm.relay.connection import ORMListConnection, PageInfo, _PageRows
+    from strawberry_orm.relay.connection import (
+        ORMListConnection,
+        PageInfo,
+        _at_the_end,
+        _PageRows,
+        is_empty_page_at_the_end,
+    )
 
     meta: AggregateMeta = backend._build_aggregate_types(  # type: ignore[union-attr]
         model, aggregate_type, group_type
@@ -1252,15 +1258,17 @@ def _build_grouped_connection(
             # Strawberry holds only first and last to max_results; before
             # alone would page to its cursor, past what the window read.
             first = info.schema.config.relay_max_results
-        return _items_conn_cls.resolve_connection(
+        at_the_end = is_empty_page_at_the_end(first, last, before)
+        connection = _items_conn_cls.resolve_connection(
             # The window started at the page, so it is handed over at its place.
             _PageRows(cast_nodes, getattr(self, "_items_offset", 0)),
             info=info,
-            first=first,
+            first=0 if at_the_end else first,
             after=after,
-            last=last,
+            last=None if at_the_end else last,
             before=before,
         )
+        return _at_the_end(connection) if at_the_end else connection
 
     group_ns: dict[str, Any] = {
         "__annotations__": {

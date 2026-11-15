@@ -1700,7 +1700,9 @@ class TestPushTo98:
         assert _items_window(_items_info(after="not-a-cursor")) is None
         assert _items_window(_items_info(first=2, after=cursor(-5))) is None
         # A tail counts back from each group's end, which the window cannot see.
-        assert _items_window(_items_info(last=2)) == (0, 11)
+        assert _items_window(_items_info(last=2)) == (0, 101)
+        assert _items_window(_items_info(last="2")) == (0, 101)
+        assert _items_window(_items_info(last="0")) == (0, 1)
         assert _extract_items_first(SimpleNamespace(selected_fields=[])) is None
         assert _extract_items_after(SimpleNamespace(selected_fields=[])) is None
 

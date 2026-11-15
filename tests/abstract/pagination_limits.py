@@ -83,6 +83,26 @@ def _grouped(path: str) -> str:
     )
 
 
+def _group_items(arguments: str) -> str:
+    """Users 4 to 12 wrote no posts, so they share one group of nine."""
+    return (
+        "{ users(first: 1, groupBy: [{objects: {posts: {field: {title: true}}}}]) "
+        "{ groups { aggregates { count } items(" + arguments + ") "
+        "{ edges { node { name } } pageInfo { hasPreviousPage hasNextPage } } } } }"
+    )
+
+
+def _items_by_count(result) -> dict[int, tuple[list[str], bool, bool]]:
+    assert result.errors is None, result.errors
+    found = {}
+    for group in result.data["users"]["groups"]:
+        items = group["items"]
+        names = [edge["node"]["name"] for edge in items["edges"]]
+        flags = items["pageInfo"]["hasPreviousPage"], items["pageInfo"]["hasNextPage"]
+        found[group["aggregates"]["count"]] = (names, *flags)
+    return found
+
+
 class AbstractTestPaginationLimits:
     async def test_a_negative_after_cursor_is_refused(
         self, orm_factory, User, Post, many_users, capture, run
@@ -192,6 +212,35 @@ class AbstractTestPaginationLimits:
         )
         assert result.errors is None, result.errors
         assert result.data["users"]["groups"], result.data
+
+    async def test_a_groups_items_last_zero_is_an_empty_page_at_the_end(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        with capture() as none_at_the_cursor:
+            await run(schema, _group_items("first: 0"))
+        with capture() as seen:
+            result = await run(schema, _group_items("last: 0"))
+        found = _items_by_count(result)
+        assert found[9] == ([], True, False), found[9]
+        assert all(names == [] for names, *_ in found.values()), found
+        assert seen.loaded <= none_at_the_cursor.loaded, seen.loaded
+
+    async def test_a_groups_items_last_zero_after_its_last_row_has_nothing_before_it(
+        self, orm_factory, User, Post, many_users, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        result = await run(schema, _group_items(f'last: 0, after: "{cursor(8)}"'))
+        assert _items_by_count(result)[9] == ([], False, False)
+
+    async def test_a_groups_items_page_is_unchanged(
+        self, orm_factory, User, Post, many_users, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        result = await run(schema, _group_items("first: 2"))
+        assert _items_by_count(result)[9] == (many_users[3:5], False, True)
+        result = await run(schema, _group_items("last: 2"))
+        assert _items_by_count(result)[9] == (many_users[-2:], True, False)
 
 
 def _entries(entry: str, count: int) -> str:

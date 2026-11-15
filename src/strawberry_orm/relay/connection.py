@@ -53,6 +53,16 @@ def _then[T](value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
     return _chained()
 
 
+def is_empty_page_at_the_end(first: Any, last: Any, before: Any) -> bool:
+    """Whether the arguments ask for Relay's empty page at the end: ``last: 0``.
+
+    Strawberry slices ``[-0:]`` for it, every row after the cursor. The rows
+    the end follows are the rows a page of none at the cursor has after it,
+    so it is read as ``first: 0`` and moved to the end with ``_at_the_end``.
+    """
+    return last == 0 and first is None and not before
+
+
 def _at_the_end(connection: Any) -> Any:
     """*connection*, a page of none, moved from its cursor to the end."""
     page_info = connection.page_info
@@ -535,14 +545,9 @@ class ORMListConnection(ORMConnection[NodeType]):
         **kwargs,
     ) -> AwaitableOrValue:
         kwargs = cls._held_to_one_page(info, **kwargs)
-        if (
-            kwargs.get("last") == 0
-            and kwargs.get("first") is None
-            and not kwargs.get("before")
+        if is_empty_page_at_the_end(
+            kwargs.get("first"), kwargs.get("last"), kwargs.get("before")
         ):
-            # Relay's empty page at the end. Strawberry slices ``[-0:]``, every
-            # row after the cursor; the rows the end follows are the rows a
-            # page of none at the cursor has after it.
             return _then(
                 cls._resolve(nodes, info=info, **{**kwargs, "first": 0, "last": None}),
                 _at_the_end,
@@ -951,7 +956,12 @@ def _get_items_arg(info: Any, arg_name: str) -> Any:
 
 def _extract_items_first(info: Any) -> int | None:
     """Extract the ``first`` argument from ``groups.items`` in the selection set."""
-    val = _get_items_arg(info, "first")
+    return _int_items_arg(info, "first")
+
+
+def _int_items_arg(info: Any, arg_name: str) -> int | None:
+    """An ``Int`` argument of ``groups.items``: a literal is selected as its text."""
+    val = _get_items_arg(info, arg_name)
     if val is not None:
         return int(val)
     return None
@@ -973,16 +983,20 @@ def _items_window(info: Any) -> tuple[int, int] | None:
     reports the arguments itself, and nothing is read for it. ``before``
     alone reads one page, as the field then answers it.
     """
-    first, last = _extract_items_first(info), _get_items_arg(info, "last")
+    first, last = _extract_items_first(info), _int_items_arg(info, "last")
+    before = _get_items_arg(info, "before")
+    max_results = info.schema.config.relay_max_results
     if first is None and last is None:
-        first = info.schema.config.relay_max_results
+        first = max_results
+    elif is_empty_page_at_the_end(first, last, before):
+        first, last = 0, None
     try:
         window = SliceMetadata.from_arguments(
             info,
             first=first,
             after=_extract_items_after(info),
             last=last,
-            before=_get_items_arg(info, "before"),
+            before=before,
         )
     except (TypeError, ValueError):
         return None
@@ -992,7 +1006,7 @@ def _items_window(info: Any) -> tuple[int, int] | None:
     if window.end == sys.maxsize:
         # ``last`` without ``before`` counts back from each group's end, which
         # the window cannot see; it reads the default page after the cursor.
-        return start, 10 + 1
+        return start, max_results + 1
     return start, min(window.overfetch, _LAST_POSITION) - start
 
 
