@@ -180,7 +180,7 @@ async def test_a_malformed_key_does_not_reveal_the_statement(run, read):
     result = await run(READS[read] % BY_ID)
     assert result.errors, result.data
     for error in result.errors:
-        _assert_hidden(error.message)
+        assert error.message == "'not-a-uuid' is not a valid ID.", error.message
 
 
 def _refused() -> Exception:
