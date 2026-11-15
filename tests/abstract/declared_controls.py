@@ -109,6 +109,32 @@ def _guarded_connection_schema(orm, models):
     return orm.schema(query=Query)
 
 
+def _inherited_guard_schema(orm, models):
+    User = models.User
+
+    @strawberry.interface
+    class HasEmail:
+        email: str = strawberry.field(
+            extensions=[PermissionExtension(permissions=[Deny()])]
+        )
+
+    @orm.type(
+        User,
+        filters=orm.filter(User),
+        order=orm.order(User),
+        group=orm.group(User),
+    )
+    class UserNode(relay.Node, HasEmail):
+        id: relay.NodeID[int]
+        name: auto
+
+    @strawberry.type
+    class Query:
+        users: ORMListConnection[UserNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
 def _assert_refused(result, name: str) -> None:
     assert result.data is None, result.data
     assert result.errors is not None
@@ -171,3 +197,19 @@ class AbstractTestDeclaredControls:
         schema = _guarded_connection_schema(orm, models)
         result = await run(schema, "{ users" + arguments + " { totalCount } }")
         _assert_refused(result, "posts")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '(filter: {field: {email: {startsWith: "bob"}}})',
+            "(order: [{field: {email: ASC}}])",
+            "(groupBy: [{field: {email: true}}])",
+        ],
+    )
+    async def test_a_guarded_inherited_field_cannot_be_read_through(
+        self, orm, models, run, arguments
+    ):
+        schema = _inherited_guard_schema(orm, models)
+        result = await run(schema, "{ users" + arguments + " { totalCount } }")
+        _assert_refused(result, "email")

@@ -134,7 +134,7 @@ def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
     interface declares would otherwise never open to the type's filters and
     orders. Walk each base's Strawberry fields and count a field the same way
     an own annotation is counted: no resolver of its own, no permission
-    classes, and not listed in the type's ``exclude=``.
+    classes or extensions, and not listed in the type's ``exclude=``.
     """
     own_declared = set(getattr(cls, "__annotations__", {})) | set(vars(cls))
     found: set[str] = set()
@@ -146,7 +146,11 @@ def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
             name = field.python_name
             if not name or name in own_declared or name in excluded or name in found:
                 continue
-            if field.base_resolver is not None or field.permission_classes:
+            if (
+                field.base_resolver is not None
+                or field.permission_classes
+                or field.extensions
+            ):
                 continue
             found.add(name)
     return frozenset(found)
