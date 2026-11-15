@@ -2166,6 +2166,8 @@ class Query:
 
 With a sync SQLAlchemy `Session` under async execution (subscriptions, `schema.execute`), the library's own reads run on the event loop by default. That includes counts, a statement a resolver returned, eager loads, and loading the relations of rows a resolver handed back. If your session refuses use from the loop's thread, pass `offload_sync_session=True`: those reads then go through `sync_to_async(thread_sensitive=True)`, one thread per operation, as Django's do. Leave it off for in-memory SQLite, whose connection pool gives each thread a database of its own. Writes (upserts, `orm.ref` lists, repo creates) are not moved.
 
+Give each request its own session: SQLAlchemy does not support one `Session` or `AsyncSession` in use by concurrent tasks. Shared anyway, the requests share its rows, and a relation one request's scope loaded sits on the row the other reads. The library trusts a relation it loaded only while no other request ran a statement on the session during the load, and only while the relation still holds what was loaded; otherwise the relation is read again under the reading request's scope, at the cost of a query.
+
 ### Your own query objects
 
 If your resolvers return a query object of your own that wraps the ORM's, pass `to_query=` to map it once, rather than in every resolver:

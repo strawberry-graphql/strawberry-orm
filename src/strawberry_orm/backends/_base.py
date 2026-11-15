@@ -2183,8 +2183,10 @@ class BaseBackend:
 
         owners: dict[type, type | None] = {}
         groups: dict[type, list[Any]] = {}
+        # Read once: another execution sharing the row can mark it meanwhile.
+        scoped = {id(row) for row in rows if row_is_scoped(row)}
         for row in rows:
-            if row_is_scoped(row):
+            if id(row) in scoped:
                 continue
             cls = type(row)
             if cls not in owners:
@@ -2213,7 +2215,7 @@ class BaseBackend:
             kept = [
                 row
                 for row in rows
-                if row_is_scoped(row)
+                if id(row) in scoped
                 or owners[type(row)] is None
                 or self.instance_pk(row) in allowed[owners[type(row)]]
             ]

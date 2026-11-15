@@ -116,13 +116,21 @@ def relation_read_by(info: Any) -> str | None:
 
 
 def mark_relations_scoped(
-    instances: Iterable[Any], names: Iterable[str], *, scope: Any = None
+    instances: Iterable[Any],
+    names: Iterable[str],
+    *,
+    scope: Any = None,
+    held: Callable[[Any, str], Any] | None = None,
 ) -> None:
     """Record that *names* on each instance were loaded with row scoping.
 
     *scope* is the ``scope=`` of the field the load was for, if it had one.
     Two types can show one model and scope one relation differently, and a
     cache holds what one of them allowed.
+
+    *held* reads the value a relation holds. A mark made with it vouches for
+    that value only: a row shared through an identity map can have the
+    relation replaced by another execution's load.
     """
     mark = execution_mark()
     adding = set(names)
@@ -135,22 +143,33 @@ def mark_relations_scoped(
         if not isinstance(current, dict):
             current = {}
             setattr(instance, _SCOPED_RELATIONS, current)
-        current.update(dict.fromkeys(adding, (mark, scope)))
+        for name in adding:
+            current[name] = (mark, scope, held(instance, name) if held else None)
 
 
 def relation_cache_is_scoped(
-    instance: Any, field_name: str, *, scope: Any = None
+    instance: Any,
+    field_name: str,
+    *,
+    scope: Any = None,
+    held: Callable[[Any, str], Any] | None = None,
 ) -> bool:
     """Whether *field_name*'s loaded value came from a scoped load in this execution.
 
-    The load must have been for a field with the same ``scope=`` as *scope*.
+    The load must have been for a field with the same ``scope=`` as *scope*
+    and, given *held*, the relation must still hold the value it loaded.
     """
     mark = execution_mark()
     current = getattr(instance, _SCOPED_RELATIONS, None)
     if mark is None or not isinstance(current, dict):
         return False
     made = current.get(field_name)
-    return made is not None and made[0] is mark and made[1] is scope
+    return (
+        made is not None
+        and made[0] is mark
+        and made[1] is scope
+        and (held is None or made[2] is held(instance, field_name))
+    )
 
 
 def mark_rows_scoped(instances: Iterable[Any]) -> None:

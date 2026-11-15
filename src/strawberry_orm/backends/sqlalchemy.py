@@ -8,6 +8,7 @@ import sys
 import uuid
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -190,15 +191,54 @@ def _related_rows(rows: list[Any], name: str) -> list[Any]:
     return found
 
 
+def _held(row: Any, name: str) -> Any:
+    """What *name* holds on *row*: the collection, the related row or ``None``."""
+    return sa_inspect(row).dict.get(name)
+
+
 def _holds(rows: list[Any], name: str, load: _PlannedLoad) -> bool:
     """Whether every row has *name* loaded, by a scoped load if it needs one."""
     from strawberry_orm.lazy_resolution import relation_cache_is_scoped
 
     return all(
         name not in sa_inspect(row).unloaded
-        and (not load.scoped or relation_cache_is_scoped(row, name, scope=load.token))
+        and (
+            not load.scoped
+            or relation_cache_is_scoped(row, name, scope=load.token, held=_held)
+        )
         for row in rows
     )
+
+
+#: In a session's ``info``: ``[mark, turn]``, the execution that last used it
+#: and a token that changes whenever another one does.
+_SESSION_TURN = "strawberry_orm_turn"
+
+
+def _note_statement(state: Any) -> None:
+    from strawberry_orm.lazy_resolution import execution_mark
+
+    turn = state.session.info.get(_SESSION_TURN)
+    mark = execution_mark()
+    if turn is not None and turn[0] is not mark:
+        turn[:] = [mark, object()]
+
+
+@dataclass(frozen=True)
+class _Window:
+    """A load's turn on its session, and the relations unloaded as it began.
+
+    Executions sharing a session share its rows, and one execution's loads
+    fill the rows another is loading. A load marks the relations it filled
+    only if no other execution ran a statement on the session meanwhile.
+    """
+
+    turn: list[Any]
+    token: object
+    unloaded: dict[int, set[str]]
+
+    def kept(self) -> bool:
+        return self.turn[1] is self.token
 
 
 def _unloaded_levels(
@@ -1643,7 +1683,7 @@ class SQLAlchemyBackend(BaseBackend):
                     row, name, held if load.uselist else next(iter(held), None)
                 )
             if load.scoped:
-                mark_relations_scoped(missing, [name], scope=load.token)
+                mark_relations_scoped(missing, [name], scope=load.token, held=_held)
             yield from self._keyed_loads(session, children, load.children)
 
     def _linked_keys(
@@ -1676,12 +1716,13 @@ class SQLAlchemyBackend(BaseBackend):
         loaded = query.options(*options) if options else query
         session = self._get_session(info)
         trusted = edges if not caller_had_options and _marks_some(edges) else []
-        before = self._unloaded_snapshot(session, []) if trusted else {}
 
         def steps() -> Steps:
+            window = (yield self._open_window(session, [])) if trusted else None
             rows = yield self._execute_in(session, loaded)
             yield from self._keyed_loads(session, rows, plan)
-            self._mark_scoped_edges(rows, trusted, before=before)
+            if window is not None and window.kept():
+                self._mark_scoped_edges(rows, trusted, before=window.unloaded)
             return rows
 
         return _drive(steps())
@@ -1705,12 +1746,13 @@ class SQLAlchemyBackend(BaseBackend):
         if not planned:
             return []
 
-        before: dict[int, set[str]] = {}
         sessions = {id(session): session for session, _model, _rows, _level in groups}
-        for session in sessions.values():
-            before.update(self._unloaded_snapshot(session, planned))
 
         def steps() -> Steps:
+            windows: list[_Window] = []
+            if _marks_some(edges):
+                for session in sessions.values():
+                    windows.append((yield self._open_window(session, planned)))
             for session, model, rows, level in groups:
                 reread = {
                     name: load
@@ -1728,7 +1770,11 @@ class SQLAlchemyBackend(BaseBackend):
                     copies = yield self._execute_in(session, stmt.options(*options))
                     _adopt(rows, copies, pk_name, reread)
                 yield from self._keyed_loads(session, rows, level, every=True)
-            self._mark_scoped_edges(planned, edges, before=before)
+            if windows and all(window.kept() for window in windows):
+                before: dict[int, set[str]] = {}
+                for window in windows:
+                    before.update(window.unloaded)
+                self._mark_scoped_edges(planned, edges, before=before)
             return planned
 
         return _drive(steps())
@@ -1779,6 +1825,30 @@ class SQLAlchemyBackend(BaseBackend):
             return session
         return asyncio_module.async_object_session(row) or session
 
+    def _open_window(self, session: Any, extra: list[Any]) -> Any:
+        """Take a turn on *session* and note what it has unloaded, as one step.
+
+        An offloaded session runs it on the worker thread, after any statement
+        already running there has filled its rows.
+        """
+        if self._is_async_session(session):
+            return self._window(session, extra)
+        return self._run_sync(self._window, session, extra)
+
+    def _window(self, session: Any, extra: list[Any]) -> _Window:
+        from sqlalchemy import event
+
+        from strawberry_orm.lazy_resolution import execution_mark
+
+        sync = getattr(session, "sync_session", session)
+        if not event.contains(sync, "do_orm_execute", _note_statement):
+            event.listen(sync, "do_orm_execute", _note_statement)
+        turn = sync.info.setdefault(_SESSION_TURN, [None, None])
+        mark = execution_mark()
+        if turn[0] is not mark or turn[1] is None:
+            turn[:] = [mark, object()]
+        return _Window(turn, turn[1], self._unloaded_snapshot(session, extra))
+
     def _unloaded_snapshot(self, session: Any, extra: list[Any]) -> dict[int, set[str]]:
         """Relations still unloaded, so a later load can see what it filled.
 
@@ -1822,9 +1892,6 @@ class SQLAlchemyBackend(BaseBackend):
         in two places under different scopes cannot tell which load filled an
         object, so it is not marked at all.
         """
-        if not roots or not _marks_some(edges):
-            return
-
         from collections import defaultdict
 
         from sqlalchemy import inspect as sa_inspect
@@ -1851,7 +1918,7 @@ class SQLAlchemyBackend(BaseBackend):
                     and name not in unloaded
                     and (was is None or name in was)
                 ):
-                    mark_relations_scoped([obj], [name], scope=token)
+                    mark_relations_scoped([obj], [name], scope=token, held=_held)
             # Iterating this namespace yields relationship objects, not names.
             for name in state.mapper.relationships.keys():  # noqa: SIM118
                 if name in unloaded:
@@ -2193,7 +2260,10 @@ def _scoped_sa_relation(
     if _sqlalchemy_relation_prefetched(instance, fname) and (
         restrict is None
         or relation_cache_is_scoped(
-            instance, fname, scope=backend._field_scope(parent_model, fname, info)
+            instance,
+            fname,
+            scope=backend._field_scope(parent_model, fname, info),
+            held=_held,
         )
     ):
         return getattr(instance, fname)
