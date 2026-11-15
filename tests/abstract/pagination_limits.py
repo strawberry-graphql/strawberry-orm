@@ -37,7 +37,7 @@ def cursor(offset: int) -> str:
 
 
 def _schema(orm, User, Post, *, max_results=None):
-    @orm.type(Post, group=orm.group(Post))
+    @orm.type(Post, order=orm.order(Post), group=orm.group(Post))
     class PostNode(relay.Node):
         id: relay.NodeID[int]
         title: auto
@@ -92,6 +92,26 @@ def _group_items(arguments: str) -> str:
         "{ groups { aggregates { count } items(" + arguments + ") "
         "{ edges { node { name } } pageInfo { hasPreviousPage hasNextPage } } } } }"
     )
+
+
+def _key_subqueries(statement: str) -> list[str]:
+    """The rows each ``objects:`` key in *statement* is built from, as SQL.
+
+    A key is ``json_group_array(...)`` over ``FROM (<rows>)``, on SQLite.
+    """
+    found = []
+    lowered = statement.lower()
+    start = lowered.find("json_group_array(")
+    while start != -1:
+        opening = lowered.index("from (", start) + len("from ")
+        depth = 0
+        for end in range(opening, len(statement)):
+            depth += {"(": 1, ")": -1}.get(statement[end], 0)
+            if depth == 0:
+                break
+        found.append(statement[opening + 1 : end])
+        start = lowered.find("json_group_array(", end)
+    return found
 
 
 def _items_by_count(result) -> dict[int, tuple[list[str], bool, bool]]:
@@ -214,6 +234,34 @@ class AbstractTestPaginationLimits:
         )
         assert result.errors is None, result.errors
         assert result.data["users"]["groups"], result.data
+
+    async def test_a_group_key_reads_no_more_related_rows_than_it_may_hold(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(max_group_key_rows=1), User, Post)
+        with capture() as seen:
+            result = await run(
+                schema, _grouped("{objects: {posts: {field: {title: true}}}}")
+            )
+        assert result.errors is not None, result.data
+        keys = [key for s in seen.statements for key in _key_subqueries(s)]
+        assert keys, seen.statements
+        for key in keys:
+            assert "LIMIT" in key.upper(), key
+
+    async def test_an_order_by_a_set_reads_every_related_row(
+        self, orm_factory, User, Post, many_users, run
+    ):
+        query = (
+            "{ users(first: 4, order: [{objects: {posts: {field: {title: DESC}}}}, "
+            "{field: {name: ASC}}]) { edges { node { name } } } }"
+        )
+        expected = await run(_schema(orm_factory(), User, Post), query)
+        capped = await run(
+            _schema(orm_factory(max_group_key_rows=1), User, Post), query
+        )
+        assert capped.errors is None, capped.errors
+        assert capped.data == expected.data, (capped.data, expected.data)
 
     async def test_a_groups_items_last_zero_is_an_empty_page_at_the_end(
         self, orm_factory, User, Post, many_users, capture, run

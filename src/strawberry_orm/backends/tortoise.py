@@ -2316,7 +2316,8 @@ class _GroupedRows:
                 self._joined[chain] = self._join(entity, hop)
             entity, owner = self._joined[chain], hop.target
         if path.through is not None:
-            term, read = self._together(path), _same
+            limit = self.backend._max_group_key_rows + 1
+            term, read = self._together(path, limit=limit), _same
         elif path.custom is not None:
             term, read = self._custom(path), _same
         else:
@@ -2375,8 +2376,8 @@ class _GroupedRows:
         self.stmt = self.stmt.join(joined, how=JoinType.left).on(on)
         return joined
 
-    def _together(self, path: Any) -> Any:
-        return _together(self.backend, self.db, self.base, path, self.info)
+    def _together(self, path: Any, *, limit: int | None = None) -> Any:
+        return _together(self.backend, self.db, self.base, path, self.info, limit=limit)
 
     def _custom(self, path: Any) -> Any:
         """The term a ``@group_field`` method groups by.
@@ -2410,13 +2411,23 @@ class _GroupedRows:
         return resolved.term
 
 
-def _together(backend: Any, db: Any, base: Any, path: Any, info: Any) -> Any:
+def _together(
+    backend: Any,
+    db: Any,
+    base: Any,
+    path: Any,
+    info: Any,
+    *,
+    limit: int | None = None,
+) -> Any:
     """The related rows *path* reads of each row of *base*, as JSON text.
 
     The rows the caller may see, their columns in an array each, distinct
     and sorted so a set of rows reads as the same text wherever it is
     read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
     which alone it promises to keep; SQLite keeps an ordered subquery's.
+    At most *limit* of them are read: a group key is refused past
+    ``max_group_key_rows`` rows, and reading one more tells it so.
     """
     from pypika_tortoise import Table
     from pypika_tortoise.functions import Cast, Coalesce, Function
@@ -2456,6 +2467,8 @@ def _together(backend: Any, db: Any, base: Any, path: Any, info: Any) -> Any:
     found = linked.select(*columns).distinct()
     for name in names:
         found = found.orderby(Field(name))
+    if limit is not None:
+        found = found.limit(limit)
     found = found.as_(alias)
     values = [found.field(name) for name in names]
     if dialect == "sqlite":

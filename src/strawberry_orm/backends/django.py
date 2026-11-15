@@ -734,7 +734,7 @@ class DjangoBackend(BaseBackend):
         from django.db.models import Case, F, Q, When
 
         if path.through is not None:
-            return self._together(path, info)
+            return self._together(path, info, limit=self._max_group_key_rows + 1)
 
         if path.custom is not None:
             expr = invoke_custom_callback(
@@ -767,10 +767,12 @@ class DjangoBackend(BaseBackend):
             expr = _truncate(expr, owner._meta.get_field(path.column), path.interval)
         return expr
 
-    def _together(self, path: Any, info: Any) -> Any:
+    def _together(self, path: Any, info: Any, *, limit: int | None = None) -> Any:
         """The related rows *path* reads of each row, as ``_Together`` JSON text.
 
-        Only the rows the caller may see, as the field reads on the type.
+        Only the rows the caller may see, as the field reads on the type, and
+        at most *limit* of them: a group key is refused past
+        ``max_group_key_rows`` rows, and reading one more tells it so.
         """
         from django.db.models import F, OuterRef
 
@@ -797,6 +799,8 @@ class DjangoBackend(BaseBackend):
             .distinct()
             .order_by(*names)
         )
+        if limit is not None:
+            rows_together = rows_together[:limit]
         return _Together(rows_together, names)
 
     def _set_order(self, by_set: Any, info: Any) -> Any:

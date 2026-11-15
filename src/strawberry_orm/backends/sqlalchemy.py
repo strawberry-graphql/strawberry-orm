@@ -881,7 +881,9 @@ class SQLAlchemyBackend(BaseBackend):
                     joined[chain], stmt = self._join_hop(stmt, entity, hop, info)
                 entity = joined[chain]
             if path.through is not None:
-                expr, rows = self._together(model, path, info)
+                expr, rows = self._together(
+                    model, path, info, limit=self._max_group_key_rows + 1
+                )
                 stmt = _carrying(stmt, rows)
             elif path.custom is not None:
                 expr = invoke_custom_callback(
@@ -908,13 +910,17 @@ class SQLAlchemyBackend(BaseBackend):
             values = {alias: pairs.c[alias] for alias in values}
         return stmt.add_columns(*values.values()), values
 
-    def _together(self, model: type, path: Any, info: Any) -> tuple[Any, Any]:
+    def _together(
+        self, model: type, path: Any, info: Any, *, limit: int | None = None
+    ) -> tuple[Any, Any]:
         """The related rows *path* reads of each row of *model*, as JSON text.
 
         The rows the caller may see, their columns in an array each, distinct
         and sorted so a set of rows reads as the same text wherever it is
         read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
         which alone it promises to keep; SQLite keeps an ordered subquery's.
+        At most *limit* of them are read: a group key is refused past
+        ``max_group_key_rows`` rows, and reading one more tells it so.
 
         Comes with the statement for those rows, which the statement the text
         goes in has to carry the row criteria of.
@@ -973,7 +979,8 @@ class SQLAlchemyBackend(BaseBackend):
                     )
                 )
             )
-        found = linked.distinct().order_by(*columns).correlate(model).subquery("_orm_t")
+        found = linked.distinct().order_by(*columns).limit(limit)
+        found = found.correlate(model).subquery("_orm_t")
         if self._dialect == "sqlite":
             together = func.json_group_array(func.json_array(*found.c))
         elif self._dialect == "postgresql":
