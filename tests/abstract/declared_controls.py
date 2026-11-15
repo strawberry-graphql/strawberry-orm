@@ -19,7 +19,7 @@ The seed: Alice wrote "Hello World" and "GraphQL Guide", Bob the unpublished
 import pytest
 import strawberry
 from strawberry import relay
-from strawberry.permission import BasePermission
+from strawberry.permission import BasePermission, PermissionExtension
 
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
@@ -86,6 +86,35 @@ def _scoped_connection_schema(orm, models, narrow):
     return orm.schema(query=Query)
 
 
+def _guarded_connection_schema(orm, models):
+    User, Post = models.User, models.Post
+
+    @orm.type(Post, filters=orm.filter(Post))
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+
+    @orm.type(User, filters=orm.filter(User), group=orm.group(User))
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        posts: ORMListConnection[PostNode] = orm.connection.eager(
+            extensions=[PermissionExtension(permissions=[Deny()])]
+        )
+
+    @strawberry.type
+    class Query:
+        users: ORMListConnection[UserNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
+def _assert_refused(result, name: str) -> None:
+    assert result.data is None, result.data
+    assert result.errors is not None
+    assert any(name in error.message for error in result.errors), result.errors
+
+
 def _by_name(result) -> dict[str, dict]:
     assert result.errors is None, result.errors
     return {user["name"]: user["posts"] for user in result.data["users"]}
@@ -127,3 +156,18 @@ class AbstractTestDeclaredControls:
         assert result.errors is not None, result.data
         assert {error.message for error in result.errors} == {"Denied."}
         assert "Hello World" not in repr(result.data), result.data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '(filter: {object: {posts: {field: {title: {exact: "Draft Post"}}}}})',
+            "(groupBy: [{object: {posts: {field: {title: true}}}}])",
+        ],
+    )
+    async def test_a_guarded_connection_cannot_be_reached_through(
+        self, orm, models, run, arguments
+    ):
+        schema = _guarded_connection_schema(orm, models)
+        result = await run(schema, "{ users" + arguments + " { totalCount } }")
+        _assert_refused(result, "posts")

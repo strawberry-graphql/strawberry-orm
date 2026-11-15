@@ -108,11 +108,12 @@ def _metadata_only_field(value: Any) -> bool:
 def _reads_as_is(value: Any) -> bool:
     """True when a type field reads its column or relation exactly as stored.
 
-    A resolver of the developer's own, an ``on=`` view, ``compute=`` or
-    permission classes all show the caller something other than the column,
-    or show it to fewer callers. Filtering or sorting on the column would get
-    around that, so such a field does not open its column to the inputs. A
-    ``scope=`` does: filter traversal applies the field's scope too.
+    A resolver of the developer's own, an ``on=`` view, ``compute=``,
+    permission classes or field extensions all may show the caller something
+    other than the column, or show it to fewer callers. Filtering or sorting
+    on the column would get around that, so such a field does not open its
+    column to the inputs. A ``scope=`` does: filter traversal applies the
+    field's scope too.
     """
     from strawberry_orm.types import FieldDefinition
 
@@ -121,7 +122,7 @@ def _reads_as_is(value: Any) -> bool:
     if isinstance(value, StrawberryField):
         pending = getattr(value, "_orm_pending_connection", None)
         if pending is not None:
-            return pending._kwargs.get("scope") is None
+            return pending.scope is None and not pending._kwargs.get("extensions")
         return getattr(value, "_orm_reads_as_is", False) or _metadata_only_field(value)
     return True
 
