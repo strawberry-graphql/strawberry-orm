@@ -22,8 +22,10 @@ The seed: Alice wrote posts 1 and 2, Bob post 3, Charlie post 4.
 """
 
 import base64
+from typing import Any
 
 import strawberry
+from graphql import GraphQLInputObjectType, GraphQLObjectType, get_named_type
 from strawberry import relay
 
 from strawberry_orm.relay import ORMListConnection
@@ -247,7 +249,85 @@ def _entries(entry: str, count: int) -> str:
     return "[" + ", ".join([entry] * count) + "]"
 
 
+def _related_schema(orm, User, Post, Comment):
+    """Users and posts point at each other, and a comment at its parent comment."""
+
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        author: UserNode
+
+    class CommentNode(relay.Node):
+        id: relay.NodeID[int]
+        body: auto
+        post: PostNode
+
+    # Set here, as types local to a function cannot be named in a string.
+    UserNode.__annotations__["posts"] = list[PostNode]
+    CommentNode.__annotations__["parent"] = CommentNode | None
+    for model, node in ((User, UserNode), (Post, PostNode), (Comment, CommentNode)):
+        orm.type(model, order=orm.order(model), group=orm.group(model))(node)
+
+    @strawberry.type
+    class Query:
+        users: ORMListConnection[UserNode] = orm.connection.eager()
+        posts: ORMListConnection[PostNode] = orm.connection.eager()
+        comments: ORMListConnection[CommentNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
+def _input_cycle(start: Any) -> list[str] | None:
+    """Input types from *start* back to one already on the way, if there are any."""
+    path: list[str] = []
+    done: set[str] = set()
+
+    def visit(input_type: Any) -> list[str] | None:
+        if input_type.name in path:
+            return [*path[path.index(input_type.name) :], input_type.name]
+        if input_type.name in done:
+            return None
+        path.append(input_type.name)
+        for field in input_type.fields.values():
+            inner = get_named_type(field.type)
+            if isinstance(inner, GraphQLInputObjectType):
+                found = visit(inner)
+                if found:
+                    return found
+        done.add(path.pop())
+        return None
+
+    return visit(start)
+
+
 class AbstractTestOrderAndGroupByLimits:
+    def test_order_and_group_by_nest_no_deeper_than_the_schema(
+        self, orm_factory, User, Post, Comment
+    ):
+        """Unlike a filter's, their ``object:`` has no depth cap, and needs none.
+
+        Each offers only relations to models whose order or group-by type was
+        built before it, so a relation to its own model, or back to one that
+        leads to it, is never offered and the nesting ends where the schema
+        does.
+        """
+        schema = _related_schema(orm_factory(), User, Post, Comment)._schema
+        starts = {
+            get_named_type(argument.type)
+            for graphql_type in schema.type_map.values()
+            if isinstance(graphql_type, GraphQLObjectType)
+            for field in graphql_type.fields.values()
+            for name, argument in field.args.items()
+            if name in ("order", "groupBy")
+        }
+        assert {start.name for start in starts} >= {"CommentOrder", "CommentGroupBy"}
+        for start in starts:
+            assert _input_cycle(start) is None, _input_cycle(start)
+
     async def test_an_order_longer_than_the_default_cap_is_refused(
         self, orm_factory, User, Post, many_users, capture, run
     ):
