@@ -79,26 +79,47 @@ def extensions_include_row_scope(extensions: list[Any]) -> bool:
 
 
 def _without_rejected(
-    result: Any, candidates: list[Any], kept: list[Any]
+    result: Any, candidates: list[Any], kept: list[Any], info: Any = None
 ) -> tuple[Any, list[Any]]:
     """Remove *candidates* that ``scope_rows`` did not keep.
 
     A list is filtered in a copy of its own type, so a ``PreslicedRows``
     subclass, and the total it carries, survive. Not in place: the list is the
     app's, which may hand the same one to the next request, whose scope can
-    allow more. A single rejected instance becomes ``None``.
+    allow more. A single rejected instance becomes ``None``, and so does a
+    rejected row of a list whose positions answer the IDs asked for.
     """
     kept_ids = {id(row) for row in kept}
     dropped = {id(row) for row in candidates if id(row) not in kept_ids}
     if isinstance(result, list):
         if dropped:
             filtered = copy.copy(result)
-            filtered[:] = [row for row in result if id(row) not in dropped]
+            if info is not None and _answers_by_position(info):
+                filtered[:] = [None if id(row) in dropped else row for row in result]
+            else:
+                filtered[:] = [row for row in result if id(row) not in dropped]
             result = filtered
         return result, [row for row in result if id(row) in kept_ids]
     if dropped:
         return None, []
     return result, list(kept)
+
+
+def _answers_by_position(info: Any) -> bool:
+    """True for a relay ``node()`` field, which answers each ID in its place.
+
+    A row dropped from it would move the answers after it up, and set apart
+    an ID whose row is hidden from one with no row, which is answered ``null``.
+    """
+    from strawberry.relay.fields import NodeExtension
+
+    raw = graphql_resolve_info(info)
+    field = raw.parent_type.fields.get(raw.field_name)
+    definition = field.extensions.get("strawberry-definition") if field else None
+    return any(
+        isinstance(extension, NodeExtension)
+        for extension in getattr(definition, "extensions", ())
+    )
 
 
 def _returns_a_list(info: Any) -> bool:
@@ -152,7 +173,7 @@ def load_kept(
     some still gets its chance; a rejected row is never marked, so it is
     checked again wherever it turns up.
     """
-    filtered, to_load = _without_rejected(result, candidates, kept)
+    filtered, to_load = _without_rejected(result, candidates, kept, info)
     if not to_load:
         return filtered
     loaded = backend.load_relations(store, to_load, info)
@@ -529,9 +550,9 @@ class RowScopeExtension(SchemaExtension):
 
             async def _await_scoped() -> Any:
                 kept = await scoped
-                filtered, _to_load = _without_rejected(result, rows, kept)
+                filtered, _to_load = _without_rejected(result, rows, kept, info)
                 return filtered
 
             return _await_scoped()
-        filtered, _to_load = _without_rejected(result, rows, scoped)
+        filtered, _to_load = _without_rejected(result, rows, scoped, info)
         return filtered
