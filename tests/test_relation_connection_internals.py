@@ -83,6 +83,7 @@ def _info(path="users.posts"):
     return types.SimpleNamespace(
         path=node_path,
         field_name=parts[-1],
+        field_nodes=[],
         parent_type=types.SimpleNamespace(fields={parts[-1]: field}),
     )
 
@@ -123,10 +124,42 @@ class TestFetchGuards:
         with pytest.raises(_Bail):
             ext._fetch_pages(ext._backend, object(), [_Parent(None)], _info())
 
-    def test_no_page_size_means_nothing_to_window(self):
+    def test_last_without_first_is_not_windowed(self):
+        """Where the last page starts depends on each parent's own count."""
         ext = _extension(_Backend())
-        with pytest.raises(_Bail):
-            ext._fetch_pages(ext._backend, object(), [_Parent(1)], _info())
+        with pytest.raises(_Bail, match="last"):
+            ext._fetch_pages(
+                ext._backend, object(), [_Parent(1)], _info(), kwargs={"last": 2}
+            )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "default_query_limit", "limit"),
+        [
+            ({}, None, 100 + 1),
+            ({}, 5, 5 + 1),
+            ({"first": 10}, 5, 5 + 1),
+            ({"first": 3}, 5, 3 + 1),
+            ({"before": "YXJyYXljb25uZWN0aW9uOjEwMDAwMDA="}, 5, 5 + 1),
+        ],
+    )
+    def test_the_window_is_the_page_the_resolver_returns(
+        self, kwargs, default_query_limit, limit
+    ):
+        """No page size means one page, held to ``default_query_limit``."""
+        seen = {}
+
+        class _Recording(_Backend):
+            _default_query_limit = default_query_limit
+
+            def batch_group_items(self, *a, **kw):
+                seen["limit"] = kw["per_group_limit"]
+                return {}
+
+        backend = _Recording()
+        ext = _extension(backend)
+        spec = types.SimpleNamespace(key_field="author_id", related_model=object)
+        ext._fetch_pages(backend, spec, [_Parent(1)], _info(), kwargs=kwargs)
+        assert seen == {"limit": limit}
 
     async def test_an_awaitable_page_is_awaited_not_refused(self):
         """An async backend windows too; the reads are just awaited."""

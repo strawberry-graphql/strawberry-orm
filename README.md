@@ -197,6 +197,8 @@ class UserNode(relay.Node):
 
 `totalCount` is each parent's own total, counted separately rather than read off the page — the page was truncated, so counting it would report the page size.
 
+With no `first` the page is the one the connection would return anyway — `max_results`, or `default_query_limit` when that is smaller — so `{ users { posts { … } } }` is windowed the same way. `last` without `first` is not, because where each parent's last page starts depends on its own count, and neither is a connection that selects `aggregates` or `groups`, which are taken over each parent's whole relation; those are read one parent at a time, each page still cut in the database.
+
 This works on all three backends. Tortoise has no window expression of its own, so that backend wraps the query it built in SQL that does the numbering; the values you filtered on stay bound rather than pasted into the statement.
 
 What it does need is a column on the related rows tying them to a parent, so a many-to-many is refused when the type is defined — those rows keep the parent key in the association table, leaving the window nothing to partition by. The error points you at `orm.connection.lazy`, which is the honest spelling for one query per parent.

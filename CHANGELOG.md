@@ -64,6 +64,11 @@
 - **SQLAlchemy: a relation whose scope is more than a `.where()` on the related table's own columns** is read in a statement of its own, keyed by the parents' join column, rather than by a `selectinload`. Through an association table, one statement more reads the links. Such a scope on a relation that does not join on one column (a composite key, or a `primaryjoin` that says more than the key comparison) now raises a `ValueError` naming the relation, where it loaded rows the scope hides. Write that scope as a `.where()` on the related table's columns, or read the relation in a resolver of your own.
 - **SQLAlchemy: an ordered scope on a many-to-many relation keeps its order**, through an association table on one key column, for it is read the same way. This lifts the 0.29.0 limit for those relations.
 - **SQLAlchemy: a scope's `with_loader_criteria` applies to the whole statement the scope runs inside**, as it does to the statement the scope returns: every place its entity is read there. A relation's `scope=` that uses it on the model the outer statement reads, as on a relation from a model to itself, narrows the outer rows too.
+- **A relation connection without `first` is read in one query for every parent.** `{ users { posts { … } } }` sent one query per user; it is windowed at the page the connection returns, `max_results` or `default_query_limit` when that is smaller, as `first` was. `first` above `default_query_limit` no longer reads past it either.
+
+### Fixed
+
+- **A relation connection's `aggregates`, `groups` and `pageInfo { aggregates }` were lost when its page was windowed.** `posts(first: 10) { aggregates { count } }` answered `null` for every parent, and `pageInfo { aggregates }` raised. A connection that selects them is read one parent at a time, from the relation's own query.
 
 ## 0.30.0
 

@@ -826,6 +826,36 @@ class AbstractTestFilteringThroughAToManyRelation:
             "Charlie": (1, {"count": 1, "max": {"id": 4}}, [("True", 1)]),
         }
 
+    @pytest.mark.parametrize(
+        ("selection", "expected"),
+        [
+            ("aggregates { count }", {"aggregates": {"count": 2}}),
+            (
+                "groups { aggregates { count } }",
+                {"groups": [{"aggregates": {"count": 2}}]},
+            ),
+            (
+                "pageInfo { aggregates { count } }",
+                {"pageInfo": {"aggregates": {"count": 1}}},
+            ),
+        ],
+    )
+    async def test_aggregates_of_one_nested_page(
+        self, orm, models, run, selection, expected
+    ):
+        """Groups and aggregates count Alice's posts; the page's aggregates, its own."""
+        schema = _users_schema(orm, models)
+        result = await run(
+            schema,
+            "{ users(order: [{field: {id: ASC}}]) { edges { node { name "
+            "posts(first: 1, groupBy: [{field: {isPublished: true}}]) "
+            "{ edges { node { id } } " + selection + " } } } } }",
+        )
+        assert result.errors is None, result.errors
+        alice = result.data["users"]["edges"][0]["node"]["posts"]
+        assert alice.pop("edges") == [{"node": {"id": "UG9zdE5vZGU6MQ=="}}], alice
+        assert alice == expected, alice
+
 
 def _counted_schema(orm, models):
     Post = models.Post

@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from asyncio import ensure_future
 from inspect import isawaitable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from graphql import GraphQLList, GraphQLNonNull
@@ -438,20 +439,23 @@ def _strawberry_field(info: Any) -> Any:
     return gql_field.extensions.get("strawberry-definition")
 
 
-def _page_window(execution_context: Any, info: Any, kwargs: dict[str, Any]) -> Any:
+def _page_window(
+    backend: Backend, execution_context: Any, info: Any, kwargs: dict[str, Any]
+) -> Any:
     """The rows every parent's page needs, read off the field's own arguments.
 
     Strawberry's own arithmetic, with the field's ``max_results``, so a page
     size over the limit or a malformed cursor is refused here, before any row
-    is read; the field then runs plain and reports it as usual.
+    is read; the field then runs plain and reports it as usual. The page is
+    the one the connection returns: held to ``max_results`` and
+    ``default_query_limit``, and one page from the start when no size is given.
     """
     from strawberry.relay.fields import ConnectionExtension
     from strawberry.relay.utils import SliceMetadata
 
-    if kwargs.get("first") is None:
-        # No page size given, so there is nothing to window against and a
-        # plain batched read is already the whole answer.
-        raise _Bail("no page size, so there is nothing to window")
+    first, last = kwargs.get("first"), kwargs.get("last")
+    if first is None and last is not None:
+        raise _Bail("last without first starts at each parent's own row count")
     field = _strawberry_field(info)
     extension = next(
         (
@@ -466,21 +470,46 @@ def _page_window(execution_context: Any, info: Any, kwargs: dict[str, Any]) -> A
     max_results = extension.max_results
     if max_results is None:
         max_results = execution_context.schema.config.relay_max_results
+    limit = getattr(backend, "_default_query_limit", None)
+    size = max_results if limit is None else min(max_results, limit)
+    cursors = {
+        "before": kwargs.get("before"),
+        "after": kwargs.get("after"),
+        "max_results": max_results,
+        "prefix": extension.connection_type._edge_type().CURSOR_PREFIX,
+    }
     try:
+        SliceMetadata.from_arguments(info, first=first, last=last, **cursors)
         window = SliceMetadata.from_arguments(
             info,
-            before=kwargs.get("before"),
-            after=kwargs.get("after"),
-            first=kwargs["first"],
-            last=kwargs.get("last"),
-            max_results=max_results,
-            prefix=extension.connection_type._edge_type().CURSOR_PREFIX,
+            first=size if first is None else min(first, size),
+            last=None if last is None else min(last, size),
+            **cursors,
         )
     except (TypeError, ValueError) as exc:
         raise _Bail(str(exc)) from exc
     if window.start < 0 or window.end < 0:
         raise _Bail("a cursor before the first row")
     return window
+
+
+def _asks_of_the_whole_relation(info: Any) -> bool:
+    """Whether the field selects what a page of rows cannot answer.
+
+    Aggregates and groups are taken over each parent's whole relation, from
+    the query the field's resolver builds; a windowed page hands it rows.
+    """
+    from strawberry.types.nodes import convert_selections
+
+    from strawberry_orm.backends._base import _selection_requests
+
+    selected = SimpleNamespace(
+        selected_fields=convert_selections(info, info.field_nodes)
+    )
+    return any(
+        _selection_requests(selected, *path)
+        for path in (("aggregates",), ("groups",), ("pageInfo", "aggregates"))
+    )
 
 
 def _connection_inputs(
@@ -681,7 +710,9 @@ class RelationConnectionExtension(SchemaExtension):
             raise _Bail("a parent has no key to group its rows by")
 
         execution_context = getattr(self, "execution_context", None)
-        window = _page_window(execution_context, info, kwargs or {})
+        window = _page_window(backend, execution_context, info, kwargs or {})
+        if _asks_of_the_whole_relation(info):
+            raise _Bail("aggregates and groups are of the whole relation")
         # Relay slices each page itself, so it is handed the page at its
         # positions plus the row that says whether another page exists. A
         # cursor can name any position; none past the last one is sent.

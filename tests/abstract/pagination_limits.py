@@ -60,6 +60,45 @@ def _schema(orm, User, Post, *, max_results=None):
     return orm.schema(query=Query)
 
 
+def _nested_schema(orm, User, Post, *, max_results=None):
+    @orm.type(Post)
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+
+    @orm.type(User)
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        posts: ORMListConnection[PostNode] = orm.connection.eager(
+            max_results=max_results
+        )
+
+    @strawberry.type
+    class Query:
+        user_list: list[UserNode] = orm.field.eager()
+
+    return orm.schema(query=Query)
+
+
+def _nested_posts(arguments: str) -> str:
+    return (
+        "{ userList { name posts%s { edges { node { title } } "
+        "pageInfo { hasNextPage } } } }" % (f"({arguments})" if arguments else "")
+    )
+
+
+def _post_pages(result) -> dict[str, tuple[list[str], bool]]:
+    assert result.errors is None, result.errors
+    return {
+        user["name"]: (
+            [edge["node"]["title"] for edge in user["posts"]["edges"]],
+            user["posts"]["pageInfo"]["hasNextPage"],
+        )
+        for user in result.data["userList"]
+    }
+
+
 def _page(arguments: str) -> str:
     return (
         "{ users%s { totalCount edges { node { name } } "
@@ -169,6 +208,20 @@ class AbstractTestPaginationLimits:
         assert _names(result) == many_users[:5], _names(result)
         assert _flags(result) == (False, True), _flags(result)
         assert seen.loaded <= 6, seen.loaded
+
+    async def test_a_nested_connection_without_page_arguments_reads_one_page(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        """Each parent's page is cut in the database, as ``first`` would cut it."""
+        schema = _nested_schema(orm_factory(), User, Post, max_results=1)
+        with capture() as seen:
+            result = await run(schema, _nested_posts(""))
+        with capture() as asked:
+            expected = await run(schema, _nested_posts("first: 1"))
+        pages = _post_pages(result)
+        assert pages == _post_pages(expected), pages
+        assert pages["Alice"][1] is True, pages
+        assert seen.statements == asked.statements, seen.statements
 
     async def test_last_zero_is_an_empty_page_at_the_end(
         self, orm_factory, User, Post, many_users, capture, run
@@ -457,6 +510,20 @@ class AbstractTestDefaultQueryLimit:
         result = await run(schema, _page(""))
         assert _names(result) == many_users[:5], _names(result)
         assert _flags(result) == (False, True), _flags(result)
+
+    async def test_it_is_a_nested_page_when_none_is_asked_for(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        """The limit also holds the parents, so two of them share the window."""
+        schema = _nested_schema(orm_factory(default_query_limit=2), User, Post)
+        with capture() as seen:
+            result = await run(schema, _nested_posts(""))
+        with capture() as asked:
+            expected = await run(schema, _nested_posts("first: 2"))
+        pages = _post_pages(result)
+        assert pages == _post_pages(expected), pages
+        assert list(pages) == ["Alice", "Bob"], pages
+        assert seen.statements == asked.statements, seen.statements
 
     async def test_it_cuts_a_root_list_after_its_filter_and_order(
         self, orm_factory, User, Post, many_users, run
