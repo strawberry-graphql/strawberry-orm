@@ -200,6 +200,43 @@ def test_a_subclass_type_without_a_scope_takes_its_bases(session):
     assert run(schema, session, "{ invoice(id: 6) { title } }") == {"invoice": None}
 
 
+@pytest.mark.parametrize("contract_first", [False, True])
+def test_a_row_under_an_interface_takes_the_type_of_its_nearest_class(
+    session, contract_first
+):
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+
+    @strawberry.interface
+    class Titled:
+        title: str
+
+    @orm.type(Document)
+    class DocumentType(Titled):
+        id: auto
+
+    @orm.type(Contract)
+    class ContractType(Titled):
+        id: auto
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def titled(self, info: strawberry.Info, id: int) -> Titled:
+            return info.context["session"].get(Document, id)
+
+    types = (
+        [ContractType, DocumentType] if contract_first else [DocumentType, ContractType]
+    )
+    schema = orm.schema(query=Query, types=types)
+    query = "query ($id: Int!) { titled(id: $id) { __typename title } }"
+    for id, typename in ((1, "DocumentType"), (3, "ContractType")):
+        result = schema.execute_sync(
+            query, variable_values={"id": id}, context_value={"session": session}
+        )
+        assert result.errors is None, result.errors
+        assert result.data["titled"]["__typename"] == typename, id
+
+
 def public_notes(stmt, info):
     return stmt.where(Note.is_private.is_(False))
 

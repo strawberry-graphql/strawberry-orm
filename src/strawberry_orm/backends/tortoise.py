@@ -34,6 +34,7 @@ from ._base import (
     extract_element_type,
     hint_hops,
     invoke_custom_callback,
+    model_is_type_of,
     past_a_hop,
     requested_aggregates,
 )
@@ -337,12 +338,7 @@ class TortoiseBackend(BaseBackend):
 
         def decorator(cls: type) -> Any:
             if "is_type_of" not in cls.__dict__:
-
-                @classmethod
-                def is_type_of(inner_cls: type, obj: object, info: Any) -> bool:
-                    return isinstance(obj, model)
-
-                cls.is_type_of = is_type_of  # type: ignore[method-assign]
+                cls.is_type_of = model_is_type_of(model)  # type: ignore[method-assign]
 
             fields_meta = self._introspect_model(model)
             col_types: dict[str, type] = {}

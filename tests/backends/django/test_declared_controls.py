@@ -27,6 +27,11 @@ def narrow():
 
 
 @pytest.fixture
+def first():
+    return lambda model: model.objects.order_by("id").afirst()
+
+
+@pytest.fixture
 def run(seed):
     async def _run(schema, query, variables=None):
         return await schema.execute(query, variable_values=variables, context_value={})

@@ -11,10 +11,13 @@ Backends supply:
 ``models``                          ``User``, ``Post``
 ``narrow.only(query, model, f, v)`` *query* keeping the rows whose *f* is *v*
 ``run(schema, query, variables)``   awaitable result of running *query*
+``first(model)``                    the first row of *model*, or an awaitable of it
 
 The seed: Alice wrote "Hello World" and "GraphQL Guide", Bob the unpublished
 "Draft Post", Charlie "Rust Adventures".
 """
+
+import inspect
 
 import pytest
 import strawberry
@@ -135,6 +138,46 @@ def _inherited_guard_schema(orm, models):
     return orm.schema(query=Query)
 
 
+def _then(value, then):
+    if inspect.isawaitable(value):
+
+        async def later():
+            return then(await value)
+
+        return later()
+    return then(value)
+
+
+def _two_user_types_schema(orm, models, first, *, types: str, cast=False):
+    User = models.User
+
+    @orm.type(User, name="PublicUser", exclude=["email"])
+    class PublicUser(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    @orm.type(User, name="StaffUser")
+    class StaffUser(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        email: auto
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def someone(self) -> relay.Node:
+            row = first(User)
+            return _then(
+                row, lambda row: strawberry.cast(PublicUser, row) if cast else row
+            )
+
+    declared = {"Staff": StaffUser, "Public": PublicUser}
+    return orm.schema(query=Query, types=[declared[name] for name in types.split()])
+
+
+SOMEONE = "{ someone { __typename ... on StaffUser { email } } }"
+
+
 def _assert_refused(result, name: str) -> None:
     assert result.data is None, result.data
     assert result.errors is not None
@@ -213,6 +256,38 @@ class AbstractTestDeclaredControls:
         schema = _inherited_guard_schema(orm, models)
         result = await run(schema, "{ users" + arguments + " { totalCount } }")
         _assert_refused(result, "email")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("types", ["Staff Public", "Public Staff"])
+    async def test_a_row_two_types_read_is_not_given_either(
+        self, orm, models, first, run, types
+    ):
+        schema = _two_user_types_schema(orm, models, first, types=types)
+        result = await run(schema, SOMEONE)
+        assert result.data is None, result.data
+        assert result.errors is not None
+        message = result.errors[0].message
+        assert "PublicUser" in message and "StaffUser" in message, message
+        assert "strawberry.cast" in message, message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("types", ["Staff Public", "Public Staff"])
+    async def test_a_cast_row_takes_the_type_it_was_cast_to(
+        self, orm, models, first, run, types
+    ):
+        schema = _two_user_types_schema(orm, models, first, types=types, cast=True)
+        result = await run(schema, SOMEONE)
+        assert result.errors is None, result.errors
+        assert result.data == {"someone": {"__typename": "PublicUser"}}
+
+    @pytest.mark.asyncio
+    async def test_a_row_one_type_in_the_schema_reads_is_given_it(
+        self, orm, models, first, run
+    ):
+        schema = _two_user_types_schema(orm, models, first, types="Public")
+        result = await run(schema, "{ someone { __typename } }")
+        assert result.errors is None, result.errors
+        assert result.data == {"someone": {"__typename": "PublicUser"}}
 
     @pytest.mark.parametrize("declare", [strawberry.type, strawberry.interface])
     def test_excluding_a_field_a_base_type_declares_is_refused(

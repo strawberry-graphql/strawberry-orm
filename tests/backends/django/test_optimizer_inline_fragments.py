@@ -76,10 +76,18 @@ class TestOptimizerInlineFragments(AbstractTestOptimizerInlineFragmentsSync):
             id: auto
             title: auto
 
+            @classmethod
+            def is_type_of(cls, obj, info):
+                return isinstance(obj, Post) and not obj.is_published
+
         @orm.type(Post, name="PostFullUnion")
         class PostFullUnion:
             id: auto
             title: auto
+
+            @classmethod
+            def is_type_of(cls, obj, info):
+                return isinstance(obj, Post) and obj.is_published
 
         PostUnion = Annotated[
             PostBriefUnion | PostFullUnion, strawberry.union("PostUnion")

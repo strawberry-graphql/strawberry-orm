@@ -18,8 +18,11 @@ from decimal import Decimal
 from difflib import get_close_matches
 from types import MappingProxyType
 from typing import Any, Literal
+from weakref import WeakKeyDictionary
 
 import strawberry
+from graphql import get_named_type, is_abstract_type
+from strawberry.types.cast import get_strawberry_type_cast
 from strawberry.types.field import StrawberryField
 
 from strawberry_orm.filters import (
@@ -74,6 +77,55 @@ def past_a_hop() -> Iterator[None]:
         yield
     finally:
         _filter_rows_type.reset(token)
+
+
+#: Per interface or union, the types that take each row class returned raw.
+_ROW_TYPES: WeakKeyDictionary[Any, dict[type, list[type]]] = WeakKeyDictionary()
+
+
+def model_is_type_of(model: type) -> Any:
+    """The ``is_type_of`` of a type over *model*: is the value one of its rows.
+
+    Under an interface or union, graphql-core gives a row returned as it is
+    the first possible type that takes it. Of two types over one model, which
+    is first is an accident of declaration, and the other can show columns
+    the first excludes. So there the type over the row's nearest model class
+    takes it, and when more than one does the row is refused: the resolver
+    has to ``strawberry.cast`` it.
+    """
+
+    def is_type_of(cls: type, obj: object, info: Any) -> bool:
+        if not isinstance(obj, model):
+            return False
+        abstract = get_named_type(info.return_type)
+        if not is_abstract_type(abstract) or get_strawberry_type_cast(obj):
+            return True
+        return cls in _row_types(info, abstract, type(obj))
+
+    is_type_of.orm_model = model  # type: ignore[attr-defined]
+    return classmethod(is_type_of)
+
+
+def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
+    known = _ROW_TYPES.setdefault(abstract, {})
+    if row_class not in known:
+        ranked = []
+        for graphql_type in info.schema.get_possible_types(abstract):
+            origin = graphql_type.extensions["strawberry-definition"].origin
+            model = getattr(getattr(origin, "is_type_of", None), "orm_model", None)
+            if model in row_class.__mro__:
+                ranked.append((row_class.__mro__.index(model), origin))
+        nearest = min((rank for rank, _ in ranked), default=None)
+        known[row_class] = [origin for rank, origin in ranked if rank == nearest]
+    types = known[row_class]
+    if len(types) > 1:
+        names = " and ".join(sorted(t.__strawberry_definition__.name for t in types))
+        raise TypeError(
+            f"{info.parent_type.name}.{info.field_name} returned a "
+            f"{row_class.__name__} row, which {names} each read. Return "
+            "strawberry.cast(TheType, row) to say which type it is."
+        )
+    return types
 
 
 _SENSITIVE_PATTERNS = re.compile(

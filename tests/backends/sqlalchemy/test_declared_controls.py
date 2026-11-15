@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from strawberry_orm import StrawberryORM
 from tests.abstract.declared_controls import AbstractTestDeclaredControls
@@ -28,6 +29,11 @@ def narrow():
             getattr(model, field) == value
         ),
     )
+
+
+@pytest.fixture
+def first(sa_session):
+    return lambda model: sa_session.scalars(select(model).order_by(model.id)).first()
 
 
 @pytest.fixture

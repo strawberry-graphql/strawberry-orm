@@ -28,6 +28,11 @@ def narrow():
     )
 
 
+@pytest.fixture
+def first():
+    return lambda model: model.all().order_by("id").first()
+
+
 @pytest_asyncio.fixture
 async def run(seed):
     async def _run(schema, query, variables=None):

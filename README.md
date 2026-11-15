@@ -2046,6 +2046,8 @@ class UserNode(relay.Node):
     email: auto
 ```
 
+A field typed as an interface, `relay.Node` say, or a union can return model rows as they are: each row takes the type over its model, or over its nearest class for a model subclass. When the schema has two types over the row's model, a `PublicUser` and a `StaffUser` over `User`, the row is refused rather than given either, since one can show columns the other excludes. Return `strawberry.cast(PublicUser, row)` to choose, or give the types an `is_type_of` of their own. `node(id:)` and `nodes(ids:)` already give each row the type its ID names.
+
 ### Connection fields
 
 Use `orm.connection.eager()` with `ORMListConnection` to create paginated connection fields. Filters and ordering from the node type are automatically wired in:
