@@ -31,7 +31,6 @@ from ._base import (
     BaseBackend,
     extract_element_type,
     hint_hops,
-    input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
 )
@@ -531,118 +530,12 @@ class TortoiseBackend(BaseBackend):
     ) -> None:
         from tortoise.transactions import in_transaction
 
-        from strawberry_orm.upserts import has_upsert
+        from strawberry_orm.upserts import run_async
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
-        if not any(has_upsert(ref) for ref in refs):
-            await self._apply_ref_items(instance, field, refs, info, authorize, writer)
-            return
+        spec = self._upsert_relation_spec(type(instance), field)
         async with in_transaction(type(instance)._meta.default_connection):
-            await self._apply_ref_items(instance, field, refs, info, authorize, writer)
-
-    async def _apply_ref_items(
-        self,
-        instance: Any,
-        field: str,
-        refs: list[Any],
-        info: Any,
-        authorize: Any | None,
-        writer: Any,
-    ) -> None:
-        from strawberry_orm.repo import _check_auth
-        from strawberry_orm.upserts import has_upsert, run_async
-
-        manager = getattr(instance, field)
-        rel_model = manager.remote_model
-        repo = self.get_repo(rel_model) if not authorize else None
-
-        to_add: list[Any] = []
-        to_unlink_ids: list[Any] = []
-        to_delete_ids: list[Any] = []
-
-        for ref in refs:
-            ref_create = getattr(ref, "create", strawberry.UNSET)
-            ref_update = getattr(ref, "update", strawberry.UNSET)
-            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
-            ref_delete = getattr(ref, "delete", strawberry.UNSET)
-
-            if has_upsert(ref):
-                spec = self._upsert_relation_spec(type(instance), field)
-                await run_async(writer.apply_ref_upsert(instance, spec, ref, link=True))
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                if authorize and not authorize("create", rel_model, None, info):
-                    continue
-                data = input_to_dict(ref_create)
-                if repo is not None:
-                    data = repo.on_before_create(data, info)
-                _check_auth(repo, "can_create", data, info)
-                if repo is not None:
-                    obj = await repo._create_async(rel_model, data, info)
-                else:
-                    obj = await rel_model.create(**data)
-                if repo is not None:
-                    repo.on_after_create(obj, info)
-                to_add.append(obj)
-            elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = input_to_dict(ref_update)
-                pk = data.pop("id")
-                if authorize and not authorize("update", rel_model, pk, info):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(rel_model, pk, info)
-                else:
-                    obj = await rel_model.filter(pk=pk).first()
-                if obj is not None:
-                    if repo is not None:
-                        data = repo.on_before_update(obj, data, info)
-                    _check_auth(repo, "can_update", obj, data, info)
-                    _check_auth(repo, "can_link", instance, field, obj, info)
-                    if data:
-                        if repo is not None:
-                            for k, v in data.items():
-                                setattr(obj, k, v)
-                            await repo._save_async(obj, info)
-                            repo.on_after_update(obj, info)
-                        else:
-                            await rel_model.filter(pk=pk).update(**data)
-                            obj = await rel_model.get(pk=pk)
-                    to_add.append(obj)
-            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                if authorize and not authorize(
-                    "unlink", rel_model, ref_unlink.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(rel_model, ref_unlink.id, info)
-                else:
-                    obj = await rel_model.filter(pk=ref_unlink.id).first()
-                if obj is not None:
-                    _check_auth(repo, "can_unlink", instance, field, obj, info)
-                    to_unlink_ids.append(ref_unlink.id)
-            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                if authorize and not authorize(
-                    "delete", rel_model, ref_delete.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(rel_model, ref_delete.id, info)
-                else:
-                    obj = await rel_model.filter(pk=ref_delete.id).first()
-                if obj is not None:
-                    _check_auth(repo, "can_delete", obj, info)
-                    if repo is not None:
-                        repo.on_before_delete(obj, info)
-                    to_delete_ids.append(ref_delete.id)
-
-        if to_add:
-            await manager.add(*to_add)
-        if to_unlink_ids:
-            to_remove = await rel_model.filter(pk__in=to_unlink_ids)
-            await manager.remove(*to_remove)
-        if to_delete_ids:
-            to_remove = await rel_model.filter(pk__in=to_delete_ids)
-            await manager.remove(*to_remove)
-            await rel_model.filter(pk__in=to_delete_ids).delete()
+            await run_async(writer.apply_refs(instance, spec, refs))
 
     # -- Upserts -------------------------------------------------------------
 
@@ -1311,6 +1204,14 @@ class _TortoiseUpsertOps:
         if spec.relation_mode == "reverse_fk":
             return self._is_child(parent, spec, child)
         return getattr(parent, spec.name).filter(pk=child.pk).exists()
+
+    def previous_parent(self, parent: Any, spec: Any, child: Any) -> Any:
+        """The other row whose reverse foreign key relation holds *child*, if any."""
+        if spec.relation_mode != "reverse_fk" or self._is_child(parent, spec, child):
+            return None
+        if getattr(child, self._foreign_key(spec).source_field) is None:
+            return None
+        return getattr(child, spec.remote_attr)
 
     def back_reference(
         self, parent_model: type, spec: Any

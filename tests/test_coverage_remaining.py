@@ -1778,6 +1778,8 @@ class TestPushTo98:
         backend = SQLAlchemyBackend(dialect="sqlite")
         backend._repos = {SATag: TagRepo}
         post = sa_session.get(SAPost, 1)
+        post.tags.append(sa_session.get(SATag, 3))
+        sa_session.flush()
         info = SimpleNamespace(context={"session": sa_session})
 
         @strawberry.input

@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import inspect
+import warnings
 from typing import Any, Generic, TypeVar, get_args
 
 try:
@@ -60,6 +61,10 @@ class AbstractRepo(Generic[M]):
         self._backend = backend
 
     # -- Authorization hooks (return True to allow, False to deny) -----------
+    #
+    # A hook may be ``async`` where the write is: on an async SQLAlchemy
+    # session and on Tortoise. A sync write refuses an awaitable with
+    # ``TypeError`` rather than treat the coroutine as a truthy "allow".
 
     def can_create(self, data: dict[str, Any], info: Any) -> bool:
         """Called before creating a new instance."""
@@ -320,9 +325,49 @@ def _check_auth(
     """Call an authorization method on a repo and raise on denial."""
     if repo is None:
         return
-    method = getattr(repo, method_name)
-    if not method(*args):
-        raise PermissionError(f"AbstractRepo.{method_name} denied the operation")
+    check = f"AbstractRepo.{method_name}"
+    _require(_sync_result(getattr(repo, method_name)(*args), check), check)
+
+
+def _sync_result(result: Any, check: str) -> Any:
+    """*result*, refused if a sync write got an awaitable it cannot wait for.
+
+    An un-awaited coroutine is truthy, so letting it through would allow
+    whatever its ``return False`` was written to deny.
+    """
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError(
+            f"{check} returned an awaitable during a sync write; make it synchronous"
+        )
+    return result
+
+
+def _allows(result: Any, check: str) -> bool:
+    """Whether a permission check's *result* allows the operation.
+
+    ``True`` allows; ``False`` and ``None`` deny. Any other truthy value still
+    allows, with a ``DeprecationWarning``, so a hook that returns a row or a
+    count keeps working until it is changed to return a bool.
+    """
+    if result is True:
+        return True
+    if not result:
+        return False
+    warnings.warn(
+        f"{check} returned {type(result).__name__}, not a bool. Return True to "
+        f"allow the operation; a later release will treat anything else as a "
+        f"denial.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return True
+
+
+def _require(result: Any, check: str) -> None:
+    if not _allows(result, check):
+        raise PermissionError(f"{check} denied the operation")
 
 
 def _get_sa_pk_column(model: type) -> Any:

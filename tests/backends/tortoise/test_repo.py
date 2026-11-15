@@ -278,7 +278,7 @@ class TestRefListRepo:
         tag = await TortTag.get(pk=1)
         assert tag.name == "python", "Scoped-out tag should not have been updated"
 
-    async def test_authorize_callback_takes_precedence(self, tortoise_db):
+    async def test_authorize_does_not_override_the_repo(self, tortoise_db):
         data = await _seed()
 
         orm = StrawberryORM.for_tortoise(repos={TortTag: DenyAllTagRepo})
@@ -291,16 +291,17 @@ class TestRefListRepo:
         ref_type = orm.ref(TortTag, create=TortCreateTag2)
         ref = ref_type(create=TortCreateTag2(name="allowed"))
 
-        await orm.apply_ref_list(
-            data["post"],
-            "tags",
-            [ref],
-            info,
-            authorize=lambda action, model, pk, info: True,
-        )
+        with pytest.raises(PermissionError, match="can_create"):
+            await orm.apply_ref_list(
+                data["post"],
+                "tags",
+                [ref],
+                info,
+                authorize=lambda action, model, pk, info: True,
+            )
         tags = await data["post"].tags.all()
         new_tags = [t.name for t in tags]
-        assert "allowed" in new_tags
+        assert "allowed" not in new_tags
 
     async def test_per_model_isolation(self, tortoise_db):
         """A repo for TortTag should not affect TortUser operations."""

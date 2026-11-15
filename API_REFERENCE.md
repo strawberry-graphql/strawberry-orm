@@ -359,8 +359,8 @@ Catch-all Relay node mutation *inputs* with recursive nested refs; you write the
 | Key | Value |
 | --- | --- |
 | `create`, `update` | `True` or a list of field names |
-| `unlink`, `delete` | `True` (to-many relations only) |
-| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only) |
+| `unlink`, `delete` | `True` (to-many relations only); absent unless set |
+| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only); a replaced row is only disconnected unless `"DELETE"` is listed |
 | `upsert.where` | a list of field names to match on, or `True` for caller-chosen optional fields |
 | `upsert.onMatch` | `"UPDATE"` (default; requires `update` when set), `"IGNORE"` or `"APPEND"` |
 | `upsert.onMatchLinks` | `"ERROR"` (default) or `"IGNORE"`; only with `onMatch: "APPEND"` |
@@ -368,7 +368,7 @@ Catch-all Relay node mutation *inputs* with recursive nested refs; you write the
 | `maxVisits` | positive integer: how many times the model may appear on one nesting path |
 | `name` | a name for the projection's generated types, which also lets it recurse |
 
-Contradictory keys raise `ValueError` when the input is built. See [What a match does](README.md#what-a-match-does-onmatch-and-immutable).
+Contradictory keys raise `ValueError` when the input is built, as does naming a column that the model's `@orm.type` excludes; generated inputs leave such columns out. See [What a match does](README.md#what-a-match-does-onmatch-and-immutable).
 
 ```python
 orm.apply_upsert(input, info, *, authorize=None) -> instance
@@ -387,8 +387,8 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | `can_create` | `(data, info) -> bool` |
 | `can_update` | `(instance, data, info) -> bool` |
 | `can_delete` | `(instance, info) -> bool` |
-| `can_link` | `(parent, field, instance, info) -> bool` |
-| `can_unlink` | `(parent, field, instance, info) -> bool` |
+| `can_link` | `(parent, field, instance, info) -> bool`; also when a single link is pointed at an existing row |
+| `can_unlink` | `(parent, field, instance, info) -> bool`; also for the row a re-pointed link replaces, and for the old parent of a row moved into another's list |
 | `can_upsert` | `(instance, info) -> bool`, for a row an upsert matched |
 | `find_for_upsert` | `(model, query, info) -> instance \| None`; may be `async` on an async session |
 | `find_for_upsert_async` | `async (model, query, info) -> instance \| None` |
@@ -399,7 +399,9 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | `on_after_update` | `(instance, info) -> None` |
 | `on_before_delete` | `(instance, info) -> None` |
 
-`MutationPolicy` is the deprecated predecessor.
+A `can_*` hook allows with `True` and denies with `False` or `None`. Any other truthy value still allows but emits a `DeprecationWarning`. On an async SQLAlchemy session and on Tortoise a `can_*` hook may be `async`; a sync write that gets an awaitable raises `TypeError` instead of allowing. An `authorize=` callback on `apply_ref_list` or `apply_upsert` is checked in addition to these hooks, and follows the same rules.
+
+`MutationPolicy` is the deprecated predecessor. Pass `policy=` or `repos=`, not both; together they raise `ValueError`.
 
 ---
 
@@ -419,7 +421,7 @@ orm.apply_ordering(query, order_input, model, info=None) -> query
 orm.apply_ref_list(instance, field, refs, info, *, authorize=None)
 ```
 
-`apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input, honouring the model's repo. Items carrying an `upsert` arm built by `orm.mutations` are validated and applied like [`apply_upsert`](#mutations), in the same unit of work as the rest of the list.
+`apply_filters` and `apply_ordering` apply a generated input to a query by hand, for resolvers that build their own. `apply_ref_list` writes a related list from `orm.ref` input as one unit of work, the same as `apply_upsert`, honouring the model's repo whether or not `authorize` is passed. `unlink` and `delete` must name rows already in the relation, or `UpsertNotFoundError` is raised. Items carrying an `upsert` arm built by `orm.mutations` are validated and applied like [`apply_upsert`](#mutations).
 
 ---
 

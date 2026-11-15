@@ -1,13 +1,14 @@
-"""Apply generated upsert inputs: find-or-create, governed by each projection.
+"""Apply generated upsert inputs and ref lists, governed by each projection.
 
-``orm.apply_upsert()`` and the ``upsert`` arm of ``orm.apply_ref_list()`` run
-here. The walk reads the policy the generated input types carry
+``orm.apply_upsert()`` and every item of ``orm.apply_ref_list()`` run here.
+The walk reads the policy the generated input types carry
 (``__upsert_policy__`` and ``__relation_policy__``), so a payload built in
 Python is held to the same rules as one the schema validated.
 
 Every payload is validated in full before the first write. The walk itself is
-a generator: each backend call returns a value or an awaitable and is yielded
-to a driver, so one walk serves both sync and async sessions.
+a generator: each backend call, repo hook and ``authorize`` call returns a
+value or an awaitable and is yielded to a driver, so one walk serves both
+sync and async sessions.
 """
 
 from __future__ import annotations
@@ -21,9 +22,11 @@ from typing import Any
 import strawberry
 from strawberry.relay import GlobalID
 
-from strawberry_orm.repo import AbstractRepo, _check_auth
+from strawberry_orm.backends._base import input_to_dict
+from strawberry_orm.repo import AbstractRepo, _allows, _require
 
 _OPERATIONS = ("create", "update", "upsert", "unlink", "delete")
+_PLAIN_OPERATIONS = ("create", "update", "unlink", "delete")
 
 Steps = Generator[Any, Any, Any]
 
@@ -47,8 +50,8 @@ def run_sync(steps: Steps) -> Any:
                     effect.close()
                 steps.close()
                 raise TypeError(
-                    "A repo hook returned an awaitable during a write on a sync "
-                    "session; make it synchronous"
+                    "A repo hook or authorize callback returned an awaitable "
+                    "during a write on a sync session; make it synchronous"
                 )
             value = effect
     except StopIteration as stop:
@@ -132,6 +135,22 @@ def _selected_operation(payload: Any, cls: type) -> tuple[str, Any]:
     return operation, getattr(payload, operation)
 
 
+def _plain_operation(ref: Any) -> tuple[str, Any]:
+    """The one operation a hand-built ``orm.ref()`` item selects."""
+    sent = [
+        (op, getattr(ref, op))
+        for op in _PLAIN_OPERATIONS
+        if _is_set(getattr(ref, op, strawberry.UNSET))
+    ]
+    if len(sent) != 1:
+        raise UpsertValidationError(
+            f"{type(ref).__name__} takes exactly one of "
+            f"{', '.join(_PLAIN_OPERATIONS)}; got "
+            f"{', '.join(op for op, _value in sent) or 'none'}"
+        )
+    return sent[0]
+
+
 def has_upsert(ref: Any) -> bool:
     """Whether *ref* selects the ``upsert`` operation."""
     return _is_set(getattr(ref, "upsert", strawberry.UNSET))
@@ -169,7 +188,7 @@ class UpsertWriter:
         return instance
 
     def validate_refs(self, parent_model: type, spec: Any, refs: list[Any]) -> None:
-        """Check generated list items before ``apply_ref_list`` writes anything."""
+        """Check every list item before ``apply_ref_list`` writes anything."""
         parent = _Parent(parent_model, spec)
         for ref in refs:
             ref_cls = type(ref)
@@ -183,26 +202,26 @@ class UpsertWriter:
                         f"orm.mutations; got {upsert_cls.__name__}"
                     )
                 self._validate_upsert(ref.upsert, upsert_cls, (parent_model,), parent)
+            elif _plain_operation(ref)[0] == "unlink":
+                self._validate_unlink(spec.related_model, parent)
 
-    def apply_ref_upsert(
-        self, parent_instance: Any, spec: Any, ref: Any, *, link: bool = False
-    ) -> Steps:
-        """Resolve the upsert arm of an ``apply_ref_list`` item.
+    def apply_refs(self, parent_instance: Any, spec: Any, refs: list[Any]) -> Steps:
+        """Apply validated ``apply_ref_list`` items to *parent_instance*, in order.
 
-        With *link*, the row is also linked to *parent_instance*; otherwise the
-        caller links it.
+        A plain item that ``authorize`` denies is skipped, and so is an update
+        of a row the repo cannot see; every other refusal raises.
         """
         parent = _Parent(type(parent_instance), spec, parent_instance)
-        instance, matched = yield from self._upsert(
-            ref.upsert, type(ref.upsert), parent
-        )
-        if matched:
-            self._check_repo(
-                type(instance), "can_link", parent_instance, spec.name, instance
-            )
-        if link:
-            yield self._ops.link(parent_instance, spec, instance)
-        return instance
+        for ref in refs:
+            if has_upsert(ref):
+                child, matched = yield from self._upsert(
+                    ref.upsert, type(ref.upsert), parent
+                )
+                if matched:
+                    yield from self._check_link(parent, child)
+                yield self._ops.link(parent_instance, spec, child)
+            else:
+                yield from self._apply_plain_ref(parent, *_plain_operation(ref))
 
     # -- Validation (no I/O) ---------------------------------------------------
 
@@ -243,9 +262,20 @@ class UpsertWriter:
         create = getattr(payload, "create", strawberry.UNSET)
         if _is_set(create):
             _expect(create, fields["create"])
+            creatable = fields["create"].__dataclass_fields__
             for name, value in where.items():
+                if name == "id":
+                    continue
+                # A miss seeds the new row from where, so a field create does
+                # not offer would be written past its allowlist.
+                if name not in creatable:
+                    raise UpsertValidationError(
+                        f"{_type_name(cls)}: where.{name} cannot be sent with "
+                        f"create, because a new {model.__name__} would be "
+                        f"written with it and create does not allow {name}"
+                    )
                 sent = getattr(create, name, strawberry.UNSET)
-                if name != "id" and sent is not strawberry.UNSET and sent != value:
+                if sent is not strawberry.UNSET and sent != value:
                     raise UpsertValidationError(
                         f"{_type_name(cls)}: where.{name} and create.{name} differ"
                     )
@@ -317,17 +347,16 @@ class UpsertWriter:
             self._validate_model_input(value, fields[operation], child_path, parent)
         else:
             self._pk(value.id, model)
-            if (
-                operation == "unlink"
-                and parent is not None
-                and parent.spec.relation_mode == "reverse_fk"
-                and not parent.spec.nullable
-            ):
-                raise UpsertValidationError(
-                    f"{model.__name__} cannot be unlinked from "
-                    f"{parent.model.__name__}.{parent.spec.name}: its foreign key "
-                    f"is not nullable"
-                )
+            if operation == "unlink" and parent is not None:
+                self._validate_unlink(model, parent)
+
+    def _validate_unlink(self, model: type, parent: _Parent) -> None:
+        if parent.spec.relation_mode == "reverse_fk" and not parent.spec.nullable:
+            raise UpsertValidationError(
+                f"{model.__name__} cannot be unlinked from "
+                f"{parent.model.__name__}.{parent.spec.name}: its foreign key "
+                f"is not nullable"
+            )
 
     def _where_values(self, payload: Any, cls: type) -> dict[str, Any]:
         where_cls = _declared_fields(cls)["where"]
@@ -380,13 +409,18 @@ class UpsertWriter:
             self._repos[model] = repo
         return self._repos[model]
 
-    def _check_repo(self, model: type, method: str, *args: Any) -> None:
-        _check_auth(self._repo(model), method, *args, self._info)
+    def _check_repo(self, model: type, method: str, *args: Any) -> Steps:
+        allowed = yield getattr(self._repo(model), method)(*args, self._info)
+        _require(allowed, f"AbstractRepo.{method}")
 
-    def _check_authorize(self, action: str, model: type, pk: Any) -> None:
-        if self._authorize is not None and not self._authorize(
-            action, model, pk, self._info
-        ):
+    def _authorized(self, action: str, model: type, pk: Any) -> Steps:
+        if self._authorize is None:
+            return True
+        allowed = yield self._authorize(action, model, pk, self._info)
+        return _allows(allowed, "authorize")
+
+    def _check_authorize(self, action: str, model: type, pk: Any) -> Steps:
+        if not (yield from self._authorized(action, model, pk)):
             raise PermissionError(
                 f"authorize denied the {action} operation on {model.__name__}"
             )
@@ -414,8 +448,8 @@ class UpsertWriter:
             created = yield from self._create(create, fields["create"], parent, seed)
             return created, False
 
-        self._check_authorize("upsert", model, self._ops.pk_value(instance))
-        self._check_repo(model, "can_upsert", instance)
+        yield from self._check_authorize("upsert", model, self._ops.pk_value(instance))
+        yield from self._check_repo(model, "can_upsert", instance)
         yield repo.on_match(instance, self._info)
 
         if policy["on_match"] == "UPDATE":
@@ -438,18 +472,26 @@ class UpsertWriter:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         fields = _declared_fields(cls)
         data = {**seed, **_scalars(payload, cls)}
+        existing: list[tuple[Any, Any]] = []
         for name, spec in cls.__orm_relations__.items():  # type: ignore[attr-defined]
             value = getattr(payload, name, strawberry.UNSET)
             if spec.kind == "single" and _is_set(value):
-                data[name] = yield from self._link_target(value, fields[name])
+                target, found = yield from self._link_target(value, fields[name])
+                data[name] = target
+                if found:
+                    existing.append((spec, target))
         if parent is not None:
             data.update(self._ops.parent_assignment(parent.instance, parent.spec))
 
-        self._check_authorize("create", model, None)
+        yield from self._check_authorize("create", model, None)
         repo = self._repo(model)
         data = repo.on_before_create(data, self._info)
-        self._check_repo(model, "can_create", data)
+        yield from self._check_repo(model, "can_create", data)
         instance = yield self._ops.create(repo, model, data)
+        for spec, target in existing:
+            yield from self._check_repo(
+                spec.related_model, "can_link", instance, spec.name, target
+            )
         repo.on_after_create(instance, self._info)
         yield from self._apply_to_many(instance, payload, cls, created=True)
         return instance
@@ -459,7 +501,7 @@ class UpsertWriter:
         fields = _declared_fields(cls)
         repo = self._repo(model)
         data = repo.on_before_update(instance, _scalars(payload, cls), self._info)
-        self._check_repo(model, "can_update", instance, data)
+        yield from self._check_repo(model, "can_update", instance, data)
         for name, value in data.items():
             setattr(instance, name, value)
 
@@ -468,15 +510,20 @@ class UpsertWriter:
             link = getattr(payload, name, strawberry.UNSET)
             if spec.kind != "single" or not _is_set(link):
                 continue
-            target = yield from self._link_target(link, fields[name])
+            target, found = yield from self._link_target(link, fields[name])
             previous = yield self._ops.load_attr(instance, name)
+            if not self._same_row(previous, target):
+                if found:
+                    yield from self._check_repo(
+                        spec.related_model, "can_link", instance, name, target
+                    )
+                if previous is not None:
+                    yield from self._check_repo(
+                        spec.related_model, "can_unlink", instance, name, previous
+                    )
+                    if self._on_replace(link, fields[name]) == "DELETE":
+                        replaced.append(previous)
             setattr(instance, name, target)
-            if (
-                previous is not None
-                and self._ops.pk_value(previous) != self._ops.pk_value(target)
-                and self._on_replace(link, fields[name]) == "DELETE"
-            ):
-                replaced.append(previous)
 
         # Saved before the old targets go, so a cascade cannot take this row too.
         yield self._ops.save(repo, instance)
@@ -524,28 +571,73 @@ class UpsertWriter:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         if operation == "create":
             child = yield from self._create(value, fields["create"], parent, {})
-            yield self._ops.link(parent.instance, parent.spec, child)
         elif operation == "upsert":
             child, matched = yield from self._upsert(value, fields["upsert"], parent)
             if matched:
-                self._check_repo(
-                    model, "can_link", parent.instance, parent.spec.name, child
-                )
-            yield self._ops.link(parent.instance, parent.spec, child)
+                yield from self._check_link(parent, child)
         elif operation == "update":
             child = yield from self._update_by_id(value, fields["update"])
-            self._check_repo(
-                model, "can_link", parent.instance, parent.spec.name, child
-            )
-            yield self._ops.link(parent.instance, parent.spec, child)
+            yield from self._check_link(parent, child)
         else:
-            yield from self._remove_member(parent, operation, value.id, model)
+            pk = self._pk(value.id, model)
+            yield from self._check_authorize(operation, model, pk)
+            yield from self._remove_member(parent, operation, pk, model)
+            return
+        yield self._ops.link(parent.instance, parent.spec, child)
+
+    def _apply_plain_ref(self, parent: _Parent, operation: str, value: Any) -> Steps:
+        model = parent.spec.related_model
+        repo = self._repo(model)
+        if operation == "create":
+            if not (yield from self._authorized("create", model, None)):
+                return
+            data = {
+                **input_to_dict(value),
+                **self._ops.parent_assignment(parent.instance, parent.spec),
+            }
+            data = repo.on_before_create(data, self._info)
+            yield from self._check_repo(model, "can_create", data)
+            child = yield self._ops.create(repo, model, data)
+            repo.on_after_create(child, self._info)
+        elif operation == "update":
+            data = input_to_dict(value)
+            raw_id = data.pop("id")
+            if not (yield from self._authorized("update", model, raw_id)):
+                return
+            child = yield self._ops.get(repo, model, self._pk(raw_id, model))
+            if child is None:
+                return
+            data = repo.on_before_update(child, data, self._info)
+            yield from self._check_repo(model, "can_update", child, data)
+            yield from self._check_link(parent, child)
+            if data:
+                for name, field_value in data.items():
+                    setattr(child, name, field_value)
+                yield self._ops.save(repo, child)
+                repo.on_after_update(child, self._info)
+        else:
+            if not (yield from self._authorized(operation, model, value.id)):
+                return
+            pk = self._pk(value.id, model)
+            yield from self._remove_member(parent, operation, pk, model)
+            return
+        yield self._ops.link(parent.instance, parent.spec, child)
+
+    def _check_link(self, parent: _Parent, child: Any) -> Steps:
+        """Ask whether *child* may join *parent*, and leave the row it is under."""
+        model = parent.spec.related_model
+        yield from self._check_repo(
+            model, "can_link", parent.instance, parent.spec.name, child
+        )
+        previous = yield self._ops.previous_parent(parent.instance, parent.spec, child)
+        if previous is not None:
+            yield from self._check_repo(
+                model, "can_unlink", previous, parent.spec.name, child
+            )
 
     def _remove_member(
-        self, parent: _Parent, operation: str, raw_id: Any, model: type
+        self, parent: _Parent, operation: str, pk: Any, model: type
     ) -> Steps:
-        pk = self._pk(raw_id, model)
-        self._check_authorize(operation, model, pk)
         child = yield self._ops.get(self._repo(model), model, pk)
         if child is not None:
             is_member = yield self._ops.is_member(parent.instance, parent.spec, child)
@@ -557,38 +649,48 @@ class UpsertWriter:
                 f"{parent.model.__name__}.{parent.spec.name}"
             )
         if operation == "unlink":
-            self._check_repo(
+            yield from self._check_repo(
                 model, "can_unlink", parent.instance, parent.spec.name, child
             )
             yield self._ops.unlink(parent.instance, parent.spec, child)
         else:
-            yield from self._delete_instance(child)
+            yield from self._delete_instance(child, parent)
 
-    def _delete_instance(self, instance: Any) -> Steps:
+    def _delete_instance(self, instance: Any, parent: _Parent | None = None) -> Steps:
         model = type(instance)
         repo = self._repo(model)
-        self._check_repo(model, "can_delete", instance)
+        yield from self._check_repo(model, "can_delete", instance)
         repo.on_before_delete(instance, self._info)
+        if parent is not None and parent.spec.relation_mode != "reverse_fk":
+            # Out of the join table first, so no link row outlives the row.
+            yield self._ops.unlink(parent.instance, parent.spec, instance)
         yield self._ops.delete(repo, instance)
 
     def _update_by_id(self, payload: Any, cls: type) -> Steps:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         pk = self._pk(payload.id, model)
-        self._check_authorize("update", model, pk)
+        yield from self._check_authorize("update", model, pk)
         instance = yield self._ops.get(self._repo(model), model, pk)
         if instance is None:
             raise UpsertNotFoundError(f"No {model.__name__} {pk!r}")
         return (yield from self._update(instance, payload, cls))
 
-    def _link_target(self, link: Any, cls: type) -> Steps:
+    def _link_target(
+        self, link: Any, cls: type
+    ) -> Generator[Any, Any, tuple[Any, bool]]:
+        """The row a single link points at, and whether it existed before."""
         operation, value = _selected_operation(link, cls)
         fields = _declared_fields(cls)
         if operation == "create":
-            return (yield from self._create(value, fields["create"], None, {}))
+            return (yield from self._create(value, fields["create"], None, {})), False
         if operation == "upsert":
-            instance, _matched = yield from self._upsert(value, fields["upsert"], None)
-            return instance
-        return (yield from self._update_by_id(value, fields["update"]))
+            return (yield from self._upsert(value, fields["upsert"], None))
+        return (yield from self._update_by_id(value, fields["update"])), True
+
+    def _same_row(self, previous: Any, target: Any) -> bool:
+        return previous is not None and (
+            self._ops.pk_value(previous) == self._ops.pk_value(target)
+        )
 
     def _on_replace(self, link: Any, cls: type) -> str:
         sent = getattr(link, "on_replace", strawberry.UNSET)

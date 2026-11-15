@@ -269,7 +269,7 @@ class TestRefListRepo:
         tag = DjTag.objects.get(pk=1)
         assert tag.name == "python", "Scoped-out tag should not have been updated"
 
-    def test_authorize_callback_takes_precedence(self, setup_tables):
+    def test_authorize_does_not_override_the_repo(self, setup_tables):
         data = _seed()
         orm = StrawberryORM.for_django(repos={DjTag: DenyAllTagRepo})
         info = SimpleNamespace(context={})
@@ -281,14 +281,15 @@ class TestRefListRepo:
         ref_type = orm.ref(DjTag, create=DjRepoCreateTag2)
         ref = ref_type(create=DjRepoCreateTag2(name="allowed"))
 
-        orm.apply_ref_list(
-            data["post"],
-            "tags",
-            [ref],
-            info,
-            authorize=lambda action, model, pk, info: True,
-        )
-        assert DjTag.objects.filter(name="allowed").exists()
+        with pytest.raises(PermissionError, match="can_create"):
+            orm.apply_ref_list(
+                data["post"],
+                "tags",
+                [ref],
+                info,
+                authorize=lambda action, model, pk, info: True,
+            )
+        assert not DjTag.objects.filter(name="allowed").exists()
 
     def test_per_model_isolation(self, setup_tables):
         """A repo for DjTag should not affect DjUser operations."""

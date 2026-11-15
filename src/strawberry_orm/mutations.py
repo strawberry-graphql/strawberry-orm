@@ -584,6 +584,7 @@ class MutationNamespace:
                     f"Unknown field(s) in _meta.{field_name} for {model.__name__}: "
                     f"{', '.join(unknown)}"
                 )
+            self._refuse_hidden(model, names, f"_meta.{field_name}")
             return OpFields(fields=names)
         raise ValueError(
             f"_meta.{field_name} for {model.__name__} must be True or a list of "
@@ -614,6 +615,7 @@ class MutationNamespace:
                 f"Unknown field(s) in _meta.upsert.where for {model.__name__}: "
                 f"{', '.join(unknown)}"
             )
+        self._refuse_hidden(model, names, "_meta.upsert.where")
         deduped: list[str] = []
         for name in names:
             if name not in deduped:
@@ -621,13 +623,37 @@ class MutationNamespace:
         return tuple(deduped)
 
     def _all_where_fields(self, model: type) -> tuple[str, ...]:
-        eligible = self._eligible_scalar_names(model)
+        eligible = self._eligible_scalar_names(model) - self._hidden_fields(model)
         return ("id",) + tuple(
             field_name
             for field_name, _type, is_relation, _related in self._backend._introspect_model(
                 model
             )
             if not is_relation and field_name in eligible
+        )
+
+    def _hidden_fields(self, model: type) -> set[str]:
+        """Columns the model's GraphQL type excludes, which no input may write."""
+        return self._backend._type_excludes.get(model, set())
+
+    def _refuse_hidden(self, model: type, names: tuple[str, ...], key: str) -> None:
+        hidden = sorted(self._hidden_fields(model) & set(names))
+        if hidden:
+            raise ValueError(
+                f"{key} for {model.__name__} names {hidden}, which the GraphQL "
+                f"type for {model.__name__} excludes. Hiding a column from reads "
+                f"leaves it writable unless the input leaves it out too; remove "
+                f"it from {key}."
+            )
+
+    def _register_input(
+        self, model: type, cls: type, annotations: dict[str, Any]
+    ) -> None:
+        """Let a type declared later refuse to exclude a column *cls* writes."""
+        relations = getattr(cls, "__orm_relations__", {})
+        scalars = set(annotations) - set(relations) - {"id"}
+        self._backend._input_registry.setdefault(model, []).append(
+            (cls.__name__, scalars)
         )
 
     def _eligible_scalar_names(
@@ -687,12 +713,7 @@ class MutationNamespace:
         self, policy: RelationPolicy, *, kind: Literal["single", "many"]
     ) -> set[str]:
         if not policy.explicit_ops:
-            if policy.immutable:
-                return {"create"}
-            enabled = {"create", "update"}
-            if kind == "many":
-                enabled.update({"unlink", "delete"})
-            return enabled
+            return {"create"} if policy.immutable else {"create", "update"}
 
         enabled: set[str] = set()
         if policy.create is not None:
@@ -1017,6 +1038,7 @@ class MutationNamespace:
         }
         pk_names = self._backend._get_pk_names(model)
         allowed_scalars = None if op_fields.fields is None else set(op_fields.fields)
+        hidden = self._hidden_fields(model)
 
         for (
             field_name,
@@ -1026,7 +1048,7 @@ class MutationNamespace:
         ) in self._backend._introspect_model(model):
             if is_relation:
                 continue
-            if field_name in excluded_scalar_fields:
+            if field_name in excluded_scalar_fields or field_name in hidden:
                 continue
             if self._backend._exclude_generated_sensitive_field(
                 field_name, op_fields.fields
@@ -1068,6 +1090,7 @@ class MutationNamespace:
         for name, default in defaults.items():
             setattr(cls, name, default)
         cls.__orm_relations__ = relations  # type: ignore[attr-defined]
+        self._register_input(model, cls, annotations)
 
     def _single_relation_input(
         self,
@@ -1137,12 +1160,8 @@ class MutationNamespace:
             "create" in enabled or "upsert" in enabled
         ) and not policy.immutable
         on_replace_options: tuple[str, ...] = ("DISCONNECT",)
-        if can_repoint:
-            on_replace_options = (
-                policy.on_replace_options
-                if policy.on_replace_options is not None
-                else ("DISCONNECT", "DELETE")
-            )
+        if can_repoint and policy.on_replace_options is not None:
+            on_replace_options = policy.on_replace_options
         has_on_replace = len(on_replace_options) > 1
         if has_on_replace:
             cls.__annotations__["on_replace"] = RelationRemovalPolicy | None

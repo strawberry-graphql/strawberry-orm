@@ -29,7 +29,6 @@ from ._base import (
     BaseBackend,
     extract_element_type,
     hint_hops,
-    input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
 )
@@ -369,112 +368,13 @@ class DjangoBackend(BaseBackend):
     ) -> Any:
         from django.db import transaction
 
-        from strawberry_orm.repo import _check_auth
-        from strawberry_orm.upserts import has_upsert
         from strawberry_orm.upserts import run_sync as run_steps
 
         def apply() -> None:
             writer = self._ref_list_writer(instance, field, refs, info, authorize)
-            if not any(has_upsert(ref) for ref in refs):
-                apply_items(writer)
-                return
+            spec = self._upsert_relation_spec(type(instance), field)
             with transaction.atomic(using=instance._state.db):
-                apply_items(writer)
-
-        def apply_items(writer: Any) -> None:
-            manager = getattr(instance, field)
-            rel_model = manager.model
-            repo = self.get_repo(rel_model) if not authorize else None
-
-            to_add: list[Any] = []
-            to_unlink: list[Any] = []
-            to_delete_ids: list[Any] = []
-
-            for ref in refs:
-                ref_create = getattr(ref, "create", strawberry.UNSET)
-                ref_update = getattr(ref, "update", strawberry.UNSET)
-                ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
-                ref_delete = getattr(ref, "delete", strawberry.UNSET)
-
-                if has_upsert(ref):
-                    spec = self._upsert_relation_spec(type(instance), field)
-                    run_steps(writer.apply_ref_upsert(instance, spec, ref, link=True))
-                elif ref_create is not strawberry.UNSET and ref_create is not None:
-                    if authorize and not authorize("create", rel_model, None, info):
-                        continue
-                    data = input_to_dict(ref_create)
-                    if repo is not None:
-                        data = repo.on_before_create(data, info)
-                    _check_auth(repo, "can_create", data, info)
-                    if repo is not None:
-                        obj = repo._create(rel_model, data, info)
-                    else:
-                        obj = rel_model.objects.create(**data)
-                    if repo is not None:
-                        repo.on_after_create(obj, info)
-                    to_add.append(obj)
-                elif ref_update is not strawberry.UNSET and ref_update is not None:
-                    data = input_to_dict(ref_update)
-                    pk = data.pop("id")
-                    if authorize and not authorize("update", rel_model, pk, info):
-                        continue
-                    if repo is not None:
-                        obj = repo._get(rel_model, pk, info)
-                    else:
-                        obj = rel_model.objects.filter(pk=pk).first()
-                    if obj is not None:
-                        if repo is not None:
-                            data = repo.on_before_update(obj, data, info)
-                        _check_auth(repo, "can_update", obj, data, info)
-                        _check_auth(repo, "can_link", instance, field, obj, info)
-                        if data:
-                            for k, v in data.items():
-                                setattr(obj, k, v)
-                            if repo is not None:
-                                repo._save(obj, info)
-                                repo.on_after_update(obj, info)
-                            else:
-                                obj.save()
-                        to_add.append(obj)
-                elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                    if authorize and not authorize(
-                        "unlink", rel_model, ref_unlink.id, info
-                    ):
-                        continue
-                    if repo is not None:
-                        obj = repo._get(rel_model, ref_unlink.id, info)
-                    else:
-                        obj = rel_model.objects.filter(pk=ref_unlink.id).first()
-                    if obj is not None:
-                        _check_auth(repo, "can_unlink", instance, field, obj, info)
-                        to_unlink.append(ref_unlink.id)
-                elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                    if authorize and not authorize(
-                        "delete", rel_model, ref_delete.id, info
-                    ):
-                        continue
-                    if repo is not None:
-                        obj = repo._get(rel_model, ref_delete.id, info)
-                    else:
-                        obj = rel_model.objects.filter(pk=ref_delete.id).first()
-                    if obj is not None:
-                        _check_auth(repo, "can_delete", obj, info)
-                        if repo is not None:
-                            repo.on_before_delete(obj, info)
-                        to_delete_ids.append(ref_delete.id)
-
-            if to_add:
-                manager.add(*to_add)
-            if to_unlink:
-                manager.remove(*rel_model.objects.filter(pk__in=to_unlink))
-            if to_delete_ids:
-                doomed = list(rel_model.objects.filter(pk__in=to_delete_ids))
-                manager.remove(*doomed)
-                if repo is not None:
-                    for obj in doomed:
-                        repo._delete(obj, info)
-                else:
-                    rel_model.objects.filter(pk__in=to_delete_ids).delete()
+                run_steps(writer.apply_refs(instance, spec, refs))
 
         return run_sync(apply, thread_sensitive=True)
 
@@ -2053,6 +1953,12 @@ class _DjangoUpsertOps:
         if spec.relation_mode == "reverse_fk":
             return self._is_child(parent, spec, child)
         return getattr(parent, spec.name).filter(pk=child.pk).exists()
+
+    def previous_parent(self, parent: Any, spec: Any, child: Any) -> Any:
+        """The other row whose reverse foreign key relation holds *child*, if any."""
+        if spec.relation_mode != "reverse_fk" or self._is_child(parent, spec, child):
+            return None
+        return getattr(child, spec.remote_attr)
 
     def back_reference(
         self, parent_model: type, spec: Any

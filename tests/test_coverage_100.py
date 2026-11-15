@@ -556,9 +556,10 @@ class TestSQLAlchemyRemaining:
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as async_session:
             tag = SATag(id=1, name="python")
+            other = SATag(id=2, name="rust")
             post = SAPost(id=1, title="T", body="B", is_published=True, author_id=1)
-            post.tags = [tag]
-            async_session.add_all([tag, post])
+            post.tags = [tag, other]
+            async_session.add_all([tag, other, post])
             await async_session.flush()
 
             class TagRepo(AbstractRepo[SATag]):
@@ -583,7 +584,7 @@ class TestSQLAlchemyRemaining:
                     create=strawberry.UNSET,
                     update=strawberry.UNSET,
                     unlink=strawberry.UNSET,
-                    delete=IdRef(id=strawberry.ID("1")),
+                    delete=IdRef(id=strawberry.ID("2")),
                 ),
             ]
             await backend.apply_ref_list(post, "tags", refs, info)

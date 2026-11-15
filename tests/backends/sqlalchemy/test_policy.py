@@ -228,7 +228,7 @@ class TestRefListPolicy:
         tag = session.get(SATag, 1)
         assert tag.name == "python", "Scoped-out tag should not have been updated"
 
-    def test_authorize_callback_takes_precedence(self):
+    def test_authorize_does_not_override_the_policy(self):
         session = _make_session()
         data = _seed(session)
 
@@ -242,12 +242,13 @@ class TestRefListPolicy:
         ref_type = orm.ref(SATag, create=CreateTag)
         ref = ref_type(create=CreateTag(name="allowed"))
 
-        orm.apply_ref_list(
-            data["post"],
-            "tags",
-            [ref],
-            info,
-            authorize=lambda action, model, pk, info: True,
-        )
+        with pytest.raises(PermissionError, match="can_create"):
+            orm.apply_ref_list(
+                data["post"],
+                "tags",
+                [ref],
+                info,
+                authorize=lambda action, model, pk, info: True,
+            )
         new_tags = [t.name for t in data["post"].tags]
-        assert "allowed" in new_tags
+        assert "allowed" not in new_tags

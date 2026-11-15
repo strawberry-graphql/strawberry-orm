@@ -279,8 +279,6 @@ class TestNormalizeMetaOps:
         assert orm.mutations._enabled_ops(policy, kind="many") == {
             "create",
             "update",
-            "unlink",
-            "delete",
         }
 
 
@@ -304,13 +302,13 @@ class TestDefaultSchemaUnchanged:
         assert "upsert" not in names
         assert "on_replace" in names or "onReplace" in names
 
-    def test_default_list_has_create_update_unlink_delete(self, orm):
+    def test_default_list_has_create_and_update_only(self, orm):
         post_project = orm.mutations._normalize_model_project(SAPost, {"tags": {}})
         spec = orm.mutations._relation_specs(SAPost)["tags"]
         ref = orm.mutations._list_relation_ref_type(
             SAPost, spec, post_project["relations"]["tags"]
         )
-        assert _field_names(ref) == {"create", "update", "unlink", "delete"}
+        assert _field_names(ref) == {"create", "update"}
 
 
 class TestOpFieldInputs:

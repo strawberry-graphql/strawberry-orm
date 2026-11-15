@@ -609,13 +609,7 @@ class BaseBackend:
         info: Any,
         authorize: Any | None,
     ) -> Any:
-        """Validate the generated items in *refs*; ``None`` when there are none."""
-        from strawberry_orm.upserts import has_upsert
-
-        if not any(
-            has_upsert(ref) or hasattr(type(ref), "__relation_policy__") for ref in refs
-        ):
-            return None
+        """A writer for *refs*, which it validates before anything is written."""
         writer = self._upsert_writer(info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
         writer.validate_refs(type(instance), spec, refs)
@@ -2237,8 +2231,9 @@ class BaseBackend:
                 raise ValueError(
                     f"{type_name} excludes {leaked} but {input_name} can still "
                     f"write them, so a caller can set values they cannot read. "
-                    f"Pass exclude={leaked!r} to the orm.input()/orm.partial() "
-                    f"call that builds {input_name}."
+                    f"Leave them out of {input_name}: pass exclude={leaked!r} to "
+                    f"orm.input()/orm.partial(), or drop them from its _meta "
+                    f"projection, or declare the type before the input."
                 )
 
     def _register_model_filter(self, model: type, filter_type: type) -> None:

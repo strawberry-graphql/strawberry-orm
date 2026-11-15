@@ -237,7 +237,10 @@ class AbstractTestGeneratedShapes:
         }
 
     def test_a_link_with_on_replace_stays_a_plain_input(self, orm, models):
-        project = orm.mutations._normalize_model_project(models.Post, {"author": {}})
+        project = orm.mutations._normalize_model_project(
+            models.Post,
+            {"author": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}}},
+        )
         spec = orm.mutations._relation_specs(models.Post)["author"]
         link = orm.mutations._single_relation_input(
             models.Post, spec, project["relations"]["author"]

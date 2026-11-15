@@ -206,7 +206,7 @@ class TestRefListPolicy:
         tag = await TortTag.get(pk=1)
         assert tag.name == "python", "Scoped-out tag should not have been updated"
 
-    async def test_authorize_callback_takes_precedence(self, tortoise_db):
+    async def test_authorize_does_not_override_the_policy(self, tortoise_db):
         data = await _seed()
         orm = StrawberryORM.for_tortoise(policy=DenyAllPolicy())
 
@@ -219,11 +219,12 @@ class TestRefListPolicy:
 
         info = SimpleNamespace(context={})
 
-        await orm.apply_ref_list(
-            data["post"],
-            "tags",
-            [ref],
-            info,
-            authorize=lambda action, model, pk, info: True,
-        )
-        assert await TortTag.filter(name="allowed").exists()
+        with pytest.raises(PermissionError, match="can_create"):
+            await orm.apply_ref_list(
+                data["post"],
+                "tags",
+                [ref],
+                info,
+                authorize=lambda action, model, pk, info: True,
+            )
+        assert not await TortTag.filter(name="allowed").exists()

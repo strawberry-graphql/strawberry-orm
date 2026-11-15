@@ -344,6 +344,8 @@ class TestInternalSqlalchemyExtraCoverage:
 
         backend = SQLAlchemyBackend(dialect="sqlite", repos={SATag: TagRepo})
         post = sa_session.get(SAPost, 1)
+        post.tags.extend([sa_session.get(SATag, 2), sa_session.get(SATag, 3)])
+        sa_session.flush()
         tag = sa_session.get(SATag, 1)
         info = SimpleNamespace(context={"session": sa_session})
 

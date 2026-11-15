@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+Each of these let a request write past a repo, an `authorize` callback or a projection, in 0.30.0.
+
+- **A ref list could unlink or delete rows outside the parent's relation.** `{unlink: {id}}` and `{delete: {id}}` in a plain `orm.ref` list acted on whatever row the id named, so a caller could detach a tag from someone else's post, or delete another post's comment, through their own post. Both now act only on rows in the parent's relation that the repo can see, and raise `UpsertNotFoundError` for any other id, including one that names no row, as the upsert arm already did. Unlinking from a relation whose foreign key is not nullable is refused before anything is written, rather than failing part-way on Django and Tortoise.
+- **`authorize=` replaced the repo instead of adding to it.** Passing an `authorize` callback to `apply_ref_list` skipped the model's repo entirely: its `scope_query`, its `can_*` checks, its `on_*` hooks and its `_create`, `_save` and `_delete`. A callback that only looked at the action allowed every write the repo refuses. The repo now always applies, and `authorize` is checked on top of it.
+- **An `async` permission check allowed what it was written to deny.** A `can_*` hook or `authorize` callback written `async` returns a coroutine, which is truthy, so ref lists and upserts treated its `return False` as an allow, even on an async session. Async writes now await it, and a sync write raises `TypeError` instead. A result is read as a bool: `False` and `None` deny, and a truthy value other than `True` still allows but emits a `DeprecationWarning`.
+- **An upsert miss wrote `where` fields that `create` does not allow.** A miss seeds the new row from `where`, so with `where: True` a caller could set any offered column on the new row, past the `_meta.create` allowlist (`is_published` on a post whose `create` lists only `title` and `body`). Sending a `where` field other than `id` that `create` does not offer, together with `create`, is now a validation error.
+- **Node mutation inputs wrote columns their type excludes.** Inputs from `orm.mutations` ignored `@orm.type(..., exclude=[...])`, so a column hidden from reads stayed writable through `create_node_input`, `update_node_input` and `upsert_node_input`, unlike through `orm.input()`. Generated inputs now leave excluded columns out. Naming one in a `_meta` projection raises `ValueError`, and so does declaring the type after an input that already writes the column.
+- **Re-pointing a link skipped `can_link` and `can_unlink`.** A single link pointed at an existing row, and an `update` item that took a row from another parent's list, asked neither whether the row could be linked nor whether it could leave where it was. A caller could move another user's comment onto their own post, or point a post at another author. Now `can_link` is asked for an existing target, `can_unlink` for the row a re-pointed link replaces, and `can_unlink` of the old parent when a row moves between lists.
+- **A refused ref list stayed partly written.** A plain `orm.ref` list was written item by item, so a denial on the third item left the first two in place. Every list is now one unit of work, like an upsert: a savepoint on SQLAlchemy, `transaction.atomic()` on Django and `in_transaction()` on Tortoise.
+- **A `MutationPolicy` passed with `repos=` never ran.** `policy=` was silently dropped whenever `repos=` was also given, so none of its checks applied to any model. Passing both now raises `ValueError`.
+- **A ref-list delete bypassed the repo's delete on SQLAlchemy and Tortoise.** `{delete: {id}}` deleted the row directly, so a soft-delete `_delete` override was skipped and the row was gone for good. It goes through the repo now, as it did on Django.
+
+### Changed
+
+- **Projections no longer imply destructive operations.** A to-many relation in a `project=` without `_meta` used to offer `unlink` and `delete`, and a single link offered `onReplace: DELETE`, which deletes the row the link replaces. A relation now offers `create` and `update` until its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed link only disconnects the row it replaces unless `onReplace` lists `"DELETE"`. A link with a single `onReplace` option is a `@oneOf` input with no `onReplace` field. This changes the generated schema for projections that relied on the defaults.
+- **Plain `orm.ref` items go through the same writer as upserts on every backend.** An item naming more than one of `create`, `update`, `unlink` and `delete` raises `UpsertValidationError` before anything is written, where the first one used to be applied. A `delete` from a many-to-many list removes the row from the relation before deleting it, so a row a soft-delete repo keeps also leaves the list.
+- **`apply_ref_list` validates every list**, not only lists with generated items, so a hand-built list is checked in full before its first write.
+
 ## 0.30.0
 
 ### Security

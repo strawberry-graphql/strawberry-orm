@@ -24,7 +24,6 @@ from strawberry_orm.backends._base import (
     BaseBackend,
     extract_element_type,
     hint_hops,
-    input_to_dict,
     invoke_custom_callback,
     requested_aggregates,
 )
@@ -1813,119 +1812,12 @@ class SQLAlchemyBackend(BaseBackend):
         info: Any,
         authorize: Callable[..., bool] | None,
     ) -> None:
-        from strawberry_orm.upserts import has_upsert
+        from strawberry_orm.upserts import run_sync
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
-        if any(has_upsert(ref) for ref in refs):
-            with session.begin_nested():
-                self._apply_ref_items_sync(
-                    session, instance, field, refs, info, authorize, writer
-                )
-            return
-        self._apply_ref_items_sync(
-            session, instance, field, refs, info, authorize, writer
-        )
-
-    def _apply_ref_items_sync(
-        self,
-        session: Any,
-        instance: Any,
-        field: str,
-        refs: list[Any],
-        info: Any,
-        authorize: Callable[..., bool] | None,
-        writer: Any,
-    ) -> None:
-        from strawberry_orm.repo import _check_auth
-        from strawberry_orm.upserts import has_upsert, run_sync
-
-        relationship = getattr(type(instance), field).property
-        target_model = relationship.mapper.class_
-        repo = self.get_repo(target_model) if not authorize else None
-
-        to_add: list[Any] = []
-        to_remove: list[Any] = []
-        to_delete: list[Any] = []
-
-        for ref in refs:
-            ref_create = getattr(ref, "create", strawberry.UNSET)
-            ref_update = getattr(ref, "update", strawberry.UNSET)
-            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
-            ref_delete = getattr(ref, "delete", strawberry.UNSET)
-
-            if has_upsert(ref):
-                spec = self._upsert_relation_spec(type(instance), field)
-                to_add.append(run_sync(writer.apply_ref_upsert(instance, spec, ref)))
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                if authorize and not authorize("create", target_model, None, info):
-                    continue
-                data = input_to_dict(ref_create)
-                if repo is not None:
-                    data = repo.on_before_create(data, info)
-                _check_auth(repo, "can_create", data, info)
-                if repo is not None:
-                    obj = repo._create(target_model, data, info)
-                else:
-                    obj = target_model(**data)
-                    session.add(obj)
-                if repo is not None:
-                    repo.on_after_create(obj, info)
-                to_add.append(obj)
-            elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = input_to_dict(ref_update)
-                pk = data.pop("id")
-                if authorize and not authorize("update", target_model, pk, info):
-                    continue
-                if repo is not None:
-                    obj = repo._get(target_model, pk, info)
-                else:
-                    obj = session.get(target_model, pk)
-                if obj is not None:
-                    if repo is not None:
-                        data = repo.on_before_update(obj, data, info)
-                    _check_auth(repo, "can_update", obj, data, info)
-                    _check_auth(repo, "can_link", instance, field, obj, info)
-                    for k, v in data.items():
-                        setattr(obj, k, v)
-                    if repo is not None:
-                        repo._save(obj, info)
-                        repo.on_after_update(obj, info)
-                    to_add.append(obj)
-            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                if authorize and not authorize(
-                    "unlink", target_model, ref_unlink.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = repo._get(target_model, ref_unlink.id, info)
-                else:
-                    obj = session.get(target_model, ref_unlink.id)
-                if obj is not None:
-                    _check_auth(repo, "can_unlink", instance, field, obj, info)
-                    to_remove.append(obj)
-            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                if authorize and not authorize(
-                    "delete", target_model, ref_delete.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = repo._get(target_model, ref_delete.id, info)
-                else:
-                    obj = session.get(target_model, ref_delete.id)
-                if obj is not None:
-                    _check_auth(repo, "can_delete", obj, info)
-                    if repo is not None:
-                        repo.on_before_delete(obj, info)
-                    to_delete.append(obj)
-
-        existing = list(getattr(instance, field))
-        merged = [o for o in existing if o not in to_remove and o not in to_delete]
-        for obj in to_add:
-            if obj not in merged:
-                merged.append(obj)
-        setattr(instance, field, merged)
-        for obj in to_delete:
-            session.delete(obj)
+        spec = self._upsert_relation_spec(type(instance), field)
+        with session.begin_nested():
+            run_sync(writer.apply_refs(instance, spec, refs))
 
     async def _apply_ref_list_async(
         self,
@@ -1937,122 +1829,12 @@ class SQLAlchemyBackend(BaseBackend):
         *,
         authorize: Callable[..., bool] | None,
     ) -> None:
-        from strawberry_orm.upserts import has_upsert
+        from strawberry_orm.upserts import run_async
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
-        if any(has_upsert(ref) for ref in refs):
-            async with session.begin_nested():
-                await self._apply_ref_items_async(
-                    session, instance, field, refs, info, authorize, writer
-                )
-            return
-        await self._apply_ref_items_async(
-            session, instance, field, refs, info, authorize, writer
-        )
-
-    async def _apply_ref_items_async(
-        self,
-        session: Any,
-        instance: Any,
-        field: str,
-        refs: list[Any],
-        info: Any,
-        authorize: Callable[..., bool] | None,
-        writer: Any,
-    ) -> None:
-        from strawberry_orm.repo import _check_auth
-        from strawberry_orm.upserts import has_upsert, run_async
-
-        relationship = getattr(type(instance), field).property
-        target_model = relationship.mapper.class_
-        repo = self.get_repo(target_model) if not authorize else None
-
-        to_add: list[Any] = []
-        to_remove: list[Any] = []
-        to_delete: list[Any] = []
-
-        for ref in refs:
-            ref_create = getattr(ref, "create", strawberry.UNSET)
-            ref_update = getattr(ref, "update", strawberry.UNSET)
-            ref_unlink = getattr(ref, "unlink", strawberry.UNSET)
-            ref_delete = getattr(ref, "delete", strawberry.UNSET)
-
-            if has_upsert(ref):
-                spec = self._upsert_relation_spec(type(instance), field)
-                to_add.append(
-                    await run_async(writer.apply_ref_upsert(instance, spec, ref))
-                )
-            elif ref_create is not strawberry.UNSET and ref_create is not None:
-                if authorize and not authorize("create", target_model, None, info):
-                    continue
-                data = input_to_dict(ref_create)
-                if repo is not None:
-                    data = repo.on_before_create(data, info)
-                _check_auth(repo, "can_create", data, info)
-                if repo is not None:
-                    obj = await repo._create_async(target_model, data, info)
-                else:
-                    obj = target_model(**data)
-                    session.add(obj)
-                if repo is not None:
-                    repo.on_after_create(obj, info)
-                to_add.append(obj)
-            elif ref_update is not strawberry.UNSET and ref_update is not None:
-                data = input_to_dict(ref_update)
-                pk = data.pop("id")
-                if authorize and not authorize("update", target_model, pk, info):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(target_model, pk, info)
-                else:
-                    obj = await session.get(target_model, pk)
-                if obj is not None:
-                    if repo is not None:
-                        data = repo.on_before_update(obj, data, info)
-                    _check_auth(repo, "can_update", obj, data, info)
-                    _check_auth(repo, "can_link", instance, field, obj, info)
-                    for k, v in data.items():
-                        setattr(obj, k, v)
-                    if repo is not None:
-                        await repo._save_async(obj, info)
-                        repo.on_after_update(obj, info)
-                    to_add.append(obj)
-            elif ref_unlink is not strawberry.UNSET and ref_unlink is not None:
-                if authorize and not authorize(
-                    "unlink", target_model, ref_unlink.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(target_model, ref_unlink.id, info)
-                else:
-                    obj = await session.get(target_model, ref_unlink.id)
-                if obj is not None:
-                    _check_auth(repo, "can_unlink", instance, field, obj, info)
-                    to_remove.append(obj)
-            elif ref_delete is not strawberry.UNSET and ref_delete is not None:
-                if authorize and not authorize(
-                    "delete", target_model, ref_delete.id, info
-                ):
-                    continue
-                if repo is not None:
-                    obj = await repo._get_async(target_model, ref_delete.id, info)
-                else:
-                    obj = await session.get(target_model, ref_delete.id)
-                if obj is not None:
-                    _check_auth(repo, "can_delete", obj, info)
-                    if repo is not None:
-                        repo.on_before_delete(obj, info)
-                    to_delete.append(obj)
-
-        await session.refresh(instance, [field])
-        existing = list(getattr(instance, field))
-        merged = [o for o in existing if o not in to_remove and o not in to_delete]
-        for obj in to_add:
-            if obj not in merged:
-                merged.append(obj)
-        setattr(instance, field, merged)
-        for obj in to_delete:
-            await session.delete(obj)
+        spec = self._upsert_relation_spec(type(instance), field)
+        async with session.begin_nested():
+            await run_async(writer.apply_refs(instance, spec, refs))
 
 
 class _SQLAlchemyUpsertOps:
@@ -2134,6 +1916,27 @@ class _SQLAlchemyUpsertOps:
         return self._with_loaded(
             parent, spec.name, lambda collection: child in collection
         )
+
+    def previous_parent(self, parent: Any, spec: Any, child: Any) -> Any:
+        """The other row whose reverse foreign key relation holds *child*, if any."""
+        from sqlalchemy import select
+
+        if spec.relation_mode != "reverse_fk" or self._is_child(parent, spec, child):
+            return None
+        keys = {
+            parent_key: getattr(child, child_key)
+            for parent_key, child_key in self._key_pairs(type(parent), spec)
+        }
+        if None in keys.values():
+            return None
+        statement = select(type(parent)).filter_by(**keys)
+        if self._async:
+            return self._first_async(statement)
+        return self._session.execute(statement).scalars().first()
+
+    async def _first_async(self, statement: Any) -> Any:
+        result = await self._session.execute(statement)
+        return result.scalars().first()
 
     def back_reference(
         self, parent_model: type, spec: Any

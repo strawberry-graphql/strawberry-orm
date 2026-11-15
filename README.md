@@ -1823,7 +1823,9 @@ Each ref is a `@oneOf` with these keys:
 
 All list mutations use **patch semantics**: only the items you mention are affected; existing related objects not listed are left untouched.
 
-Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. An optional `authorize` callback `(action, model, obj_id, info) -> bool` can be provided for per-operation authorization.
+Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. The list is one unit of work, the same as [an upsert's](#applying-an-upsert), so a refusal part-way through leaves nothing written. `unlink` and `delete` act only on rows currently in `parent`'s relation; any other id raises `UpsertNotFoundError`, and unlinking from a relation whose foreign key is not nullable is a validation error. A `delete` goes through the repo's `_delete`, so a soft-delete override is honoured.
+
+An optional `authorize` callback `(action, model, obj_id, info) -> bool` adds a per-item check on top of the model's repo: an item it denies is skipped, and an item it allows must still pass the repo's `scope_query` and `can_*` hooks. An `update` that takes a row from another parent asks that parent's `can_unlink` as well as this one's `can_link`.
 
 ```graphql
 mutation {
@@ -1888,6 +1890,8 @@ Rules:
 - Nested keys are relation names on that model.
 - `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `unlink`, `delete`, `onReplace`, `immutable`, `maxVisits`, `name`).
 - Relations you do not declare are absent from the input, so the schema rejects them.
+- Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`.
+- Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
 
 #### Upserting with `_meta.upsert`
 
@@ -1964,7 +1968,7 @@ def save_person(self, info: strawberry.Info, input: PersonInput) -> PersonNode:
 For each upsert in the payload:
 
 - The lookup uses the sent `where` fields, scoped to the parent row for a nested item, and runs through the repo's `scope_query`.
-- On a miss with `create`, the row is created from `create` merged with `where` (except `id`), through the normal create path (`on_before_create`, `can_create`, `on_after_create`).
+- On a miss with `create`, the row is created from `create` merged with `where` (except `id`), through the normal create path (`on_before_create`, `can_create`, `on_after_create`). Because of that merge, a `where` field that `create` does not offer cannot be sent together with `create`; validation rejects it.
 - On a miss without `create`, `UpsertNotFoundError` is raised.
 - On a match, `onMatch` applies. A matched person with two new events issues no `UPDATE`, only two `INSERT`s.
 
@@ -1985,7 +1989,9 @@ Two repo hooks are specific to upserts:
 | `find_for_upsert(model, query, info)` | to find the match; `query` maps the sent `where` fields (plus the parent's foreign key when nested) to values. Override for a custom lookup; on async, an `async def` override, or `find_for_upsert_async`, is awaited. The default returns an awaitable on an async SQLAlchemy session and on Tortoise, so `await` it when calling `super()`. |
 | `can_upsert(instance, info)` / `on_match(instance, info)` | once per matched row, after authorization. `on_match` may be `async` on an async SQLAlchemy session and on Tortoise; Django runs the write synchronously, so its hooks must be sync. |
 
-`authorize(action, model, pk, info)` sees `"upsert"` for a match and `"create"` for a miss, alongside `"update"`, `"unlink"` and `"delete"` for nested items. Unlike a plain `apply_ref_list` item, which is skipped when `authorize` returns `False`, every denial inside an upsert raises `PermissionError`, so a write is never partly applied.
+`authorize(action, model, pk, info)` sees `"upsert"` for a match and `"create"` for a miss, alongside `"update"`, `"unlink"` and `"delete"` for nested items. Unlike a plain `apply_ref_list` item, which is skipped when `authorize` returns `False`, every denial inside an upsert raises `PermissionError`, so a write is never partly applied. `authorize` runs in addition to the repo's hooks, never instead of them.
+
+Re-pointing a single link asks the target model's repo `can_link` for an existing row it now points at and `can_unlink` for the row it replaced.
 
 Validation failures raise `UpsertValidationError` (a `ValueError`); a missing row raises `UpsertNotFoundError` (a `LookupError`).
 

@@ -1325,11 +1325,18 @@ class StrawberryORM:
         self._backend_name = backend
         repos: dict[type, type[AbstractRepo]] | None = kwargs.pop("repos", None)  # type: ignore[type-arg]
         policy = kwargs.pop("policy", None)
+        if policy is not None and repos is not None:
+            raise ValueError(
+                "Pass either policy= or repos=, not both: a policy is a repo for "
+                "every model, so one of the two would go unused. Move the "
+                "policy's checks into AbstractRepo subclasses and pass repos= "
+                "alone."
+            )
         self._payload_policy = kwargs.pop("payload", None)
         self._backend: Backend = _create_backend(backend, **kwargs)
         self._backend._repos = repos or {}  # type: ignore[attr-defined]
 
-        if policy is not None and not repos:
+        if policy is not None:
             from strawberry_orm.policy import _policy_to_repos
 
             self._backend._repos = _policy_to_repos(policy)  # type: ignore[attr-defined]

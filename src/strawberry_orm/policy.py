@@ -74,12 +74,13 @@ def _check_policy(
     method_name: str,
     *args: Any,
 ) -> None:
-    """Call a policy method and raise ``PermissionError`` when it returns False."""
+    """Call a policy method and raise ``PermissionError`` unless it allows."""
+    from strawberry_orm.repo import _require, _sync_result
+
     if policy is None:
         return
-    method = getattr(policy, method_name)
-    if not method(*args):
-        raise PermissionError(f"MutationPolicy.{method_name} denied the operation")
+    check = f"MutationPolicy.{method_name}"
+    _require(_sync_result(getattr(policy, method_name)(*args), check), check)
 
 
 class _PolicyRepoDict(dict):
