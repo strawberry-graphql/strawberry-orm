@@ -505,9 +505,29 @@ class TestSQLAlchemyRemaining:
         assert result.count == 0
 
     def test_coerce_reference_value_branches(self):
-        assert _coerce_reference_value(3) == 3
-        assert _coerce_reference_value("abc") == "abc"
-        assert _coerce_reference_value(["1", "2"]) == [1, 2]
+        import uuid
+
+        from sqlalchemy import Column, Integer, LargeBinary, String, Uuid
+        from sqlalchemy.types import UserDefinedType
+
+        class Unnamed(UserDefinedType):
+            """A type that cannot name its Python type, as SQLAlchemy 2.0's default."""
+
+            cache_ok = True
+
+            @property
+            def python_type(self):
+                raise NotImplementedError
+
+        key = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        assert _coerce_reference_value(Column(Integer), 3) == 3
+        assert _coerce_reference_value(Column(Integer), ["1", "2"]) == [1, 2]
+        assert _coerce_reference_value(Column(String), "00123") == "00123"
+        assert _coerce_reference_value(Column(Uuid), str(key)) == key
+        assert _coerce_reference_value(Column(LargeBinary), "ab") == "ab"
+        assert _coerce_reference_value(Column(Unnamed()), "7") == "7"
+        with pytest.raises(ValueError, match="'abc' is not a valid ID"):
+            _coerce_reference_value(Column(Integer), "abc")
 
     def test_build_sa_filter_forward_relation_has(self, Post, User, sa_session):
         from tests.backends.sqlalchemy.fixtures import PostFilter, UserFilter

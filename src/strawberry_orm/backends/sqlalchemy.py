@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import functools
 import sys
+import uuid
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from decimal import Decimal
@@ -26,8 +27,10 @@ from strawberry_orm.backends._base import (
     hint_hops,
     input_to_dict,
     invoke_custom_callback,
+    past_a_hop,
     requested_aggregates,
 )
+from strawberry_orm.backends.filter_budget import check_filter_budget
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
@@ -547,17 +550,24 @@ class SQLAlchemyBackend(BaseBackend):
     def apply_filters(
         self, query: Any, filter_input: Any, model: type, info: Any = None
     ) -> Any:
-        clause, query = _build_sa_filter(
+        check_filter_budget(
             filter_input,
-            model,
-            query=query,
-            info=info,
-            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
-            enable_regex=self._enable_regex_filters,
-            max_in_list_size=self._max_in_list_size,
+            max_values=self._max_in_list_size,
         )
+        with self.filtering(model, info):
+            clause, query = _build_sa_filter(
+                filter_input,
+                model,
+                query=query,
+                info=info,
+                backend=self,
+                max_depth=self._max_filter_depth,
+                max_branches=self._max_filter_branches,
+                enable_regex=self._enable_regex_filters,
+                max_in_list_size=self._max_in_list_size,
+            )
         if clause is not None:
             query = query.where(clause)
         return query
@@ -2692,8 +2702,14 @@ def _build_sa_filter(
     enable_regex: bool = True,
     max_in_list_size: int = 500,
     _depth: int = 0,
+    _on_query: bool = True,
 ) -> tuple[Any, Any]:
-    """Return ``(clause | None, query)``."""
+    """Return ``(clause | None, query)``.
+
+    A ``@filter_field`` narrows *query* itself only while the filter so far
+    is a plain AND at the top (``_on_query``). Anywhere else - under
+    ``not:``, ``any:``, ``oneOf:`` or ``object:`` - it becomes a clause.
+    """
     from sqlalchemy import and_, not_, or_
 
     if _depth > max_depth:
@@ -2713,6 +2729,7 @@ def _build_sa_filter(
         enable_regex=enable_regex,
         max_in_list_size=max_in_list_size,
         _depth=_depth + 1,
+        _on_query=False,
     )
 
     for key in fields:
@@ -2764,13 +2781,17 @@ def _build_sa_filter(
                     )
                     return clause, query
                 rel_model = relationship_prop.property.mapper.class_
-                if not relationship_prop.property.uselist:
-                    local_col = list(relationship_prop.property.local_columns)[0]
+                reference = _sa_reference_key(relationship_prop)
+                if reference is not None:
+                    local_col, key = reference
                     fk_clause = build_reference_object_filter_clause(
                         nested_filter,
+                        key=key,
                         build_field_clause=_build_sa_reference_field_clause,
                         custom_filter_keys=frozenset(custom_filters.keys()),
                         max_branches=max_branches,
+                        max_depth=max_depth,
+                        depth=_depth + 1,
                         local_col=local_col,
                         enable_regex=enable_regex,
                         max_in_list_size=max_in_list_size,
@@ -2781,11 +2802,12 @@ def _build_sa_filter(
                                 fk_clause, relationship_prop.has(scope_criteria)
                             )
                         return fk_clause, query
-                inner, query = _build_sa_filter(
-                    nested_filter,
-                    rel_model,
-                    **{**recurse_kw, "query": query},
-                )
+                with past_a_hop():
+                    inner, query = _build_sa_filter(
+                        nested_filter,
+                        rel_model,
+                        **{**recurse_kw, "query": query},
+                    )
                 if inner is not None:
                     if scope_criteria is not None:
                         inner = and_(inner, scope_criteria)
@@ -2801,7 +2823,7 @@ def _build_sa_filter(
             clauses = []
             for f in val:
                 sub_clause, query = _build_sa_filter(
-                    f, model, **{**recurse_kw, "query": query}
+                    f, model, **{**recurse_kw, "query": query, "_on_query": _on_query}
                 )
                 if sub_clause is not None:
                     clauses.append(sub_clause)
@@ -2838,6 +2860,11 @@ def _build_sa_filter(
                     clauses.append(sub_clause)
             return (or_(*clauses) if clauses else None), query
         elif key in custom_filters:
+            if not _on_query:
+                clause = _sa_custom_filter_clause(
+                    custom_filters[key], filter_input, model, val, info
+                )
+                return clause, query
             query = invoke_custom_callback(
                 custom_filters[key],
                 filter_input,
@@ -2848,6 +2875,43 @@ def _build_sa_filter(
             return None, query
 
     return None, query
+
+
+def _sa_custom_filter_clause(
+    handler: Any, filter_input: Any, model: type, value: Any, info: Any
+) -> Any:
+    """A ``@filter_field`` as a condition on rows of *model*.
+
+    The handler narrows a query of its own over *model*, and the rows it
+    keeps are matched by key, so the condition can be negated, made one
+    alternative of several, or tested on a related row.
+    """
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import select as sa_select
+
+    narrowed = invoke_custom_callback(
+        handler, filter_input, query=sa_select(model), value=value, info=info
+    )
+    pk_col = sa_inspect(model).primary_key[0]
+    return pk_col.in_(narrowed.with_only_columns(pk_col).correlate(None))
+
+
+def _sa_reference_key(relationship_prop: Any) -> tuple[Any, str] | None:
+    """The parent's foreign key column and the related key it holds.
+
+    Only a many-to-one whose foreign key holds the related primary key: the
+    key is then on the parent's own row, and comparing it needs no join.
+    """
+    from sqlalchemy.orm import MANYTOONE
+
+    prop = relationship_prop.property
+    if prop.direction is not MANYTOONE or len(prop.local_remote_pairs) != 1:
+        return None
+    local_col, remote_col = prop.local_remote_pairs[0]
+    primary_key = prop.mapper.primary_key
+    if len(primary_key) != 1 or primary_key[0] is not remote_col:
+        return None
+    return local_col, prop.mapper.get_property_by_column(remote_col).key
 
 
 def _build_sa_field_clause(
@@ -2890,16 +2954,23 @@ def _escape_like(val: str) -> str:
     return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _coerce_reference_value(val: Any) -> Any:
+def _coerce_reference_value(column: Any, val: Any) -> Any:
+    """*val*, an ID, as *column* holds it; never guessed from how it reads.
+
+    ``"00123"`` keys a text column as itself, not as the integer 123.
+    """
     if isinstance(val, list):
-        return [_coerce_reference_value(item) for item in val]
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return val
-    text = str(val)
+        return [_coerce_reference_value(column, item) for item in val]
     try:
-        return int(text)
+        python_type = column.type.python_type
+    except NotImplementedError:
+        return val
+    if python_type not in (int, uuid.UUID) or isinstance(val, python_type):
+        return val
+    try:
+        return python_type(str(val))
     except ValueError:
-        return text
+        raise ValueError(f"{val!r} is not a valid ID.") from None
 
 
 def _build_reference_lookup_clauses(
@@ -2919,11 +2990,11 @@ def _build_reference_lookup_clauses(
         if val is strawberry.UNSET or val is None:
             continue
 
-        val = _coerce_reference_value(val)
-
         if op_name == "is_null":
             clauses.append(column.is_(None) if val else column.isnot(None))
-        elif op_name in ("in_list", "not_in_list"):
+            continue
+        val = _coerce_reference_value(column, val)
+        if op_name in ("in_list", "not_in_list"):
             if len(val) > max_in_list_size:
                 raise ValueError(
                     f"in_list/not_in_list has {len(val)} items; "
@@ -3257,7 +3328,7 @@ def _sa_connection_ordering(
         if isinstance(term, SetOrder):
             clauses.append(backend._set_order(model, term, info))
         else:
-            _sa_order_clauses(term, model, (), clauses, joins)
+            _sa_order_clauses(term, model, (), clauses, joins, backend=backend)
     return clauses, joins
 
 
@@ -3267,6 +3338,8 @@ def _sa_order_clauses(
     path: tuple[Any, ...],
     clauses: list[Any],
     joins: list[Any],
+    *,
+    backend: Any,
 ) -> None:
     """Collect one order input's column clauses, and the joins they need."""
     for key in order_input.__class__.__dataclass_fields__:
@@ -3282,11 +3355,19 @@ def _sa_order_clauses(
                 nested = getattr(value, relation)
                 if nested is strawberry.UNSET or nested is None:
                     continue
+                backend.reject_scoped_order_traversal(
+                    model, relation, type(order_input)
+                )
                 join = getattr(model, relation)
                 if join.property.uselist:
                     continue
                 _sa_order_clauses(
-                    nested, join.property.mapper.class_, (*path, join), clauses, joins
+                    nested,
+                    join.property.mapper.class_,
+                    (*path, join),
+                    clauses,
+                    joins,
+                    backend=backend,
                 )
 
 

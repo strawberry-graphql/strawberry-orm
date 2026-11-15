@@ -48,9 +48,9 @@ Accepted by all three constructors.
 | `strict_hints` | `True` | Raise at schema build when `using=` names a missing relation, or `scope=` sits on a non-relation. |
 | `batch_relations` | `True` | Collapse per-parent relation resolvers into one query per shape. |
 | `default_query_limit` | `None` | Cap rows returned by generated list fields. |
-| `max_filter_depth` | `10` | Cap recursive filter nesting. |
-| `max_filter_branches` | `50` | Cap `all` / `any` / `oneOf` branch count. |
-| `max_in_list_size` | `500` | Cap `inList` / `notInList` size. |
+| `max_filter_depth` | `10` | Cap filter nesting: each `not`, `all` / `any` / `oneOf` entry and `object` hop is a level, the foreign-key shortcut included. |
+| `max_filter_branches` | `50` | Cap the `all` / `any` / `oneOf` entries across one filter argument, each reference to a variable included. |
+| `max_in_list_size` | `500` | Cap the `inList` / `notInList` values (two per `range`) across one filter argument, each reference to a variable included. |
 | `enable_regex_filters` | `False` | Enable the `regex` and `iRegex` string lookups. |
 | `filter_overrides` | `{}` | `{python_type: lookup_type}` to change the generated lookup for a column type. |
 
@@ -180,6 +180,8 @@ class PostFilter:
     def search(self, value: str, query):
         return query.filter(title__icontains=value)
 ```
+
+A `filter_field` narrows the field's own query only at the top of the filter (alone or in a top-level `all`). Under `not`, in `any` or `oneOf`, or through `object`, it gets a fresh query over its filter's model, and the rows it keeps are matched by primary key.
 
 See [Custom filters and ordering](README.md#custom-filters-and-ordering).
 

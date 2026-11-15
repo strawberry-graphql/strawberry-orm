@@ -15,6 +15,7 @@ from django.db.models import Aggregate, FloatField, Model, QuerySet
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
+from strawberry_orm.backends.filter_budget import check_filter_budget
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
@@ -31,6 +32,7 @@ from ._base import (
     hint_hops,
     input_to_dict,
     invoke_custom_callback,
+    past_a_hop,
     requested_aggregates,
 )
 
@@ -524,17 +526,24 @@ class DjangoBackend(BaseBackend):
     def apply_filters(
         self, query: Any, filter_input: Any, model: type, info: Any = None
     ) -> Any:
-        q_obj, query = _build_django_filter(
+        check_filter_budget(
             filter_input,
-            query=query,
-            model=model,
-            info=info,
-            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
-            enable_regex=self._enable_regex_filters,
-            max_in_list_size=self._max_in_list_size,
+            max_values=self._max_in_list_size,
         )
+        with self.filtering(model, info):
+            q_obj, query = _build_django_filter(
+                filter_input,
+                query=query,
+                model=model,
+                info=info,
+                backend=self,
+                max_depth=self._max_filter_depth,
+                max_branches=self._max_filter_branches,
+                enable_regex=self._enable_regex_filters,
+                max_in_list_size=self._max_in_list_size,
+            )
         if q_obj is not None:
             if self.filter_crosses_to_many(filter_input, model):
                 # Matched in a subquery, so the outer query keeps each row once.
@@ -2125,16 +2134,37 @@ _LOOKUP_TO_DJANGO: dict[str, str] = {
 }
 
 
-def _django_forward_fk_attname(model: type, rel_name: str) -> str | None:
+def _django_reference_key(model: type, rel_name: str) -> tuple[str, str] | None:
+    """The parent's foreign key column and the related key it holds.
+
+    Only a forward foreign key to the related primary key: the key is then on
+    the parent's own row, and comparing it needs no join.
+    """
     from django.db.models.fields.related import ForeignKey, OneToOneField
 
     try:
         field = model._meta.get_field(rel_name)  # type: ignore[attr-defined]
     except Exception:
         return None
-    if isinstance(field, (ForeignKey, OneToOneField)):
-        return field.attname
+    if (
+        isinstance(field, (ForeignKey, OneToOneField))
+        and field.target_field.primary_key
+    ):
+        return field.attname, field.target_field.name
     return None
+
+
+def _django_to_many_link(model: type | None, rel_name: str) -> str | None:
+    """How the far side of a to-many *rel_name* names its way back to *model*."""
+    if model is None:
+        return None
+    try:
+        field = model._meta.get_field(rel_name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if _relation_kind(field) != "many":
+        return None
+    return field.remote_field.name
 
 
 def _django_related_model(model: type, rel_name: str) -> type | None:
@@ -2165,10 +2195,10 @@ def _django_traversal_model(model: type | None, rel_name: str) -> type | None:
     return getattr(field, "related_model", None)
 
 
-def _django_relation_scope_q(
-    backend: Any, model: type | None, relation: str, info: Any, prefix: str
+def _django_relation_scope(
+    backend: Any, model: type | None, relation: str, info: Any
 ) -> Any | None:
-    """``Q`` restricting *relation* to the rows its scoping allows.
+    """The rows of *relation*'s far side its scoping allows, or ``None``.
 
     Covers both the related type's ``scope_rows`` and any ``scope=`` on this
     edge, so a filter cannot reach rows the read path hides.
@@ -2178,11 +2208,29 @@ def _django_relation_scope_q(
     get_qs = backend.relation_scope(model, relation, info)
     if get_qs is None:
         return None
+    related = backend._relation_target_model(model, relation)
+    return get_qs(related._default_manager.all(), info)
+
+
+def _django_custom_filter_q(
+    handler: Any, filter_input: Any, model: type, value: Any, info: Any, prefix: str
+) -> Any:
+    """A ``@filter_field`` as a condition on rows of *model*.
+
+    The handler narrows a query of its own over *model*, and the rows it
+    keeps are matched by key, so the condition can be negated, made one
+    alternative of several, or tested on a related row.
+    """
     from django.db.models import Q
 
-    related = backend._relation_target_model(model, relation)
-    scoped = get_qs(related._default_manager.all(), info)
-    return Q(**{f"{prefix}{relation}__in": scoped})
+    narrowed = invoke_custom_callback(
+        handler,
+        filter_input,
+        query=model._base_manager.all(),  # type: ignore[attr-defined]
+        value=value,
+        info=info,
+    )
+    return Q(**{f"{prefix}pk__in": narrowed.values("pk")})
 
 
 def _build_django_filter(
@@ -2198,8 +2246,14 @@ def _build_django_filter(
     max_in_list_size: int = 500,
     _depth: int = 0,
     _prefix: str = "",
+    _on_query: bool = True,
 ) -> tuple[Any, Any]:
-    """Return ``(Q_clause | None, query)``."""
+    """Return ``(Q_clause | None, query)``.
+
+    A ``@filter_field`` narrows *query* itself only while the filter so far
+    is a plain AND at the top (``_on_query``). Anywhere else - under
+    ``not:``, ``any:``, ``oneOf:`` or ``object:`` - it becomes a clause.
+    """
     from django.db.models import Q
 
     if _depth > max_depth:
@@ -2222,6 +2276,7 @@ def _build_django_filter(
         max_in_list_size=max_in_list_size,
         _depth=_depth + 1,
         _prefix=_prefix,
+        _on_query=False,
     )
 
     for key in fields:
@@ -2252,49 +2307,74 @@ def _build_django_filter(
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
                 rel_model = _django_traversal_model(model, rel_name)
+                link = _django_to_many_link(model, rel_name)
                 # Traversal joins straight to the related table, so the related
                 # type's row scoping has to be re-applied or it is bypassed.
-                scope_q = _django_relation_scope_q(
-                    backend, model, rel_name, info, _prefix
+                scoped = _django_relation_scope(backend, model, rel_name, info)
+                scope_q = (
+                    None
+                    if scoped is None
+                    else Q(**{f"{_prefix}{rel_name}__in": scoped})
                 )
-                if scope_q is not None:
-                    is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
-                    if is_null_val is not strawberry.UNSET and is_null_val is not None:
+                is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
+                if is_null_val is not strawberry.UNSET and is_null_val is not None:
+                    if scope_q is not None:
                         # "Has no related row" has to mean "none the caller can see".
                         return (~scope_q if is_null_val else scope_q), query
-                if model is not None:
-                    fk_attname = _django_forward_fk_attname(model, rel_name)
-                    if fk_attname is not None:
-                        fk_prefix = f"{_prefix}{fk_attname}"
-                        fk_clause = build_reference_object_filter_clause(
-                            nested_filter,
-                            build_field_clause=_build_django_reference_field_clause,
-                            custom_filter_keys=custom_filter_keys,
-                            max_branches=max_branches,
-                            fk_prefix=fk_prefix,
-                            enable_regex=enable_regex,
-                            max_in_list_size=max_in_list_size,
-                        )
-                        if fk_clause is not None:
-                            if scope_q is not None:
-                                fk_clause = fk_clause & scope_q
-                            return fk_clause, query
-                nested_clause, query = _build_django_filter(
-                    nested_filter,
-                    query=query,
-                    model=rel_model,
-                    info=info,
-                    backend=backend,
-                    max_depth=max_depth,
-                    max_branches=max_branches,
-                    enable_regex=enable_regex,
-                    max_in_list_size=max_in_list_size,
-                    _depth=_depth + 1,
-                    _prefix=f"{_prefix}{rel_name}__",
+                    if link is not None:
+                        return Q(**{f"{_prefix}{rel_name}__isnull": is_null_val}), query
+                reference = (
+                    _django_reference_key(model, rel_name)
+                    if model is not None
+                    else None
                 )
-                if nested_clause is not None and scope_q is not None:
-                    nested_clause = nested_clause & scope_q
-                return nested_clause, query
+                if reference is not None:
+                    fk_attname, key_name = reference
+                    fk_clause = build_reference_object_filter_clause(
+                        nested_filter,
+                        key=key_name,
+                        build_field_clause=_build_django_reference_field_clause,
+                        custom_filter_keys=custom_filter_keys,
+                        max_branches=max_branches,
+                        max_depth=max_depth,
+                        depth=_depth + 1,
+                        fk_prefix=f"{_prefix}{fk_attname}",
+                        enable_regex=enable_regex,
+                        max_in_list_size=max_in_list_size,
+                    )
+                    if fk_clause is not None:
+                        if scope_q is not None:
+                            fk_clause = fk_clause & scope_q
+                        return fk_clause, query
+                with past_a_hop():
+                    nested_clause, query = _build_django_filter(
+                        nested_filter,
+                        query=query,
+                        model=rel_model,
+                        info=info,
+                        backend=backend,
+                        max_depth=max_depth,
+                        max_branches=max_branches,
+                        enable_regex=enable_regex,
+                        max_in_list_size=max_in_list_size,
+                        _depth=_depth + 1,
+                        _prefix="" if link is not None else f"{_prefix}{rel_name}__",
+                        _on_query=False,
+                    )
+                if nested_clause is None or link is None:
+                    if nested_clause is not None and scope_q is not None:
+                        nested_clause = nested_clause & scope_q
+                    return nested_clause, query
+                # One correlated condition per parent, so a negation negates
+                # "a readable related row matches" rather than each part of it.
+                from django.db.models import Exists, OuterRef
+
+                related = rel_model._base_manager.filter(  # type: ignore[union-attr]
+                    nested_clause, **{f"{link}__pk": OuterRef(f"{_prefix}pk")}
+                )
+                if scoped is not None:
+                    related = related.filter(pk__in=scoped)
+                return Exists(related), query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -2304,7 +2384,7 @@ def _build_django_filter(
             has_clause = False
             for f in val:
                 sub_clause, query = _build_django_filter(
-                    f, **{**recurse_kw, "query": query}
+                    f, **{**recurse_kw, "query": query, "_on_query": _on_query}
                 )
                 if sub_clause is not None:
                     combined &= sub_clause
@@ -2344,6 +2424,11 @@ def _build_django_filter(
                     has_clause = True
             return (combined if has_clause else None), query
         elif key in custom_filters:
+            if not _on_query:
+                clause = _django_custom_filter_q(
+                    custom_filters[key], filter_input, model, val, info, _prefix
+                )
+                return clause, query
             query = invoke_custom_callback(
                 custom_filters[key],
                 filter_input,
@@ -2354,18 +2439,6 @@ def _build_django_filter(
             return None, query
 
     return None, query
-
-
-def _coerce_reference_value(val: Any) -> Any:
-    if isinstance(val, list):
-        return [_coerce_reference_value(item) for item in val]
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return val
-    text = str(val)
-    try:
-        return int(text)
-    except ValueError:
-        return text
 
 
 def _build_django_reference_lookup(
@@ -2386,8 +2459,6 @@ def _build_django_reference_lookup(
         val = getattr(lookup, op_name)
         if val is strawberry.UNSET or val is None:
             continue
-
-        val = _coerce_reference_value(val)
 
         if op_name == "is_null":
             q &= Q(**{f"{col_name}__isnull": val})
@@ -2805,7 +2876,9 @@ def _ordered_field(model: type, name: str) -> Any:
     return field
 
 
-def _order_clauses(order_input: Any, prefix: str = "") -> list[Any]:
+def _order_clauses(
+    order_input: Any, model: type, *, backend: Any, prefix: str = ""
+) -> list[Any]:
     """The column clauses of one order input, through ``object:`` too."""
     clauses: list[Any] = []
     for key in order_input.__class__.__dataclass_fields__:
@@ -2818,7 +2891,17 @@ def _order_clauses(order_input: Any, prefix: str = "") -> list[Any]:
             for relation in value.__class__.__dataclass_fields__:
                 nested = getattr(value, relation)
                 if nested is not strawberry.UNSET and nested is not None:
-                    clauses.extend(_order_clauses(nested, f"{prefix}{relation}__"))
+                    backend.reject_scoped_order_traversal(
+                        model, relation, type(order_input)
+                    )
+                    clauses.extend(
+                        _order_clauses(
+                            nested,
+                            backend._relation_target_model(model, relation),
+                            backend=backend,
+                            prefix=f"{prefix}{relation}__",
+                        )
+                    )
     return clauses
 
 
@@ -2844,7 +2927,7 @@ def _connection_ordering(
             if isinstance(term, SetOrder):
                 clauses.append(backend._set_order(term, info))
             else:
-                clauses.extend(_order_clauses(term))
+                clauses.extend(_order_clauses(term, model, backend=backend))
     else:
         inner = query.query
         terms = inner.order_by or (

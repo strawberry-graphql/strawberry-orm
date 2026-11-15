@@ -18,9 +18,9 @@ from strawberry_orm.backends.django import (
     _build_django_lookup,
     _build_django_reference_field_clause,
     _build_django_reference_lookup,
-    _coerce_reference_value,
-    _django_forward_fk_attname,
+    _django_reference_key,
     _django_related_model,
+    _django_to_many_link,
     _primary_key,
 )
 from strawberry_orm.backends.filter_pk_shortcut import (
@@ -96,6 +96,12 @@ class TestInternalBackendCoverage:
             _build_django_filter(
                 EmptyFilterGroup(one_of=[EmptyFilterGroup()]), max_branches=0
             )
+        with pytest.raises(ValueError, match="maximum is 0"):
+            _build_django_filter(
+                EmptyFilterGroup(any=[EmptyFilterGroup()]), max_branches=0
+            )
+        with pytest.raises(ValueError, match="maximum depth of 0"):
+            _build_django_filter(EmptyFilterGroup(not_=EmptyFilterGroup()), max_depth=0)
 
     def test_query_object_helpers_handle_fallback_values(self, User):
         backend = DjangoBackend()
@@ -139,34 +145,36 @@ class TestInternalBackendCoverage:
         assert plain_backend.wrap_async_safe(resolver) is resolver
 
     def test_django_fk_introspection_helpers(self, Post):
-        assert _django_forward_fk_attname(Post, "author") == "author_id"
+        assert _django_reference_key(Post, "author") == ("author_id", "id")
         assert _django_related_model(Post, "author") is User
-        assert _django_forward_fk_attname(Post, "missing") is None
+        assert _django_reference_key(Post, "missing") is None
         assert _django_related_model(Post, "missing") is None
-        assert _django_forward_fk_attname(Post, "title") is None
+        assert _django_reference_key(Post, "title") is None
+        assert _django_to_many_link(User, "posts") == "author"
+        assert _django_to_many_link(Post, "author") is None
+        assert _django_to_many_link(User, "missing") is None
+        assert _django_to_many_link(None, "posts") is None
 
     def test_django_fk_introspection_custom_pk(self):
-        assert _django_forward_fk_attname(Book, "publisher") == "publisher_id"
+        assert _django_reference_key(Book, "publisher") == (
+            "publisher_id",
+            "publisher_code",
+        )
         assert _django_related_model(Book, "publisher") is Publisher
 
-    def test_coerce_reference_value_and_reference_lookups(self):
-        assert _coerce_reference_value(7) == 7
-        assert _coerce_reference_value("42") == 42
-        assert _coerce_reference_value("abc") == "abc"
-        assert _coerce_reference_value(["1", "2"]) == [1, 2]
-
+    def test_reference_lookups_leave_ids_to_the_field(self):
         exact_q = _build_django_reference_lookup(
             "author_id", ReferenceLookup(exact="1", neq="2", is_null=True)
         )
-        assert exact_q == Q(author_id__exact=1) & ~Q(author_id__exact=2) & Q(
-            author_id__isnull="True"
+        assert exact_q == Q(author_id__exact="1") & ~Q(author_id__exact="2") & Q(
+            author_id__isnull=True
         )
 
         list_q = _build_django_reference_lookup(
             "author_id",
             ReferenceLookup(in_list=["1", "2"], not_in_list=["3"]),
         )
-        assert list_q == Q(author_id__in=[1, 2]) & ~Q(author_id__in=[3])
+        assert list_q == Q(author_id__in=["1", "2"]) & ~Q(author_id__in=["3"])
 
         with pytest.raises(ValueError, match="maximum is 2"):
             _build_django_reference_lookup(
@@ -181,7 +189,7 @@ class TestInternalBackendCoverage:
             UserFilter._field_type(id=ReferenceLookup(exact="1")),
             fk_prefix="author_id",
         )
-        assert fk_clause == Q(author_id__exact=1)
+        assert fk_clause == Q(author_id__exact="1")
 
         shortcut_clause = _build_django_reference_field_clause(
             UserFilter._field_type(id=IntComparisonLookup(exact=1)),
@@ -205,7 +213,7 @@ class TestInternalBackendCoverage:
             )
         )
         id_clause, _ = _build_django_filter(id_filter, model=Post)
-        assert id_clause == Q(author_id__in=[1])
+        assert id_clause == Q(author_id__in=["1"])
 
         combined_filter = PostFilter(
             object=post_object(
@@ -218,10 +226,11 @@ class TestInternalBackendCoverage:
             )
         )
         assert filter_tree_uses_only_reference_lookups(
-            combined_filter.object.author  # type: ignore[union-attr]
+            combined_filter.object.author,  # type: ignore[union-attr]
+            key="id",
         )
         combined_clause, _ = _build_django_filter(combined_filter, model=Post)
-        assert combined_clause == Q(author_id__exact=1) & Q(author_id__exact=2)
+        assert combined_clause == Q(author_id__exact="1") & Q(author_id__exact="2")
 
         any_filter = PostFilter(
             object=post_object(
@@ -234,7 +243,7 @@ class TestInternalBackendCoverage:
             )
         )
         any_clause, _ = _build_django_filter(any_filter, model=Post)
-        assert any_clause == Q(author_id__exact=1) | Q(author_id__exact=3)
+        assert any_clause == Q(author_id__exact="1") | Q(author_id__exact="3")
 
         not_filter = PostFilter(
             object=post_object(
@@ -244,7 +253,7 @@ class TestInternalBackendCoverage:
             )
         )
         not_clause, _ = _build_django_filter(not_filter, model=Post)
-        assert not_clause == ~Q(author_id__exact=1)
+        assert not_clause == ~Q(author_id__exact="1")
 
         one_of_filter = PostFilter(
             object=post_object(
@@ -257,7 +266,7 @@ class TestInternalBackendCoverage:
             )
         )
         one_of_clause, _ = _build_django_filter(one_of_filter, model=Post)
-        assert one_of_clause == Q(author_id__exact=1) | Q(author_id__exact=3)
+        assert one_of_clause == Q(author_id__exact="1") | Q(author_id__exact="3")
 
         join_filter = PostFilter(
             object=post_object(
@@ -302,10 +311,28 @@ class TestInternalBackendCoverage:
             PublisherRefFilter(
                 field=PublisherRefField(publisher_code=ReferenceLookup(exact="ACE"))
             ),
+            key="publisher_code",
             build_field_clause=_build_django_reference_field_clause,
             fk_prefix="publisher_id",
         )
         assert nested == Q(publisher_id__exact="ACE")
+
+        with pytest.raises(ValueError, match="maximum depth of 0"):
+            build_reference_object_filter_clause(
+                PublisherRefFilter(
+                    all=[
+                        PublisherRefFilter(
+                            field=PublisherRefField(
+                                publisher_code=ReferenceLookup(exact="ACE")
+                            )
+                        )
+                    ]
+                ),
+                key="publisher_code",
+                build_field_clause=_build_django_reference_field_clause,
+                max_depth=0,
+                fk_prefix="publisher_id",
+            )
 
     @pytest.mark.django_db
     def test_apply_aggregation_and_grouping(self, seed, Post):

@@ -18,6 +18,7 @@ from strawberry.extensions import SchemaExtension
 from tortoise.models import Model
 from tortoise.queryset import QuerySet
 
+from strawberry_orm.backends.filter_budget import check_filter_budget
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
@@ -33,6 +34,7 @@ from ._base import (
     hint_hops,
     input_to_dict,
     invoke_custom_callback,
+    past_a_hop,
     requested_aggregates,
 )
 
@@ -459,18 +461,26 @@ class TortoiseBackend(BaseBackend):
     def apply_filters(
         self, query: Any, filter_input: Any, model: type, info: Any = None
     ) -> Any:
-        q_obj, query = _build_tortoise_filter(
+        check_filter_budget(
             filter_input,
-            query=query,
-            model=model,
-            info=info,
-            backend=self,
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
-            enable_regex=self._enable_regex_filters,
-            max_in_list_size=self._max_in_list_size,
+            max_values=self._max_in_list_size,
         )
+        with self.filtering(model, info):
+            q_obj, query = _build_tortoise_filter(
+                filter_input,
+                query=query,
+                model=model,
+                info=info,
+                backend=self,
+                max_depth=self._max_filter_depth,
+                max_branches=self._max_filter_branches,
+                enable_regex=self._enable_regex_filters,
+                max_in_list_size=self._max_in_list_size,
+            )
         if q_obj is not None:
+            _tortoise_checked_q(model, q_obj)
             if self.filter_crosses_to_many(filter_input, model):
                 # Matched in a subquery, so the outer query keeps each row once.
                 from tortoise.expressions import Q, Subquery
@@ -1580,8 +1590,14 @@ def _build_tortoise_filter(
     max_in_list_size: int = 500,
     _depth: int = 0,
     _prefix: str = "",
+    _on_query: bool = True,
 ) -> tuple[Any, Any]:
-    """Return ``(Q_clause | None, query)``."""
+    """Return ``(Q_clause | None, query)``.
+
+    A ``@filter_field`` narrows *query* itself only while the filter so far
+    is a plain AND at the top (``_on_query``). Anywhere else - under
+    ``not:``, ``any:``, ``oneOf:`` or ``object:`` - it becomes a clause.
+    """
 
     if _depth > max_depth:
         raise ValueError(f"Filter nesting exceeds maximum depth of {max_depth}")
@@ -1603,6 +1619,7 @@ def _build_tortoise_filter(
         max_in_list_size=max_in_list_size,
         _depth=_depth + 1,
         _prefix=_prefix,
+        _on_query=False,
     )
 
     for key in fields:
@@ -1658,41 +1675,70 @@ def _build_tortoise_filter(
                     if is_null_val is not strawberry.UNSET and is_null_val is not None:
                         # "Has no related row" has to mean "none the caller can see".
                         return (~scope_q if is_null_val else scope_q), query
-                fk_col = f"{rel_name}_id"
-                fk_prefix = f"{_prefix}{fk_col}"
-                fk_clause = build_reference_object_filter_clause(
-                    nested_filter,
-                    build_field_clause=_build_tortoise_reference_field_clause,
-                    custom_filter_keys=custom_filter_keys,
-                    max_branches=max_branches,
-                    fk_prefix=fk_prefix,
-                    enable_regex=enable_regex,
-                    max_in_list_size=max_in_list_size,
+                reference = _tortoise_reference_key(model, rel_name)
+                if reference is not None:
+                    fk_col, key_name = reference
+                    fk_clause = build_reference_object_filter_clause(
+                        nested_filter,
+                        key=key_name,
+                        build_field_clause=_build_tortoise_reference_field_clause,
+                        custom_filter_keys=custom_filter_keys,
+                        max_branches=max_branches,
+                        max_depth=max_depth,
+                        depth=_depth + 1,
+                        fk_prefix=f"{_prefix}{fk_col}",
+                        enable_regex=enable_regex,
+                        max_in_list_size=max_in_list_size,
+                    )
+                    if fk_clause is not None:
+                        if scope_q is not None:
+                            fk_clause = fk_clause & scope_q
+                        return fk_clause, query
+                to_many = model is not None and (
+                    type(model._meta.fields_map.get(rel_name)).__name__  # type: ignore[attr-defined]
+                    in _TO_MANY_REL_TYPES
                 )
-                if fk_clause is not None:
-                    if scope_q is not None:
-                        fk_clause = fk_clause & scope_q
-                    return fk_clause, query
-                nested_clause, query = _build_tortoise_filter(
-                    nested_filter,
-                    query=query,
-                    model=(
-                        backend._relation_target_model(model, rel_name)
-                        if backend is not None and model is not None
-                        else None
-                    ),
-                    info=info,
-                    backend=backend,
-                    max_depth=max_depth,
-                    max_branches=max_branches,
-                    enable_regex=enable_regex,
-                    max_in_list_size=max_in_list_size,
-                    _depth=_depth + 1,
-                    _prefix=f"{_prefix}{rel_name}__",
+                with past_a_hop():
+                    nested_clause, query = _build_tortoise_filter(
+                        nested_filter,
+                        query=query,
+                        model=(
+                            backend._relation_target_model(model, rel_name)
+                            if backend is not None and model is not None
+                            else None
+                        ),
+                        info=info,
+                        backend=backend,
+                        max_depth=max_depth,
+                        max_branches=max_branches,
+                        enable_regex=enable_regex,
+                        max_in_list_size=max_in_list_size,
+                        _depth=_depth + 1,
+                        _prefix=f"{rel_name}__"
+                        if to_many
+                        else f"{_prefix}{rel_name}__",
+                        _on_query=False,
+                    )
+                if nested_clause is None or not to_many:
+                    if nested_clause is not None and scope_q is not None:
+                        nested_clause = nested_clause & scope_q
+                    return nested_clause, query
+                # The parents a readable related row matches, found in one
+                # subquery, so a negation keeps the parents with none.
+                from tortoise.expressions import Q, Subquery
+
+                own_scope_q = (
+                    _tortoise_relation_scope_q(backend, model, rel_name, info, "")
+                    if _prefix
+                    else scope_q
                 )
-                if nested_clause is not None and scope_q is not None:
-                    nested_clause = nested_clause & scope_q
-                return nested_clause, query
+                if own_scope_q is not None:
+                    nested_clause = nested_clause & own_scope_q
+                pk_attr = model._meta.pk_attr  # type: ignore[union-attr]
+                matching = model.filter(  # type: ignore[union-attr]
+                    _tortoise_checked_q(model, nested_clause)
+                ).values(pk_attr)
+                return Q(**{f"{_prefix}{pk_attr}__in": Subquery(matching)}), query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -1701,7 +1747,7 @@ def _build_tortoise_filter(
             clauses = []
             for f in val:
                 sub_clause, query = _build_tortoise_filter(
-                    f, **{**recurse_kw, "query": query}
+                    f, **{**recurse_kw, "query": query, "_on_query": _on_query}
                 )
                 if sub_clause is not None:
                     clauses.append(sub_clause)
@@ -1751,6 +1797,11 @@ def _build_tortoise_filter(
                 result = result | s
             return result, query
         elif key in custom_filters:
+            if not _on_query:
+                clause = _tortoise_custom_filter_q(
+                    custom_filters[key], filter_input, model, val, info, _prefix
+                )
+                return clause, query
             query = invoke_custom_callback(
                 custom_filters[key],
                 filter_input,
@@ -1763,16 +1814,63 @@ def _build_tortoise_filter(
     return None, query
 
 
-def _coerce_reference_value(val: Any) -> Any:
-    if isinstance(val, list):
-        return [_coerce_reference_value(item) for item in val]
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return val
-    text = str(val)
+def _tortoise_reference_key(
+    model: type | None, rel_name: str
+) -> tuple[str, str] | None:
+    """The parent's foreign key column and the related key it holds.
+
+    Only a forward foreign key to the related primary key: the key is then on
+    the parent's own row, and comparing it needs no join. A reverse or
+    many-to-many relation has no such column.
+    """
+    if model is None:
+        return None
+    field = model._meta.fields_map.get(rel_name)  # type: ignore[attr-defined]
+    if type(field).__name__ not in _FORWARD_REL_TYPES or not field.to_field_instance.pk:
+        return None
+    return field.source_field, field.to_field_instance.model_field_name
+
+
+def _tortoise_custom_filter_q(
+    handler: Any, filter_input: Any, model: Any, value: Any, info: Any, prefix: str
+) -> Any:
+    """A ``@filter_field`` as a condition on rows of *model*.
+
+    The handler narrows a query of its own over *model*, and the rows it
+    keeps are matched by key, so the condition can be negated, made one
+    alternative of several, or tested on a related row.
+    """
+    from tortoise.expressions import Q, Subquery
+
+    narrowed = invoke_custom_callback(
+        handler, filter_input, query=model.all(), value=value, info=info
+    )
+    pk_attr = model._meta.pk_attr
+    return Q(**{f"{prefix}{pk_attr}__in": Subquery(narrowed.values(pk_attr))})
+
+
+def _tortoise_checked_q(model: Any, q: Any) -> Any:
+    """*q*, once it is known to resolve on *model*.
+
+    Tortoise rejects an unknown filter name only when the query runs, in a
+    message listing every column of the model. Checked here, the client gets
+    the short message the other backends give.
+    """
+    from tortoise.exceptions import FieldError
+    from tortoise.expressions import ResolveContext
+
     try:
-        return int(text)
-    except ValueError:
-        return text
+        q.resolve(
+            ResolveContext(
+                model=model,
+                table=model._meta.basetable,
+                annotations={},
+                custom_filters={},
+            )
+        )
+    except FieldError:
+        raise ValueError("Invalid filter expression") from None
+    return q
 
 
 def _build_tortoise_reference_lookup(
@@ -1793,8 +1891,6 @@ def _build_tortoise_reference_lookup(
         val = getattr(lookup, op_name)
         if val is strawberry.UNSET or val is None:
             continue
-
-        val = _coerce_reference_value(val)
 
         if op_name == "is_null":
             q = q & Q(**{f"{col_name}__isnull": val})
@@ -2256,6 +2352,9 @@ class _GroupedRows:
                     nested = getattr(value, relation)
                     if nested is strawberry.UNSET or nested is None:
                         continue
+                    self.backend.reject_scoped_order_traversal(
+                        model, relation, type(entry)
+                    )
                     field = meta.fields_map[relation]
                     if type(field).__name__ not in _FORWARD_REL_TYPES:
                         continue

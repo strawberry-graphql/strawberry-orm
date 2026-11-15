@@ -1015,7 +1015,7 @@ class TestFilterPkShortcutCoverage:
                 RefFilter(field=RefField(id=ReferenceLookup(exact="2"))),
             ]
         )
-        assert filter_tree_uses_only_reference_lookups(any_input)
+        assert filter_tree_uses_only_reference_lookups(any_input, key="id")
         any_clause = _build_reference_clause_recursive(
             any_input,
             build_field_clause=build_field,
@@ -1056,6 +1056,7 @@ class TestFilterPkShortcutCoverage:
                     RefFilter(field=RefField(id=ReferenceLookup(exact="2"))),
                 ]
             ),
+            key="id",
             build_field_clause=build_field,
         )
         assert str(combined) == "(eq:1&eq:2)"
@@ -1516,7 +1517,7 @@ class TestFinalCoveragePush:
             one_of: list[RefFilter] | None = strawberry.UNSET
             not_: RefFilter | None = strawberry.UNSET
 
-        assert filter_tree_uses_only_reference_lookups(None) is True
+        assert filter_tree_uses_only_reference_lookups(None, key="id") is True
 
         def build_clause(field_input, **_kwargs):
             from django.db.models import Q
@@ -1527,7 +1528,7 @@ class TestFinalCoveragePush:
         any_filter = RefFilter(any=[RefFilter(field=RefField(id=ref))])
         assert (
             build_reference_object_filter_clause(
-                any_filter, build_field_clause=build_clause
+                any_filter, key="id", build_field_clause=build_clause
             )
             is not None
         )
@@ -1537,7 +1538,7 @@ class TestFinalCoveragePush:
         )
         assert (
             build_reference_object_filter_clause(
-                one_of_filter, build_field_clause=build_clause
+                one_of_filter, key="id", build_field_clause=build_clause
             )
             is not None
         )
@@ -1547,7 +1548,7 @@ class TestFinalCoveragePush:
         )
         assert (
             build_reference_object_filter_clause(
-                not_filter, build_field_clause=build_clause
+                not_filter, key="id", build_field_clause=build_clause
             )
             is not None
         )
@@ -1566,13 +1567,16 @@ class TestFinalCoveragePush:
 
         assert (
             filter_tree_uses_only_reference_lookups(
-                BadFilter(field=BadField(name=StringLookup(exact="x")))
+                BadFilter(field=BadField(name=StringLookup(exact="x"))), key="name"
             )
             is False
         )
         assert (
             filter_tree_uses_only_reference_lookups(
-                BadFilter(any=[BadFilter(field=BadField(name=StringLookup(exact="y")))])
+                BadFilter(
+                    any=[BadFilter(field=BadField(name=StringLookup(exact="y")))]
+                ),
+                key="name",
             )
             is False
         )
@@ -1706,7 +1710,9 @@ class TestPushTo98:
             bogus: RefField | None = strawberry.UNSET
 
         assert (
-            filter_tree_uses_only_reference_lookups(RefFilter(bogus=RefField()))
+            filter_tree_uses_only_reference_lookups(
+                RefFilter(bogus=RefField()), key="id"
+            )
             is False
         )
 
@@ -1717,7 +1723,7 @@ class TestPushTo98:
         bad_not = RefFilter(
             not_=RefFilter(field=BadField(name=StringLookup(exact="x")))
         )
-        assert filter_tree_uses_only_reference_lookups(bad_not) is False
+        assert filter_tree_uses_only_reference_lookups(bad_not, key="id") is False
 
         def build_field(val, **_kwargs):
             return "clause"

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+Each of these, in 0.30.0, let a filter or an order learn about rows the caller cannot read, let a small request build a very large statement, or gave wrong rows.
+
+- **`not:` over a to-many relation tested hidden related rows.** On Django, `posts(filter: {not: {object: {comments: {field: {body: {startsWith: "the password is h"}}}}}})` dropped a post when a comment the caller cannot read matched, so hidden values could be read a character at a time. On Tortoise, a hidden related row was enough to drop a parent, and a parent with no related rows was dropped too. Through a to-many relation, `object:` is now one condition per parent, "a readable related row matches" (an `EXISTS` on Django, one subquery of the matching parents on Tortoise, as SQLAlchemy already did), and `not:` negates it whole.
+- **A `@filter_field` through `object:` ran on the parent's query, over every row.** `posts(filter: {object: {author: {search: "bob@secret"}}})` ran `search` on the posts query, uncorrelated and unscoped, so all posts or none came back: a yes/no question about users the caller cannot read. Under `not:`, a custom filter was applied as if `not:` were absent, and in `any:` it narrowed the whole query instead of adding an alternative. Anywhere but the top of the filter (alone or in a top-level `all:`), a custom filter is now called on a fresh query over its own model, its rows are matched by primary key, and that condition is negated, combined or tested on the related row as its place says.
+- **Root filters and `groupBy` used the edge `scope=` of the model's first-registered type.** With an admin type and a public type over one model, the public type's `scope=` on a relation was skipped when the admin type was registered first, so grouping or filtering through that relation read the rows it hides. The `scope=` now comes from the type the field returns. Where that cannot be told, as past an `object:` hop, every type over the model contributes its `scope=`, and only rows all of them allow are reached.
+- **Filter limits held for each list, not for the filter.** A variable can be referenced any number of times, so a 10 KB request repeating one 500-value `inList` a couple of thousand times built a statement with a million bind parameters, every list within its limit. `max_filter_branches` and `max_in_list_size` now count every entry and every value across one filter argument, each reference to a variable included, and a filter over either is refused before any SQL is built.
+- **A connection over a relation could sort by a scoped type's columns.** `comments(first: 10, order: [{object: {author: {field: {name: ASC}}}}])` was refused on a root connection but, on a relation connection, ranked comments by authors the caller cannot read. Connection ordering now runs the same check as every other order, and the check `orm.schema()` runs at build time covers the order of every type over a model, not only the last one registered.
+- **The foreign-key shortcut compared any integer column with the foreign key.** `object: {author: {field: {age: {exact: 2}}}}` matched the posts whose `author_id` is 2, revealing foreign-key values and returning the wrong rows. The shortcut is taken only for the related model's primary key through a forward foreign key now, and any other column is compared on the related row.
+- **Tortoise errors listed every column of the model.** A filter by key through a reverse relation (`object: {posts: {field: {id: {exact: 1}}}}`) was built as a `posts_id` column that does not exist, and Tortoise's error, which lists the model's columns, hidden ones included, reached the client. Reverse and many-to-many relations are filtered on the related rows now, and a filter Tortoise cannot resolve is refused with "Invalid filter expression".
+- **`max_filter_depth` did not count levels under the foreign-key shortcut.** `object: {author: {not: {not: …}}}` was accepted as deep as graphql-core allows. Those levels count now.
+- **Reference lookups read numeric-looking IDs as integers.** `{exact: "00123"}` on a text key was compared as `123`, so it missed its row and matched another or nothing, and raised on PostgreSQL. An ID is matched as the key column holds it now: as given on Django and Tortoise, and on SQLAlchemy converted only for an integer or UUID column, where an ID that is not one is refused.
+
+### Changed
+
+- **Filter limits are totals.** `max_filter_branches` and `max_in_list_size` count across the whole filter argument, and `max_in_list_size` counts the two ends of a `range` too. A filter that ran with several lists each under the limit may now be refused. A custom filter's value is not counted; a `@filter_field` that takes a list should cap it.
+- **A custom filter under `not:`, `any:`, `oneOf:` or `object:` gets a fresh query over its filter's model**, not the field's query, and its rows are matched by primary key. A `@filter_field` that relied on what the field's query was already narrowed or joined by sees only its own model there.
+- **Each `object:` through a to-many relation is its own condition.** On Django and Tortoise, `all: [{object: {tags: A}}, {object: {tags: B}}]` matches a post with one tag matching `A` and another matching `B`, as on SQLAlchemy, rather than needing one tag to match both.
+- **`orm.schema()` checks the order input of every type over a model**, so a schema with an earlier-registered type whose order reaches a scoped type now fails to build, as one with that type registered last already did.
+- **`build_reference_object_filter_clause` and `filter_tree_uses_only_reference_lookups` take `key=`**, the related field the foreign key holds, and the first takes `max_depth=` and `depth=`.
+
 ## 0.30.0
 
 ### Security

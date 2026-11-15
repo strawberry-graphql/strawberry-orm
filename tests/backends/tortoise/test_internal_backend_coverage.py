@@ -16,6 +16,7 @@ from strawberry_orm.backends.tortoise import (
     _build_tortoise_reference_lookup,
     _hide_scoped_out,
     _PlannedPrefetch,
+    _tortoise_reference_key,
 )
 from strawberry_orm.filters import ReferenceLookup, StringLookup
 from strawberry_orm.grouping import GroupPath, group_paths
@@ -131,6 +132,16 @@ class TestInternalBackendCoverage:
             _build_tortoise_filter(
                 EmptyFilterGroup(one_of=[EmptyFilterGroup()]),
                 max_branches=0,
+            )
+        with pytest.raises(ValueError, match="maximum is 0"):
+            _build_tortoise_filter(
+                EmptyFilterGroup(any=[EmptyFilterGroup()]),
+                max_branches=0,
+            )
+        with pytest.raises(ValueError, match="maximum depth of 0"):
+            _build_tortoise_filter(
+                EmptyFilterGroup(not_=EmptyFilterGroup()),
+                max_depth=0,
             )
         with pytest.raises(ValueError, match="Regex filters are disabled"):
             _build_tortoise_lookup("name", RegexLookup(regex="a.*"))
@@ -384,12 +395,6 @@ class TestInternalBackendCoverage:
         meta = TortoiseBackend()._introspect_model(User)
         assert any(name == "posts" and is_rel for name, _, is_rel, _ in meta)
 
-    def test_coerce_reference_value_numeric_passthrough(self):
-        from strawberry_orm.backends.tortoise import _coerce_reference_value
-
-        assert _coerce_reference_value(3) == 3
-        assert _coerce_reference_value(3.5) == 3.5
-
     def test_build_tortoise_reference_lookup_branches(self):
         q = _build_tortoise_reference_lookup(
             "author_id",
@@ -402,6 +407,14 @@ class TestInternalBackendCoverage:
             ),
         )
         assert q is not None
+
+    @pytest.mark.asyncio
+    async def test_reference_key_is_only_a_foreign_key_to_the_primary_key(
+        self, User, Post
+    ):
+        assert _tortoise_reference_key(Post, "author") == ("author_id", "id")
+        assert _tortoise_reference_key(User, "posts") is None
+        assert _tortoise_reference_key(None, "author") is None
 
     def test_build_tortoise_reference_field_clause_type_error(self):
         with pytest.raises(TypeError, match="Expected ReferenceLookup"):
