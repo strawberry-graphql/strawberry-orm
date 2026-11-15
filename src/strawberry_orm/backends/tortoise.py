@@ -2130,6 +2130,7 @@ class _GroupedRows:
         # limit keeps.
         if query._limit is None and not query._offset:
             query = query.order_by()
+        self.query = query
         own = _pypika(query.values_list(meta.pk_attr, flat=True))
         self.stmt = self.query_class.from_(self.base).where(self.pk.isin(own))
         self._joined: dict[tuple[str, ...], Any] = {}
@@ -2390,7 +2391,7 @@ class _GroupedRows:
         expr = invoke_custom_callback(
             path.custom,
             path.owner,
-            query=self.model.all(),
+            query=self.query,
             value=path.value,
             info=self.info,
         )

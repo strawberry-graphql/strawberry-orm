@@ -4,9 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+import strawberry
+from strawberry import relay
 from tortoise.expressions import F
 
-from strawberry_orm import StrawberryORM
+from strawberry_orm import StrawberryORM, group_field
+from strawberry_orm.relay import ORMListConnection
+from strawberry_orm.types import auto
 from tests.abstract.grouping_across_relations import (
     AbstractTestAggregateSelections,
     AbstractTestARelationToManyRowsCanBeEmpty,
@@ -139,3 +143,35 @@ def together_read(orm, models):
 
 class TestTheRowsTogetherOnEachDatabase(AbstractTestTheRowsTogetherOnEachDatabase):
     pass
+
+
+async def test_a_group_field_is_handed_the_rows_the_type_shows(orm, models, run):
+    """As on Django and SQLAlchemy: a subquery built from it reads no hidden row."""
+    handed = []
+
+    @orm.group_type(Post)
+    class PostGroupBy:
+        @group_field
+        def by_author(self, value: bool, query):
+            handed.append(query)
+            return F("author_id")
+
+    @orm.type(Post, group=PostGroupBy)
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+
+        @classmethod
+        def scope_rows(cls, qs, info):
+            return qs.filter(is_published=True)
+
+    @strawberry.type
+    class Query:
+        posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+    query = "{ posts(groupBy: [{byAuthor: true}]) { groups { key { byAuthor } } } }"
+    result = await run(orm.schema(query=Query), query)
+    assert result.errors is None, result.errors
+    assert handed
+    for rows in handed:
+        assert "Draft Post" not in await rows.values_list("title", flat=True)
