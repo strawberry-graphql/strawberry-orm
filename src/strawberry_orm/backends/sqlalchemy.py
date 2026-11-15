@@ -540,15 +540,16 @@ class SQLAlchemyBackend(BaseBackend):
         if self._is_async_session(session):
             return self._apply_upsert_async(session, writer, payload)
         writer.validate_root(payload)
-        with session.begin_nested():
+        with _database_errors(_WRITE_REFUSED), session.begin_nested():
             return run_sync(writer.apply_root(payload))
 
     async def _apply_upsert_async(self, session: Any, writer: Any, payload: Any) -> Any:
         from strawberry_orm.upserts import run_async
 
         writer.validate_root(payload)
-        async with session.begin_nested():
-            return await run_async(writer.apply_root(payload))
+        with _database_errors(_WRITE_REFUSED):
+            async with session.begin_nested():
+                return await run_async(writer.apply_root(payload))
 
     def _upsert_ops(self, info: Any) -> Any:
         return _SQLAlchemyUpsertOps(self, self._get_session(info), info)
@@ -1959,7 +1960,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        with session.begin_nested():
+        with _database_errors(_WRITE_REFUSED), session.begin_nested():
             run_sync(writer.apply_refs(instance, spec, refs))
 
     async def _apply_ref_list_async(
@@ -1976,8 +1977,9 @@ class SQLAlchemyBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        async with session.begin_nested():
-            await run_async(writer.apply_refs(instance, spec, refs))
+        with _database_errors(_WRITE_REFUSED):
+            async with session.begin_nested():
+                await run_async(writer.apply_refs(instance, spec, refs))
 
 
 class _SQLAlchemyUpsertOps:
@@ -2473,21 +2475,29 @@ def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
     ]
 
 
-def _sanitized(exc: Any) -> Exception:
+#: What a client is told when a statement run by a read fails.
+_READ_REFUSED = "Invalid filter expression"
+
+#: What a client is told when a statement run by a write fails.
+_WRITE_REFUSED = "The database refused the write"
+
+
+def _sanitized(exc: Any, refused: str = _READ_REFUSED) -> Exception:
     """What a client sees in place of a database error.
 
-    The original names tables and columns, or the database host, so it is
-    kept only as the cause, for the server log. Only an error from running the
-    statement can be a bad filter: a refused connection ("too many clients")
-    carries no statement, and a dropped one is invalidated.
+    The original names tables and columns, or the database host, and a
+    write's carries the row's values, so it is kept only as the cause, for the
+    server log. Only an error from running the statement is the request's
+    doing: a refused connection ("too many clients") carries no statement, and
+    a dropped one is invalidated.
     """
     if exc.statement is None or getattr(exc, "connection_invalidated", False):
         return ConnectionError("Database connection failed")
-    return ValueError("Invalid filter expression")
+    return ValueError(refused)
 
 
 @contextmanager
-def _database_errors() -> Generator[None]:
+def _database_errors(refused: str = _READ_REFUSED) -> Generator[None]:
     """Raise what a client may see in place of an error running a statement.
 
     ``StatementError`` covers the driver's errors and SQLAlchemy's own, such
@@ -2498,7 +2508,7 @@ def _database_errors() -> Generator[None]:
     try:
         yield
     except StatementError as exc:
-        raise _sanitized(exc) from exc
+        raise _sanitized(exc, refused) from exc
 
 
 def _sanitizing(work: Callable[..., Any], *args: Any) -> Any:
