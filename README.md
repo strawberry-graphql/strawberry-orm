@@ -2254,7 +2254,7 @@ server = mcp_server(
 ```
 
 - **Queries only, unless you opt in.** `graphql` runs only queries, and `graphql_schema` shows no mutations. `allow_mutations=True` shows and allows them, and marks `graphql` destructive.
-- **Checked before it runs.** An operation must be a single operation within `max_depth` levels (default 10) that passes validation. Depth does not bound width, so give the schema Strawberry's `MaxAliasesLimiter` or `MaxTokensLimiter` to cap that; they apply here as to any request.
+- **Checked before it runs.** An operation must be a single operation of at most `max_tokens` tokens (default 2,000) and `max_depth` levels (default 10) that passes validation. The token limit is applied as the operation is parsed, so it bounds the work of checking it too; the check runs off the event loop. The schema's own extensions, such as Strawberry's `MaxAliasesLimiter` and `MaxTokensLimiter`, apply when the operation executes, as for any request.
 - **No introspection.** An operation asking for `__schema` or `__type` is refused, since it would describe the whole schema, mutations and fields `root_fields` leaves out included. `graphql_schema` describes what `graphql` may use; `__typename` still works.
 - **`root_fields`** limits the root fields `graphql` may use, and `graphql_schema` shows only those and the types they reach. `descriptions=False` leaves the schema's descriptions out of `graphql_schema`. To expose only part of the schema in the first place, build it with `orm.schema(query=Query, tags="mcp")`.
 

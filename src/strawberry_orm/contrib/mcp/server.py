@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import Callable, Collection
@@ -34,17 +35,22 @@ class GraphQLTool:
 
     Only queries run unless ``allow_mutations``. ``root_fields`` limits the
     root fields it may use, and the schema shows only those and the types
-    they reach. An operation must be a single operation within
-    ``max_depth`` levels that passes validation, and may not ask for
-    ``__schema`` or ``__type``: ``graphql_schema`` describes what it may
-    use. ``descriptions=False``
+    they reach. An operation must be a single operation of at most
+    ``max_tokens`` tokens and ``max_depth`` levels that passes validation,
+    and may not ask for ``__schema`` or ``__type``: ``graphql_schema``
+    describes what it may use. ``descriptions=False``
     leaves the schema's descriptions out of ``graphql_schema``.
+
+    The token limit is checked as the operation is parsed, before anything
+    else reads it; the schema's own extensions, such as Strawberry's
+    ``MaxTokensLimiter``, only run once it executes.
     """
 
     allow_mutations: bool = False
     root_fields: Collection[str] | None = None
     max_depth: int = 10
     descriptions: bool = True
+    max_tokens: int = 2_000
 
 
 def mcp_server(
@@ -188,8 +194,13 @@ def _add_graphql_tools(
     async def graphql(
         query: str, ctx: Context, variables: dict[str, Any] | None = None
     ) -> CallToolResult:
-        errors, kind = check_operation(
-            exposed, query, allowed=allowed, max_depth=options.max_depth
+        errors, kind = await asyncio.to_thread(
+            check_operation,
+            exposed,
+            query,
+            allowed=allowed,
+            max_depth=options.max_depth,
+            max_tokens=options.max_tokens,
         )
         if errors:
             raise ToolError("\n".join(errors))

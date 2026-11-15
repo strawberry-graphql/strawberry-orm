@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import AsyncGenerator
 
 import pytest
 import strawberry
 from mcp import Client
 from mcp.server.mcpserver.tools import Tool
+from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
+from strawberry_orm.contrib.mcp.checks import check_operation
 
 from .fakes import OPERATIONS, RUNS, Query, schema
 
@@ -339,6 +343,56 @@ async def test_the_graphql_tool_checks_an_operation_before_it_runs(query, error)
 
     assert result.is_error is True
     assert error in result.content[0].text
+
+
+def _doubling_fragments(levels: int) -> str:
+    """One selection of posts, through fragments that each spread the next twice."""
+    spreads = " ".join(
+        f"fragment F{i} on Post {{ ...F{i + 1} ...F{i + 1} }}" for i in range(levels)
+    )
+    return f"{{ posts {{ ...F0 }} }} {spreads} fragment F{levels} on Post {{ title }}"
+
+
+def test_a_fragment_spread_many_times_is_measured_once():
+    started = time.perf_counter()
+    errors, kind = check_operation(
+        schema._schema,
+        _doubling_fragments(22),
+        allowed={OperationType.QUERY},
+        max_depth=2,
+        max_tokens=2_000,
+    )
+    assert time.perf_counter() - started < 1
+    assert (errors, kind) == ([], OperationType.QUERY)
+
+
+async def test_the_graphql_tool_refuses_a_document_past_its_token_limit():
+    server = _server(graphql_tool=GraphQLTool(max_tokens=8))
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "graphql", {"query": "{ posts { title author { name } } }"}
+        )
+
+    assert result.is_error is True
+    assert "Document contains more than 8 tokens." in result.content[0].text
+
+
+async def test_the_graphql_tool_checks_an_operation_off_the_event_loop(monkeypatch):
+    from strawberry_orm.contrib.mcp import server as module
+
+    threads = []
+
+    def recording(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return check_operation(*args, **kwargs)
+
+    monkeypatch.setattr(module, "check_operation", recording)
+    async with Client(_server(graphql_tool=True)) as client:
+        await client.call_tool("graphql", {"query": "{ named { name } }"})
+
+    assert len(threads) == 1
+    assert threads[0] is not threading.main_thread()
 
 
 async def test_the_graphql_tool_may_run_mutations_when_allowed():

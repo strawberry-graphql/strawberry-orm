@@ -115,14 +115,17 @@ def check_operation(
     *,
     allowed: set[OperationType],
     max_depth: int,
+    max_tokens: int,
 ) -> tuple[list[str], OperationType | None]:
     """Errors that stop ``query`` from running, and the kind of operation it is.
 
     The operation runs on the whole schema, so ``__schema`` and ``__type``
-    are refused: they would describe what *schema* leaves out.
+    are refused: they would describe what *schema* leaves out. A document
+    past ``max_tokens`` is refused while it is parsed, before anything else
+    reads it.
     """
     try:
-        document = parse(query)
+        document = parse(query, max_tokens=max_tokens)
     except GraphQLError as error:
         return [error.message], None
     operations = [
@@ -138,7 +141,7 @@ def check_operation(
         for d in document.definitions
         if isinstance(d, FragmentDefinitionNode)
     }
-    depth = _depth(operations[0].selection_set, fragments, frozenset())
+    depth = _depth(operations[0].selection_set, fragments, {}, set())
     if depth > max_depth:
         return [f"The query is {depth} levels deep; the limit is {max_depth}."], kind
     finder = _FindIntrospection()
@@ -153,22 +156,36 @@ def check_operation(
 def _depth(
     selection_set: SelectionSetNode | None,
     fragments: dict[str, FragmentDefinitionNode],
-    seen: frozenset[str],
+    depths: dict[str, int],
+    entered: set[str],
 ) -> int:
+    """How many fields deep *selection_set* goes, fragments included.
+
+    Each fragment is measured once, in *depths*: one spread twice by each of
+    a chain of fragments would otherwise be walked once per path, which
+    doubles with every link. A spread of a fragment being measured, a cycle
+    validation refuses, adds nothing.
+    """
     if selection_set is None:
         return 0
     deepest = 0
     for selection in selection_set.selections:
         if isinstance(selection, FieldNode):
-            depth = 1 + _depth(selection.selection_set, fragments, seen)
+            depth = 1 + _depth(selection.selection_set, fragments, depths, entered)
         elif isinstance(selection, InlineFragmentNode):
-            depth = _depth(selection.selection_set, fragments, seen)
+            depth = _depth(selection.selection_set, fragments, depths, entered)
         else:
             assert isinstance(selection, FragmentSpreadNode)
             name = selection.name.value
             fragment = fragments.get(name)
-            if fragment is None or name in seen:
+            if fragment is None or name in entered:
                 continue
-            depth = _depth(fragment.selection_set, fragments, seen | {name})
+            if name not in depths:
+                entered.add(name)
+                depths[name] = _depth(
+                    fragment.selection_set, fragments, depths, entered
+                )
+                entered.discard(name)
+            depth = depths[name]
         deepest = max(deepest, depth)
     return deepest
