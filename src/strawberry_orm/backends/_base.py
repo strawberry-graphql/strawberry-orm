@@ -41,7 +41,7 @@ from strawberry_orm.grouping import (
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
-from strawberry_orm.types import DateGroupByOption, Ordering
+from strawberry_orm.types import DateGroupByOption, FieldHints, Ordering
 
 LazyResolutionMode = Literal["off", "warn", "error"]
 _LAZY_RESOLUTION_MODES: frozenset[str] = frozenset({"off", "warn", "error"})
@@ -3077,6 +3077,12 @@ class BaseBackend:
                 f"query. Give it a resolver with @orm.connection.lazy, which says "
                 f"that plainly."
             )
+        scope = pending.scope
+        if scope is not None:
+            # The relation resolver and the windowed read both narrow the
+            # relation by its field's hints, so that is where the scope goes.
+            hints = dataclasses.replace(hints or FieldHints(), scope=scope)
+            self._store.register(type_name, attr_name, hints)
         resolver = self._make_relation_query_resolver(model, attr_name, relation)
         setattr(cls, attr_name, pending.rebuild_for_relation(resolver))
         self._register_relation_connection(model, type_name, attr_name, relation)

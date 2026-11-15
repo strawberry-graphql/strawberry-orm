@@ -947,6 +947,11 @@ class _AutoConnection:
         self._resolver = resolver
         self._kwargs = kwargs
 
+    @property
+    def scope(self) -> Any:
+        """The ``scope=`` narrowing this connection's rows, if one was given."""
+        return self._kwargs.get("scope")
+
     def __set_name__(self, owner: type, name: str) -> None:
         graphql_type = self._graphql_type or getattr(owner, "__annotations__", {}).get(
             name
