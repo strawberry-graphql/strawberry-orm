@@ -227,7 +227,7 @@ class AbstractRepo(Generic[M]):
         if name == "TortoiseBackend":
             qs = model.all()
             qs = self.scope_query(qs, info)
-            return await qs.filter(pk=int(pk)).first()
+            return await qs.filter(pk=pk).first()
 
         if name == "SQLAlchemyBackend":
             session = backend._get_session(info)

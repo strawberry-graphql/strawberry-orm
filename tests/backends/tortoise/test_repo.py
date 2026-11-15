@@ -1,5 +1,6 @@
 """Tests for AbstractRepo enforcement in the Tortoise backend."""
 
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -184,6 +185,25 @@ class TestRepoModelExtraction:
             pass
 
         assert BareRepo.model is None
+
+
+async def test_a_repo_looks_a_row_up_by_its_key_as_it_is():
+    """A key that is not an integer, a UUID say, is not cast to one."""
+    asked = {}
+
+    class Rows:
+        def filter(self, **kwargs):
+            asked.update(kwargs)
+            return self
+
+        async def first(self):
+            return None
+
+    orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+    key = uuid.UUID(int=7)
+    repo = AbstractRepo(orm.backend)
+    assert await repo._get_async(SimpleNamespace(all=Rows), key, _make_info()) is None
+    assert asked == {"pk": key}
 
 
 # ---------------------------------------------------------------------------

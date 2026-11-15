@@ -83,6 +83,7 @@
 
 ### Fixed
 
+- **On Tortoise, a repo could not find a row whose key is not an integer.** `AbstractRepo._get_async` cast every key with `int()`, so an `update`, `unlink` or `delete` on a model keyed by a UUID matched nothing, and one keyed by a string raised `ValueError`. The key is now looked up as the model stores it.
 - **A relation connection's `aggregates`, `groups` and `pageInfo { aggregates }` were lost when its page was windowed.** `posts(first: 10) { aggregates { count } }` answered `null` for every parent, and `pageInfo { aggregates }` raised. A connection that selects them is read one parent at a time, from the relation's own query.
 
 ## 0.30.0
