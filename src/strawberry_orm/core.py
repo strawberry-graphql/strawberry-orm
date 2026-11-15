@@ -592,23 +592,21 @@ class FieldFactory:
         """
         merged = field_metadata(metadata, tags)
         supplied = fn if fn is not None else scope
-        if supplied is not None:
-            check_scope_signature(supplied)
+        if supplied is not None or any(
+            [on, compute, disable_optimization, permission_classes]
+        ):
+            if supplied is not None:
+                check_scope_signature(supplied)
             return FieldDefinition(
                 scope=supplied,
-                on=on,
-                description=description,
-                declared_type=_return_annotation(supplied),
-                metadata=merged,
-            )
-        if any([on, compute, disable_optimization, permission_classes]):
-            return FieldDefinition(
-                scope=None,
                 on=on,
                 compute=compute,
                 disable_optimization=disable_optimization,
                 permission_classes=permission_classes,
                 description=description,
+                declared_type=(
+                    _return_annotation(supplied) if supplied is not None else None
+                ),
                 metadata=merged,
             )
         return _AutoField(

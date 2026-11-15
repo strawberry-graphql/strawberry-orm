@@ -19,13 +19,48 @@ The seed: Alice wrote "Hello World" and "GraphQL Guide", Bob the unpublished
 import pytest
 import strawberry
 from strawberry import relay
+from strawberry.permission import BasePermission
 
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
 
 
+class Deny(BasePermission):
+    message = "Denied."
+
+    def has_permission(self, source, info, **kwargs):
+        return False
+
+
 def _published(narrow, Post):
     return lambda query, info: narrow.only(query, Post, "is_published", True)
+
+
+def _guarded_scope_schema(orm, models, narrow, *, positional: bool):
+    User, Post = models.User, models.Post
+    published = _published(narrow, Post)
+    guarded = (
+        orm.field.eager(published, permission_classes=[Deny])
+        if positional
+        else orm.field.eager(scope=published, permission_classes=[Deny])
+    )
+
+    @orm.type(Post)
+    class PostNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+
+    @orm.type(User)
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+        posts: list[PostNode] = guarded
+
+    @strawberry.type
+    class Query:
+        users: list[UserNode] = orm.field.eager()
+
+    return orm.schema(query=Query)
 
 
 def _scoped_connection_schema(orm, models, narrow):
@@ -56,8 +91,8 @@ def _by_name(result) -> dict[str, dict]:
     return {user["name"]: user["posts"] for user in result.data["users"]}
 
 
-@pytest.mark.asyncio
 class AbstractTestDeclaredControls:
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("selection", "bob"),
         [
@@ -81,3 +116,14 @@ class AbstractTestDeclaredControls:
         schema = _scoped_connection_schema(orm, models, narrow)
         result = await run(schema, "{ users { name " + selection + " } }")
         assert _by_name(result)["Bob"] == bob, result.data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("positional", [False, True])
+    async def test_a_scoped_fields_permission_is_checked(
+        self, orm, models, narrow, run, positional
+    ):
+        schema = _guarded_scope_schema(orm, models, narrow, positional=positional)
+        result = await run(schema, "{ users { name posts { title } } }")
+        assert result.errors is not None, result.data
+        assert {error.message for error in result.errors} == {"Denied."}
+        assert "Hello World" not in repr(result.data), result.data
