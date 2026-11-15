@@ -1570,8 +1570,15 @@ class StrawberryORM:
         Relations are loaded onto the instances given, so scalar values held in
         memory - which may be fresher than the database, straight out of a
         mutation - are preserved. On an async backend the result is awaitable.
+
+        Instances are checked against ``scope_rows`` first, as a query object
+        is scoped before it runs: what comes back leaves out the rows the
+        scope rejects, and ``None`` stands for a single rejected instance.
         """
-        from strawberry_orm.optimizer.extension import _mark_prepared
+        from strawberry_orm.optimizer.extension import (
+            _mark_prepared,
+            scope_then_load,
+        )
         from strawberry_orm.optimizer.selections import narrow_info
 
         if data is None or info is None:
@@ -1606,19 +1613,10 @@ class StrawberryORM:
         else:
             return data
 
-        loaded = self._backend.load_relations(store, instances, info)
-        if isawaitable(loaded):
-
-            async def _await_loaded() -> Any:
-                # Only what was loaded is marked, so the optimizer's automatic
-                # pass does not repeat the work - and, when this call turned
-                # out to be a no-op, is not suppressed by it either.
-                _mark_prepared(await loaded)
-                return data
-
-            return _await_loaded()
-        _mark_prepared(loaded)
-        return data
+        # Only what was kept and loaded is marked, so the optimizer's automatic
+        # pass does not repeat the work, is not suppressed when this call loaded
+        # nothing, and still drops a rejected row the resolver returns anyway.
+        return scope_then_load(self._backend, store, data, instances, info)
 
     def optimizer_extension(self, **kwargs: Any) -> type[SchemaExtension]:
         return self._backend.optimizer_extension(**kwargs)

@@ -505,6 +505,35 @@ class RelationConnectionSpec:
     key_field: str
 
 
+class ScopeHooks(dict):
+    """``scope_rows`` by model, found for a model through the classes it inherits.
+
+    A row of a subclass - an inherited mapping, a proxy, a multi-table child -
+    is a row of its base as well, and the base's type accepts it as one. Looked
+    up by its exact class, such a row or query would find no scope at all, so
+    ``get`` and ``in`` answer for the nearest class up its hierarchy that has
+    one. Iterating, indexing and storing stay exact.
+    """
+
+    def owner(self, model: Any) -> type | None:
+        """The class whose ``scope_rows`` scopes *model*'s rows, if any."""
+        for cls in getattr(model, "__mro__", ()):
+            if dict.__contains__(self, cls):
+                return cls
+        return None
+
+    def exact(self, model: Any) -> Any | None:
+        """The hook registered for *model* itself, not one it inherits."""
+        return dict.get(self, model)
+
+    def get(self, model: Any, default: Any = None) -> Any:
+        owner = self.owner(model)
+        return default if owner is None else dict.__getitem__(self, owner)
+
+    def __contains__(self, model: object) -> bool:
+        return self.owner(model) is not None
+
+
 class BaseBackend:
     """Shared foundation for Django, SQLAlchemy, and Tortoise backends.
 
@@ -529,7 +558,7 @@ class BaseBackend:
         self._group_registry: dict[type, type] = {}
         self._aggregate_type_cache: dict[type, AggregateMeta] = {}
         self._group_key_cache: dict[tuple, tuple[type, dict[str, Any]]] = {}
-        self._type_querysets: dict[type, Any] = {}
+        self._type_querysets = ScopeHooks()
         self._type_queryset_owner: dict[type, str] = {}
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._warn_missing_scope: bool = kwargs.get("warn_missing_scope", True)
@@ -2056,21 +2085,26 @@ class BaseBackend:
         """Drop instances whose model ``scope_rows`` rejects.
 
         Returns a list, or an awaitable of a list on async backends. Instances
-        of models with no ``scope_rows`` pass through. A scoped model whose
-        instance has no primary key cannot be checked, so that raises rather
-        than returning the row.
+        of models with no ``scope_rows`` pass through. A subclass's instance is
+        checked against the scope it inherits, by the class that declares it.
+        A scoped model whose instance has no primary key cannot be checked, so
+        that raises rather than returning the row.
         """
         from inspect import isawaitable
 
         from strawberry_orm.lazy_resolution import mark_rows_scoped, row_is_scoped
 
+        owners: dict[type, type | None] = {}
         groups: dict[type, list[Any]] = {}
         for row in rows:
             if row_is_scoped(row):
                 continue
-            model = type(row)
-            if model in self._type_querysets:
-                groups.setdefault(model, []).append(row)
+            cls = type(row)
+            if cls not in owners:
+                owners[cls] = self._type_querysets.owner(cls)
+            owner = owners[cls]
+            if owner is not None:
+                groups.setdefault(owner, []).append(row)
         if not groups:
             return list(rows)
 
@@ -2093,8 +2127,8 @@ class BaseBackend:
                 row
                 for row in rows
                 if row_is_scoped(row)
-                or type(row) not in allowed
-                or self.instance_pk(row) in allowed[type(row)]
+                or owners[type(row)] is None
+                or self.instance_pk(row) in allowed[owners[type(row)]]
             ]
             mark_rows_scoped(kept)
             return kept
@@ -2590,7 +2624,7 @@ class BaseBackend:
         get the last one, turning a restrictive scope into a permissive one.
         That is an authorization bypass, so it is rejected outright.
         """
-        existing = self._type_querysets.get(model)
+        existing = self._type_querysets.exact(model)
         new = getattr(cls, _ROW_SCOPE_HOOK)
         if existing is not None and getattr(existing, "__func__", existing) is not (
             getattr(new, "__func__", new)

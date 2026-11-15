@@ -320,6 +320,10 @@ Define it on the `@orm.type` class for the model **being loaded**. A nested quer
 | `users { posts { … } }`  | `UserType.scope_rows` | `PostType.scope_rows` |
 | `posts { author { … } }` | `PostType.scope_rows` | `UserType.scope_rows` |
 
+A row of a subclass of the model (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) is a row of the model too, and is scoped by the model's `scope_rows` unless a type over the subclass defines its own.
+
+On SQLAlchemy the hook may return more than a `.where()`: joins, nested selects and `with_loader_criteria` hold wherever the rows are read, in counts, aggregates, groups, orders and filters through relations included. A `with_loader_criteria` applies to every place its entity is read in the statement the scope runs inside. A scope that is more than a `.where()` on the related table's own columns is loaded onto a relation one statement per relation, by the relation's join key; a relation that does not join on one column (a composite key, a `primaryjoin` that says more than the key comparison) cannot be loaded that way and raises.
+
 ### Parent scoping does not flow to children
 
 This is the mistake that bites hardest, so it is worth one careful example.
@@ -447,12 +451,12 @@ Relations are loaded **onto the rows you returned**, so a value you just set in 
 
 `orm.optimize` — the manual form
 
-Rows that never pass through a resolver's return value are out of reach, and for those there is `orm.optimize(data, info)`. It takes a query object, a model instance, or a list, and returns anything else untouched.
+Rows that never pass through a resolver's return value are out of reach, and for those there is `orm.optimize(data, info)`. It takes a query object, a model instance, or a list, and returns anything else untouched. Instances are checked against their type's `scope_rows` before anything is loaded onto them, and what comes back leaves out the rows it rejects (`None` for a single rejected instance), so use what it returns.
 
 ```python
 # Django
 rows = list(Post.objects.filter(...))
-orm.optimize(rows, info)
+rows = orm.optimize(rows, info)
 ```
 
 Calling it on rows the optimizer already prepared costs nothing. `at="data"` re-roots the selection when the rows sit below the resolved field; `at` also takes a sequence for a deeper path and matches either `camelCase` or `snake_case`. Getting it wrong is not an error — nothing is eager-loaded and the rows come back as they would have anyway.

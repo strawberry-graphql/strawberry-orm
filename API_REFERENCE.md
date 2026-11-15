@@ -417,7 +417,7 @@ A `can_*` hook allows with `True` and denies with `False` or `None`. Any other t
 orm.optimize(data, info, *, at: str | Sequence[str] | None = None) -> Any
 ```
 
-Eager-load what the current selection needs from rows already in memory. Rarely needed: a resolver's return value is optimized automatically, including rows under a payload's `data`. Accepts a query object, a model instance, or a list, and returns anything else untouched. `at` re-roots the selection when the rows sit below the resolved field. Awaitable on async backends. See [Rows a resolver already fetched](README.md#rows-a-resolver-already-fetched).
+Eager-load what the current selection needs from rows already in memory. Rarely needed: a resolver's return value is optimized automatically, including rows under a payload's `data`. Accepts a query object, a model instance, or a list, and returns anything else untouched. Instances are checked against `scope_rows` first: the result leaves out rows the scope rejects, and is `None` for a single rejected instance. `at` re-roots the selection when the rows sit below the resolved field. Awaitable on async backends. See [Rows a resolver already fetched](README.md#rows-a-resolver-already-fetched).
 
 ```python
 orm.get_default_queryset(model) -> query

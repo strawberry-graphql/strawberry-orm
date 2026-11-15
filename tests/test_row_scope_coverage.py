@@ -18,10 +18,10 @@ from strawberry_orm.lazy_resolution import (
     row_is_scoped,
 )
 from strawberry_orm.optimizer.extension import (
-    OptimizerExtension,
     RowScopeExtension,
     _without_rejected,
     extensions_include_row_scope,
+    load_kept,
 )
 
 
@@ -118,10 +118,7 @@ def test_row_scope_extension_detection_and_rejected_singletons():
     assert filtered is None
     assert to_load == []
 
-    extension = OptimizerExtension.__new__(OptimizerExtension)
-    extension._backend = object()
-    extension._store = object()
-    assert extension._load_kept(row, [row], [], None) is None
+    assert load_kept(object(), object(), row, [row], [], None) is None
 
 
 def test_hint_validation_stops_when_the_far_side_is_unknown():

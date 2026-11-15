@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import AsyncIterable
 from contextlib import suppress
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
 from graphql import GraphQLList, GraphQLNonNull
+from graphql.pyutils import is_iterable
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import await_maybe
@@ -99,6 +101,98 @@ def _without_rejected(
     return result, list(kept)
 
 
+def _returns_a_list(info: Any) -> bool:
+    return_type = getattr(info, "return_type", None)
+    while isinstance(return_type, GraphQLNonNull):
+        return_type = return_type.of_type
+    return isinstance(return_type, GraphQLList)
+
+
+def read_rows(result: Any) -> Any:
+    """What an iterable *result* yields, as a list, or ``None`` if it is not one.
+
+    An async iterable gives an awaitable of the list. Strings and mappings are
+    not read, as graphql-core does not read them as lists either.
+    """
+    if isinstance(result, AsyncIterable):
+
+        async def _collect() -> list[Any]:
+            return [row async for row in result]
+
+        return _collect()
+    if is_iterable(result):
+        return list(result)
+    return None
+
+
+def listed_rows(result: Any, info: Any) -> Any:
+    """*result* read into a list, when a list field was given another iterable.
+
+    graphql-core reads any iterable for a list field, an async one included, so
+    a tuple, a generator or a ``ScalarResult`` reaches the client just as a list
+    does. Read into one, its rows are checked as a list's are.
+    """
+    if isinstance(result, list) or not _returns_a_list(info):
+        return None
+    return read_rows(result)
+
+
+def load_kept(
+    backend: Backend,
+    store: OptimizerStore,
+    result: Any,
+    candidates: list[Any],
+    kept: list[Any],
+    info: Any,
+) -> Any:
+    """Drop the *candidates* ``scope_rows`` rejected, then eager-load the rest.
+
+    Only rows that were actually loaded onto are marked. A selection that
+    named no relations leaves them unmarked, so a later field that does name
+    some still gets its chance; a rejected row is never marked, so it is
+    checked again wherever it turns up.
+    """
+    filtered, to_load = _without_rejected(result, candidates, kept)
+    if not to_load:
+        return filtered
+    loaded = backend.load_relations(store, to_load, info)
+    if isawaitable(loaded):
+
+        async def _await_loaded() -> Any:
+            _mark_prepared(await loaded)
+            return filtered
+
+        return _await_loaded()
+    _mark_prepared(loaded)
+    return filtered
+
+
+def scope_then_load(
+    backend: Backend,
+    store: OptimizerStore,
+    result: Any,
+    rows: list[Any],
+    info: Any,
+) -> Any:
+    """Check *rows*, found in *result*, against ``scope_rows``, then load them.
+
+    Rows that were read rather than queried for never passed through
+    ``apply_optimizer_hints``, so their scope has not run. It runs before any
+    relation is loaded onto them, as loading is what marks a row prepared.
+    """
+    scoped = backend.scope_instances(rows, info)
+    if isawaitable(scoped):
+
+        async def _await_scoped() -> Any:
+            kept = await scoped
+            return await await_maybe(
+                load_kept(backend, store, result, rows, kept, info)
+            )
+
+        return _await_scoped()
+    return load_kept(backend, store, result, rows, scoped, info)
+
+
 def returns_single_orm_object(backend: Backend, info: Any) -> bool:
     """Return True when the field yields one ORM object rather than a list.
 
@@ -162,8 +256,10 @@ def _unwrap_single(result: Any, singular: bool) -> Any:
 # from the first, so the second falls back to loading relations as it reads
 # them. That is slower, not wrong: the lazy path applies the same row scoping.
 #
-# A prepared row is not scope-checked again, so the mark holds only for the
-# execution that made it, like the scope marks in ``lazy_resolution``.
+# A prepared row is not scope-checked again, so a row is marked only once its
+# scope has run - a scoped query read it, or ``scope_instances`` kept it - and
+# the mark holds only for the execution that made it, like the scope marks in
+# ``lazy_resolution``.
 _PREPARED = "_strawberry_orm_relations_loaded"
 
 #: Exact types a resolved value can have that no branch below ``resolve``
@@ -308,49 +404,21 @@ class OptimizerExtension(SchemaExtension):
             if not rows:
                 return result
         else:
-            return result
+            listed = listed_rows(result, info)
+            if listed is None:
+                return result
+            if isawaitable(listed):
 
-        # A materialized list never passed through apply_optimizer_hints, so
-        # scope_rows has not run. Relation fields of the parent returned
-        # above: those caches were scoped with the parent, and checking again
-        # would query once per parent.
-        scoped = backend.scope_instances(rows, info)
-        if isawaitable(scoped):
+                async def _await_listed() -> Any:
+                    return await await_maybe(self._load_rows(await listed, root, info))
 
-            async def _await_scoped() -> Any:
-                kept = await scoped
-                loaded = self._load_kept(result, rows, kept, info)
-                return await await_maybe(loaded)
+                return _await_listed()
+            return self._load_rows(listed, root, info)
 
-            return _await_scoped()
-        return self._load_kept(result, rows, scoped, info)
-
-    def _load_kept(
-        self,
-        result: Any,
-        candidates: list[Any],
-        kept: list[Any],
-        info: Any,
-    ) -> Any:
-        """Drop rows ``scope_rows`` rejected, then eager-load the rest."""
-        backend = self._backend
-        filtered, to_load = _without_rejected(result, candidates, kept)
-        if not to_load or backend is None or self._store is None:
-            return filtered
-
-        # Only rows that were actually loaded onto are marked. A selection
-        # that named no relations leaves them unmarked, so a later field that
-        # does name some still gets its chance.
-        loaded = backend.load_relations(self._store, to_load, info)
-        if isawaitable(loaded):
-
-            async def _await_loaded() -> Any:
-                _mark_prepared(await loaded)
-                return filtered
-
-            return _await_loaded()
-        _mark_prepared(loaded)
-        return filtered
+        # Relation fields of the parent returned above: those caches were
+        # scoped with the parent, and checking again would query once per
+        # parent.
+        return scope_then_load(backend, self._store, result, rows, info)
 
     async def _resolve_async(
         self,
@@ -440,12 +508,19 @@ class RowScopeExtension(SchemaExtension):
 
         if backend.is_model_instance(result):
             rows: list[Any] | None = [result]
-        elif isinstance(result, list) and any(
-            backend.is_model_instance(row) for row in result
-        ):
+        elif isinstance(result, list):
             rows = [row for row in result if backend.is_model_instance(row)]
         else:
-            rows = None
+            listed = listed_rows(result, info)
+            if listed is None:
+                return result
+            if isawaitable(listed):
+
+                async def _await_listed() -> Any:
+                    return await await_maybe(self._scope(await listed, info))
+
+                return _await_listed()
+            return self._scope(listed, info)
         if not rows:
             return result
 
