@@ -75,7 +75,9 @@ class TestQueryFilterLimits:
         assert "maximum is 1" in str(result.errors[0])
 
     @pytest.mark.asyncio
-    async def test_regex_filter_works_when_enabled(self, seed, User):
+    async def test_a_rejected_regex_filter_does_not_list_the_models_columns(
+        self, seed, User
+    ):
         schema = self._build_schema(User, enable_regex_filters=True)
         result = await schema.execute(
             """
@@ -87,4 +89,6 @@ class TestQueryFilterLimits:
             """
         )
         assert result.errors is not None
-        assert "Unknown filter param 'name__regex'" in str(result.errors[0])
+        message = result.errors[0].message
+        assert message == "Invalid filter expression"
+        assert "email" not in message

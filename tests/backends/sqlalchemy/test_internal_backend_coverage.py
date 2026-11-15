@@ -17,6 +17,7 @@ from strawberry_orm.backends.sqlalchemy import (
     _build_sa_order_field,
     _build_sa_ordering,
     _build_sa_reference_field_clause,
+    _sa_reference_key,
     _truncate,
 )
 from strawberry_orm.filters import (
@@ -145,6 +146,14 @@ class TestInternalBackendCoverage:
                 EmptyFilterGroup(one_of=[EmptyFilterGroup()]),
                 User,
                 max_branches=0,
+            )
+        with pytest.raises(ValueError, match="maximum is 0"):
+            _build_sa_filter(
+                EmptyFilterGroup(any=[EmptyFilterGroup()]), User, max_branches=0
+            )
+        with pytest.raises(ValueError, match="maximum depth of 0"):
+            _build_sa_filter(
+                EmptyFilterGroup(not_=EmptyFilterGroup()), User, max_depth=0
             )
         with pytest.raises(ValueError, match="Regex filters are disabled"):
             _build_lookup_clauses(
@@ -786,6 +795,30 @@ class TestInternalBackendCoverage:
     def test_build_reference_lookup_type_error(self, Post):
         with pytest.raises(TypeError, match="Expected ReferenceLookup"):
             _build_reference_lookup_clauses(Post.id, StringLookup(exact="1"))
+
+    def test_reference_key_is_only_a_foreign_key_to_the_primary_key(self, User, Post):
+        from sqlalchemy import ForeignKey
+        from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+        class Base(DeclarativeBase):
+            pass
+
+        class Region(Base):
+            __tablename__ = "region"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            code: Mapped[str] = mapped_column(unique=True)
+
+        class Office(Base):
+            __tablename__ = "office"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            region_code: Mapped[str] = mapped_column(ForeignKey("region.code"))
+            region: Mapped[Region] = relationship()
+
+        column, key = _sa_reference_key(Post.author)
+        assert column is Post.__table__.c.author_id
+        assert key == "id"
+        assert _sa_reference_key(User.posts) is None
+        assert _sa_reference_key(Office.region) is None
 
     def test_build_sa_order_field_skips_missing_column(self, Post):
         @strawberry.input

@@ -9,7 +9,9 @@ import inspect
 import re
 import typing
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from decimal import Decimal
@@ -50,6 +52,25 @@ _FILTER_RELATION_PRESENCE_ERROR = (
     "Filter is_null is only valid under object.<relation> for FK presence on the "
     "parent row. Use field.<fk_id>.isNull for the FK column, or nest under object."
 )
+
+_NOT_FILTERING: Any = object()
+
+#: While a filter is built, the name of the type its rows are read as; ``None``
+#: past an ``object:`` hop, where the type of the rows reached is not known.
+_filter_rows_type: ContextVar[Any] = ContextVar(
+    "strawberry_orm_filter_rows_type", default=_NOT_FILTERING
+)
+
+
+@contextmanager
+def past_a_hop() -> Iterator[None]:
+    """Build the part of a filter that applies to the rows a relation reaches."""
+    token = _filter_rows_type.set(None)
+    try:
+        yield
+    finally:
+        _filter_rows_type.reset(token)
+
 
 _SENSITIVE_PATTERNS = re.compile(
     r"(password|passwd|secret|token|api_key|apikey|hash|ssn|"
@@ -2092,13 +2113,99 @@ class BaseBackend:
 
     # -- Scoping across relation traversal -----------------------------------
 
+    @contextmanager
+    def filtering(self, model: type, info: Any) -> Iterator[None]:
+        """Build a filter over the rows of *model* the current field returns."""
+        token = _filter_rows_type.set(self._returned_type_name(model, info))
+        try:
+            yield
+        finally:
+            _filter_rows_type.reset(token)
+
     def _field_scope(self, model: type, relation: str, info: Any = None) -> Any | None:
-        """The ``scope=`` declared on *model*'s own ``relation`` field, if any."""
-        type_name = self._resolved_type_name(model, info)
-        if type_name is None:
+        """The ``scope=`` on *relation* of the type *model*'s rows are read as.
+
+        When that type cannot be told, every type over *model* is a candidate
+        and each one's ``scope=`` applies, so a filter or group reaches only
+        the rows all of them allow.
+        """
+        rows_type = _filter_rows_type.get()
+        if rows_type is _NOT_FILTERING:
+            type_names = self._reading_type_names(model, info)
+        elif rows_type is not None and self._type_registry.get(rows_type) is model:
+            type_names = [rows_type]
+        else:
+            type_names = self._type_names_of(model)
+        scopes: list[Any] = []
+        for type_name in type_names:
+            hints = self._store.get(type_name, relation)
+            scope = getattr(hints, "scope", None) if hints else None
+            if scope is not None and scope not in scopes:
+                scopes.append(scope)
+        if len(scopes) < 2:
+            return scopes[0] if scopes else None
+
+        from strawberry_orm.fields import call_scope
+
+        def every_scope(query: Any, info: Any) -> Any:
+            for scope in scopes:
+                query = call_scope(scope, query, info)
+            return query
+
+        return every_scope
+
+    def _reading_type_names(self, model: type, info: Any) -> list[str]:
+        """The type *model*'s rows are read as outside a filter.
+
+        On a relation that is the type the field is resolved on; for the rows
+        a field returns, as when grouping them, it is that field's type.
+        """
+        from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+        if info is not None:
+            parent_type = getattr(graphql_resolve_info(info), "parent_type", None)
+            name = getattr(parent_type, "name", None)
+            if name is not None and self._type_registry.get(name) is model:
+                return [name]
+        returned = self._returned_type_name(model, info)
+        return [returned] if returned is not None else self._type_names_of(model)
+
+    def _type_names_of(self, model: type) -> list[str]:
+        return [name for name, m in self._type_registry.items() if m is model]
+
+    def _returned_type_name(self, model: type, info: Any) -> str | None:
+        """Name of *model*'s type the current field returns rows of, if just one.
+
+        Wrappers around the rows, such as a connection's ``edges { node }``,
+        are looked through. Another model's type is not: its fields lead to
+        related rows, not to these.
+        """
+        from graphql import get_named_type
+
+        from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+        if info is None:
             return None
-        hints = self._store.get(type_name, relation)
-        return getattr(hints, "scope", None) if hints else None
+        return_type = getattr(graphql_resolve_info(info), "return_type", None)
+        frontier = [get_named_type(return_type)]
+        seen: set[Any] = set()
+        found: set[str] = set()
+        for _ in range(4):
+            wrapped: list[Any] = []
+            for named in frontier:
+                if named is None or named in seen:
+                    continue
+                seen.add(named)
+                name = getattr(named, "name", None)
+                if name in self._type_registry:
+                    if self._type_registry[name] is model:
+                        found.add(name)
+                    continue
+                fields = getattr(named, "fields", None)
+                if isinstance(fields, dict):
+                    wrapped.extend(get_named_type(f.type) for f in fields.values())
+            frontier = wrapped
+        return found.pop() if len(found) == 1 else None
 
     def relation_scope(
         self, model: type, relation: str, info: Any, *, on: str | None = None
@@ -2204,8 +2311,9 @@ class BaseBackend:
                     )
                 walk(nested.get(relation), related)
 
-        for model, graphql_type in self._graphql_type_registry.items():
-            walk(getattr(graphql_type, "__orm_order__", None), model)
+        for model, graphql_types in self._types_by_model.items():
+            for graphql_type in graphql_types:
+                walk(getattr(graphql_type, "__orm_order__", None), model)
 
         if problems:
             raise ValueError("\n".join(dict.fromkeys(problems)))

@@ -651,14 +651,14 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 
 - `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
 - String regex filters are disabled by default
-- Filter depth, branch count, and `inList` size are capped
+- Filter depth is capped, and so are the branches and the listed values of a whole filter argument, every reference to a variable included
 - A connection reads at most one page: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
 - `order` and `groupBy` lists, the groups a connection answers with, and the related rows in an `objects:` group key are capped (`max_order_entries`, `max_group_by_entries`, `max_groups`, `max_group_key_rows`)
 - On SQLAlchemy, an error running a statement reaches the client as `Invalid filter expression` (or `Database connection failed`), never with its SQL or parameters; the original is the exception's `__cause__`, for your logs
 - `orm.ref()` provides explicit `unlink` and `delete` operations — both opt-in via `unlink=True` and `delete=True`
 - When you use `orm.schema()` (optimizer enabled by default), nested relation loads honor each type's `scope_rows` — but **only for types where you define it** (the ORM warns at type registration when `scope_rows` is missing)
 - Filters, ordering, group-by and aggregates cover only the columns and relations the GraphQL types they serve show — through `object:`, the type the relation returns. A column those types leave out, or show through a resolver of your own, `on=`, `compute=` or permission classes, cannot be filtered on, sorted by, grouped by, or read through `min`/`max` — any of which would reveal it. `orm.schema()` works this out for the types each schema reaches, and a kept field carries the tags of the type field it mirrors, so a tagged schema drops both together
-- Filtering through a relation (`filter: { object: { author: … } }`) is restricted to the rows the related type's `scope_rows` allows, so a filter cannot confirm values on rows the caller cannot read
+- Filtering through a relation (`filter: { object: { author: … } }`) is restricted to the rows the related type's `scope_rows` and the relation's `scope=` allow, so a filter cannot confirm values on rows the caller cannot read. The `scope=` is the one on the type the field returns; past an `object:` hop, where that type is not known, every type over the model contributes its `scope=`. Through a to-many relation, `object:` asks whether some readable related row matches, and `not:` negates that whole question
 - Ordering through a relation into a scoped type is **rejected when `orm.schema()` builds**, because the resulting sequence would itself rank hidden rows — see [Ordering into a scoped type](#ordering-into-a-scoped-type)
 - Connection `aggregates` and `groups` are computed with the type's `scope_rows` applied, so counts and sums cover only readable rows
 
@@ -1278,6 +1278,10 @@ Each `@filter_field` method must:
 - Have a `query` parameter — receives the backend's native query object (Django `QuerySet`, SQLAlchemy `Select`, or Tortoise `QuerySet`).
 - Return the modified query.
 - Optionally accept an `info` parameter to receive the Strawberry `Info` context.
+
+Where a custom filter sits decides which query it gets. At the top of the filter, alone or in a top-level `all`, it narrows the field's own query. Anywhere else (under `not`, in `any` or `oneOf`, or in a related type's filter reached through `object`) it gets a fresh query over its filter's model, and the rows it keeps are matched by primary key. So `not: { search: "john" }` returns exactly the rows `search` leaves out, and `object: { author: { search: "john" } }` tests each post's own author. Narrow the query by conditions on that model's rows, and do not rely on what it was narrowed by before.
+
+A custom filter's value is not counted toward `max_in_list_size`; if it takes a list, cap it in the method.
 
 The generated GraphQL input places custom fields as top-level keys alongside `field`, `object`, `all`, `any`, `not`, and `oneOf`:
 
@@ -2269,9 +2273,9 @@ Shared options:
 | `enable_optimizer`         | `True`   | When using `orm.schema()`, mount the query optimizer extension automatically.                                                                                                 |
 | `strict_hints`             | `True`   | Raises at schema build when `using=[...]` names a relation the model does not have, or `scope=` is put on a field that is not a relation. Set `False` to ignore both instead. |
 | `batch_relations`          | `True`   | Collapses per-parent relation resolvers into one query per query shape. See [Relation batching](#relation-batching).                                                          |
-| `max_filter_depth`         | `10`     | Caps recursive filter nesting.                                                                                                                                                |
-| `max_filter_branches`      | `50`     | Caps `all` / `any` / `oneOf` branch count.                                                                                                                                    |
-| `max_in_list_size`         | `500`    | Caps `inList` / `notInList` size.                                                                                                                                             |
+| `max_filter_depth`         | `10`     | Caps filter nesting. Each `not`, each `all` / `any` / `oneOf` entry and each `object` hop is a level, the foreign-key shortcut included.                                      |
+| `max_filter_branches`      | `50`     | Caps the `all` / `any` / `oneOf` entries of one filter argument, counted across the whole filter, each reference to a variable included.                                     |
+| `max_in_list_size`         | `500`    | Caps the `inList` / `notInList` values of one filter argument, and two for each `range`, counted across the whole filter, each reference to a variable included.             |
 | `max_order_entries`        | `10`     | Caps the entries in an `order` list.                                                                                                                                          |
 | `max_group_by_entries`     | `10`     | Caps the entries in a `groupBy` list.                                                                                                                                         |
 | `max_groups`               | `100`    | Refuses a connection whose `groupBy` makes more groups than this.                                                                                                             |
