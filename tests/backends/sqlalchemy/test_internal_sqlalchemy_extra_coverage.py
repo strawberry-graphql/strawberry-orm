@@ -432,7 +432,7 @@ def test_scoped_edge_marks_walk_loaded_collections(sa_session, seed):
     ).first()
     backend = SQLAlchemyBackend(dialect="sqlite")
     with execution_scope():
-        backend._mark_scoped_edges([user], [(User, "posts")], before={})
+        backend._mark_scoped_edges([user], [(User, "posts", None)], before={})
         assert relation_cache_is_scoped(user, "posts")
     assert not relation_cache_is_scoped(user, "posts")
     assert user.posts

@@ -66,10 +66,19 @@ class _PlannedLookup:
     """One relation in a query's load plan, with the relations under it.
 
     ``to_attr`` is set for an ``on=`` view, which loads ``relation`` into an
-    attribute of its own and is never shared.
+    attribute of its own and is never shared. ``token`` is the edge's own
+    ``scope=``, which the cache it fills is marked with.
     """
 
-    __slots__ = ("to_one", "queryset", "relation", "to_attr", "scoped", "children")
+    __slots__ = (
+        "to_one",
+        "queryset",
+        "relation",
+        "to_attr",
+        "scoped",
+        "token",
+        "children",
+    )
 
     def __init__(
         self,
@@ -78,12 +87,14 @@ class _PlannedLookup:
         relation: str = "",
         to_attr: str | None = None,
         scoped: bool = False,
+        token: Any = None,
     ) -> None:
         self.to_one = to_one
         self.queryset = queryset
         self.relation = relation
         self.to_attr = to_attr
         self.scoped = scoped
+        self.token = token
         self.children: dict[str, _PlannedLookup] = {}
 
 
@@ -1184,6 +1195,12 @@ class DjangoBackend(BaseBackend):
             def _to_snake(name: str) -> str:
                 return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
+            def _edge_scope(type_name: str | None, field_name: str) -> Any:
+                hints = (
+                    store.get(type_name, field_name) if type_name and store else None
+                )
+                return hints.scope if hints else None
+
             def _get_nested_queryset(
                 type_name: str | None,
                 field_name: str,
@@ -1192,12 +1209,7 @@ class DjangoBackend(BaseBackend):
                 """Build a custom queryset if the field has a scope callable or
                 the related model's type defines scope_rows."""
                 get_qs = self._type_querysets.get(related_model)
-
-                load_fn = None
-                if type_name and store:
-                    hints = store.get(type_name, field_name)
-                    if hints and hints.scope is not None:
-                        load_fn = hints.scope
+                load_fn = _edge_scope(type_name, field_name)
 
                 if get_qs is None and load_fn is None:
                     return None
@@ -1226,6 +1238,7 @@ class DjangoBackend(BaseBackend):
                     lookup = level[key] = _PlannedLookup(
                         to_one=to_one,
                         queryset=_get_nested_queryset(type_name, key, related_model),
+                        token=_edge_scope(type_name, key),
                     )
                 return lookup
 
@@ -1323,6 +1336,7 @@ class DjangoBackend(BaseBackend):
                                 relation=relation_name,
                                 to_attr=field_name,
                                 scoped=custom_qs is not None,
+                                token=_edge_scope(type_name, field_name),
                             ),
                         )
                         if node.selection_set:
@@ -1358,11 +1372,18 @@ class DjangoBackend(BaseBackend):
                     if lookup.to_attr is not None:
                         relation = lookup.relation
                         path = f"{prefix}__{relation}" if prefix else relation
-                        prefetch = Prefetch(
-                            path, queryset=lookup.queryset, to_attr=lookup.to_attr
+                        prefetch = (
+                            _scoped_prefetch(
+                                path,
+                                lookup.queryset,
+                                lookup.token,
+                                to_attr=lookup.to_attr,
+                            )
+                            if lookup.scoped
+                            else Prefetch(
+                                path, queryset=lookup.queryset, to_attr=lookup.to_attr
+                            )
                         )
-                        if lookup.scoped:
-                            prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
                         prefetch_related.append(prefetch)
                         # Django prefetches through the list a to_attr holds.
                         view_path = (
@@ -1372,7 +1393,9 @@ class DjangoBackend(BaseBackend):
                         continue
                     path = f"{prefix}__{key}" if prefix else key
                     if lookup.queryset is not None:
-                        prefetch_related.append(_scoped_prefetch(path, lookup.queryset))
+                        prefetch_related.append(
+                            _scoped_prefetch(path, lookup.queryset, lookup.token)
+                        )
                         _emit(lookup.children, path, True)
                     elif lookup.to_one and not in_prefetch:
                         select_related.append(path)
@@ -1526,7 +1549,12 @@ def _make_on_resolver(
         prefetched = self.__dict__.get(field_name)
         restrict = backend.relation_scope(type(self), field_name, info, on=relation)
         if prefetched is not None and (
-            restrict is None or relation_cache_is_scoped(self, field_name)
+            restrict is None
+            or relation_cache_is_scoped(
+                self,
+                field_name,
+                scope=backend._field_scope(type(self), field_name, info),
+            )
         ):
             return prefetched
         queryset = getattr(self, relation).all()
@@ -1542,12 +1570,16 @@ def _make_on_resolver(
     return resolver
 
 
-def _scoped_prefetch(path: str, queryset: Any, **kwargs: Any) -> Any:
-    """A ``Prefetch`` whose cache is safe to trust at resolve time."""
+def _scoped_prefetch(path: str, queryset: Any, token: Any = None, **kwargs: Any) -> Any:
+    """A ``Prefetch`` whose cache is safe to trust at resolve time.
+
+    *token* is the ``scope=`` of the field it loads for, if any.
+    """
     from django.db.models import Prefetch
 
     prefetch = Prefetch(path, queryset=queryset, **kwargs)
     prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
+    prefetch._strawberry_orm_token = token  # type: ignore[attr-defined]
     return prefetch
 
 
@@ -1653,7 +1685,9 @@ def _mark_scoped_prefetches(instances: list[Any], lookups: list[Any]) -> None:
         for segment in path[:-1]:
             nodes = _django_related_children(nodes, segment)
         attr = getattr(lookup, "to_attr", None) or path[-1]
-        mark_relations_scoped(nodes, [attr])
+        mark_relations_scoped(
+            nodes, [attr], scope=getattr(lookup, "_strawberry_orm_token", None)
+        )
 
 
 def _scoped_related_queryset(
@@ -1679,7 +1713,12 @@ def _scoped_related_queryset(
     restrict = backend.relation_scope(type(instance), field_name, info)
     prefetched = _django_relation_prefetched(instance, field_name)
     if prefetched and (
-        restrict is None or relation_cache_is_scoped(instance, field_name)
+        restrict is None
+        or relation_cache_is_scoped(
+            instance,
+            field_name,
+            scope=backend._field_scope(type(instance), field_name, info),
+        )
     ):
         return manager.all()
     if prefetched and restrict is not None:
@@ -1713,7 +1752,11 @@ def _scoped_related_instance(
     # raises rather than returning None for a non-nullable column. A cache
     # this library did not fill is not that load: re-check the primary key.
     if _django_relation_prefetched(instance, field_name):
-        if relation_cache_is_scoped(instance, field_name):
+        if relation_cache_is_scoped(
+            instance,
+            field_name,
+            scope=backend._field_scope(type(instance), field_name, info),
+        ):
             return getattr(instance, field_name, None)
         related = getattr(instance, field_name, None)
         if related is None:
@@ -1892,7 +1935,11 @@ def _relation_in_memory(backend: Any, field_name: str) -> Any:
         if instance is None or not _django_relation_prefetched(instance, field_name):
             return False
         return (
-            relation_cache_is_scoped(instance, field_name)
+            relation_cache_is_scoped(
+                instance,
+                field_name,
+                scope=backend._field_scope(type(instance), field_name, info),
+            )
             or backend.relation_scope(type(instance), field_name, info) is None
         )
 

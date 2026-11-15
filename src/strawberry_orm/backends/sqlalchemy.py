@@ -51,10 +51,14 @@ Steps = Generator[Any, Any, Any]
 class _PlannedLoad:
     """One relation in a query's load plan, with the relations under it.
 
-    A to-many relation keyed on the related row has ``keys`` (the parent's key
-    attribute, the related row's column, and that column's attribute) and can
-    be read by a statement of its own: ``scope`` narrowed to the parents'
-    keys. One whose scope orders (``ordered``) is always read that way.
+    A relation that joins on one column a side has ``keys`` (the parent's
+    attribute, the related row's column, and that column's attribute), and
+    through an association table, ``link``: the table's column for each side.
+    It can be read by a statement of its own: ``scope`` narrowed to the
+    parents' keys. A to-many relation whose scope orders (``ordered``) is
+    always read that way, and so is one whose scope says more than a loader's
+    criteria can (``whole``). ``token`` is the edge's own ``scope=``, which
+    its relation cache is marked with.
     """
 
     __slots__ = (
@@ -63,8 +67,11 @@ class _PlannedLoad:
         "mapper",
         "criteria",
         "scope",
+        "token",
         "ordered",
+        "whole",
         "keys",
+        "link",
         "children",
     )
 
@@ -74,13 +81,27 @@ class _PlannedLoad:
         self.mapper = mapper
         self.criteria = criteria
         self.scope: Callable[[Any], Any] | None = None
+        self.token: Any = None
         self.ordered = False
+        self.whole = False
         self.keys: tuple[str, Any, str] | None = None
+        self.link: tuple[Any, Any] | None = None
         self.children: dict[str, _PlannedLoad] = {}
 
     @property
     def scoped(self) -> bool:
         return self.criteria is not None or self.scope is not None
+
+    def reads_alone(self, every: bool = False) -> bool:
+        """Whether a statement of its own reads it, not a loader option.
+
+        With *every*, so does each to-many relation keyed on the related row.
+        """
+        return (
+            self.ordered
+            or self.whole
+            or (every and self.uselist and self.keys is not None and self.link is None)
+        )
 
 
 def _loader_options(level: dict[str, _PlannedLoad], parent: Any = None) -> list[Any]:
@@ -93,7 +114,7 @@ def _loader_options(level: dict[str, _PlannedLoad], parent: Any = None) -> list[
 
     chains: list[Any] = []
     for load in level.values():
-        if load.ordered:
+        if load.reads_alone():
             continue
         attr = load.attr if load.criteria is None else load.attr.and_(load.criteria)
         if parent is None:
@@ -106,25 +127,49 @@ def _loader_options(level: dict[str, _PlannedLoad], parent: Any = None) -> list[
 
 _KEYS_PER_STATEMENT = 500
 
+#: Stands for the scope a planned relation is loaded with when its load does
+#: not apply that scope, so a cache it fills is never marked as scoped.
+_UNMARKED = object()
 
-def _keyed_pair(rel: Any) -> tuple[Any, Any] | None:
-    """The ``(local, remote)`` columns a to-many relation joins on, if that is all.
 
-    A relation whose join says more (``viewonly`` with a filter in its
-    ``primaryjoin``) is left to a loader, which reads the whole join.
+def _equates(join: Any, left: Any, right: Any) -> bool:
+    return (left == right).compare(join) or (right == left).compare(join)
+
+
+def _join_keys(rel: Any) -> tuple[Any, Any, tuple[Any, Any] | None] | None:
+    """The columns a relation joins on, if that is all its join says.
+
+    ``(the parent's column, the related row's column, link)``, where ``link``
+    is ``None`` unless the relation goes through an association table, and
+    then that table's columns for each. A relation whose join says more
+    (``viewonly`` with a filter in its ``primaryjoin``) has none: only a
+    loader reads the whole join.
     """
-    pairs = list(rel.local_remote_pairs or ())
-    if not rel.uselist or rel.secondary is not None or len(pairs) != 1:
+    if rel.secondary is None:
+        pairs = list(rel.local_remote_pairs or ())
+        if len(pairs) == 1 and _equates(rel.primaryjoin, *pairs[0]):
+            return pairs[0][0], pairs[0][1], None
         return None
-    local, remote = pairs[0]
-    join = rel.primaryjoin
-    if (local == remote).compare(join) or (remote == local).compare(join):
-        return local, remote
+    if len(rel.synchronize_pairs) != 1 or len(rel.secondary_synchronize_pairs) != 1:
+        return None
+    parent, parent_link = rel.synchronize_pairs[0]
+    related, related_link = rel.secondary_synchronize_pairs[0]
+    if _equates(rel.primaryjoin, parent, parent_link) and _equates(
+        rel.secondaryjoin, related, related_link
+    ):
+        return parent, related, (parent_link, related_link)
     return None
 
 
-def _orders_below(level: dict[str, _PlannedLoad]) -> bool:
-    return any(load.ordered or _orders_below(load.children) for load in level.values())
+def _marks_some(edges: list[tuple[type, str, Any]]) -> bool:
+    return any(token is not _UNMARKED for _model, _name, token in edges)
+
+
+def _reads_alone_below(level: dict[str, _PlannedLoad]) -> bool:
+    return any(
+        load.reads_alone() or _reads_alone_below(load.children)
+        for load in level.values()
+    )
 
 
 def _related_rows(rows: list[Any], name: str) -> list[Any]:
@@ -147,7 +192,7 @@ def _holds(rows: list[Any], name: str, load: _PlannedLoad) -> bool:
 
     return all(
         name not in sa_inspect(row).unloaded
-        and (not load.scoped or relation_cache_is_scoped(row, name))
+        and (not load.scoped or relation_cache_is_scoped(row, name, scope=load.token))
         for row in rows
     )
 
@@ -575,7 +620,9 @@ class SQLAlchemyBackend(BaseBackend):
         query = query.order_by(None)
         for term in order_terms(self, model, order_input):
             if isinstance(term, SetOrder):
-                clauses.append(self._set_order(model, term, info))
+                clause, rows = self._set_order(model, term, info)
+                clauses.append(clause)
+                query = _carrying(query, rows)
                 continue
             entry_clauses, entry_joins, query = _build_sa_ordering(
                 term, model, query=query, backend=self
@@ -628,7 +675,7 @@ class SQLAlchemyBackend(BaseBackend):
         if not agg_cols:
             return aggregate_meta.build_aggregates(None, requested)
 
-        stmt = select(*agg_cols).select_from(subq)
+        stmt = _carrying(select(*agg_cols).select_from(subq), query)
         session = self._get_session(info)
         if self._is_async_session(session):
             return self._apply_aggregation_async(
@@ -683,9 +730,10 @@ class SQLAlchemyBackend(BaseBackend):
             info=info,
             dialect=self._dialect,
         )
-        clauses, joins = _sa_connection_ordering(
+        clauses, joins, carried = _sa_connection_ordering(
             query, order_input, model, backend=self, info=info
         )
+        stmt = _carrying(stmt, *carried)
         for join in joins:
             stmt = stmt.outerjoin(join)
         firsts, ordering = _sa_group_ordering(clauses, self._dialect)
@@ -723,9 +771,10 @@ class SQLAlchemyBackend(BaseBackend):
         from strawberry_orm.grouping import key_tuple
 
         stmt, values = self._grouped_select(query, model, paths, info)
-        clauses, joins = _sa_connection_ordering(
+        clauses, joins, carried = _sa_connection_ordering(
             query, order_input, model, backend=self, info=info
         )
+        stmt = _carrying(stmt, *carried)
         for join in joins:
             stmt = stmt.outerjoin(join)
         clauses += _missing_pk(clauses, model)
@@ -734,7 +783,7 @@ class SQLAlchemyBackend(BaseBackend):
         )
         ranked = stmt.add_columns(*model.__table__.c, rn.label("_rn")).subquery()
         row = aliased(model, ranked)
-        page = (
+        page = _carrying(
             select(row, *(ranked.c[alias] for alias in values))
             .where(
                 ranked.c._rn > per_group_offset,
@@ -743,7 +792,8 @@ class SQLAlchemyBackend(BaseBackend):
             # Ordered by the row number so each group comes back in the order
             # the window put it in; without it the rows arrive however the
             # database found them and the requested order is lost.
-            .order_by(ranked.c._rn)
+            .order_by(ranked.c._rn),
+            stmt,
         )
 
         def collect(result: Any) -> dict[tuple, list[Any]]:
@@ -801,7 +851,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         pk = _get_sa_pk_column(model)
         own = query.with_only_columns(pk).order_by(None)
-        stmt = select().select_from(model).where(pk.in_(own))
+        stmt = _carrying(select().select_from(model).where(pk.in_(own)), query)
         joined: dict[tuple[str, ...], Any] = {}
         values: dict[str, Any] = {}
         for path in paths:
@@ -813,7 +863,8 @@ class SQLAlchemyBackend(BaseBackend):
                     joined[chain], stmt = self._join_hop(stmt, entity, hop, info)
                 entity = joined[chain]
             if path.through is not None:
-                expr = self._together(model, path, info)
+                expr, rows = self._together(model, path, info)
+                stmt = _carrying(stmt, rows)
             elif path.custom is not None:
                 expr = invoke_custom_callback(
                     path.custom, path.owner, query=query, value=path.value, info=info
@@ -833,17 +884,22 @@ class SQLAlchemyBackend(BaseBackend):
                 .distinct()
                 .subquery()
             )
-            stmt = select().select_from(model).join(pairs, pairs.c._orm_pk == pk)
+            stmt = _carrying(
+                select().select_from(model).join(pairs, pairs.c._orm_pk == pk), stmt
+            )
             values = {alias: pairs.c[alias] for alias in values}
         return stmt.add_columns(*values.values()), values
 
-    def _together(self, model: type, path: Any, info: Any) -> Any:
+    def _together(self, model: type, path: Any, info: Any) -> tuple[Any, Any]:
         """The related rows *path* reads of each row of *model*, as JSON text.
 
         The rows the caller may see, their columns in an array each, distinct
         and sorted so a set of rows reads as the same text wherever it is
         read; ``[]`` for none. PostgreSQL sorts again inside the aggregate,
         which alone it promises to keep; SQLite keeps an ordered subquery's.
+
+        Comes with the statement for those rows, which the statement the text
+        goes in has to carry the row criteria of.
         """
         from sqlalchemy import Text, and_, cast, func, literal_column, select
         from sqlalchemy.dialects.postgresql import aggregate_order_by
@@ -914,15 +970,19 @@ class SQLAlchemyBackend(BaseBackend):
                 f"Grouping or ordering by objects: is supported on PostgreSQL "
                 f"and SQLite, not {self._dialect}."
             )
-        return func.coalesce(
+        together = func.coalesce(
             select(together).select_from(found).scalar_subquery(),
             literal_column("'[]'"),
         )
+        return together, rows
 
-    def _set_order(self, model: type, by_set: Any, info: Any) -> Any:
-        """The clause a ``SetOrder`` orders by: the text its set groups under."""
-        together = self._together(model, by_set.path, info)
-        return together.desc() if by_set.descending else together.asc()
+    def _set_order(self, model: type, by_set: Any, info: Any) -> tuple[Any, Any]:
+        """The clause a ``SetOrder`` orders by: the text its set groups under.
+
+        Comes with the statement whose row criteria the ordered one carries.
+        """
+        together, rows = self._together(model, by_set.path, info)
+        return (together.desc() if by_set.descending else together.asc()), rows
 
     def _join_hop(self, stmt: Any, entity: Any, hop: Any, info: Any) -> Any:
         """Outer-join *hop*'s related rows the caller may see onto *stmt*."""
@@ -934,6 +994,7 @@ class SQLAlchemyBackend(BaseBackend):
         if restrict is not None:
             rows = restrict(rows, info)
         prop = sa_inspect(hop.model).relationships[hop.relation]
+        stmt = _carrying(stmt, rows)
         if prop.secondary is None:
             target = aliased(hop.target, rows.subquery())
             return target, stmt.outerjoin(
@@ -1031,17 +1092,19 @@ class SQLAlchemyBackend(BaseBackend):
     def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
         from inspect import isawaitable
 
-        from sqlalchemy import inspect as sa_inspect
         from sqlalchemy import select
 
-        pk_column = sa_inspect(model).primary_key[0]
+        pk_column = _get_sa_pk_column(model)
         scoped = self.apply_type_scope(
             select(model).where(pk_column.in_(pks)), model, info
         )
         # Only the keys: as a subquery, the loader options a scope may attach
         # to load what a selection reads are not run for a membership check.
-        stmt = select(pk_column).where(
-            pk_column.in_(scoped.with_only_columns(pk_column).scalar_subquery())
+        stmt = _carrying(
+            select(pk_column).where(
+                pk_column.in_(scoped.with_only_columns(pk_column).scalar_subquery())
+            ),
+            scoped,
         )
         keys = self._execute_stmt(stmt, info)
         if isawaitable(keys):
@@ -1158,7 +1221,7 @@ class SQLAlchemyBackend(BaseBackend):
                 subq.corresponding_column(c) for c in sa_inspect(entity).primary_key
             ]
             counted = select(*keys).distinct().subquery()
-        stmt = select(func.count()).select_from(counted)
+        stmt = _carrying(select(func.count()).select_from(counted), query)
         session = self._get_session(info)
         if self._is_async_session(session):
             return self._scalar_async(session, stmt)
@@ -1227,7 +1290,9 @@ class SQLAlchemyBackend(BaseBackend):
 
         subq = _unordered(query).subquery()
         key_col = subq.c[key_field]
-        stmt = select(key_col, func.count()).select_from(subq).group_by(key_col)
+        stmt = _carrying(
+            select(key_col, func.count()).select_from(subq).group_by(key_col), query
+        )
         session = self._get_session(info)
         if self._is_async_session(session):
             return self._group_counts_async(session, stmt)
@@ -1295,12 +1360,13 @@ class SQLAlchemyBackend(BaseBackend):
 
     def _plan_relation_loads(
         self, store: Any, entity: type, info: Any
-    ) -> tuple[dict[str, _PlannedLoad], list[tuple[type, str]]]:
+    ) -> tuple[dict[str, _PlannedLoad], list[tuple[type, str, Any]]]:
         """Plan the relations the current selection reads below *entity*.
 
         Shared by query optimization and by loading relations onto instances
         the caller already holds, so both apply the same row scoping. Returns
-        the plan and the relations it loads scoped.
+        the plan and each relation it loads, with the ``scope=`` its load
+        applies, or ``_UNMARKED`` when the load does not apply the scope.
         """
         from sqlalchemy import inspect as sa_inspect
 
@@ -1312,7 +1378,7 @@ class SQLAlchemyBackend(BaseBackend):
 
         fragments = fragments_from_info(info)
         mapper = sa_inspect(entity)
-        scoped_edges: list[tuple[type, str]] = []
+        scoped_edges: list[tuple[type, str, Any]] = []
 
         def _get_field_name(node: Any) -> str:
             """Extract field name from a GraphQL FieldNode, converting camelCase
@@ -1322,38 +1388,24 @@ class SQLAlchemyBackend(BaseBackend):
 
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
-        def _get_nested_criteria(
-            type_name: str | None,
-            field_name: str,
-            related_entity: type,
-        ) -> tuple[Any, Callable[[Any], Any] | None, bool]:
-            """The WHERE criteria of a scope and nested scope_rows.
+        def _scope_load(
+            load: _PlannedLoad, owner: str, type_name: str | None, field_name: str
+        ) -> None:
+            """Scope *load* by the related type's ``scope_rows`` and the edge's ``scope=``.
 
-            A loader option keeps only that, so the scopes come back whole
-            too, to be run as a statement of their own, with whether they
-            order.
+            A loader option carries only a WHERE clause, so it carries the
+            scope (``criteria``) only when that is all the scope says. One
+            that says more is read whole, by a statement of its own narrowed
+            to the parents' keys, and a relation with no such keys refuses it.
             """
             from sqlalchemy import select as sa_select
 
-            criteria_parts: list[Any] = []
-            ordered = False
-
+            related_entity = load.mapper.class_
             get_qs = self._type_querysets.get(related_entity)
-            if get_qs is not None:
-                temp_stmt = get_qs(sa_select(related_entity), info)
-                if temp_stmt.whereclause is not None:
-                    criteria_parts.append(temp_stmt.whereclause)
-                ordered = ordered or bool(temp_stmt._order_by_clauses)
-
-            field_scope = None
-            if type_name and store:
-                hints = store.get(type_name, field_name)
-                if hints and hints.scope is not None:
-                    field_scope = hints.scope
-                    temp_stmt = call_scope(field_scope, sa_select(related_entity), info)
-                    if temp_stmt.whereclause is not None:
-                        criteria_parts.append(temp_stmt.whereclause)
-                    ordered = ordered or bool(temp_stmt._order_by_clauses)
+            hints = store.get(type_name, field_name) if type_name and store else None
+            field_scope = hints.scope if hints else None
+            if get_qs is None and field_scope is None:
+                return
 
             def scope(stmt: Any) -> Any:
                 if get_qs is not None:
@@ -1362,15 +1414,26 @@ class SQLAlchemyBackend(BaseBackend):
                     stmt = call_scope(field_scope, stmt, info)
                 return stmt
 
-            whole = scope if get_qs is not None or field_scope is not None else None
-            if not criteria_parts:
-                return None, whole, ordered
-            if len(criteria_parts) == 1:
-                return criteria_parts[0], whole, ordered
-
-            from sqlalchemy import and_ as sa_and
-
-            return sa_and(*criteria_parts), whole, ordered
+            scoped = scope(sa_select(related_entity))
+            load.scope = scope
+            load.token = field_scope
+            if load.keys is not None:
+                load.ordered = load.uselist and bool(scoped._order_by_clauses)
+            if _says_only_where(scoped, related_entity):
+                load.criteria = scoped.whereclause
+                return
+            if load.keys is None:
+                raise ValueError(
+                    f"Cannot load {owner}.{field_name} with the row scope of "
+                    f"{related_entity.__name__}: the scope does more than a "
+                    f".where() on {related_entity.__name__}'s own columns (a "
+                    f"join, a nested select, raw SQL or loader options), and "
+                    f"this relation does not join on one column, so the scope "
+                    f"cannot be applied to it whole. Write the scope as a "
+                    f".where() on those columns, or read this relation in a "
+                    f"resolver of your own."
+                )
+            load.whole = True
 
         # A relation reached both by the selection and by a ``using=`` path
         # must be loaded once, with one set of criteria. Two loaders on one
@@ -1386,29 +1449,35 @@ class SQLAlchemyBackend(BaseBackend):
             load = level.get(rel_name)
             if load is None:
                 rel = current_mapper.relationships[rel_name]
-                criteria, whole, ordered = _get_nested_criteria(
-                    type_name, rel_name, rel.mapper.class_
-                )
-                if criteria is not None:
-                    scoped_edges.append((current_mapper.class_, rel_name))
                 load = level[rel_name] = _PlannedLoad(
                     attr=getattr(current_mapper.entity, rel_name),
                     uselist=rel.uselist,
                     mapper=rel.mapper,
-                    criteria=criteria,
+                    criteria=None,
                 )
-                load.scope = whole
-                pair = _keyed_pair(rel)
-                # Through an association table there is no key on the related
-                # row to narrow by, so a loader reads it and its order is lost.
-                if pair is not None:
-                    local, remote = pair
-                    load.ordered = ordered
+                join_keys = _join_keys(rel)
+                if join_keys is not None:
+                    local, remote, load.link = join_keys
                     load.keys = (
                         current_mapper.get_property_by_column(local).key,
                         remote,
                         rel.mapper.get_property_by_column(remote).key,
                     )
+                _scope_load(
+                    load,
+                    type_name or current_mapper.class_.__name__,
+                    type_name,
+                    rel_name,
+                )
+                scoped_edges.append(
+                    (
+                        current_mapper.class_,
+                        rel_name,
+                        load.token
+                        if load.criteria is not None or load.reads_alone()
+                        else _UNMARKED,
+                    )
+                )
             return load
 
         def _plan_hints(
@@ -1477,11 +1546,12 @@ class SQLAlchemyBackend(BaseBackend):
     ) -> Steps:
         """Read relations by a statement of their own, for every row at once.
 
-        A loader option orders only by ``relationship(order_by=...)``, so a
-        relation whose scope orders is read as Django's ``Prefetch`` reads it:
-        the scope's own statement, narrowed to the rows' keys, then handed to
-        each row. With *every*, so is each to-many relation keyed on the
-        related row, which then needs no statement re-reading the rows.
+        A loader option orders only by ``relationship(order_by=...)`` and
+        carries only a WHERE clause, so a relation whose scope orders or says
+        more is read as Django's ``Prefetch`` reads it: the scope's own
+        statement, narrowed to the rows' keys, then handed to each row. With
+        *every*, so is each to-many relation keyed on the related row, which
+        then needs no statement re-reading the rows.
 
         Only rows whose relation is unloaded are filled: a collection the app
         already holds may carry changes the database has not seen.
@@ -1494,15 +1564,28 @@ class SQLAlchemyBackend(BaseBackend):
         for name, load in level.items():
             if not rows:
                 return
-            if not (load.ordered or (every and load.keys is not None)):
-                if _orders_below(load.children):
+            if not load.reads_alone(every):
+                if _reads_alone_below(load.children):
                     yield from self._keyed_loads(
                         session, _related_rows(rows, name), load.children
                     )
                 continue
             missing = [row for row in rows if name in sa_inspect(row).unloaded]
             local_key, remote, remote_key = load.keys
-            keys = list(dict.fromkeys(getattr(row, local_key) for row in missing))
+            keys = [
+                key
+                for key in dict.fromkeys(getattr(row, local_key) for row in missing)
+                if key is not None
+            ]
+            links = (
+                [(key, key) for key in keys]
+                if load.link is None
+                else (yield from self._linked_keys(session, load.link, keys))
+            )
+            parents_of: dict[Any, list[Any]] = {}
+            for parent, key in links:
+                parents_of.setdefault(key, []).append(parent)
+            keys = list(parents_of)
             order_by = load.attr.property.order_by
             options = _loader_options(load.children)
             children: list[Any] = []
@@ -1518,12 +1601,30 @@ class SQLAlchemyBackend(BaseBackend):
                 children.extend((yield self._execute_in(session, stmt)))
             grouped: dict[Any, list[Any]] = {}
             for child in children:
-                grouped.setdefault(getattr(child, remote_key), []).append(child)
+                for parent in parents_of.get(getattr(child, remote_key), ()):
+                    grouped.setdefault(parent, []).append(child)
             for row in missing:
-                set_committed_value(row, name, grouped.get(getattr(row, local_key), []))
+                held = grouped.get(getattr(row, local_key), [])
+                set_committed_value(
+                    row, name, held if load.uselist else next(iter(held), None)
+                )
             if load.scoped:
-                mark_relations_scoped(missing, [name])
+                mark_relations_scoped(missing, [name], scope=load.token)
             yield from self._keyed_loads(session, children, load.children)
+
+    def _linked_keys(
+        self, session: Any, link: tuple[Any, Any], keys: list[Any]
+    ) -> Steps:
+        """``(parent key, related key)`` for each row of an association table."""
+        from sqlalchemy import select
+
+        parent_link, related_link = link
+        links: list[tuple[Any, Any]] = []
+        for start in range(0, len(keys), _KEYS_PER_STATEMENT):
+            chunk = keys[start : start + _KEYS_PER_STATEMENT]
+            stmt = select(parent_link, related_link).where(parent_link.in_(chunk))
+            links.extend((yield self._execute_rows_in(session, stmt)))
+        return list(dict.fromkeys(links))
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         try:
@@ -1540,7 +1641,7 @@ class SQLAlchemyBackend(BaseBackend):
         options = _loader_options(plan)
         loaded = query.options(*options) if options else query
         session = self._get_session(info)
-        trusted = edges if not caller_had_options else []
+        trusted = edges if not caller_had_options and _marks_some(edges) else []
         before = self._unloaded_snapshot(session, []) if trusted else {}
 
         def steps() -> Steps:
@@ -1578,7 +1679,9 @@ class SQLAlchemyBackend(BaseBackend):
         def steps() -> Steps:
             for session, model, rows, level in groups:
                 reread = {
-                    name: load for name, load in level.items() if load.keys is None
+                    name: load
+                    for name, load in level.items()
+                    if not load.reads_alone(every=True)
                 }
                 options = _loader_options(reread)
                 if options:
@@ -1670,7 +1773,7 @@ class SQLAlchemyBackend(BaseBackend):
     def _mark_scoped_edges(
         self,
         roots: Any,
-        edges: list[tuple[type, str]],
+        edges: list[tuple[type, str, Any]],
         *,
         before: dict[int, set[str]],
     ) -> None:
@@ -1680,8 +1783,12 @@ class SQLAlchemyBackend(BaseBackend):
         relation it now holds came from that loader. An object that was
         already persistent is marked only for relations that moved from
         unloaded to loaded.
+
+        Each edge comes with the scope it was loaded with. One relation planned
+        in two places under different scopes cannot tell which load filled an
+        object, so it is not marked at all.
         """
-        if not edges or not roots:
+        if not roots or not _marks_some(edges):
             return
 
         from collections import defaultdict
@@ -1690,9 +1797,10 @@ class SQLAlchemyBackend(BaseBackend):
 
         from strawberry_orm.lazy_resolution import mark_relations_scoped
 
-        by_model: dict[type, set[str]] = defaultdict(set)
-        for model, name in edges:
-            by_model[model].add(name)
+        by_model: dict[type, dict[str, Any]] = defaultdict(dict)
+        for model, name, token in edges:
+            names = by_model[model]
+            names[name] = token if names.get(name, token) is token else _UNMARKED
         seen: set[int] = set()
 
         def walk(obj: Any) -> None:
@@ -1702,16 +1810,14 @@ class SQLAlchemyBackend(BaseBackend):
             state = sa_inspect(obj)
             # Computed afresh on every read, so read once per object.
             unloaded = state.unloaded
-            names = by_model.get(type(obj), set())
             was = before.get(id(obj))
-            if was is None:
-                loaded = [name for name in names if name not in unloaded]
-            else:
-                loaded = [
-                    name for name in names if name in was and name not in unloaded
-                ]
-            if loaded:
-                mark_relations_scoped([obj], loaded)
+            for name, token in by_model.get(type(obj), {}).items():
+                if (
+                    token is not _UNMARKED
+                    and name not in unloaded
+                    and (was is None or name in was)
+                ):
+                    mark_relations_scoped([obj], [name], scope=token)
             # Iterating this namespace yields relationship objects, not names.
             for name in state.mapper.relationships.keys():  # noqa: SIM118
                 if name in unloaded:
@@ -1771,6 +1877,21 @@ class SQLAlchemyBackend(BaseBackend):
         if self._is_async_session(session):
             return self._execute_stmt_async(session, stmt)
         return self._run_sync(self._execute_stmt_sync, session, stmt)
+
+    def _execute_rows_in(self, session: Any, stmt: Any) -> Any:
+        """The rows of a statement over plain columns, as tuples."""
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        def read(sync_session: Any) -> list[tuple[Any, ...]]:
+            try:
+                result = sync_session.execute(stmt)
+            except (OperationalError, ProgrammingError) as exc:
+                raise _sanitized(exc) from exc
+            return [tuple(row) for row in result]
+
+        if self._is_async_session(session):
+            return session.run_sync(read)
+        return self._run_sync(read, session)
 
     def _run_sync(self, work: Callable[..., Any], *args: Any) -> Any:
         """Run *work* on a sync session, off the event loop if asked to.
@@ -2246,7 +2367,10 @@ def _scoped_sa_relation(
 
     restrict = backend.relation_scope(parent_model, fname, info)
     if _sqlalchemy_relation_prefetched(instance, fname) and (
-        restrict is None or relation_cache_is_scoped(instance, fname)
+        restrict is None
+        or relation_cache_is_scoped(
+            instance, fname, scope=backend._field_scope(parent_model, fname, info)
+        )
     ):
         return getattr(instance, fname)
     if restrict is None:
@@ -2464,8 +2588,7 @@ def _get_sa_pk_column(model: type) -> Any:
     from sqlalchemy import inspect as sa_inspect
 
     mapper = sa_inspect(model)
-    pk_col = mapper.primary_key[0]
-    return getattr(model, pk_col.key)
+    return mapper.get_property_by_column(mapper.primary_key[0]).class_attribute
 
 
 def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
@@ -2585,32 +2708,35 @@ _LOOKUP_TO_SA_OP: dict[str, str] = {
 
 
 def _sa_relation_scope_criteria(
-    backend: Any, model: type, relation: str, info: Any
-) -> Any | None:
+    backend: Any, model: type, relation: str, info: Any, query: Any = None
+) -> tuple[Any | None, Any]:
     """Criteria limiting *relation* to the rows its type's scope allows.
 
     A scope that only filters the related table's own columns is applied as
     its WHERE clause. Any other is embedded whole as a subquery over primary
     keys, so joins, limits and anything else ``scope_rows`` adds are carried
-    across intact. Any ``scope=`` on this edge is applied too, so a filter
-    cannot reach rows the read path hides.
+    across intact, and *query*, the statement the criteria go in, comes back
+    carrying its ``with_loader_criteria``. Any ``scope=`` on this edge is
+    applied too, so a filter cannot reach rows the read path hides.
     """
     if backend is None:
-        return None
+        return None, query
     get_qs = backend.relation_scope(model, relation, info)
     if get_qs is None:
-        return None
+        return None, query
 
-    from sqlalchemy import inspect as sa_inspect
     from sqlalchemy import select as sa_select
 
     related = backend._relation_target_model(model, relation)
     scoped = get_qs(sa_select(related), info)
     lifted = _liftable_criteria(scoped, related, model)
     if lifted is not None:
-        return lifted
-    pk_col = sa_inspect(related).primary_key[0]
-    return pk_col.in_(scoped.with_only_columns(pk_col).scalar_subquery())
+        return lifted, query
+    pk_col = _get_sa_pk_column(related)
+    return (
+        pk_col.in_(scoped.with_only_columns(pk_col).scalar_subquery()),
+        _carrying(query, scoped),
+    )
 
 
 def _unordered(query: Any) -> Any:
@@ -2629,6 +2755,25 @@ def _unordered(query: Any) -> Any:
     return query.order_by(None)
 
 
+def _carrying(outer: Any, *embedded: Any) -> Any:
+    """*outer* with the ``with_loader_criteria`` of statements embedded in it.
+
+    SQLAlchemy applies those criteria from the outermost statement only, to
+    every place their entity is read in it, so the rows a scope keeps through
+    them are lost once the scope runs inside another statement.
+    """
+    from sqlalchemy.orm.util import LoaderCriteriaOption
+
+    held = {id(option) for option in getattr(outer, "_with_options", ())}
+    carried = []
+    for stmt in embedded:
+        for option in getattr(stmt, "_with_options", ()):
+            if isinstance(option, LoaderCriteriaOption) and id(option) not in held:
+                held.add(id(option))
+                carried.append(option)
+    return outer.options(*carried) if carried else outer
+
+
 def _liftable_criteria(scoped: Any, related: type, model: type) -> Any | None:
     """The scope's WHERE clause, when it can stand in for the whole statement.
 
@@ -2639,19 +2784,37 @@ def _liftable_criteria(scoped: Any, related: type, model: type) -> Any | None:
     selects, raw SQL, a relation back to the same table, or criteria the WHERE
     clause does not hold - keeps the subquery.
     """
-    from sqlalchemy import Select
+    from sqlalchemy import inspect as sa_inspect
+
+    mapper = sa_inspect(related)
+    if (
+        mapper.local_table is sa_inspect(model).local_table
+        # The discriminator of a class sharing its table with others is added
+        # when the ORM compiles the statement, not in its WHERE clause.
+        or mapper.single
+        or len(mapper.tables) != 1
+        or not _says_only_where(scoped, related)
+    ):
+        return None
+    return scoped.whereclause
+
+
+def _says_only_where(scoped: Any, related: type) -> bool:
+    """Whether *scoped* is ``select(related)`` narrowed by a WHERE clause alone.
+
+    Criteria on *related*'s own tables mean the same wherever they are put.
+    Anything more - joins, limits, grouping, nested selects, raw SQL, or
+    criteria the WHERE clause does not hold, such as ``with_loader_criteria``
+    and other options the ORM applies when it compiles the statement - does
+    not.
+    """
+    from sqlalchemy import Select, select
     from sqlalchemy import inspect as sa_inspect
     from sqlalchemy.sql import visitors
     from sqlalchemy.sql.elements import TextClause
     from sqlalchemy.sql.selectable import SelectBase
 
-    if not isinstance(scoped, Select):
-        return None
-    mapper = sa_inspect(related)
-    table = mapper.local_table
-    if table is sa_inspect(model).local_table:
-        return None
-    if (
+    if not isinstance(scoped, Select) or (
         scoped._limit_clause is not None
         or scoped._offset_clause is not None
         or scoped._group_by_clauses
@@ -2659,25 +2822,18 @@ def _liftable_criteria(scoped: Any, related: type, model: type) -> Any | None:
         or scoped._distinct
         or scoped._setup_joins
         or scoped._from_obj
-        or scoped.get_final_froms() != [table]
-        # Criteria added when the ORM compiles the statement, not in its WHERE
-        # clause: with_loader_criteria and other options, and the
-        # discriminator of a class sharing its table with others.
         or scoped._with_options
-        or mapper.single
         or [d.get("entity") for d in scoped.column_descriptions] != [related]
+        or scoped.get_final_froms() != select(related).get_final_froms()
     ):
-        return None
+        return False
+    tables = sa_inspect(related).tables
     where = scoped.whereclause
-    if where is None:
-        return None
-    for element in visitors.iterate(where):
-        if (
-            isinstance(element, (SelectBase, TextClause))
-            or getattr(element, "table", table) is not table
-        ):
-            return None
-    return where
+    return where is None or not any(
+        isinstance(element, (SelectBase, TextClause))
+        or not any(getattr(element, "table", tables[0]) is table for table in tables)
+        for element in visitors.iterate(where)
+    )
 
 
 def _build_sa_filter(
@@ -2741,8 +2897,8 @@ def _build_sa_filter(
                 relationship_prop = getattr(model, rel_name)
                 # Traversal reaches the related table directly, so the related
                 # type's row scoping has to be re-applied here or it is bypassed.
-                scope_criteria = _sa_relation_scope_criteria(
-                    backend, model, rel_name, info
+                scope_criteria, query = _sa_relation_scope_criteria(
+                    backend, model, rel_name, info, query
                 )
                 is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
                 if is_null_val is not strawberry.UNSET and is_null_val is not None:
@@ -3233,8 +3389,9 @@ def _sa_connection_ordering(
     *,
     backend: Any = None,
     info: Any = None,
-) -> tuple[list[Any], list[Any]]:
-    """The order the connection reads its rows in, and the joins it needs.
+) -> tuple[list[Any], list[Any], list[Any]]:
+    """The order the connection reads its rows in, the joins it needs, and the
+    statements whose row criteria the ordered statement has to carry.
 
     The client's ``order`` when given, else the query's own. An order through
     a to-many relation is left out: its join would repeat rows. The set an
@@ -3246,19 +3403,26 @@ def _sa_connection_ordering(
 
     if not order_input:
         table = model.__table__  # type: ignore[attr-defined]
-        return [
-            clause
-            for clause in query._order_by_clauses
-            if getattr(_order_parts(clause)[0], "table", None) is table
-        ], []
+        return (
+            [
+                clause
+                for clause in query._order_by_clauses
+                if getattr(_order_parts(clause)[0], "table", None) is table
+            ],
+            [],
+            [],
+        )
     clauses: list[Any] = []
     joins: list[Any] = []
+    carried: list[Any] = []
     for term in order_terms(backend, model, order_input):
         if isinstance(term, SetOrder):
-            clauses.append(backend._set_order(model, term, info))
+            clause, rows = backend._set_order(model, term, info)
+            clauses.append(clause)
+            carried.append(rows)
         else:
             _sa_order_clauses(term, model, (), clauses, joins)
-    return clauses, joins
+    return clauses, joins, carried
 
 
 def _sa_order_clauses(

@@ -75,7 +75,7 @@ async def _await_nodes_if_needed(nodes: Any, info: Info) -> Any:
 
 def _orm_backend_from_info(info: Any) -> Any | None:
     """Return the active ORM backend from resolver context or schema extensions."""
-    ctx = info.context
+    ctx = getattr(info, "context", None)
     if isinstance(ctx, dict):
         backend = ctx.get("_orm_backend")
     else:
@@ -124,6 +124,40 @@ class PreslicedRows(list):
         self.orm_total_count = total_count
         #: Where the first row sits in the parent's whole result.
         self.orm_offset = offset
+
+
+def _visible_rows(nodes: Any, info: Info) -> Any:
+    """*nodes* as a list, without the rows ``scope_rows`` hides.
+
+    A query is scoped where it is read. Rows a resolver already read reach the
+    connection unchecked, and each ``node`` is checked only as it resolves -
+    after ``totalCount`` and the cursors have counted the hidden rows too. So
+    they are checked here, before anything counts or slices them. Returns
+    *nodes* untouched when they are a query, or a coroutine on async backends.
+    """
+    from strawberry_orm.optimizer.extension import (
+        _is_prepared,
+        _without_rejected,
+        read_rows,
+    )
+
+    backend = _orm_backend_from_info(info)
+    if backend is None or backend.is_query_object(nodes):
+        return nodes
+    if not isinstance(nodes, list):
+        listed = read_rows(nodes)
+        if listed is None:
+            return nodes
+        return _then(listed, lambda read: _visible_rows(read, info))
+    rows = [
+        row for row in nodes if backend.is_model_instance(row) and not _is_prepared(row)
+    ]
+    if not rows:
+        return nodes
+    return _then(
+        backend.scope_instances(rows, info),
+        lambda kept: _without_rejected(nodes, rows, kept)[0],
+    )
 
 
 def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
@@ -656,10 +690,19 @@ class ORMListConnection(ORMConnection[NodeType]):
         **kwargs,
     ) -> AwaitableOrValue:
         """Read every row and slice the page out in Python."""
+
+        def slice_visible(read: Any) -> AwaitableOrValue:
+            visible = _visible_rows(read, info)
+            if inspect.iscoroutine(visible):
+                return _then(
+                    visible, lambda rows: cls._slice_rows(rows, info=info, **kwargs)
+                )
+            return cls._slice_rows(visible, info=info, **kwargs)
+
         rows = optimize_query_nodes(nodes, info)
         if _should_await_nodes(rows, info):
-            return _then(rows, lambda read: cls._slice_rows(read, info=info, **kwargs))
-        return cls._slice_rows(rows, info=info, **kwargs)
+            return _then(rows, slice_visible)
+        return slice_visible(rows)
 
     @classmethod
     def _slice_rows(

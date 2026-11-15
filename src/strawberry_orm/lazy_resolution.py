@@ -115,8 +115,15 @@ def relation_read_by(info: Any) -> str | None:
     return getattr(resolver, _READS_RELATION, None)
 
 
-def mark_relations_scoped(instances: Iterable[Any], names: Iterable[str]) -> None:
-    """Record that *names* on each instance were loaded with row scoping."""
+def mark_relations_scoped(
+    instances: Iterable[Any], names: Iterable[str], *, scope: Any = None
+) -> None:
+    """Record that *names* on each instance were loaded with row scoping.
+
+    *scope* is the ``scope=`` of the field the load was for, if it had one.
+    Two types can show one model and scope one relation differently, and a
+    cache holds what one of them allowed.
+    """
     mark = execution_mark()
     adding = set(names)
     if mark is None or not adding:
@@ -128,18 +135,22 @@ def mark_relations_scoped(instances: Iterable[Any], names: Iterable[str]) -> Non
         if not isinstance(current, dict):
             current = {}
             setattr(instance, _SCOPED_RELATIONS, current)
-        current.update(dict.fromkeys(adding, mark))
+        current.update(dict.fromkeys(adding, (mark, scope)))
 
 
-def relation_cache_is_scoped(instance: Any, field_name: str) -> bool:
-    """Whether *field_name*'s loaded value came from a scoped load in this execution."""
+def relation_cache_is_scoped(
+    instance: Any, field_name: str, *, scope: Any = None
+) -> bool:
+    """Whether *field_name*'s loaded value came from a scoped load in this execution.
+
+    The load must have been for a field with the same ``scope=`` as *scope*.
+    """
     mark = execution_mark()
     current = getattr(instance, _SCOPED_RELATIONS, None)
-    return (
-        mark is not None
-        and isinstance(current, dict)
-        and current.get(field_name) is mark
-    )
+    if mark is None or not isinstance(current, dict):
+        return False
+    made = current.get(field_name)
+    return made is not None and made[0] is mark and made[1] is scope
 
 
 def mark_rows_scoped(instances: Iterable[Any]) -> None:

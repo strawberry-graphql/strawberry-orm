@@ -114,15 +114,29 @@ def _query_orderings(
 
 
 class _PlannedPrefetch:
-    """One relation in a query's load plan, with the relations under it."""
+    """One relation in a query's load plan, with the relations under it.
 
-    __slots__ = ("related_model", "forward", "many_to_many", "scope", "children")
+    ``token`` is the edge's own ``scope=``, which the cache it fills is marked
+    with.
+    """
 
-    def __init__(self, related_model: type, field_cls: str, scope: Any) -> None:
+    __slots__ = (
+        "related_model",
+        "forward",
+        "many_to_many",
+        "scope",
+        "token",
+        "children",
+    )
+
+    def __init__(
+        self, related_model: type, field_cls: str, scope: Any, token: Any = None
+    ) -> None:
         self.related_model = related_model
         self.forward = field_cls in _FORWARD_REL_TYPES
         self.many_to_many = field_cls == "ManyToManyFieldInstance"
         self.scope = scope
+        self.token = token
         self.children: dict[str, _PlannedPrefetch] = {}
 
 
@@ -412,7 +426,11 @@ class TortoiseBackend(BaseBackend):
                             # resolver is re-queried.
                             if _tortoise_relation_prefetched(self, fname) and (
                                 restrict is None
-                                or relation_cache_is_scoped(self, fname)
+                                or relation_cache_is_scoped(
+                                    self,
+                                    fname,
+                                    scope=backend._field_scope(type(self), fname, info),
+                                )
                             ):
                                 return list(rel_value)
                             qs = (
@@ -1074,6 +1092,10 @@ class TortoiseBackend(BaseBackend):
         def _to_snake(name: str) -> str:
             return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
 
+        def _edge_scope(type_name: str | None, field_name: str) -> Any:
+            hints = store.get(type_name, field_name) if type_name and store else None
+            return hints.scope if hints else None
+
         def _get_custom_qs(
             type_name: str | None,
             field_name: str,
@@ -1081,11 +1103,7 @@ class TortoiseBackend(BaseBackend):
         ) -> Any:
             """Return a load callable or None."""
             nested_get_qs = self._type_querysets.get(related_model)
-            load_fn = None
-            if type_name and store:
-                hints = store.get(type_name, field_name)
-                if hints and hints.scope is not None:
-                    load_fn = hints.scope
+            load_fn = _edge_scope(type_name, field_name)
             if nested_get_qs is None and load_fn is None:
                 return None
 
@@ -1117,6 +1135,7 @@ class TortoiseBackend(BaseBackend):
                     related_model=related_model,
                     field_cls=field_cls,
                     scope=_get_custom_qs(type_name, rel_name, related_model),
+                    token=_edge_scope(type_name, rel_name),
                 )
             return load
 
@@ -1248,7 +1267,7 @@ class TortoiseBackend(BaseBackend):
             if load.scope is not None:
                 if load.forward:
                     await _hide_scoped_out(rows, name, load)
-                mark_relations_scoped(rows, [name])
+                mark_relations_scoped(rows, [name], scope=load.token)
             if not load.children:
                 continue
             related = _cached_related(rows, name)
@@ -1386,7 +1405,9 @@ def _make_tortoise_to_one_resolver(
         restrict = backend.relation_scope(type(self), fname, info)
         if restrict is None or (
             _tortoise_relation_prefetched(self, fname)
-            and relation_cache_is_scoped(self, fname)
+            and relation_cache_is_scoped(
+                self, fname, scope=backend._field_scope(type(self), fname, info)
+            )
         ):
             related = getattr(self, fname, None)
             return await related if inspect.isawaitable(related) else related
@@ -1422,9 +1443,9 @@ def _make_tortoise_rel_resolver(
         rel_value = getattr(self, fname, None)
         if not getattr(rel_value, "_fetched", False):
             return None
-        if not relation_cache_is_scoped(self, fname) and (
-            backend.relation_scope(type(self), fname, info) is not None
-        ):
+        if not relation_cache_is_scoped(
+            self, fname, scope=backend._field_scope(type(self), fname, info)
+        ) and (backend.relation_scope(type(self), fname, info) is not None):
             return None
         return list(rel_value.related_objects)
 
