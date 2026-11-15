@@ -213,3 +213,18 @@ class AbstractTestDeclaredControls:
         schema = _inherited_guard_schema(orm, models)
         result = await run(schema, "{ users" + arguments + " { totalCount } }")
         _assert_refused(result, "email")
+
+    @pytest.mark.parametrize("declare", [strawberry.type, strawberry.interface])
+    def test_excluding_a_field_a_base_type_declares_is_refused(
+        self, orm, models, declare
+    ):
+        @declare
+        class Person:
+            name: str
+            email: str
+
+        with pytest.raises(ValueError, match="'email'.*Person"):
+
+            @orm.type(models.User, exclude=["email"])
+            class UserNode(Person):
+                id: auto

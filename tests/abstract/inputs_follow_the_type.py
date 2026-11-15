@@ -299,7 +299,7 @@ class AbstractTestInputsFollowTheType:
         schema = _lists_schema(orm, UserNode)
         assert fields(schema, "UserOrderField") == {"createdAt"}
 
-    def test_exclude_still_cuts_a_column_an_interface_declares(self, orm, models):
+    def test_inputs_still_cut_a_column_an_interface_declares(self, orm, models):
         @strawberry.interface
         class Contact:
             name: str
@@ -307,7 +307,6 @@ class AbstractTestInputsFollowTheType:
 
         @orm.type(
             models.User,
-            exclude=["email"],
             filters=orm.filter(models.User, exclude=["email"]),
             order=orm.order(models.User, exclude=["email"]),
         )
@@ -317,6 +316,21 @@ class AbstractTestInputsFollowTheType:
         schema = _lists_schema(orm, UserNode)
         assert "email" not in fields(schema, "UserField")
         assert "email" not in fields(schema, "UserOrderField")
+
+    def test_a_column_redeclared_from_an_interface_reads_as_the_type_says(
+        self, orm, models
+    ):
+        @strawberry.interface
+        class Named:
+            name: str
+
+        @orm.type(models.User, filters=orm.filter(models.User))
+        class UserNode(Named):
+            id: auto
+            name: auto
+
+        schema = _lists_schema(orm, UserNode)
+        assert fields(schema, "UserField") == {"id", "name"}
 
     def test_an_interface_resolver_does_not_open_its_column(self, orm, models):
         @strawberry.interface

@@ -110,6 +110,8 @@ orm.type(model, *, name=None, include=None, exclude=None,
 
 Class decorator mapping a model to a GraphQL type. `filters` / `order` / `group` / `aggregate` attach generated argument types to fields of this type. See [Defining types](README.md#ormtypemodel).
 
+`exclude=` cannot name a field the class inherits from a Strawberry type or interface, which Strawberry shows on every subclass; doing so raises `ValueError`. Declare such a column only on the types that show it.
+
 ```python
 orm.input(model, *, name=None, include=None, exclude=None, exclude_pk=True)
 orm.partial(model, *, name=None, include=None, exclude=None, exclude_pk=True)

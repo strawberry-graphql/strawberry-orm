@@ -127,14 +127,14 @@ def _reads_as_is(value: Any) -> bool:
     return True
 
 
-def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
+def _inherited_reads_as_is(cls: type) -> frozenset[str]:
     """Fields a base Strawberry type shows as stored that *cls* does not redeclare.
 
     ``cls.__annotations__`` holds only the class's own names, so a column an
     interface declares would otherwise never open to the type's filters and
     orders. Walk each base's Strawberry fields and count a field the same way
-    an own annotation is counted: no resolver of its own, no permission
-    classes or extensions, and not listed in the type's ``exclude=``.
+    an own annotation is counted: no resolver of its own, and no permission
+    classes or extensions. The type's ``exclude=`` cannot name one of them.
     """
     own_declared = set(getattr(cls, "__annotations__", {})) | set(vars(cls))
     found: set[str] = set()
@@ -144,7 +144,7 @@ def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
             continue
         for field in definition.fields:
             name = field.python_name
-            if not name or name in own_declared or name in excluded or name in found:
+            if not name or name in own_declared or name in found:
                 continue
             if (
                 field.base_resolver is not None
@@ -154,6 +154,32 @@ def _inherited_reads_as_is(cls: type, *, excluded: set[str]) -> frozenset[str]:
                 continue
             found.add(name)
     return frozenset(found)
+
+
+def _refuse_excluding_inherited(cls: type, type_name: str, excluded: set[str]) -> None:
+    """Raise if ``exclude=`` names a field a base Strawberry type declares.
+
+    Strawberry copies a base type's fields into each subclass, whatever the
+    subclass's own annotations say, so the field would be shown regardless.
+    """
+    for base in cls.__mro__[1:]:
+        definition = getattr(base, "__strawberry_definition__", None)
+        if definition is None:
+            continue
+        shown = sorted(
+            name
+            for name in excluded
+            if any(field.python_name == name for field in definition.fields)
+        )
+        if shown:
+            raise ValueError(
+                f"{type_name} excludes {shown!r}, which it inherits from "
+                f"{base.__name__}. Strawberry shows a base type's fields on "
+                f"every subclass, so exclude= cannot hide them: declare them on "
+                f"the types that show them instead of on {base.__name__}. To "
+                f"keep a shown column out of filters and orders only, pass "
+                f"exclude= to orm.filter() and orm.order()."
+            )
 
 
 def _node_id_attr(graphql_type: type) -> str | None:
@@ -2928,10 +2954,10 @@ class BaseBackend:
         # Read before the backend installs resolvers of its own, which would
         # make every relation look like a field with a custom resolver. Own
         # annotations alone miss columns an interface or mixin declares.
-        excluded = set(exclude) if exclude else set()
+        _refuse_excluding_inherited(cls, name or cls.__name__, set(exclude or ()))
         cls._orm_reads_as_is = frozenset(  # type: ignore[attr-defined]
             name for name in annotations if _reads_as_is(vars(cls).get(name))
-        ) | _inherited_reads_as_is(cls, excluded=excluded)
+        ) | _inherited_reads_as_is(cls)
 
         if self._warn_sensitive:
             for field_name in annotations:
