@@ -865,11 +865,13 @@ class SQLAlchemyBackend(BaseBackend):
         ``None``, as it does on the type. Across a to-many hop the join is to
         the visible rows alone, leaving one ``None`` row for a parent with none.
         """
-        from sqlalchemy import select
+        from sqlalchemy import and_, select
 
-        pk = _get_sa_pk_column(model)
-        own = query.with_only_columns(pk).order_by(None)
-        stmt = _carrying(select().select_from(model).where(pk.in_(own)), query)
+        keys = _get_sa_pk_columns(model)
+        own = query.with_only_columns(*keys).order_by(None)
+        stmt = _carrying(
+            select().select_from(model).where(_whole_key_in(keys, own)), query
+        )
         joined: dict[tuple[str, ...], Any] = {}
         values: dict[str, Any] = {}
         for path in paths:
@@ -899,14 +901,17 @@ class SQLAlchemyBackend(BaseBackend):
         if any(hop.many for path in paths for hop in path.hops):
             # A row joined to two related rows with the same values would be
             # grouped twice under one key, so its keys are taken once each.
+            labelled = {f"_orm_pk{i}": key for i, key in enumerate(keys)}
             pairs = (
-                stmt.add_columns(pk.label("_orm_pk"), *values.values())
+                stmt.add_columns(
+                    *(key.label(label) for label, key in labelled.items()),
+                    *values.values(),
+                )
                 .distinct()
                 .subquery()
             )
-            stmt = _carrying(
-                select().select_from(model).join(pairs, pairs.c._orm_pk == pk), stmt
-            )
+            same_row = and_(*(pairs.c[label] == key for label, key in labelled.items()))
+            stmt = _carrying(select().select_from(model).join(pairs, same_row), stmt)
             values = {alias: pairs.c[alias] for alias in values}
         return stmt.add_columns(*values.values()), values
 
@@ -2411,6 +2416,30 @@ def _get_sa_pk_column(model: type) -> Any:
     return mapper.get_property_by_column(mapper.primary_key[0]).class_attribute
 
 
+def _get_sa_pk_columns(model: type) -> list[Any]:
+    """Every primary-key column attribute of *model*, in key order."""
+    from sqlalchemy import inspect as sa_inspect
+
+    mapper = sa_inspect(model)
+    return [
+        mapper.get_property_by_column(column).class_attribute
+        for column in mapper.primary_key
+    ]
+
+
+def _whole_key_in(keys: list[Any], rows: Any) -> Any:
+    """Whether a row's *keys* are among *rows*, a select of the same columns.
+
+    A key of more than one column is compared as one value: matching on its
+    first column alone takes in every row that shares it.
+    """
+    from sqlalchemy import tuple_
+
+    if len(keys) == 1:
+        return keys[0].in_(rows)
+    return tuple_(*keys).in_(rows)
+
+
 def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
     """The primary-key columns an order lacks, to end it with.
 
@@ -2636,9 +2665,9 @@ def _sa_relation_scope_criteria(
     lifted = _liftable_criteria(scoped, related, model)
     if lifted is not None:
         return lifted, query
-    pk_col = _get_sa_pk_column(related)
+    keys = _get_sa_pk_columns(related)
     return (
-        pk_col.in_(scoped.with_only_columns(pk_col).scalar_subquery()),
+        _whole_key_in(keys, scoped.with_only_columns(*keys)),
         _carrying(query, scoped),
     )
 
@@ -2942,8 +2971,8 @@ def _sa_custom_filter_clause(
     narrowed = invoke_custom_callback(
         handler, filter_input, query=sa_select(model), value=value, info=info
     )
-    pk_col = sa_inspect(model).primary_key[0]
-    return pk_col.in_(narrowed.with_only_columns(pk_col).correlate(None))
+    keys = list(sa_inspect(model).primary_key)
+    return _whole_key_in(keys, narrowed.with_only_columns(*keys).correlate(None))
 
 
 def _sa_reference_key(relationship_prop: Any) -> tuple[Any, str] | None:
