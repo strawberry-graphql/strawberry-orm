@@ -1914,7 +1914,7 @@ Rules:
 - Nested keys are relation names on that model.
 - `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `unlink`, `delete`, `onReplace`, `immutable`, `maxVisits`, `name`).
 - Relations you do not declare are absent from the input, so the schema rejects them.
-- Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`.
+- Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`. Even then the replaced row is deleted only if the caller could delete it by its key: one the related repo's `scope_query` hides, or whose deletion `authorize` denies, is disconnected and left in place.
 - Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
 
 #### Upserting with `_meta.upsert`

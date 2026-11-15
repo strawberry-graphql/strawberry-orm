@@ -368,7 +368,7 @@ Catch-all Relay node mutation *inputs* with recursive nested refs; you write the
 | --- | --- |
 | `create`, `update` | `True` or a list of field names |
 | `unlink`, `delete` | `True` (to-many relations only); absent unless set |
-| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only); a replaced row is only disconnected unless `"DELETE"` is listed |
+| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only); a replaced row is only disconnected unless `"DELETE"` is listed, and one the related repo's `scope_query` hides or `authorize` will not delete is never deleted |
 | `upsert.where` | a list of field names to match on, or `True` for caller-chosen optional fields |
 | `upsert.onMatch` | `"UPDATE"` (default; requires `update` when set), `"IGNORE"` or `"APPEND"` |
 | `upsert.onMatchLinks` | `"ERROR"` (default) or `"IGNORE"`; only with `onMatch: "APPEND"` |

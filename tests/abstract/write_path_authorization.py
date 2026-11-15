@@ -724,6 +724,67 @@ class AbstractTestProjectionDefaults(Blog):
         ]
 
 
+# -- onReplace: DELETE removes only a row the caller may delete ---------------------------
+
+
+POST_REPLACING_AUTHOR = {
+    "_meta": {"update": ["title"], "upsert": {"where": ["title"], "onMatch": "UPDATE"}},
+    "author": {
+        "_meta": {
+            "update": ["name"],
+            "upsert": {"where": ["id"], "onMatch": "IGNORE"},
+            "onReplace": ["DISCONNECT", "DELETE"],
+        }
+    },
+}
+
+
+class AbstractTestOnReplaceDelete(Blog):
+    @staticmethod
+    def replace_author(orm: Any, writes: WriteDb, title: str, pk: str) -> Any:
+        upsert = orm.mutations.upsert_node_input(
+            model=writes.m.Post, project=POST_REPLACING_AUTHOR, name="PostUpsertInput"
+        )
+        link_type = member(upsert, "update", "author")
+        link = link_type(update=member(link_type, "update")(id=pk))
+        link.on_replace = RelationRemovalPolicy.DELETE
+        return upsert(
+            where=member(upsert, "where")(title=title),
+            update=member(upsert, "update")(author=link),
+        )
+
+    async def users(self, writes: WriteDb) -> list[str]:
+        return [user.name for user in await writes.rows(writes.m.User)]
+
+    async def test_a_replaced_target_the_repo_hides_is_left_alone(self, writes, blog):
+        orm = writes.new_orm(repos={writes.m.User: scoped_repo(writes, [1, 3])})
+        await writes.upsert(orm, self.replace_author(orm, writes, "Other", "1"))
+        assert (await writes.reload(blog.other)).author_id == 1
+        assert await self.users(writes) == ["Alice", "Bob", "Carol"]
+
+    async def test_a_replaced_target_authorize_will_not_delete_is_left_alone(
+        self, writes, blog
+    ):
+        def no_deletes(action, model, pk, info):
+            return action != "delete"
+
+        orm = writes.new_orm()
+        payload = self.replace_author(orm, writes, "Other", "1")
+        await writes.upsert(orm, payload, authorize=no_deletes)
+        assert (await writes.reload(blog.other)).author_id == 1
+        assert await self.users(writes) == ["Alice", "Bob", "Carol"]
+
+    async def test_a_replaced_target_the_caller_may_delete_is_deleted(
+        self, writes, blog
+    ):
+        orm = writes.new_orm(repos={writes.m.User: scoped_repo(writes, [1, 2, 3])})
+        await writes.upsert(
+            orm, self.replace_author(orm, writes, "Other", "3"), authorize=allow
+        )
+        assert (await writes.reload(blog.other)).author_id == 3
+        assert await self.users(writes) == ["Alice", "Carol"]
+
+
 # -- Re-pointing a link asks both sides ------------------------------------------------
 
 

@@ -522,13 +522,13 @@ class UpsertWriter:
                         spec.related_model, "can_unlink", instance, name, previous
                     )
                     if self._on_replace(link, fields[name]) == "DELETE":
-                        replaced.append(previous)
+                        replaced.append((spec.related_model, previous))
             setattr(instance, name, target)
 
         # Saved before the old targets go, so a cascade cannot take this row too.
         yield self._ops.save(repo, instance)
-        for previous in replaced:
-            yield from self._delete_instance(previous)
+        for related_model, previous in replaced:
+            yield from self._delete_replaced(related_model, previous)
         repo.on_after_update(instance, self._info)
         yield from self._apply_to_many(instance, payload, cls, created=False)
         return instance
@@ -665,6 +665,21 @@ class UpsertWriter:
             # Out of the join table first, so no link row outlives the row.
             yield self._ops.unlink(parent.instance, parent.spec, instance)
         yield self._ops.delete(repo, instance)
+
+    def _delete_replaced(self, model: type, previous: Any) -> Steps:
+        """Delete a link's old target, if the caller could delete it by its key.
+
+        The target was read off the row, not through the repo, so it is read
+        again through the repo's ``scope_query``. One that hides it, or an
+        ``authorize`` that denies its deletion, leaves it unlinked but in place,
+        and the caller is told nothing either way.
+        """
+        pk = self._ops.pk_value(previous)
+        if not (yield from self._authorized("delete", model, pk)):
+            return
+        visible = yield self._ops.get(self._repo(model), model, pk)
+        if visible is not None:
+            yield from self._delete_instance(visible)
 
     def _update_by_id(self, payload: Any, cls: type) -> Steps:
         model = cls.__orm_model__  # type: ignore[attr-defined]

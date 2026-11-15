@@ -13,6 +13,7 @@ from tests.abstract.write_path_authorization import (
     AbstractTestAuthorizeKeepsTheRepo,
     AbstractTestLinkChecks,
     AbstractTestNodeInputsFollowTypeExclude,
+    AbstractTestOnReplaceDelete,
     AbstractTestPermissionResults,
     AbstractTestPolicyWithRepos,
     AbstractTestProjectionDefaults,
@@ -112,4 +113,8 @@ class TestPolicyWithRepos(AbstractTestPolicyWithRepos):
 
 
 class TestRefListDeleteUsesTheRepo(AbstractTestRefListDeleteUsesTheRepo):
+    pass
+
+
+class TestOnReplaceDelete(AbstractTestOnReplaceDelete):
     pass
