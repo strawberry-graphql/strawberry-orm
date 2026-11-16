@@ -23,13 +23,14 @@ from inspect import isawaitable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from graphql import GraphQLList, GraphQLNonNull
+from graphql import GraphQLList, GraphQLNonNull, get_named_type, is_abstract_type
 from strawberry.extensions import SchemaExtension
 from strawberry.relay import Edge
+from strawberry.types.cast import get_strawberry_type_cast
 
 from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.grouping import GroupPath
-from strawberry_orm.lazy_resolution import _path_field_names
+from strawberry_orm.lazy_resolution import _path_field_names, execution_mark
 
 if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 _PARENTS_KEY = "_orm_batch_parents"
 _BAILS_KEY = "_orm_batch_bails"
 _RESULTS_KEY = "_orm_batch_results"
+_CONNECTION_KEY = "_orm_connection_pages"
+#: Which execution the parents, rows and pages kept on the context were read in.
+_EXECUTION_KEY = "_orm_batch_execution"
 _MISSING = object()
 _UNBATCHABLE = object()
 
@@ -80,28 +84,164 @@ def _operation_store(execution_context: Any, key: str) -> dict[str, Any] | None:
     return store
 
 
+def _execution_store(execution_context: Any, key: str) -> dict[Any, Any] | None:
+    """A per-operation dict, emptied whenever another execution has opened.
+
+    A subscription's events share one ``ExecutionContext``, and each event is
+    an execution of its own. The parents, rows and pages one event read, under
+    the scope it had, are dropped before the next event reads anything.
+    """
+    if execution_context is None:
+        return None
+    mark = execution_mark()
+    if getattr(execution_context, _EXECUTION_KEY, None) is not mark:
+        try:
+            setattr(execution_context, _EXECUTION_KEY, mark)
+        except Exception:  # pragma: no cover - exotic context objects
+            return None
+        for stale in (_PARENTS_KEY, _RESULTS_KEY, _CONNECTION_KEY):
+            setattr(execution_context, stale, {})
+    return _operation_store(execution_context, key)
+
+
 def path_key(info: Any) -> str:
     """Dotted field path with list indices removed, shared by all siblings."""
     return ".".join(_path_field_names(info))
+
+
+def _parent_type_name(info: Any) -> str | None:
+    return getattr(getattr(info, "parent_type", None), "name", None)
+
+
+def _cache_key(key: str, info: Any) -> tuple[Any, ...]:
+    """Where a field's batched reads are kept: per path, and per parent type.
+
+    The rows of a union or interface list share their fields' paths, but each
+    of their types resolves a field its own way, with its own ``scope=``. One
+    path can also be selected in several branches of the query, with other
+    arguments, so the field's nodes in the query are part of the key too.
+    """
+    nodes = tuple(id(node) for node in getattr(info, "field_nodes", None) or ())
+    return (key, _parent_type_name(info), nodes)
+
+
+def _type_of(row: Any, abstract: Any, info: Any) -> str | None:
+    """The object type *row* will complete as in *abstract*, if it can be told now.
+
+    graphql-core decides that only as the row completes, after its siblings'
+    fields are batched, so it is decided here the way Strawberry decides it:
+    by the row's ``strawberry.cast``, or else by the first possible type whose
+    ``is_type_of`` takes the row. Only the library's own ``is_type_of`` is
+    asked ahead of time; a type that decides for itself is not told.
+    """
+    possible = info.schema.get_possible_types(abstract)
+    cast = get_strawberry_type_cast(row)
+    if cast is not None:
+        return next(
+            (
+                type_.name
+                for type_ in possible
+                if type_.extensions["strawberry-definition"].origin is cast
+            ),
+            None,
+        )
+    for type_ in possible:
+        is_type_of = type_.is_type_of
+        if getattr(is_type_of, "orm_model", None) is None:
+            return None
+        try:
+            if is_type_of(row, info):
+                return type_.name
+        except TypeError:  # two types read the row, and it was not cast
+            return None
+    return None
+
+
+class _Parents:
+    """The rows a list field produced, for the fields below them to batch across.
+
+    The rows of a union or interface list can complete as several types, and
+    each type resolves a field its own way: its own resolver, relation and
+    ``scope=``. So a field is batched across the rows of its own type only,
+    and a row whose type cannot be told ahead is batched with none.
+    """
+
+    __slots__ = ("_by_type", "info", "item_type", "rows")
+
+    def __init__(self, rows: list[Any], item_type: Any, info: Any) -> None:
+        self.rows = rows
+        self.item_type = item_type
+        self.info = info
+        self._by_type: dict[str, list[Any]] | None = None
+
+    def of_type(self, type_name: str | None) -> list[Any]:
+        """The rows that complete as the object type *type_name*."""
+        if self._by_type is None:
+            rows = [row for row in self.rows if row is not None]
+            if not is_abstract_type(self.item_type):
+                self._by_type = {self.item_type.name: rows}
+            else:
+                self._by_type = {}
+                for row in rows:
+                    name = _type_of(row, self.item_type, self.info)
+                    if name is not None:
+                        self._by_type.setdefault(name, []).append(row)
+        return self._by_type.get(type_name, []) if type_name else []
 
 
 def stash_parents(execution_context: Any, info: Any, rows: Any) -> None:
     """Record the rows a field produced so its children can batch across them."""
     if not isinstance(rows, list) or len(rows) < 2:
         return
-    store = _operation_store(execution_context, _PARENTS_KEY)
+    store = _execution_store(execution_context, _PARENTS_KEY)
     if store is None:
         return
     key = path_key(info)
-    store[key] = rows
+    item_type = get_named_type(info.return_type)
+    store[key] = _Parents(rows, item_type, info)
     # A connection's edges each resolve ``node`` to one row, which is never a
     # list to record, so what is read under ``node`` is batched across these.
     if all(isinstance(row, Edge) for row in rows):
-        store[f"{key}.node"] = [row.node for row in rows]
+        node_type = get_named_type(item_type.fields["node"].type)
+        store[f"{key}.node"] = _Parents([row.node for row in rows], node_type, info)
+
+
+def _siblings(
+    execution_context: Any, root: Any, key: str, info: Any
+) -> list[Any] | None:
+    """The parents of *root*'s type this field is being resolved for, if batchable.
+
+    Not when *root* is not among them: its type could not be told ahead, or
+    the parents recorded at this path are another branch's.
+    """
+    parent_path, _, _ = key.rpartition(".")
+    if not parent_path:
+        return None
+    store = _execution_store(execution_context, _PARENTS_KEY)
+    stashed = store.get(parent_path) if store else None
+    if stashed is None:
+        return None
+    parents = stashed.of_type(_parent_type_name(info))
+    if len(parents) < 2 or not any(parent is root for parent in parents):
+        return None
+    return parents
+
+
+def _held_for(entries: dict[int, tuple[Any, Any]], parent: Any) -> Any:
+    """What *entries* keep for *parent*, or ``None``.
+
+    They are keyed by ``id()``, which a row allocated after another was freed
+    can share. So each entry holds its parent too: kept alive, its address is
+    not reused, and compared, the entry is never handed to another row.
+    """
+    entry = entries.get(id(parent))
+    if entry is None or entry[0] is not parent:
+        return None
+    return entry[1]
 
 
 def _hand_out(
-    batched: dict[int, list[Any]],
+    batched: dict[int, tuple[Any, Any]],
     attr_name: str,
     members: list[tuple[Any, Any, Any]],
     rows: list[Any],
@@ -118,18 +258,18 @@ def _hand_out(
     for row in rows:
         grouped.setdefault(getattr(row, attr_name), []).append(row)
     for parent, parent_pk, _ in members:
-        batched[id(parent)] = grouped.get(parent_pk, [])
+        batched[id(parent)] = (parent, grouped.get(parent_pk, []))
 
 
 def _own_rows(entry: Any, root: Any) -> Any:
     """A parent's rows, or a wait for them when the batched read is pending."""
     if isawaitable(entry):
-        return _await_own_rows(entry, id(root))
+        return _await_own_rows(entry, root)
     return entry
 
 
-async def _await_own_rows(shared: Any, parent_id: int) -> list[Any]:
-    return (await shared).get(parent_id, [])
+async def _await_own_rows(shared: Any, root: Any) -> list[Any]:
+    return _held_for(await shared, root) or []
 
 
 def _to_snake(name: str) -> str:
@@ -240,21 +380,24 @@ class BatchingExtension(SchemaExtension):
 
         key = path_key(info)
         execution_context = getattr(self, "execution_context", None)
-        results = _operation_store(execution_context, _RESULTS_KEY)
+        results = _execution_store(execution_context, _RESULTS_KEY)
         if results is None:
             return _next(root, info, *args, **kwargs)
 
-        cached = results.get(key, _MISSING)
+        cache_key = _cache_key(key, info)
+        cached = results.get(cache_key, _MISSING)
         if cached is _UNBATCHABLE:  # this path already proved unrewritable
             return _next(root, info, *args, **kwargs)
 
         # A path is resolved once per parent *group*, not once per operation:
         # ``users.posts.comments`` is reached separately for each user's posts.
         # A cache miss therefore means "not batched yet", never "no rows".
-        if cached is not _MISSING and id(root) in cached:
-            return _own_rows(cached[id(root)], root)
+        if cached is not _MISSING:
+            own = _held_for(cached, root)
+            if own is not None:
+                return _own_rows(own, root)
 
-        parents = self._siblings(execution_context, root, key)
+        parents = _siblings(execution_context, root, key, info)
         if parents is None:
             return _next(root, info, *args, **kwargs)
 
@@ -263,7 +406,7 @@ class BatchingExtension(SchemaExtension):
         # would have thrown away one query per parent to find that out.
         first = _next(root, info, *args, **kwargs)
         if isawaitable(first) or not backend.is_query_object(first):
-            results[key] = _UNBATCHABLE
+            results[cache_key] = _UNBATCHABLE
             if not _already_loaded(root, info):
                 record_bail(
                     execution_context,
@@ -278,7 +421,7 @@ class BatchingExtension(SchemaExtension):
         try:
             batched = self._run_ahead(_next, parents, root, first, info, args, kwargs)
         except _Bail:
-            results[key] = _UNBATCHABLE
+            results[cache_key] = _UNBATCHABLE
             record_bail(
                 execution_context,
                 key,
@@ -290,31 +433,14 @@ class BatchingExtension(SchemaExtension):
             # Siblings resolve before the read finishes, so each is handed the
             # read itself: a task, which every one of them can await.
             shared = ensure_future(batched)
-            batched = {id(parent): shared for parent in parents}
+            batched = {id(parent): (parent, shared) for parent in parents}
 
         # Merge rather than replace: earlier parent groups at this path keep
         # their rows.
         merged = {} if cached is _MISSING else dict(cached)
         merged.update(batched)
-        results[key] = merged
-        return _own_rows(merged.get(id(root), []), root)
-
-    def _siblings(
-        self, execution_context: Any, root: Any, key: str
-    ) -> list[Any] | None:
-        """The parent rows this field is being resolved for, if batchable."""
-        parent_path, _, _ = key.rpartition(".")
-        if not parent_path:
-            return None
-        store = _operation_store(execution_context, _PARENTS_KEY)
-        if not store:
-            return None
-        parents = store.get(parent_path)
-        if not parents or len(parents) < 2:
-            return None
-        if not any(parent is root for parent in parents):
-            return None
-        return parents
+        results[cache_key] = merged
+        return _own_rows(_held_for(merged, root), root)
 
     def _run_ahead(
         self,
@@ -325,7 +451,7 @@ class BatchingExtension(SchemaExtension):
         info: Any,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> dict[int, list[Any]]:
+    ) -> dict[int, tuple[Any, Any]]:
         """Build every sibling's query, group by shape, run one query per group."""
         backend = self._backend
         assert backend is not None
@@ -376,7 +502,7 @@ class BatchingExtension(SchemaExtension):
 
         if any(isawaitable(rows) for _, _, rows in reads):
             return self._hand_out_async(reads)
-        batched: dict[int, list[Any]] = {}
+        batched: dict[int, tuple[Any, Any]] = {}
         for attr_name, members, rows in reads:
             _hand_out(batched, attr_name, members, rows)
         return batched
@@ -384,14 +510,11 @@ class BatchingExtension(SchemaExtension):
     @staticmethod
     async def _hand_out_async(
         reads: list[tuple[str, list[tuple[Any, Any, Any]], Any]],
-    ) -> dict[int, list[Any]]:
-        batched: dict[int, list[Any]] = {}
+    ) -> dict[int, tuple[Any, Any]]:
+        batched: dict[int, tuple[Any, Any]] = {}
         for attr_name, members, rows in reads:
             _hand_out(batched, attr_name, members, await await_maybe(rows))
         return batched
-
-
-_CONNECTION_KEY = "_orm_connection_pages"
 
 
 def page_attr(field_name: str) -> str:
@@ -579,23 +702,24 @@ class RelationConnectionExtension(SchemaExtension):
             return _next(root, info, *args, **kwargs)
 
         execution_context = getattr(self, "execution_context", None)
-        pages = _operation_store(execution_context, _CONNECTION_KEY)
+        pages = _execution_store(execution_context, _CONNECTION_KEY)
         if pages is None:
             return _next(root, info, *args, **kwargs)
 
         key = path_key(info)
-        cached = pages.get(key)
+        cache_key = _cache_key(key, info)
+        cached = pages.get(cache_key)
         if cached is _UNBATCHABLE:
             return _next(root, info, *args, **kwargs)
 
         if cached is None:
-            parents = self._siblings(execution_context, root, key)
+            parents = _siblings(execution_context, root, key, info)
             if parents is None:
                 return _next(root, info, *args, **kwargs)
             try:
                 cached = self._fetch_pages(backend, spec, parents, info, kwargs=kwargs)
             except _Bail as exc:
-                pages[key] = _UNBATCHABLE
+                pages[cache_key] = _UNBATCHABLE
                 record_bail(execution_context, key, str(exc) or "not windowable")
                 return _next(root, info, *args, **kwargs)
             if isawaitable(cached):
@@ -605,17 +729,25 @@ class RelationConnectionExtension(SchemaExtension):
                 # once, which would leave every other sibling to start a read of
                 # its own - the N+1 this exists to collapse.
                 cached = ensure_future(cached)
-            pages[key] = cached
+            pages[cache_key] = cached
 
         if isawaitable(cached):
             return self._resolve_async(
-                cached, _next, root, info, spec, execution_context, key, args, kwargs
+                cached,
+                _next,
+                root,
+                info,
+                spec,
+                execution_context,
+                cache_key,
+                args,
+                kwargs,
             )
         return self._with_page(cached, _next, root, info, spec, args, kwargs)
 
     def _with_page(
         self,
-        pages_by_parent: dict[int, Any],
+        pages_by_parent: dict[int, tuple[Any, Any]],
         _next: Any,
         root: Any,
         info: Any,
@@ -629,7 +761,7 @@ class RelationConnectionExtension(SchemaExtension):
         the resolver rather than returned here - returning rows would replace
         the connection itself.
         """
-        hand_over_page(root, spec.field_name, info, pages_by_parent.get(id(root)))
+        hand_over_page(root, spec.field_name, info, _held_for(pages_by_parent, root))
         result = None
         try:
             result = _next(root, info, *args, **kwargs)
@@ -658,7 +790,7 @@ class RelationConnectionExtension(SchemaExtension):
         info: Any,
         spec: Any,
         execution_context: Any,
-        key: str,
+        cache_key: tuple[Any, ...],
         args: tuple,
         kwargs: dict,
     ) -> Any:
@@ -671,28 +803,12 @@ class RelationConnectionExtension(SchemaExtension):
         from strawberry_orm._async import await_maybe
 
         fetched = await pending
-        pages = _operation_store(execution_context, _CONNECTION_KEY)
+        pages = _execution_store(execution_context, _CONNECTION_KEY)
         if pages is not None:
-            pages[key] = fetched
+            pages[cache_key] = fetched
         return await await_maybe(
             self._with_page(fetched, _next, root, info, spec, args, kwargs)
         )
-
-    def _siblings(
-        self, execution_context: Any, root: Any, key: str
-    ) -> list[Any] | None:
-        parent_path, _, _ = key.rpartition(".")
-        if not parent_path:
-            return None
-        store = _operation_store(execution_context, _PARENTS_KEY)
-        if not store:
-            return None
-        parents = store.get(parent_path)
-        if not parents or len(parents) < 2:
-            return None
-        if not any(parent is root for parent in parents):
-            return None
-        return parents
 
     def _fetch_pages(
         self,
@@ -701,7 +817,7 @@ class RelationConnectionExtension(SchemaExtension):
         parents: list[Any],
         info: Any,
         kwargs: dict[str, Any] | None = None,
-    ) -> AwaitableOrValue[dict[int, Any]]:
+    ) -> AwaitableOrValue[dict[int, tuple[Any, Any]]]:
         """One windowed query for the pages, one grouped query for the totals."""
         from strawberry_orm.relay.connection import _LAST_POSITION
 
@@ -754,7 +870,7 @@ class RelationConnectionExtension(SchemaExtension):
         base: Any,
         rows_by_key: Any,
         start: int,
-    ) -> dict[int, Any]:
+    ) -> dict[int, tuple[Any, Any]]:
         """The same two reads, for a backend that only answers asynchronously."""
         from strawberry_orm._async import await_maybe
 
@@ -769,7 +885,7 @@ class RelationConnectionExtension(SchemaExtension):
         rows_by_key: dict[tuple, list[Any]],
         totals: dict[Any, int],
         start: int,
-    ) -> dict[int, Any]:
+    ) -> dict[int, tuple[Any, Any]]:
         """Pair every parent with its own page, from *start*, and its real total."""
         from strawberry_orm.lazy_resolution import mark_rows_scoped
         from strawberry_orm.relay.connection import PreslicedRows
@@ -777,11 +893,11 @@ class RelationConnectionExtension(SchemaExtension):
         # Every backend stringifies its group keys, so the parent key has to be
         # compared in the same form. The window already applied scope_rows, so
         # the page must not be checked again one row at a time.
-        pages: dict[int, Any] = {}
+        pages: dict[int, tuple[Any, Any]] = {}
         for parent, pk in zip(parents, pks, strict=True):
             page = rows_by_key.get((str(pk),), [])
             mark_rows_scoped(page)
-            pages[id(parent)] = PreslicedRows(page, totals.get(pk, 0), start)
+            pages[id(parent)] = (parent, PreslicedRows(page, totals.get(pk, 0), start))
         return pages
 
 

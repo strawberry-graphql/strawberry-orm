@@ -11,8 +11,11 @@ and on the test class:
 
 - ``run(schema, query, context)``, executing with *context* (a dict) against
   the seeded rows;
+- ``subscribe(schema, query, context)``, every answer of a subscription run
+  with *context* (a dict) against the seeded rows;
 - ``published_only(qs)``, keeping the published posts;
 - ``all_posts()``, an unexecuted query over every post, in id order;
+- ``posts_of(user)``, an unexecuted query over the user's posts, in id order;
 - ``load_posts()`` and ``load_users()``, every post or user, read before any
   execution, in id order.
 
@@ -32,7 +35,18 @@ ALL_TITLES = ["Hello World", "GraphQL Guide", "Draft Post", "Rust Adventures"]
 PUBLISHED_TITLES = ["Hello World", "GraphQL Guide", "Rust Adventures"]
 
 
-class AbstractTestTrustAcrossExecutions:
+def _titles(data, field):
+    """Every title the users' *field* returned, page or list, in seed order."""
+    found = []
+    for user in data["users"]:
+        value = user[field]
+        if isinstance(value, dict):
+            value = [edge["node"] for edge in value["edges"]]
+        found.extend(post["title"] for post in value)
+    return sorted(found, key=ALL_TITLES.index)
+
+
+class _Trust:
     async def execute(self, schema, query, **context):
         result = await self.run(schema, query, context)
         assert result.errors is None, result.errors
@@ -53,6 +67,53 @@ class AbstractTestTrustAcrossExecutions:
         }
         return orm.type(models.Post)(type("PostType", (), namespace))
 
+    def event_parts(self, orm, models):
+        """A post type that checks no row itself, and a field scope keeping
+        the drafts for an admin: the field's read is all that hides them."""
+        published_only = self.published_only
+
+        @orm.type(models.Post)
+        class PostType:
+            id: auto
+            title: auto
+
+        def admin_or_published(qs, info):
+            return qs if info.context.get("admin") else published_only(qs)
+
+        return PostType, admin_or_published
+
+    async def _each_event_rescoped(self, orm, UserType, field):
+        """A subscription hands back the same users twice, to an admin and then
+        to a caller who is not: what the first event read is not the second's."""
+        cached = await self.load_users()
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def ok(self) -> bool:
+                return True
+
+        @strawberry.type
+        class Subscription:
+            @strawberry.subscription
+            async def users(self, info: strawberry.Info) -> list[UserType]:
+                for admin in (True, False):
+                    info.context["admin"] = admin
+                    yield cached
+
+        schema = orm.schema(query=Query, subscription=Subscription)
+        selection = f"{field} {{ title }}"
+        if field == "posts":
+            selection = "posts { edges { node { title } } }"
+        answers = await self.subscribe(
+            schema, f"subscription {{ users {{ name {selection} }} }}", {}
+        )
+        assert [answer.errors for answer in answers] == [None, None]
+        assert [_titles(answer.data, field) for answer in answers] == [
+            ALL_TITLES,
+            PUBLISHED_TITLES,
+        ]
+
     async def _as_admin_then_not(self, schema, query, read):
         for admin, expected in (
             (False, PUBLISHED_TITLES),
@@ -62,6 +123,8 @@ class AbstractTestTrustAcrossExecutions:
             data = await self.execute(schema, query, admin=admin)
             assert read(data) == expected, (admin, data)
 
+
+class AbstractTestTrustAcrossExecutions(_Trust):
     async def test_a_shared_query_an_admin_read_is_scoped_for_the_next_user(
         self, orm, models
     ):
@@ -223,3 +286,46 @@ class AbstractTestTrustAcrossExecutions:
         first, second = seen
         assert first is not None and second is not None
         assert first is not second
+
+    async def test_a_batch_one_event_read_is_not_served_to_the_next(self, orm, models):
+        PostType, admin_or_published = self.event_parts(orm, models)
+        posts_of = self.posts_of
+
+        @orm.type(models.User)
+        class UserType:
+            id: auto
+            name: auto
+
+            @orm.field.lazy
+            def writing(self, info: strawberry.Info) -> list[PostType]:
+                return admin_or_published(posts_of(self), info)
+
+        await self._each_event_rescoped(orm, UserType, "writing")
+
+    async def test_a_page_one_event_cut_is_not_served_to_the_next(self, orm, models):
+        PostType, admin_or_published = self.event_parts(orm, models)
+
+        @orm.type(models.User)
+        class UserType:
+            id: auto
+            name: auto
+            posts: ORMListConnection[PostType] = orm.connection.eager(
+                scope=admin_or_published
+            )
+
+        await self._each_event_rescoped(orm, UserType, "posts")
+
+
+class AbstractTestOnViewsAcrossExecutions(_Trust):
+    async def test_a_view_one_event_read_is_not_served_to_the_next(self, orm, models):
+        PostType, admin_or_published = self.event_parts(orm, models)
+
+        @orm.type(models.User)
+        class UserType:
+            id: auto
+            name: auto
+            recent: list[PostType] = orm.field.eager(
+                on="posts", scope=admin_or_published
+            )
+
+        await self._each_event_rescoped(orm, UserType, "recent")

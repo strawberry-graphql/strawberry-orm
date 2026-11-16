@@ -15,6 +15,9 @@ from strawberry_orm.batching import (
     RelationConnectionExtension,
     _already_loaded,
     _Bail,
+    _cache_key,
+    _Parents,
+    _siblings,
     extensions_include_relation_connections,
     page_attr,
     take_page,
@@ -64,7 +67,7 @@ class _Connection:
         return _Edge
 
 
-def _info(path="users.posts"):
+def _info(path="users.posts", parent_type="UserNode"):
     """A resolve info carrying a path and a connection field to read it off."""
     from graphql.pyutils import Path
     from strawberry.relay.fields import ConnectionExtension
@@ -84,8 +87,14 @@ def _info(path="users.posts"):
         path=node_path,
         field_name=parts[-1],
         field_nodes=[],
-        parent_type=types.SimpleNamespace(fields={parts[-1]: field}),
+        parent_type=types.SimpleNamespace(name=parent_type, fields={parts[-1]: field}),
     )
+
+
+def _stash(execution_context, parents):
+    """Record *parents* as the ``UserNode`` rows listed at ``users``."""
+    user_node = types.SimpleNamespace(name="UserNode")
+    execution_context._orm_batch_parents = {"users": _Parents(parents, user_node, None)}
 
 
 def _extension(backend):
@@ -97,25 +106,33 @@ def _extension(backend):
 
 class TestSiblings:
     def test_a_root_field_has_no_parents_to_batch_across(self):
-        ext = _extension(_Backend())
-        assert ext._siblings(ext.execution_context, _Parent(1), "users") is None
+        ctx = types.SimpleNamespace()
+        assert _siblings(ctx, _Parent(1), "users", _info("users")) is None
 
     def test_one_parent_is_not_worth_a_window(self):
-        ext = _extension(_Backend())
+        ctx = types.SimpleNamespace()
         parent = _Parent(1)
-        ext.execution_context._orm_batch_parents = {"users": [parent]}
-        assert ext._siblings(ext.execution_context, parent, "users.posts") is None
+        _stash(ctx, [parent])
+        assert _siblings(ctx, parent, "users.posts", _info()) is None
 
     def test_a_parent_from_another_branch_is_not_batched_with_these(self):
         """Same path, different parent list: rewriting across them would be wrong."""
-        ext = _extension(_Backend())
-        stored = [_Parent(1), _Parent(2)]
-        ext.execution_context._orm_batch_parents = {"users": stored}
-        assert ext._siblings(ext.execution_context, _Parent(9), "users.posts") is None
+        ctx = types.SimpleNamespace()
+        _stash(ctx, [_Parent(1), _Parent(2)])
+        assert _siblings(ctx, _Parent(9), "users.posts", _info()) is None
+
+    def test_a_parent_of_another_type_is_not_batched_with_these(self):
+        """Its field may run another resolver, under another scope."""
+        ctx = types.SimpleNamespace()
+        parents = [_Parent(1), _Parent(2)]
+        _stash(ctx, parents)
+        team_info = _info(parent_type="TeamNode")
+        assert _siblings(ctx, parents[0], "users.posts", team_info) is None
+        assert _siblings(ctx, parents[0], "users.posts", _info()) == parents
 
     def test_no_parents_recorded_at_all(self):
-        ext = _extension(_Backend())
-        assert ext._siblings(ext.execution_context, _Parent(1), "users.posts") is None
+        ctx = types.SimpleNamespace()
+        assert _siblings(ctx, _Parent(1), "users.posts", _info()) is None
 
 
 class TestFetchGuards:
@@ -170,7 +187,8 @@ class TestFetchGuards:
             backend, spec, [_Parent(1)], _info(), kwargs={"first": 1}
         )
         pages = await pending
-        assert list(pages.values())[0].orm_total_count == 4
+        _, page = list(pages.values())[0]
+        assert page.orm_total_count == 4
 
     async def test_siblings_share_one_read_rather_than_one_each(self):
         """Cache the coroutine and each sibling starts the N+1 this collapses."""
@@ -192,7 +210,7 @@ class TestFetchGuards:
         )
         ext = _extension(backend)
         parents = [_Parent(1), _Parent(2)]
-        ext.execution_context._orm_batch_parents = {"users": parents}
+        _stash(ext.execution_context, parents)
         info = _info()
         handed = []
 
@@ -255,7 +273,7 @@ class TestFetchGuards:
         )
         # The page plus the row that answers hasNextPage, from just past it.
         assert seen == {"offset": 3, "limit": 3 + 1}
-        page = list(pages.values())[0]
+        _, page = list(pages.values())[0]
         assert (page.orm_offset, page.orm_total_count) == (3, 7)
 
 
@@ -276,10 +294,15 @@ class TestResolveGuards:
         backend = _Backend()
         ext = _extension(backend)
         backend.relation_connection_spec = lambda info: object()
-        setattr(ext.execution_context, _CONNECTION_KEY, {"users.posts": _UNBATCHABLE})
+        info = _info()
+        parents = [_Parent(1), _Parent(2)]
+        _stash(ext.execution_context, parents)
+        unbatchable = {_cache_key("users.posts", info): _UNBATCHABLE}
+        setattr(ext.execution_context, _CONNECTION_KEY, unbatchable)
+        ext._fetch_pages = lambda *a, **k: pytest.fail("the window was retried")
 
         called = []
-        ext.resolve(lambda *a, **k: called.append(1), _Parent(1), _info())
+        ext.resolve(lambda *a, **k: called.append(1), parents[0], info)
         assert called == [1]
 
 

@@ -8,6 +8,7 @@ returning the wrong rows.
 
 from types import SimpleNamespace
 
+from graphql import GraphQLField, GraphQLList, GraphQLObjectType, GraphQLString
 from sqlalchemy import or_, select
 from strawberry.relay import Edge
 
@@ -17,6 +18,7 @@ from strawberry_orm.backends.tortoise import TortoiseBackend
 from strawberry_orm.batching import (
     BatchingExtension,
     _operation_store,
+    _Parents,
     extensions_include_batching,
     path_key,
     stash_parents,
@@ -24,6 +26,25 @@ from strawberry_orm.batching import (
 from tests.backends.sqlalchemy.models import Comment as SAComment
 from tests.backends.sqlalchemy.models import Post as SAPost
 from tests.backends.sqlalchemy.models import User as SAUser
+
+_USER_TYPE = GraphQLObjectType("UT", {"name": GraphQLField(GraphQLString)})
+
+
+def _users_info():
+    """Info for a ``users`` field returning ``[UT]``."""
+    return SimpleNamespace(
+        path=SimpleNamespace(key="users", prev=None),
+        field_name="users",
+        python_name="users",
+        return_type=GraphQLList(_USER_TYPE),
+    )
+
+
+def _stashed(rows):
+    """An execution context holding *rows* as the parents at ``users``."""
+    return SimpleNamespace(
+        _orm_batch_parents={"users": _Parents(rows, _USER_TYPE, _users_info())}
+    )
 
 
 class _MinimalBackend(BaseBackend):
@@ -186,39 +207,40 @@ class TestBatchingHelpers:
 
     def test_stash_parents_ignores_non_lists_and_short_lists(self):
         ctx = SimpleNamespace()
-        info = SimpleNamespace(
-            path=SimpleNamespace(key="users", prev=None),
-            field_name="users",
-            python_name="users",
-        )
+        info = _users_info()
         stash_parents(ctx, info, "not a list")
         stash_parents(ctx, info, [object()])
         assert getattr(ctx, "_orm_batch_parents", None) is None
 
     def test_stash_parents_records_multiple_rows(self):
         ctx = SimpleNamespace()
-        info = SimpleNamespace(
-            path=SimpleNamespace(key="users", prev=None),
-            field_name="users",
-            python_name="users",
-        )
-        rows = [object(), object()]
-        stash_parents(ctx, info, rows)
-        assert ctx._orm_batch_parents == {"users": rows}
+        rows = [object(), None, object()]
+        stash_parents(ctx, _users_info(), rows)
+        assert list(ctx._orm_batch_parents) == ["users"]
+        stashed = ctx._orm_batch_parents["users"]
+        # A null in the list has no fields to batch.
+        assert stashed.of_type("UT") == [rows[0], rows[2]]
+        assert stashed.of_type("Other") == []
+        assert stashed.of_type(None) == []
 
     def test_only_edges_have_their_nodes_recorded(self):
+        edge_type = GraphQLObjectType("UTEdge", {"node": GraphQLField(_USER_TYPE)})
         info = SimpleNamespace(
             path=SimpleNamespace(key="users", prev=None),
             field_name="users",
             python_name="users",
+            return_type=GraphQLList(edge_type),
         )
         rows = [SimpleNamespace(node=1), SimpleNamespace(node=2)]
         ctx = SimpleNamespace()
         stash_parents(ctx, info, rows)
-        assert ctx._orm_batch_parents == {"users": rows}
+        assert list(ctx._orm_batch_parents) == ["users"]
         edges = [Edge(cursor="a", node=1), Edge(cursor="b", node=2)]
         stash_parents(ctx, info, edges)
-        assert ctx._orm_batch_parents == {"users": edges, "users.node": [1, 2]}
+        stashed = ctx._orm_batch_parents
+        assert list(stashed) == ["users", "users.node"]
+        assert stashed["users"].of_type("UTEdge") == edges
+        assert stashed["users.node"].of_type("UT") == [1, 2]
 
 
 class TestBatchingExtensionGuards:
@@ -242,14 +264,13 @@ class TestBatchingExtensionGuards:
         assert ext.resolve(lambda *a, **k: "value", object(), info) == "value"
 
     def _orm_list_info(self, path):
-        """Info whose return type is ``[PT]`` with PT registered as an ORM type."""
-        from graphql import GraphQLList, GraphQLObjectType, GraphQLString
-
+        """Info for ``UT.posts``, returning ``[PT]`` with PT an ORM type."""
         object_type = GraphQLObjectType(
             "PT", {"title": SimpleNamespace(type=GraphQLString)}
         )
         return SimpleNamespace(
             return_type=GraphQLList(object_type),
+            parent_type=_USER_TYPE,
             path=path,
             field_name="posts",
             python_name="posts",
@@ -283,9 +304,7 @@ class TestBatchingExtensionGuards:
     def test_single_parent_is_not_batched(self):
         ext = self._registered_extension()
         root = object()
-        ext.execution_context = SimpleNamespace(
-            _orm_batch_parents={"users": [root]},
-        )
+        ext.execution_context = _stashed([root])
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )
@@ -294,9 +313,7 @@ class TestBatchingExtensionGuards:
 
     def test_root_outside_the_stashed_parents_is_not_batched(self):
         ext = self._registered_extension()
-        ext.execution_context = SimpleNamespace(
-            _orm_batch_parents={"users": [object(), object()]},
-        )
+        ext.execution_context = _stashed([object(), object()])
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )
@@ -307,7 +324,7 @@ class TestBatchingExtensionGuards:
         ext = self._registered_extension()
         root = object()
         parents = [root, object()]
-        ext.execution_context = SimpleNamespace(_orm_batch_parents={"users": parents})
+        ext.execution_context = _stashed(parents)
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )
@@ -327,9 +344,7 @@ class TestBatchingExtensionGuards:
         ext = self._registered_extension()
         root = SAUser(id=1, name="a", email="b")
         sibling = SAUser(id=2, name="c", email="d")
-        ext.execution_context = SimpleNamespace(
-            _orm_batch_parents={"users": [root, sibling]}
-        )
+        ext.execution_context = _stashed([root, sibling])
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )
@@ -346,9 +361,7 @@ class TestBatchingExtensionGuards:
     def test_parent_without_a_primary_key_bails(self):
         ext = self._registered_extension()
         root = object()
-        ext.execution_context = SimpleNamespace(
-            _orm_batch_parents={"users": [root, object()]}
-        )
+        ext.execution_context = _stashed([root, object()])
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )
@@ -361,9 +374,7 @@ class TestBatchingExtensionGuards:
         ext = self._registered_extension()
         root = SAUser(id=1, name="a", email="b")
         sibling = SAUser(id=2, name="c", email="d")
-        ext.execution_context = SimpleNamespace(
-            _orm_batch_parents={"users": [root, sibling]}
-        )
+        ext.execution_context = _stashed([root, sibling])
         path = SimpleNamespace(
             key="posts", prev=SimpleNamespace(key="users", prev=None)
         )

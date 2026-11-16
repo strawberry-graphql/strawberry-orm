@@ -1,3 +1,6 @@
+"""Tortoise refuses an eager ``on=`` view (see ``test_on.py``), so the view
+case does not apply here."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +28,10 @@ class TestTrustAcrossExecutions(AbstractTestTrustAcrossExecutions):
     async def run(self, schema, query, context):
         return await schema.execute(query, context_value=context)
 
+    async def subscribe(self, schema, query, context):
+        events = await schema.subscribe(query, context_value=context)
+        return [answer async for answer in events]
+
     @staticmethod
     def published_only(qs):
         return qs.filter(is_published=True)
@@ -32,6 +39,10 @@ class TestTrustAcrossExecutions(AbstractTestTrustAcrossExecutions):
     @staticmethod
     def all_posts():
         return Post.all().order_by("id")
+
+    @staticmethod
+    def posts_of(user):
+        return Post.filter(author_id=user.id).order_by("id")
 
     async def load_posts(self):
         return list(await Post.all().order_by("id"))

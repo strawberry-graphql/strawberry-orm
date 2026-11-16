@@ -197,7 +197,7 @@ class UserNode(relay.Node):
 
 `totalCount` is each parent's own total, counted separately rather than read off the page — the page was truncated, so counting it would report the page size.
 
-With no `first` the page is the one the connection would return anyway — `max_results`, or `default_query_limit` when that is smaller — so `{ users { posts { … } } }` is windowed the same way. `last` without `first` is not, because where each parent's last page starts depends on its own count, and neither is a connection that selects `aggregates` or `groups`, which are taken over each parent's whole relation; those are read one parent at a time, each page still cut in the database.
+With no `first` the page is the one the connection would return anyway — `max_results`, or `default_query_limit` when that is smaller — so `{ users { posts { … } } }` is windowed the same way. `last` without `first` is not, because where each parent's last page starts depends on its own count, and neither is a connection that selects `aggregates` or `groups`, which are taken over each parent's whole relation; those are read one parent at a time, each page still cut in the database. In a union or interface list, such as `nodes(ids:)`, parents are windowed only with others of their own type, since each type's field may be scoped differently.
 
 This works on all three backends. Tortoise has no window expression of its own, so that backend wraps the query it built in SQL that does the numbering; the values you filtered on stay bound rather than pasted into the statement.
 
@@ -595,7 +595,7 @@ class UserType:
 | 253     | 255 statements   | 3             |
 
 
-Parents are already in memory and building a queryset touches no database, so the resolver runs for every sibling parent up front, the parent predicate is reflected out of each query, and the remainders are grouped. Branching therefore costs one statement per branch rather than one per row:
+Parents are already in memory and building a queryset touches no database, so the resolver runs up front for every sibling parent of the same GraphQL type, the parent predicate is reflected out of each query, and the remainders are grouped. Branching therefore costs one statement per branch rather than one per row:
 
 ```python
 # Django
@@ -613,6 +613,7 @@ It falls back to per-row resolution — never to wrong rows — when:
 - the parent key sits inside an `OR` arm, or is reached through a join
 - the query is sliced, since a per-parent `LIMIT` needs a window function
 - the resolver executed its own query: `list(...)`, `.first()`, `.count()`
+- the parent is in a union or interface list and its type cannot be told ahead: an `is_type_of` of your own decides it, or it was returned without `strawberry.cast` where two types share its model
 - the backend is Tortoise, whose query internals are not stable to introspect
 
 A resolver embedding a per-parent literal such as `created_at__gte=self.joined_at` stays correct but forms one group per distinct value, so it may not reduce the count.
