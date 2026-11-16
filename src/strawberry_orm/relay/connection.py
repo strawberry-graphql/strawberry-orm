@@ -109,6 +109,55 @@ def _orm_backend_from_info(info: Any) -> Any | None:
     return backend
 
 
+def _page_size(info: Any, max_results: int | None) -> tuple[int, int]:
+    """The ``max_results`` a page is refused above, and the size it is cut to.
+
+    The size is ``max_results``, or ``default_query_limit`` when that is
+    smaller, and is the page's size when neither ``first`` nor ``last`` is given.
+    """
+    if max_results is None:
+        max_results = info.schema.config.relay_max_results
+    limit = getattr(_orm_backend_from_info(info), "_default_query_limit", None)
+    return max_results, max_results if limit is None else min(max_results, limit)
+
+
+def _held_to_one_page(
+    info: Any, prefix: str | None, limits: tuple[int, int], **kwargs: Any
+) -> dict[str, Any]:
+    """*kwargs*, with the page held to *limits*, as ``_page_size`` gives them.
+
+    Strawberry holds only ``first`` and ``last`` to ``max_results``, so
+    ``before`` alone would page to its cursor, however far that is; it
+    reads one page from the start instead, as no arguments do. A cursor
+    before the first row is refused: Strawberry slices a Python list from
+    its end there, which only reading every row repeats.
+    """
+    max_results, size = limits
+    window = SliceMetadata.from_arguments(
+        info,
+        before=kwargs.get("before"),
+        after=kwargs.get("after"),
+        first=kwargs.get("first"),
+        last=kwargs.get("last"),
+        max_results=max_results,
+        prefix=prefix,
+    )
+    for argument, position in (("after", window.start), ("before", window.end)):
+        if position < 0:
+            raise ValueError(
+                f"Argument '{argument}' cannot point before the first item."
+            )
+    first, last = kwargs.get("first"), kwargs.get("last")
+    if first is None and last is None:
+        first = size
+    return {
+        **kwargs,
+        "max_results": max_results,
+        "first": None if first is None else min(first, size),
+        "last": None if last is None else min(last, size),
+    }
+
+
 class _PageRows:
     """A page the database cut at *offset*, indexed as the whole result.
 
@@ -201,6 +250,37 @@ def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
 
 class ORMConnectionExtension(ConnectionExtension):
     """Connection field extension that applies optimizer hints before pagination."""
+
+    def apply(self, field: Any) -> None:
+        """Make sure the field's connection type cuts its own page.
+
+        A forward reference (``ListConnection["PostNode"]``) is only resolved
+        here, as the schema is built, so the connection type ``orm.connection``
+        builds for a named node is built now. Any other type would read every
+        row and slice the page in Python, past ``max_results`` and
+        ``default_query_limit``, so it is refused.
+        """
+        super().apply(field)
+        if _cuts_its_own_page(self.connection_type):
+            return
+        definition = get_object_definition(self.connection_type)
+        generic = definition.concrete_of if definition is not None else None
+        if generic is None or generic.origin not in (
+            Connection,
+            ListConnection,
+            ORMConnection,
+        ):
+            name = getattr(self.connection_type, "__name__", self.connection_type)
+            raise TypeError(
+                f"{field.python_name}: {name} slices the rows it is given in "
+                f"Python, so its page would not be cut in the database or held "
+                f"to max_results and default_query_limit. Derive it from "
+                f"ORMListConnection."
+            )
+        self.connection_type = connection_type_for_node(
+            definition.type_var_map["NodeType"]
+        )
+        field.type = self.connection_type
 
     def _paginate_nodes(
         self,
@@ -495,11 +575,10 @@ class ORMConnection(ListConnection[NodeType]):
 def connection_type_for_node(node_type: type) -> Any:
     """Return a concrete Strawberry connection type for *node_type* with ``totalCount``.
 
-    *node_type* may still be a forward reference, which is the normal case for
-    a module that declares its connections above the types they name. The
-    subclass is built around the reference and Strawberry resolves it when the
-    schema is assembled, so a deferred node type keeps ``totalCount`` rather
-    than falling back to a bare connection.
+    A forward reference names the type, but the subclass's fields cannot
+    resolve it: they are looked up where ``ORMListConnection`` is declared.
+    ``orm.connection`` therefore builds it once the schema has resolved the
+    name, in ``ORMConnectionExtension.apply``.
     """
     import types as _types_mod
 
@@ -544,7 +623,12 @@ class ORMListConnection(ORMConnection[NodeType]):
         info,
         **kwargs,
     ) -> AwaitableOrValue:
-        kwargs = cls._held_to_one_page(info, **kwargs)
+        kwargs = _held_to_one_page(
+            info,
+            cls._edge_type().CURSOR_PREFIX,
+            _page_size(info, kwargs.get("max_results")),
+            **kwargs,
+        )
         if is_empty_page_at_the_end(
             kwargs.get("first"), kwargs.get("last"), kwargs.get("before")
         ):
@@ -553,44 +637,6 @@ class ORMListConnection(ORMConnection[NodeType]):
                 _at_the_end,
             )
         return cls._resolve(nodes, info=info, **kwargs)
-
-    @classmethod
-    def _held_to_one_page(cls, info: Any, **kwargs: Any) -> dict[str, Any]:
-        """*kwargs*, with the page held to ``max_results`` and ``default_query_limit``.
-
-        Strawberry holds only ``first`` and ``last`` to ``max_results``, so
-        ``before`` alone would page to its cursor, however far that is; it
-        reads one page from the start instead, as no arguments do. A cursor
-        before the first row is refused: Strawberry slices a Python list from
-        its end there, which only reading every row repeats.
-        """
-        max_results = kwargs.get("max_results")
-        if max_results is None:
-            max_results = info.schema.config.relay_max_results
-        window = SliceMetadata.from_arguments(
-            info,
-            before=kwargs.get("before"),
-            after=kwargs.get("after"),
-            first=kwargs.get("first"),
-            last=kwargs.get("last"),
-            max_results=max_results,
-            prefix=cls._edge_type().CURSOR_PREFIX,
-        )
-        for argument, position in (("after", window.start), ("before", window.end)):
-            if position < 0:
-                raise ValueError(
-                    f"Argument '{argument}' cannot point before the first item."
-                )
-        limit = getattr(_orm_backend_from_info(info), "_default_query_limit", None)
-        size = max_results if limit is None else min(max_results, limit)
-        first, last = kwargs.get("first"), kwargs.get("last")
-        if first is None and last is None:
-            first = size
-        return {
-            **kwargs,
-            "first": None if first is None else min(first, size),
-            "last": None if last is None else min(last, size),
-        }
 
     @classmethod
     def _resolve(cls, nodes: Any, *, info: Any, **kwargs: Any) -> AwaitableOrValue:
@@ -845,16 +891,23 @@ class ORMListConnection(ORMConnection[NodeType]):
             cls._attach_page_aggregates(connection, info, meta)
             return connection
 
-        return _then(cls._collect_groups(connection, state, info, meta), finish)
+        return _then(
+            cls._collect_groups(
+                connection, state, info, meta, kwargs.get("max_results")
+            ),
+            finish,
+        )
 
     @classmethod
-    def _collect_groups(cls, connection, state, info, meta):
+    def _collect_groups(cls, connection, state, info, meta, max_results):
         """Fetch the groups, their items, and the keys of the page's edges.
 
-        Returns ``(groups, items_by_key, items_offset, memberships)``, ``None``
+        Returns ``(groups, items_by_page, items_limits, memberships)``, ``None``
         when groups were not asked for, or a coroutine yielding them on async
-        backends. The reads run one after another: an async backend's
-        connection serves one statement at a time.
+        backends. Each group's ``items`` are held to the connection's
+        *max_results* and ``default_query_limit``, and each distinct page of
+        them selected is its own read. The reads run one after another: an
+        async backend's connection serves one statement at a time.
         """
         from strawberry_orm.grouping import group_paths
 
@@ -863,26 +916,26 @@ class ORMListConnection(ORMConnection[NodeType]):
         backend, base_query = state.backend, state.base_query
         paths = group_paths(backend, meta.model, state.group_by)
         if not paths:
-            return [], None, 0, None
+            return [], {}, None, None
 
-        window = (
-            _items_window(info)
-            if _selection_requests(info, "groups", "items")
-            else None
-        )
-        start = window[0] if window is not None else 0
+        limits = _page_size(info, max_results)
+        pages = _items_pages(info, limits)
 
-        def items() -> Any:
-            if window is None:
-                return None
-            return backend.batch_group_items(
+        def items(remaining: list[tuple[int, int]], read: dict) -> Any:
+            if not remaining:
+                return read
+            start, end = page = remaining[0]
+            by_key = backend.batch_group_items(
                 base_query,
                 paths,
                 info,
                 meta.model,
-                per_group_limit=window[1],
+                per_group_limit=end - start,
                 per_group_offset=start,
                 order_input=state.order,
+            )
+            return _then(
+                by_key, lambda found: items(remaining[1:], {**read, page: found})
             )
 
         groups = backend.apply_grouping(
@@ -891,17 +944,17 @@ class ORMListConnection(ORMConnection[NodeType]):
         return _then(
             groups,
             lambda resolved: _then(
-                items(),
-                lambda by_key: _then(
+                items(pages, {}),
+                lambda by_page: _then(
                     _edge_memberships(connection, state, paths, info),
-                    lambda memberships: (resolved, by_key, start, memberships),
+                    lambda memberships: (resolved, by_page, limits, memberships),
                 ),
             ),
         )
 
     @classmethod
     def _attach_groups(
-        cls, connection, groups, items_by_key, items_offset, memberships
+        cls, connection, groups, items_by_page, items_limits, memberships
     ):
         from strawberry_orm.grouping import assign_edge_indices
         from strawberry_orm.lazy_resolution import mark_rows_scoped
@@ -909,11 +962,14 @@ class ORMListConnection(ORMConnection[NodeType]):
         if memberships is not None:
             assign_edge_indices(groups, memberships)
         for grp in groups:
-            if items_by_key is not None:
-                grp._items_nodes = items_by_key.get(grp._orm_key_values, [])
-                grp._items_offset = items_offset
+            grp._items_limits = items_limits
+            grp._items_pages = {
+                page: by_key.get(grp._orm_key_values, [])
+                for page, by_key in items_by_page.items()
+            }
+            for rows in grp._items_pages.values():
                 # Read from the scoped base query, so not re-checked per group.
-                mark_rows_scoped(grp._items_nodes)
+                mark_rows_scoped(rows)
 
         connection.groups = groups
 
@@ -935,79 +991,73 @@ class ORMListConnection(ORMConnection[NodeType]):
         )
 
 
-def _get_items_arg(info: Any, arg_name: str) -> Any:
-    """Extract a named argument from the ``groups { items(...) }`` selection."""
-    from strawberry_orm.backends._base import _find_selection
+def _items_arguments(info: Any) -> list[dict[str, Any]]:
+    """The arguments of every ``groups { items }`` the connection selects.
 
-    groups_sel = _find_selection(info, "groups")
-    if groups_sel is None:
-        return None
-    for sel in groups_sel.selections:
-        if sel.name == "items":
-            arguments = getattr(sel, "arguments", {})
-            if isinstance(arguments, dict):
-                return arguments.get(arg_name)
-            for arg in arguments:
-                name = getattr(arg, "name", None) or arg
-                if name == arg_name:
-                    return getattr(arg, "value", arg)
-    return None
-
-
-def _extract_items_first(info: Any) -> int | None:
-    """Extract the ``first`` argument from ``groups.items`` in the selection set."""
-    return _int_items_arg(info, "first")
-
-
-def _int_items_arg(info: Any, arg_name: str) -> int | None:
-    """An ``Int`` argument of ``groups.items``: a literal is selected as its text."""
-    val = _get_items_arg(info, arg_name)
-    if val is not None:
-        return int(val)
-    return None
-
-
-def _extract_items_after(info: Any) -> str | None:
-    """Extract the ``after`` cursor argument from ``groups.items``."""
-    val = _get_items_arg(info, "after")
-    if val is not None:
-        return str(val)
-    return None
-
-
-def _items_window(info: Any) -> tuple[int, int] | None:
-    """Where each group's page of items starts, and how many rows it needs.
-
-    Strawberry's own arithmetic for the ``items`` arguments. ``None`` when it
-    would refuse them, or for a cursor before the first row: the field then
-    reports the arguments itself, and nothing is read for it. ``before``
-    alone reads one page, as the field then answers it.
+    Aliases and fragments can select ``items`` more than once, each with a
+    page of its own, under more than one ``groups``.
     """
-    first, last = _extract_items_first(info), _int_items_arg(info, "last")
-    before = _get_items_arg(info, "before")
-    max_results = info.schema.config.relay_max_results
-    if first is None and last is None:
-        first = max_results
-    elif is_empty_page_at_the_end(first, last, before):
-        first, last = 0, None
-    try:
-        window = SliceMetadata.from_arguments(
-            info,
-            first=first,
-            after=_extract_items_after(info),
-            last=last,
-            before=before,
-        )
-    except (TypeError, ValueError):
-        return None
-    if window.start < 0 or window.end < 0:
-        return None
+    from strawberry_orm.backends._base import _selected_fields
+
+    return [
+        items.arguments
+        for connection in info.selected_fields
+        for groups in _selected_fields(connection)
+        if groups.name == "groups"
+        for items in _selected_fields(groups)
+        if items.name == "items"
+    ]
+
+
+def _int_argument(arguments: dict[str, Any], name: str) -> int | None:
+    """An ``Int`` argument as selected: a literal is its text."""
+    value = arguments.get(name)
+    return None if value is None else int(value)
+
+
+def _items_page(
+    info: Any, limits: tuple[int, int], **arguments: Any
+) -> tuple[dict[str, Any], tuple[int, int]]:
+    """A group's ``items`` page: its arguments held to *limits*, and its rows.
+
+    The rows are where the page starts in each group and where it stops,
+    counting the one that answers ``hasNextPage``. Arguments the connection
+    would refuse are refused the same way.
+    """
+    page = _held_to_one_page(info, None, limits, **arguments)
+    read = page
+    if is_empty_page_at_the_end(page["first"], page["last"], page["before"]):
+        read = {**page, "first": 0, "last": None}
+    window = SliceMetadata.from_arguments(info, **read)
     start = min(window.start, _LAST_POSITION)
     if window.end == sys.maxsize:
         # ``last`` without ``before`` counts back from each group's end, which
-        # the window cannot see; it reads the default page after the cursor.
-        return start, max_results + 1
-    return start, min(window.overfetch, _LAST_POSITION) - start
+        # the window cannot see; it reads one page after the cursor.
+        return page, (start, min(start + limits[1] + 1, _LAST_POSITION))
+    return page, (start, min(window.overfetch, _LAST_POSITION))
+
+
+def _items_pages(info: Any, limits: tuple[int, int]) -> list[tuple[int, int]]:
+    """The rows each distinct ``items`` page selected reads from a group.
+
+    A page the field refuses is left out: the field reports it, and nothing
+    is read for it.
+    """
+    pages = set()
+    for arguments in _items_arguments(info):
+        try:
+            _page, rows = _items_page(
+                info,
+                limits,
+                first=_int_argument(arguments, "first"),
+                last=_int_argument(arguments, "last"),
+                after=arguments.get("after"),
+                before=arguments.get("before"),
+            )
+        except (TypeError, ValueError):
+            continue
+        pages.add(rows)
+    return sorted(pages)
 
 
 __all__ = [

@@ -62,7 +62,6 @@ from strawberry_orm.lazy_resolution import (
     _tortoise_relation_prefetched,
     relation_is_prefetched,
 )
-from strawberry_orm.relay.connection import _get_items_arg
 from strawberry_orm.types import (
     FieldDefinition,
     auto,
@@ -609,29 +608,6 @@ class TestSQLAlchemyRemaining:
             ]
             await backend.apply_ref_list(post, "tags", refs, info)
         await engine.dispose()
-
-    def test_get_items_arg_list_form_returns_value(self):
-        arg = SimpleNamespace(name="first", value=9)
-        groups_sel = SimpleNamespace(
-            selections=[SimpleNamespace(name="items", arguments=[arg])]
-        )
-        info = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(name="groups", selections=groups_sel.selections)
-            ]
-        )
-        assert _get_items_arg(info, "first") == 9
-
-    def test_get_items_arg_returns_none_when_missing(self):
-        info = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(
-                    name="groups",
-                    selections=[SimpleNamespace(name="items", arguments=["after"])],
-                )
-            ]
-        )
-        assert _get_items_arg(info, "first") is None
 
 
 class TestFinal100Coverage:

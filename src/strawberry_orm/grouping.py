@@ -487,8 +487,10 @@ class Group:
         self.aggregates = aggregates
         self.edge_indices: list[int] = []
         self._orm_key_values = key_values
-        self._items_nodes: list[Any] | None = None
-        self._items_offset = 0
+        #: Each ``items`` page read, by the rows it covers, and the page limits
+        #: of the connection the group belongs to.
+        self._items_pages: dict[tuple[int, int], list[Any]] = {}
+        self._items_limits: tuple[int, int] | None = None
 
 
 def build_group(

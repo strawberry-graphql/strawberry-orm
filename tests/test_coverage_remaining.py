@@ -92,10 +92,7 @@ from strawberry_orm.relay.connection import (
     _await_nodes_if_needed,
     _compute_page_aggregates,
     _connection_total_count,
-    _extract_items_after,
-    _extract_items_first,
-    _get_items_arg,
-    _items_window,
+    _items_pages,
     _should_await_nodes,
     _use_orm_connection_extension,
     connection_state,
@@ -758,42 +755,6 @@ class TestConnectionCoverage:
             result = await ext.resolve_async(next_, None, info)
         assert result == "paginated"
 
-    def test_get_items_arg_dict_and_list_forms(self):
-        groups_sel = SimpleNamespace(
-            selections=[
-                SimpleNamespace(
-                    name="items",
-                    arguments={"first": 5, "after": "cursor"},
-                )
-            ]
-        )
-        info = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(
-                    name="groups",
-                    selections=groups_sel.selections,
-                )
-            ]
-        )
-        assert _get_items_arg(info, "first") == 5
-        assert _get_items_arg(info, "after") == "cursor"
-
-        arg_obj = SimpleNamespace(name="order", value="ASC")
-        groups_sel2 = SimpleNamespace(
-            selections=[
-                SimpleNamespace(
-                    name="items",
-                    arguments=[arg_obj],
-                )
-            ]
-        )
-        info2 = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(name="groups", selections=groups_sel2.selections)
-            ]
-        )
-        assert _get_items_arg(info2, "order") == "ASC"
-
     @pytest.mark.asyncio
     async def test_orm_connection_extension_async_resolve_branches(self):
         ext = ORMConnectionExtension(max_results=10)
@@ -1229,6 +1190,7 @@ class TestMiscCoverage:
             ],
             context={"session": sa_session},
             path=SimpleNamespace(as_list=lambda: ["orders"]),
+            schema=SimpleNamespace(config=SimpleNamespace(relay_max_results=100)),
         )
         stash_state(
             info,
@@ -1682,29 +1644,46 @@ class TestPushTo98:
             ConnWithMeta._post_process_connection(connection, info=info) is connection
         )
 
-    def test_relay_items_helpers_and_bad_cursor(self):
+    def test_relay_items_pages_and_bad_cursor(self):
         import base64
 
-        def _items_info(**arguments):
-            items = SimpleNamespace(name="items", arguments=arguments, selections=[])
+        def _items_info(*pages):
+            items = [
+                SimpleNamespace(name="items", arguments=arguments, selections=[])
+                for arguments in pages
+            ]
+            groups = SimpleNamespace(name="groups", selections=items)
             return SimpleNamespace(
-                selected_fields=[SimpleNamespace(name="groups", selections=[items])],
-                schema=SimpleNamespace(config=SimpleNamespace(relay_max_results=100)),
+                selected_fields=[SimpleNamespace(name="posts", selections=[groups])]
             )
 
         def cursor(offset):
             return base64.b64encode(f"arrayconnection:{offset}".encode()).decode()
 
+        limits = (100, 100)
         # The page and the row that answers hasNextPage, from just past after.
-        assert _items_window(_items_info(first=2, after=cursor(4))) == (5, 3)
-        assert _items_window(_items_info(after="not-a-cursor")) is None
-        assert _items_window(_items_info(first=2, after=cursor(-5))) is None
+        assert _items_pages(_items_info({"first": 2, "after": cursor(4)}), limits) == [
+            (5, 8)
+        ]
+        assert _items_pages(_items_info({"after": "not-a-cursor"}), limits) == []
+        assert (
+            _items_pages(_items_info({"first": 2, "after": cursor(-5)}), limits) == []
+        )
         # A tail counts back from each group's end, which the window cannot see.
-        assert _items_window(_items_info(last=2)) == (0, 101)
-        assert _items_window(_items_info(last="2")) == (0, 101)
-        assert _items_window(_items_info(last="0")) == (0, 1)
-        assert _extract_items_first(SimpleNamespace(selected_fields=[])) is None
-        assert _extract_items_after(SimpleNamespace(selected_fields=[])) is None
+        assert _items_pages(_items_info({"last": 2}), limits) == [(0, 101)]
+        assert _items_pages(_items_info({"last": "2"}), limits) == [(0, 101)]
+        assert _items_pages(_items_info({"last": "0"}), limits) == [(0, 1)]
+        # default_query_limit cuts the page and the tail alike.
+        assert _items_pages(_items_info({"first": 50}), (100, 5)) == [(0, 6)]
+        assert _items_pages(_items_info({"last": 50}), (100, 5)) == [(0, 6)]
+        # Each distinct page is its own read, and the same page is read once.
+        assert _items_pages(
+            _items_info(
+                {"first": "1"}, {"first": 1}, {"first": 2, "after": cursor(90)}
+            ),
+            limits,
+        ) == [(0, 2), (91, 94)]
+        assert _items_pages(SimpleNamespace(selected_fields=[]), limits) == []
 
     def test_filter_pk_shortcut_failure_and_limit_branches(self):
         from strawberry_orm.filters import StringLookup
@@ -2110,22 +2089,6 @@ class TestPushTo98:
         assert "password_hash" not in cls.__annotations__
         assert "name" in cls.__annotations__
 
-    def test_get_items_arg_when_arg_is_scalar_name(self):
-        info = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(
-                    name="groups",
-                    selections=[
-                        SimpleNamespace(
-                            name="items",
-                            arguments=["first"],
-                        )
-                    ],
-                )
-            ]
-        )
-        assert _get_items_arg(info, "first") == "first"
-
     def test_lazy_resolution_format_and_query_path_branches(self):
         from strawberry_orm.lazy_resolution import (
             _format_selection_set,
@@ -2181,18 +2144,6 @@ class TestPushTo98:
         backend.materialize_query = materialize
         result = materialize_result(backend, object(), SimpleNamespace())
         assert await result == [1, 2]
-
-    def test_get_items_arg_list_argument_value(self):
-        arg = SimpleNamespace(name="first", value=7)
-        groups_sel = SimpleNamespace(
-            selections=[SimpleNamespace(name="items", arguments=[arg])]
-        )
-        info = SimpleNamespace(
-            selected_fields=[
-                SimpleNamespace(name="groups", selections=groups_sel.selections)
-            ]
-        )
-        assert _get_items_arg(info, "first") == 7
 
 
 class TestLazyResolutionDeep:

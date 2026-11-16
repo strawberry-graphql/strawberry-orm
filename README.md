@@ -659,7 +659,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 - `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
 - String regex filters are disabled by default
 - Filter depth is capped, and so are the branches and the listed values of a whole filter argument, every reference to a variable included
-- A connection reads at most one page: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
+- A connection reads at most one page, and so does each group's `items`: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
 - `order` and `groupBy` lists, the groups a connection answers with, and the related rows in an `objects:` group key are capped (`max_order_entries`, `max_group_by_entries`, `max_groups`, `max_group_key_rows`)
 - On SQLAlchemy, an error running a statement reaches the client as `Invalid filter expression` (or `Database connection failed`), never with its SQL or parameters. On every backend, the database refusing a statement that `orm.apply_upsert()` or `orm.apply_ref_list()` runs reaches it as `The database refused the write`, without the table, columns or values. Either way the original is the exception's `__cause__`, for your logs
 - `orm.ref()` provides explicit `unlink` and `delete` operations — both opt-in via `unlink=True` and `delete=True`
@@ -1576,7 +1576,7 @@ Each group includes:
 - `key` — the group-by values, as strings (`null` for rows with no value)
 - `aggregates` — per-group aggregate values (count, sum, avg, min, max)
 - `edgeIndices` — indices into the parent connection's `edges` array. A `null` key matches only rows whose value is null.
-- `items` — a nested cursor-paginated connection of items in that group, in the connection's order
+- `items` — a nested cursor-paginated connection of items in that group, in the connection's order, held to the connection's `max_results` and `default_query_limit` as its edges are
 
 Groups come in the order of the connection's edges, so each group's edges sit together. A group is ranked by its first row under the connection's `order` (or the query's own ordering when there is none), then by its key. An `object:` order through a to-many relation does not rank groups. An `objects:` order does, by each group's least (or greatest) set, since a row has one set. Grouping does not need an `order` on the grouped column.
 
@@ -2096,6 +2096,8 @@ This gives you:
 Filters and ordering are applied *before* pagination, so the connection always slices from a correctly filtered and sorted result set.
 
 `orm.connection` raises a `TypeError` for a keyword it does not accept, listing the ones it does, so a misspelling fails where you write it.
+
+Whichever connection type you name — `ORMListConnection`, `ORMConnection`, or Strawberry's `ListConnection` or `Connection`, with the node class or its name as a string — the page is cut as described below. A connection type of your own must derive from `ORMListConnection`; the schema refuses to build with one that would slice its rows in Python.
 
 The page is cut in the database, not in Python. `first: 50` reads 51 rows (the extra one answers `hasNextPage`), `after` becomes an `OFFSET`, and `totalCount` is a separate count sent only when it is selected — and not even then when the page comes back short, because a short page is the end of the result. `last` without `before` counts first, to find where the window starts. Cursors are the same either way. Each page is its own query, and a database may break ties in a non-unique order differently from one query to the next, so a row could land on two pages and another on none. The cut therefore ends every order — the client's, the resolver's or the model's — with the primary key, unless it already includes it; with no order at all, the primary key alone orders the pages. Rows that do not tie keep their order. A Django queryset the resolver already sliced, or ordered with `.extra(order_by=...)`, is cut in the order it has.
 

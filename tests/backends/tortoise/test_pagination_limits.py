@@ -4,6 +4,7 @@ import pytest
 
 from tests.abstract.pagination_limits import (
     AbstractTestDefaultQueryLimit,
+    AbstractTestEveryConnectionCutsItsPage,
     AbstractTestOrderAndGroupByLimits,
     AbstractTestPaginationLimits,
 )
@@ -30,4 +31,8 @@ class TestOrderAndGroupByLimits(AbstractTestOrderAndGroupByLimits):
 
 
 class TestDefaultQueryLimit(AbstractTestDefaultQueryLimit):
+    pass
+
+
+class TestEveryConnectionCutsItsPage(AbstractTestEveryConnectionCutsItsPage):
     pass

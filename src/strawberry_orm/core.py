@@ -897,8 +897,8 @@ def _is_forward_reference(node_type: Any) -> bool:
     A module that declares a connection above the type it names can only refer
     to it by name, and a concrete connection subclass cannot be built around a
     name. The parameterized annotation is left for Strawberry to resolve once
-    the module finishes; that connection has no generated ``totalCount``, so
-    name the class directly when you need one.
+    the module finishes; ``ORMConnectionExtension.apply`` then builds the
+    connection type for the node it names.
     """
     return isinstance(node_type, str) or hasattr(node_type, "__forward_arg__")
 
@@ -1191,6 +1191,7 @@ def _build_grouped_connection(
         ORMListConnection,
         PageInfo,
         _at_the_end,
+        _items_page,
         _PageRows,
         is_empty_page_at_the_end,
     )
@@ -1254,24 +1255,24 @@ def _build_grouped_connection(
         last: int | None = None,
         before: str | None = None,
     ) -> Any:
-        # None when the arguments were refused: nothing was read for them.
-        nodes = getattr(self, "_items_nodes", None) or []
-        cast_nodes = [strawberry_cast(_items_node_type, n) for n in nodes]
-        if first is None and last is None:
-            # Strawberry holds only first and last to max_results; before
-            # alone would page to its cursor, past what the window read.
-            first = info.schema.config.relay_max_results
-        at_the_end = is_empty_page_at_the_end(first, last, before)
-        connection = _items_conn_cls.resolve_connection(
-            # The window started at the page, so it is handed over at its place.
-            _PageRows(cast_nodes, getattr(self, "_items_offset", 0)),
-            info=info,
-            first=0 if at_the_end else first,
+        page, rows = _items_page(
+            info,
+            self._items_limits,
+            first=first,
             after=after,
-            last=None if at_the_end else last,
+            last=last,
             before=before,
         )
-        return _at_the_end(connection) if at_the_end else connection
+        read = self._items_pages.get(rows, [])
+        # The read started at the page, so it is handed over at its place.
+        nodes = _PageRows([strawberry_cast(_items_node_type, n) for n in read], rows[0])
+        if is_empty_page_at_the_end(page["first"], page["last"], before):
+            return _at_the_end(
+                _items_conn_cls.resolve_connection(
+                    nodes, info=info, **{**page, "first": 0, "last": None}
+                )
+            )
+        return _items_conn_cls.resolve_connection(nodes, info=info, **page)
 
     group_ns: dict[str, Any] = {
         "__annotations__": {

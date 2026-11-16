@@ -24,11 +24,12 @@ The seed: Alice wrote posts 1 and 2, Bob post 3, Charlie post 4.
 import base64
 from typing import Any
 
+import pytest
 import strawberry
 from graphql import GraphQLInputObjectType, GraphQLObjectType, get_named_type
 from strawberry import relay
 
-from strawberry_orm.relay import ORMListConnection
+from strawberry_orm.relay import ORMConnection, ORMListConnection
 from strawberry_orm.types import auto
 
 
@@ -128,9 +129,52 @@ def _group_items(arguments: str) -> str:
     """Users 4 to 12 wrote no posts, so they share one group of nine."""
     return (
         "{ users(first: 1, groupBy: [{objects: {posts: {field: {title: true}}}}]) "
-        "{ groups { aggregates { count } items(" + arguments + ") "
-        "{ edges { node { name } } pageInfo { hasPreviousPage hasNextPage } } } } }"
+        "{ groups { aggregates { count } items"
+        + (f"({arguments})" if arguments else "")
+        + " { edges { node { name } } pageInfo { hasPreviousPage hasNextPage } } "
+        "} } }"
     )
+
+
+def _aliased_group_items(*pages: tuple[str, str]) -> str:
+    """Each ``(alias, arguments)`` in *pages* as an ``items`` of its own.
+
+    Ordered by name, so the groups of Alice, Bob and Charlie come first.
+    """
+    selections = " ".join(
+        f"{alias}: items({arguments})" + " { edges { node { name } } }"
+        for alias, arguments in pages
+    )
+    return (
+        "{ users(first: 1, order: [{field: {name: ASC}}], "
+        "groupBy: [{objects: {posts: {field: {title: true}}}}]) "
+        "{ groups { aggregates { count } " + selections + " } } }"
+    )
+
+
+def _items_reads(statements: list[str]) -> list[str]:
+    """The statements that read a page of every group's items, by row number."""
+    return [s for s in statements if "ROW_NUMBER" in s.upper()]
+
+
+def _forward_schema(orm, User, connection, *, max_results=None):
+    """A root connection that names its node type before the type exists.
+
+    The name is resolved in this module, so the caller puts the type there.
+    """
+
+    @strawberry.type
+    class Query:
+        @orm.connection(connection["ForwardUserNode"], max_results=max_results)
+        def users(self) -> list["ForwardUserNode"]:  # noqa: F821
+            return orm.get_default_queryset(User)
+
+    @orm.type(User)
+    class ForwardUserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+    return Query, ForwardUserNode
 
 
 def _key_subqueries(statement: str) -> list[str]:
@@ -345,6 +389,187 @@ class AbstractTestPaginationLimits:
         result = await run(schema, _group_items("last: 2"))
         assert _items_by_count(result)[9] == (many_users[-2:], True, False)
 
+    async def test_a_groups_items_are_held_to_the_connections_max_results(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post, max_results=5)
+        connection = await run(schema, _page("first: 6"))
+        with capture() as seen:
+            result = await run(schema, _group_items("first: 6"))
+        assert connection.errors[0].message == (
+            "Argument 'first' cannot be higher than 5."
+        )
+        assert result.errors[0].message == connection.errors[0].message
+        assert result.data == {"users": {"groups": None}}, result.data
+        assert _items_reads(seen.statements) == [], seen.statements
+        result = await run(schema, _group_items("last: 6"))
+        assert result.errors[0].message == "Argument 'last' cannot be higher than 5."
+
+    async def test_a_groups_items_without_page_arguments_read_one_page(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post, max_results=5)
+        with capture() as asked:
+            expected = await run(schema, _group_items("first: 5"))
+        with capture() as seen:
+            result = await run(schema, _group_items(""))
+        assert _items_by_count(result)[9] == (many_users[3:8], False, True)
+        assert result.data == expected.data, result.data
+        assert seen.loaded == asked.loaded, seen.loaded
+
+    async def test_a_groups_items_before_alone_reads_one_page(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post, max_results=5)
+        with capture() as asked:
+            expected = await run(schema, _group_items("first: 5"))
+        with capture() as seen:
+            result = await run(schema, _group_items(f'before: "{cursor(10**15)}"'))
+        assert _items_by_count(result)[9] == (many_users[3:8], False, True)
+        assert result.data == expected.data, result.data
+        assert seen.loaded == asked.loaded, seen.loaded
+
+    async def test_a_cursor_before_a_groups_first_item_is_refused(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        with capture() as seen:
+            result = await run(
+                schema, _group_items(f'first: 3, after: "{cursor(-5000)}"')
+            )
+        assert result.errors[0].message == (
+            "Argument 'after' cannot point before the first item."
+        )
+        assert result.data == {"users": {"groups": None}}, result.data
+        assert _items_reads(seen.statements) == [], seen.statements
+        result = await run(schema, _group_items(f'before: "{cursor(-3)}"'))
+        assert result.errors[0].message == (
+            "Argument 'before' cannot point before the first item."
+        )
+
+    async def test_each_items_selected_on_a_group_gets_its_own_page(
+        self, orm_factory, User, Post, many_users, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        result = await run(
+            schema,
+            _aliased_group_items(
+                ("a", "first: 1"), ("b", f'first: 2, after: "{cursor(6)}"')
+            ),
+        )
+        assert result.errors is None, result.errors
+
+        def names(*found):
+            return {"edges": [{"node": {"name": name}} for name in found]}
+
+        assert result.data == {
+            "users": {
+                "groups": [
+                    {"aggregates": {"count": 1}, "a": names("Alice"), "b": names()},
+                    {"aggregates": {"count": 1}, "a": names("Bob"), "b": names()},
+                    {"aggregates": {"count": 1}, "a": names("Charlie"), "b": names()},
+                    {
+                        "aggregates": {"count": 9},
+                        "a": names(many_users[3]),
+                        "b": names(*many_users[10:12]),
+                    },
+                ]
+            }
+        }, result.data
+
+    async def test_items_pages_far_apart_do_not_read_the_rows_between(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(), User, Post)
+        with capture() as near:
+            await run(schema, _aliased_group_items(("a", "first: 1")))
+        with capture() as seen:
+            result = await run(
+                schema,
+                _aliased_group_items(
+                    ("a", "first: 1"), ("b", f'first: 1, after: "{cursor(7)}"')
+                ),
+            )
+        assert result.errors is None, result.errors
+        nine = result.data["users"]["groups"][3]
+        assert nine == {
+            "aggregates": {"count": 9},
+            "a": {"edges": [{"node": {"name": many_users[3]}}]},
+            "b": {"edges": [{"node": {"name": many_users[11]}}]},
+        }, nine
+        # The far page reads the ninth of the nine, and none of the rows between.
+        assert len(_items_reads(seen.statements)) == 2, seen.statements
+        assert seen.loaded == near.loaded + 1, (seen.loaded, near.loaded)
+
+
+class AbstractTestEveryConnectionCutsItsPage:
+    """However a connection type is named, its page is cut in the database."""
+
+    @pytest.mark.parametrize(
+        "connection",
+        [relay.Connection, relay.ListConnection, ORMConnection, ORMListConnection],
+        ids=lambda connection: connection.__name__,
+    )
+    async def test_a_forward_referenced_node_type_is_held_to_one_page(
+        self, orm_factory, User, many_users, capture, run, monkeypatch, connection
+    ):
+        orm = orm_factory()
+        Query, node = _forward_schema(orm, User, connection, max_results=5)
+        monkeypatch.setitem(globals(), "ForwardUserNode", node)
+        schema = orm.schema(query=Query)
+        with capture() as seen:
+            result = await run(
+                schema,
+                "{ users { totalCount edges { node { name } } "
+                "pageInfo { hasNextPage } } }",
+            )
+        assert result.errors is None, result.errors
+        assert result.data == {
+            "users": {
+                "totalCount": 12,
+                "edges": [{"node": {"name": name}} for name in many_users[:5]],
+                "pageInfo": {"hasNextPage": True},
+            }
+        }, result.data
+        assert seen.loaded <= 6, seen.loaded
+        assert any("LIMIT" in s.upper() for s in seen.statements), seen.statements
+        result = await run(
+            schema,
+            '{ users(after: "' + cursor(-5) + '") { edges { node { name } } } }',
+        )
+        assert result.errors[0].message == (
+            "Argument 'after' cannot point before the first item."
+        )
+
+    def test_a_connection_type_that_slices_in_python_is_refused(
+        self, orm_factory, User
+    ):
+        orm = orm_factory()
+
+        @orm.type(User)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+        @strawberry.type
+        class PlainUserConnection(relay.ListConnection[UserNode]):
+            pass
+
+        @strawberry.type
+        class Query:
+            @orm.connection(PlainUserConnection)
+            def users(self) -> list[UserNode]:
+                return orm.get_default_queryset(User)
+
+        with pytest.raises(TypeError) as refused:
+            orm.schema(query=Query)
+        assert str(refused.value) == (
+            "Query fields cannot be resolved. users: PlainUserConnection slices "
+            "the rows it is given in Python, so its page would not be cut in the "
+            "database or held to max_results and default_query_limit. Derive it "
+            "from ORMListConnection."
+        )
+
 
 def _entries(entry: str, count: int) -> str:
     return "[" + ", ".join([entry] * count) + "]"
@@ -502,6 +727,19 @@ class AbstractTestDefaultQueryLimit:
         assert _names(result) == many_users[:5], _names(result)
         assert _flags(result) == (False, True), _flags(result)
         assert seen.loaded <= 6, seen.loaded
+
+    async def test_it_caps_a_groups_items(
+        self, orm_factory, User, Post, many_users, capture, run
+    ):
+        schema = _schema(orm_factory(default_query_limit=5), User, Post)
+        with capture() as asked:
+            expected = await run(schema, _group_items("first: 5"))
+        assert _items_by_count(expected)[9] == (many_users[3:8], False, True)
+        for arguments in ("first: 10", ""):
+            with capture() as seen:
+                result = await run(schema, _group_items(arguments))
+            assert result.data == expected.data, (arguments, result.data)
+            assert seen.loaded == asked.loaded, (arguments, seen.loaded)
 
     async def test_it_is_the_page_when_none_is_asked_for(
         self, orm_factory, User, Post, many_users, run
