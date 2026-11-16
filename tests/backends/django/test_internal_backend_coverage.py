@@ -688,6 +688,7 @@ class TestScopedRelationHelpers:
 
         empty = Bare()
         empty._strawberry_orm_scoped = True
+        empty._strawberry_orm_tag = object()
         empty.prefetch_through = ""
         empty.to_attr = None
         _mark_scoped_prefetches([alice_post], [empty])

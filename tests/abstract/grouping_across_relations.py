@@ -895,6 +895,25 @@ class AbstractTestAggregateSelections:
     Word counts: post 1 has 100, post 2 250, post 3 (the draft) 40, post 4 310.
     """
 
+    async def test_groups_without_aggregates_are_one_for_each_key(
+        self, orm, models, run
+    ):
+        schema = _counted_schema(orm, models)
+        result = await run(
+            schema,
+            "{ posts(groupBy: [{field: {isPublished: true}}]) "
+            "{ groups { key { isPublished } } } }",
+        )
+        assert result.errors is None, result.errors
+        assert result.data == {
+            "posts": {
+                "groups": [
+                    {"key": {"isPublished": "False"}},
+                    {"key": {"isPublished": "True"}},
+                ]
+            }
+        }
+
     async def test_two_word_fields(self, orm, models, run):
         schema = _counted_schema(orm, models)
         selection = (

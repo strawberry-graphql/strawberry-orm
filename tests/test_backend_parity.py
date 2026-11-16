@@ -35,6 +35,15 @@ EXCLUDED_FILES = {
     # Only Django runs sync ORM reads from async resolvers, so only it has a
     # worker thread to keep loaded reads out of.
     "test_async_inline_reads.py",
+    # Only Django skips a prefetch whose relation a select_related in the
+    # query one level up has already cached.
+    "test_scoped_prefetch_trust.py",
+    # Subclasses of Django's relation fields, as django-mptt and modelcluster
+    # declare, and contenttypes' GenericRelation.
+    "test_relation_field_subclasses.py",
+    # Django's to_field keys, which its grouping and relation connections
+    # compared with the related row's primary key.
+    "test_to_field_keys.py",
 }
 
 EXCLUDED_METHODS = {

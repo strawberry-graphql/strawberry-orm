@@ -1325,10 +1325,11 @@ class MutationNamespace:
 
 
 def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
+    from django.db import models
+
     specs: dict[str, RelationSpec] = {}
     for field in model._meta.get_fields():  # type: ignore[attr-defined]
-        field_type = type(field).__name__
-        if field_type in {"ManyToManyField", "ManyToManyRel"}:
+        if isinstance(field, (models.ManyToManyField, models.ManyToManyRel)):
             specs[field.name] = RelationSpec(
                 name=field.name,
                 related_model=field.related_model,
@@ -1336,7 +1337,7 @@ def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
                 relation_mode="many_to_many",
                 nullable=True,
             )
-        elif field_type == "ManyToOneRel":
+        elif isinstance(field, models.ManyToOneRel) and not field.one_to_one:
             remote_field = field.field.name
             specs[field.name] = RelationSpec(
                 name=field.name,
@@ -1346,7 +1347,7 @@ def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
                 remote_attr=remote_field,
                 nullable=getattr(field.field, "null", False),
             )
-        elif field_type in {"ForeignKey", "OneToOneField"}:
+        elif isinstance(field, models.ForeignKey):
             specs[field.name] = RelationSpec(
                 name=field.name,
                 related_model=field.related_model,

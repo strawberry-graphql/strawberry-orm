@@ -40,8 +40,6 @@ from ._base import (
 #: Relation-name sets by model class; see :meth:`DjangoBackend.relation_names`.
 _RELATION_NAMES: dict[type, set[str]] = {}
 
-_TO_ONE_FIELDS = frozenset({"ForeignKey", "OneToOneField", "OneToOneRel"})
-_TO_MANY_FIELDS = frozenset({"ManyToManyField", "ManyToManyRel", "ManyToOneRel"})
 #: Columns PostgreSQL has no ``MIN`` or ``MAX`` of, even cast.
 _UNRANKABLE_FIELDS = frozenset(
     {
@@ -56,13 +54,27 @@ _UNRANKABLE_FIELDS = frozenset(
 
 
 def _relation_kind(field: Any) -> str | None:
-    """``"one"`` or ``"many"`` for a relation the optimizer can load, else ``None``."""
-    name = type(field).__name__
-    if name in _TO_ONE_FIELDS:
-        return "one"
-    if name in _TO_MANY_FIELDS:
-        return "many"
-    return None
+    """``"one"`` or ``"many"`` for a relation the optimizer can load, else ``None``.
+
+    Told by Django's relation flags, not the field's class, so a subclass
+    (django-mptt's ``TreeForeignKey``, modelcluster's ``ParentalKey``) is the
+    relation it extends rather than a column.
+    """
+    if not getattr(field, "is_relation", False) or field.related_model is None:
+        return None
+    return "one" if field.many_to_one or field.one_to_one else "many"
+
+
+def _followed_model(field: Any) -> type | None:
+    """The model filters, orders and groups may follow *field* to, or ``None``.
+
+    A generic relation is loaded and read like any to-many relation, but its
+    rows are also told apart by content type, which the subqueries correlated
+    on its key would not check, so it is not followed.
+    """
+    if _relation_kind(field) is None or (field.one_to_many and not field.auto_created):
+        return None
+    return field.related_model
 
 
 class _PlannedLookup:
@@ -172,41 +184,20 @@ class DjangoBackend(BaseBackend):
         result: list[tuple[str, type, bool, type | None]] = []
 
         for field in meta.get_fields():
-            field_class_name = type(field).__name__
-
-            if field_class_name in (
-                "ManyToManyField",
-                "ManyToManyRel",
-                "ManyToOneRel",
-                "OneToOneRel",
-                "ForeignObject",
-            ):
-                related_model = (
-                    field.related_model if hasattr(field, "related_model") else None
-                )
-                result.append((field.name, Any, True, related_model))
-                continue
-
-            if field_class_name in ("ForeignKey", "OneToOneField"):
-                related_model = (
-                    field.related_model if hasattr(field, "related_model") else None
-                )
-                result.append((field.name, Any, True, related_model))
-                attname = getattr(field, "attname", None)
-                if attname and attname != field.name:
-                    fk_type: type = int
-                    if related_model is not None:
-                        pk_field = related_model._meta.pk
-                        if pk_field is not None:
-                            fk_type = _DJANGO_FIELD_MAP.get(
-                                type(pk_field).__name__, str
-                            )
-                    if getattr(field, "null", False):
+            if field.is_relation:
+                result.append((field.name, Any, True, _followed_model(field)))
+                if isinstance(field, models.ForeignKey) and field.attname != field.name:
+                    # The column holds the value of the field the key points
+                    # at, the primary key unless ``to_field`` names another.
+                    fk_type: type = _DJANGO_FIELD_MAP.get(
+                        type(field.target_field).__name__, str
+                    )
+                    if field.null:
                         fk_type = fk_type | None  # type: ignore[assignment]
-                    result.append((attname, fk_type, False, related_model))
+                    result.append((field.attname, fk_type, False, field.related_model))
                 continue
 
-            py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
+            py_type = _DJANGO_FIELD_MAP.get(type(field).__name__, str)
             result.append((field.name, py_type, False, None))
 
         return result
@@ -238,31 +229,22 @@ class DjangoBackend(BaseBackend):
             rel_fields: dict[str, dict[str, Any]] = {}
 
             for field_obj in meta.get_fields():
-                field_class_name = type(field_obj).__name__
-                if field_class_name in (
-                    "ManyToManyField",
-                    "ManyToManyRel",
-                    "ManyToOneRel",
-                    "OneToOneRel",
-                ):
-                    rel_fields[field_obj.name] = {
-                        "kind": "many" if field_class_name != "OneToOneRel" else "one",
-                        "model": field_obj.related_model,
-                    }
+                if field_obj.is_relation:
+                    kind = _relation_kind(field_obj)
+                    if kind is not None:
+                        rel_fields[field_obj.name] = {
+                            "kind": kind,
+                            "model": field_obj.related_model,
+                        }
+                    if (
+                        isinstance(field_obj, models.ForeignKey)
+                        and field_obj.attname != field_obj.name
+                    ):
+                        col_types[field_obj.attname] = (
+                            int | None if field_obj.null else int
+                        )
                     continue
-                if field_class_name in ("ForeignKey", "OneToOneField"):
-                    rel_fields[field_obj.name] = {
-                        "kind": "fk" if field_class_name == "ForeignKey" else "one",
-                        "model": field_obj.related_model,
-                    }
-                    attname = getattr(field_obj, "attname", None)
-                    if attname and attname != field_obj.name:
-                        fk_type: type = int
-                        if getattr(field_obj, "null", False):
-                            fk_type = int | None
-                        col_types[attname] = fk_type
-                    continue
-                py_type = _DJANGO_FIELD_MAP.get(field_class_name, str)
+                py_type = _DJANGO_FIELD_MAP.get(type(field_obj).__name__, str)
                 if getattr(field_obj, "null", False):
                     py_type = py_type | None  # type: ignore[assignment]
                 col_types[field_obj.name] = py_type
@@ -316,9 +298,12 @@ class DjangoBackend(BaseBackend):
                             fname: str, return_ann: Any, backend: Any
                         ) -> Any:
                             def resolver(self: Any, info: Any) -> Any:
-                                return list(
-                                    _scoped_related_queryset(backend, self, fname, info)
-                                )
+                                with _read_errors(_instance_db(self)):
+                                    return list(
+                                        _scoped_related_queryset(
+                                            backend, self, fname, info
+                                        )
+                                    )
 
                             resolver.__name__ = fname
                             resolver.__annotations__ = {
@@ -334,13 +319,16 @@ class DjangoBackend(BaseBackend):
                             return strawberry.field(resolver=resolver)
 
                         setattr(cls, field_name, _make_resolver(field_name, ann, self))
-                elif kind in ("fk", "one"):
+                else:
 
                     def _make_fk_resolver(
                         fname: str, return_ann: Any, backend: Any
                     ) -> Any:
                         def resolver(self: Any, info: Any) -> Any:
-                            return _scoped_related_instance(backend, self, fname, info)
+                            with _read_errors(_instance_db(self)):
+                                return _scoped_related_instance(
+                                    backend, self, fname, info
+                                )
 
                         resolver.__name__ = fname
                         resolver.__annotations__ = {
@@ -494,7 +482,8 @@ class DjangoBackend(BaseBackend):
             return aggregate_meta.build_aggregates(None, requested)
 
         def _run():
-            result = _own_rows(query).aggregate(**agg_kwargs)
+            with _read_errors(query.db):
+                result = _own_rows(query).aggregate(**agg_kwargs)
             row = type("Row", (), result)()
             return aggregate_meta.build_aggregates(row, requested)
 
@@ -560,6 +549,10 @@ class DjangoBackend(BaseBackend):
                 .annotate(**aggregates, **firsts)
                 .order_by(*ordering, *aliases)
             )
+            if not aggregates and not firsts:
+                # Django groups by the values only to aggregate; without an
+                # aggregate each row would be a group of its own.
+                grouped = grouped.distinct()
             return [
                 build_group(
                     aggregate_meta,
@@ -569,7 +562,7 @@ class DjangoBackend(BaseBackend):
                     max_key_rows=self._max_group_key_rows,
                 )
                 for row in within_max_groups(
-                    list(grouped[: self._max_groups + 1]), self._max_groups
+                    _listed(grouped[: self._max_groups + 1]), self._max_groups
                 )
             ]
 
@@ -618,7 +611,7 @@ class DjangoBackend(BaseBackend):
                 .order_by("_rn")
             )
             items_by_key: dict[tuple, list[Any]] = defaultdict(list)
-            for row in qs:
+            for row in _listed(qs):
                 values = {path.alias: getattr(row, path.alias) for path in paths}
                 items_by_key[key_tuple(paths, values)].append(row)
             return dict(items_by_key)
@@ -640,7 +633,7 @@ class DjangoBackend(BaseBackend):
                 .values("pk", *(path.alias for path in paths))
             )
             found: dict[Any, set[tuple]] = defaultdict(set)
-            for row in rows:
+            for row in _listed(rows):
                 found[row["pk"]].add(key_tuple(paths, row))
             return dict(found)
 
@@ -696,7 +689,7 @@ class DjangoBackend(BaseBackend):
         )
         earlier = related.filter(
             **{
-                _remote_name(hop): OuterRef("pk"),
+                _remote_key(hop): OuterRef("pk"),
                 "pk__lt": OuterRef(f"_m_{hop.relation}"),
             }
         )
@@ -750,7 +743,7 @@ class DjangoBackend(BaseBackend):
                 if hop.many:
                     _keep_visible_links(hop, visible, markers, keep)
                 conditions.append(
-                    Q(**{f"{prefix}{hop.relation}__in": visible.values("pk")})
+                    Q(**{f"{prefix}{hop.relation}__pk__in": visible.values("pk")})
                 )
             prefix = f"{prefix}{hop.relation}__"
 
@@ -790,7 +783,7 @@ class DjangoBackend(BaseBackend):
             )
         }
         rows_together = (
-            related.filter(**{_remote_name(hop): OuterRef("pk")})
+            related.filter(**{_remote_key(hop): OuterRef("pk")})
             .annotate(**values)
             .values(*names)
             .distinct()
@@ -850,7 +843,7 @@ class DjangoBackend(BaseBackend):
             queryset = self.apply_type_scope(
                 model._default_manager.filter(pk__in=pks), model, info
             )
-            return set(queryset.values_list("pk", flat=True))
+            return set(_listed(queryset.values_list("pk", flat=True)))
 
         return run_sync(_run, thread_sensitive=True)
 
@@ -928,7 +921,7 @@ class DjangoBackend(BaseBackend):
             yield probe
 
     def count_query(self, query: Any, info: Any) -> Any:
-        return run_sync(query.count, thread_sensitive=True)
+        return run_sync(_counted, query, thread_sensitive=True)
 
     def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
         from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
@@ -948,8 +941,8 @@ class DjangoBackend(BaseBackend):
         from strawberry_orm._async import in_async_context
 
         if not in_async_context():
-            return list(query)
-        return run_sync(list, query, thread_sensitive=True)
+            return _listed(query)
+        return run_sync(_listed, query, thread_sensitive=True)
 
     _supports_on_prefetch = True
     _supports_relation_batching = True
@@ -1051,7 +1044,7 @@ class DjangoBackend(BaseBackend):
 
         def _run() -> dict[Any, int]:
             rows = query.values(key_field).annotate(_n=Count("pk"))
-            return {row[key_field]: row["_n"] for row in rows}
+            return {row[key_field]: row["_n"] for row in _listed(rows)}
 
         return run_sync(_run, thread_sensitive=True)
 
@@ -1065,15 +1058,18 @@ class DjangoBackend(BaseBackend):
         # Only a reverse FK carries the parent key on the related row; a
         # many-to-many keeps it in the join table, where a window cannot
         # partition by it.
-        fk = getattr(rel, "field", None)
-        if type(rel).__name__ != "ManyToOneRel" or fk is None:
+        if not isinstance(rel, models.ManyToOneRel) or rel.one_to_one:
             return None
+        fk = rel.field
         return RelationConnectionSpec(
             model=model,
             field_name=field_name,
             relation=relation,
             related_model=rel.related_model,
-            key_field=fk.attname,
+            # Rows are matched to parents by primary key. A key with
+            # ``to_field`` holds another column of the parent, so the parent's
+            # primary key is read through it.
+            key_field=fk.attname if fk.target_field.primary_key else f"{fk.name}__pk",
         )
 
     def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
@@ -1291,16 +1287,16 @@ class DjangoBackend(BaseBackend):
                     if lookup.to_attr is not None:
                         relation = lookup.relation
                         path = f"{prefix}__{relation}" if prefix else relation
+                        queryset = _without_select_related(
+                            lookup.queryset, _scoped_paths(lookup.children)
+                        )
                         prefetch = (
                             _scoped_prefetch(
-                                path,
-                                lookup.queryset,
-                                lookup.token,
-                                to_attr=lookup.to_attr,
+                                path, queryset, lookup.token, to_attr=lookup.to_attr
                             )
                             if lookup.scoped
                             else Prefetch(
-                                path, queryset=lookup.queryset, to_attr=lookup.to_attr
+                                path, queryset=queryset, to_attr=lookup.to_attr
                             )
                         )
                         prefetch_related.append(prefetch)
@@ -1312,8 +1308,11 @@ class DjangoBackend(BaseBackend):
                         continue
                     path = f"{prefix}__{key}" if prefix else key
                     if lookup.queryset is not None:
+                        queryset = _without_select_related(
+                            lookup.queryset, _scoped_paths(lookup.children)
+                        )
                         prefetch_related.append(
-                            _scoped_prefetch(path, lookup.queryset, lookup.token)
+                            _scoped_prefetch(path, queryset, lookup.token)
                         )
                         _emit(lookup.children, path, True)
                     elif lookup.to_one and not in_prefetch:
@@ -1366,8 +1365,8 @@ class DjangoBackend(BaseBackend):
                     *_dedupe_lookups(prefetch_related)
                 )
 
-            rows = list(optimized_query)
-            _mark_scoped_prefetches(rows, prefetch_related)
+            rows = _listed(optimized_query)
+            _mark_scoped_prefetches(rows, _dedupe_lookups(prefetch_related))
             return rows
 
         return run_sync(optimize, thread_sensitive=True)
@@ -1401,7 +1400,8 @@ class DjangoBackend(BaseBackend):
                     # makes Django skip this prefetch and keep the unscoped
                     # cache. Drop those caches so the scoped prefetch runs.
                     _clear_scoped_relation_caches(rows, lookups)
-                    prefetch_related_objects(rows, *lookups)
+                    with _read_errors(_instance_db(rows[0])):
+                        prefetch_related_objects(rows, *lookups)
                     _mark_scoped_prefetches(rows, lookups)
                     loaded.extend(rows)
             return loaded
@@ -1489,17 +1489,82 @@ def _make_on_resolver(
     return resolver
 
 
+#: On a row a scoped ``Prefetch`` read: that prefetch's tag.
+_LOADED_BY = "_strawberry_orm_loaded_by"
+
+
 def _scoped_prefetch(path: str, queryset: Any, token: Any = None, **kwargs: Any) -> Any:
     """A ``Prefetch`` whose cache is safe to trust at resolve time.
 
-    *token* is the ``scope=`` of the field it loads for, if any.
+    *token* is the ``scope=`` of the field it loads for, if any. Every row
+    its query reads is tagged, so the cache can be told from one Django
+    filled some other way.
     """
     from django.db.models import Prefetch
 
     prefetch = Prefetch(path, queryset=queryset, **kwargs)
+    tag = object()
+    prefetch.queryset = _tagging(queryset, tag)
     prefetch._strawberry_orm_scoped = True  # type: ignore[attr-defined]
     prefetch._strawberry_orm_token = token  # type: ignore[attr-defined]
+    prefetch._strawberry_orm_tag = tag  # type: ignore[attr-defined]
     return prefetch
+
+
+def _tagging(queryset: Any, tag: object) -> Any:
+    """*queryset*, leaving *tag* on every row it reads."""
+    base = queryset._iterable_class
+
+    class Tagging(base):  # type: ignore[misc, valid-type]
+        def __iter__(self) -> Any:
+            for row in super().__iter__():
+                row.__dict__[_LOADED_BY] = tag
+                yield row
+
+    tagged = queryset._chain()
+    tagged._iterable_class = Tagging
+    return tagged
+
+
+def _scoped_paths(level: dict[str, _PlannedLookup], prefix: str = "") -> list[str]:
+    """Paths under *level*, relative to it, that a scoped ``Prefetch`` loads.
+
+    A ``select_related`` of one of them in the query that reads *level*'s
+    rows would fill the cache first, and Django would skip the prefetch.
+    """
+    paths: list[str] = []
+    for key, lookup in level.items():
+        if lookup.to_attr is not None:
+            continue
+        path = f"{prefix}__{key}" if prefix else key
+        if lookup.queryset is not None:
+            paths.append(path)
+        else:
+            paths.extend(_scoped_paths(lookup.children, path))
+    return paths
+
+
+def _without_select_related(queryset: Any, paths: list[str]) -> Any:
+    """*queryset* without the ``select_related`` of any of *paths*."""
+    current = queryset.query.select_related
+    if not current or not paths:
+        return queryset
+    if current is True:
+        return queryset.select_related(None)
+
+    def prune(node: dict[str, Any], parts: list[str]) -> dict[str, Any]:
+        head, *rest = parts
+        if head not in node:
+            return node
+        if not rest:
+            return {key: value for key, value in node.items() if key != head}
+        return {**node, head: prune(node[head], rest)}
+
+    for path in paths:
+        current = prune(current, path.split("__"))
+    clone = queryset._clone()
+    clone.query.select_related = current or False
+    return clone
 
 
 def _scoped_prefetch_attr(lookup: Any) -> str | None:
@@ -1590,22 +1655,41 @@ def _django_related_children(instances: list[Any], name: str) -> list[Any]:
 
 
 def _mark_scoped_prefetches(instances: list[Any], lookups: list[Any]) -> None:
-    """Mark caches filled by scoped prefetches so resolvers can trust them."""
+    """Mark caches filled by scoped prefetches so resolvers can trust them.
+
+    Django skips a prefetch where the relation is already cached - by a
+    ``select_related``, a manager's or the scope's own - so a cache is marked
+    only when every row in it was read by that prefetch, or is the row it was
+    reached from, which Django caches as the far side of the relation.
+    """
     from strawberry_orm.lazy_resolution import mark_relations_scoped
 
     for lookup in lookups:
-        if not getattr(lookup, "_strawberry_orm_scoped", False):
+        tag = getattr(lookup, "_strawberry_orm_tag", None)
+        if tag is None:
             continue
         through = getattr(lookup, "prefetch_through", "") or ""
         path = [part for part in through.split("__") if part]
         if not path:
             continue
-        nodes = list(instances)
+        pairs = [(None, instance) for instance in instances]
         for segment in path[:-1]:
-            nodes = _django_related_children(nodes, segment)
+            pairs = [
+                (node, child)
+                for _, node in pairs
+                for child in _django_related_children([node], segment)
+            ]
         attr = getattr(lookup, "to_attr", None) or path[-1]
+        filled = [
+            node
+            for parent, node in pairs
+            if all(
+                row is parent or getattr(row, _LOADED_BY, None) is tag
+                for row in _django_related_children([node], attr)
+            )
+        ]
         mark_relations_scoped(
-            nodes, [attr], scope=getattr(lookup, "_strawberry_orm_token", None)
+            filled, [attr], scope=getattr(lookup, "_strawberry_orm_token", None)
         )
 
 
@@ -1778,7 +1862,8 @@ def _make_dj_rel_resolver(
         order: Any = None,
     ) -> list[Any]:
         if filter is None and order is None:
-            return list(_scoped_related_queryset(backend, self, fname, info))
+            with _read_errors(_instance_db(self)):
+                return list(_scoped_related_queryset(backend, self, fname, info))
 
         # Filtering or ordering re-runs the query, so a prefetched result
         # cannot carry the scope through - it has to be reapplied here.
@@ -1790,7 +1875,7 @@ def _make_dj_rel_resolver(
             qs = backend.apply_filters(qs, filter, rel_model, info=info)
         if order is not None:
             qs = backend.apply_ordering(qs, order, rel_model, info=info)
-        return list(qs)
+        return _listed(qs)
 
     if filter_type and order_type:
 
@@ -2743,14 +2828,18 @@ def _truncate(expr: Any, field: Any, interval: Any) -> Any:
     return Trunc(expr, interval.value.lower(), output_field=output)
 
 
-def _remote_name(hop: Any) -> str:
-    """How *hop*'s target model names the way back to the model it left."""
+def _remote_key(hop: Any) -> str:
+    """The lookup from *hop*'s target to the primary key of the row it left.
+
+    Through the related row's key, not the link's own column: a foreign key
+    with ``to_field`` holds another column of that row.
+    """
     from django.db.models import ForeignObjectRel
 
     field = hop.model._meta.get_field(hop.relation)
     if isinstance(field, ForeignObjectRel):
-        return field.field.name
-    return field.related_query_name()
+        return f"{field.field.name}__pk"
+    return f"{field.related_query_name()}__pk"
 
 
 def _keep_visible_links(
@@ -2768,7 +2857,7 @@ def _keep_visible_links(
     if marker in markers:
         return
     markers[marker] = F(f"{hop.relation}__pk")
-    own = {_remote_name(hop): OuterRef("pk")}
+    own = {_remote_key(hop): OuterRef("pk")}
     first = hop.target._base_manager.filter(**own).order_by("pk").values("pk")[:1]
     keep.append(
         Q(**{f"{marker}__in": visible.values("pk")})
@@ -2946,6 +3035,53 @@ def _group_ordering(
             )
         )
     return firsts, ordering
+
+
+#: What a client is told when a read this library runs fails.
+_READ_REFUSED = "Invalid filter expression"
+
+
+@contextmanager
+def _read_errors(using: str | None = None) -> Any:
+    """Raise what a client may see in place of the database failing a read.
+
+    Django's error names tables and columns, or the database host, so it is
+    kept only as the cause, for the server log. Only an error from running the
+    statement is the request's doing: one that leaves *using* with no open
+    connection - refused, or dropped - is the connection failing.
+    """
+    from django.db import (
+        DEFAULT_DB_ALIAS,
+        Error,
+        InterfaceError,
+        OperationalError,
+        connections,
+    )
+
+    try:
+        yield
+    except Error as exc:
+        raw = connections[using or DEFAULT_DB_ALIAS].connection
+        if isinstance(exc, InterfaceError) or (
+            isinstance(exc, OperationalError)
+            and (raw is None or getattr(raw, "closed", False))
+        ):
+            raise ConnectionError("Database connection failed") from exc
+        raise ValueError(_READ_REFUSED) from exc
+
+
+def _instance_db(instance: Any) -> str | None:
+    return getattr(getattr(instance, "_state", None), "db", None)
+
+
+def _listed(query: Any) -> list[Any]:
+    with _read_errors(query.db):
+        return list(query)
+
+
+def _counted(query: Any) -> int:
+    with _read_errors(query.db):
+        return query.count()
 
 
 @contextmanager
