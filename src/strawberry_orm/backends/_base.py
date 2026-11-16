@@ -147,11 +147,31 @@ def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
     return types
 
 
-_SENSITIVE_PATTERNS = re.compile(
-    r"(password|passwd|secret|token|api_key|apikey|hash|ssn|"
+#: Matched anywhere in a name, so ``hashed_password`` and ``isAdmin`` are
+#: caught, along with a few ordinary names such as ``controller``.
+_SENSITIVE_ANYWHERE = (
+    r"password|passwd|secret|token|api_key|apikey|hash|ssn|"
     r"credit_card|creditcard|private_key|privatekey|admin|staff|"
-    r"superuser|permission|role)",
-    re.IGNORECASE,
+    r"superuser|permission|role"
+)
+#: Matched only as whole words of a snake_case, kebab-case or camelCase name,
+#: so ``pin`` catches ``card_pin`` and ``pinCode`` but not ``pinned``,
+#: ``spinner`` or ``opinion``. A bare ``pin`` counts only as the last word,
+#: which leaves ``pin_count`` alone. Words that also name ordinary data
+#: (``is_active``, ``group``, ``scope``, ``plan``, ``balance``) are left out.
+_SENSITIVE_WORDS = (
+    r"pwd|pass[_-]?(?:phrase|code)s?|salt|[th]?otps?|mfa|"
+    r"(?:recovery|backup)[_-]?codes?|pin[_-]?(?:code|number)s?|pin$|jwts?|"
+    r"(?:api|access|signing|encryption|auth|license|master|session)[_-]?keys?|"
+    r"credentials?|"
+    r"social[_-]?security|national[_-]?ids?|tax[_-]?ids?|passports?|"
+    r"card[_-]?numbers?|cvv|cvc|ibans?|bank[_-]?accounts?|"
+    r"groups|scopes|acls?|privileges?"
+)
+_WORD_START = r"(?:(?<![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
+_WORD_END = r"(?:(?![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
+_SENSITIVE_PATTERNS = re.compile(
+    rf"(?i:{_SENSITIVE_ANYWHERE})|{_WORD_START}(?i:{_SENSITIVE_WORDS}){_WORD_END}"
 )
 
 

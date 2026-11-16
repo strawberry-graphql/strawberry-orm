@@ -649,12 +649,26 @@ class MutationNamespace:
     def _register_input(
         self, model: type, cls: type, annotations: dict[str, Any]
     ) -> None:
-        """Let a type declared later refuse to exclude a column *cls* writes."""
+        """Let a type declared later refuse to exclude what *cls* writes.
+
+        That is its columns, its relations, and the foreign key column each
+        single link sets.
+        """
         relations = getattr(cls, "__orm_relations__", {})
-        scalars = set(annotations) - set(relations) - {"id"}
-        self._backend._input_registry.setdefault(model, []).append(
-            (cls.__name__, scalars)
+        written = set(annotations).union(
+            *(self._written_by(spec) for spec in relations.values())
         )
+        self._backend._input_registry.setdefault(model, []).append(
+            (cls.__name__, written - {"id"})
+        )
+
+    @staticmethod
+    def _written_by(spec: RelationSpec) -> set[str]:
+        """The relation's name and, for a single link, the column it sets."""
+        names = {spec.name}
+        if spec.fk_column is not None and spec.relation_mode == "forward_fk":
+            names.add(spec.fk_column)
+        return names
 
     def _eligible_scalar_names(
         self, model: type, *, include: tuple[str, ...] | None = None
@@ -1066,8 +1080,23 @@ class MutationNamespace:
 
         relations: dict[str, RelationSpec] = {}
         if project != _PROJECT_LEAF:
+            named = set(project["relations"]) if isinstance(project, dict) else None
             for field_name, spec in relation_specs.items():
-                if isinstance(project, dict) and field_name not in project["relations"]:
+                if named is not None and field_name not in named:
+                    continue
+                leaked = self._written_by(spec) & hidden
+                if leaked and named is not None:
+                    raise ValueError(
+                        f"The project for {model.__name__} names the relation "
+                        f"'{field_name}', but the GraphQL type for "
+                        f"{model.__name__} excludes {sorted(leaked)}. Hiding a "
+                        f"relation, or the foreign key column it sets, from "
+                        f"reads leaves it writable unless the input leaves the "
+                        f"relation out too; remove '{field_name}' from the project."
+                    )
+                if leaked or self._backend._exclude_generated_sensitive_field(
+                    field_name, named
+                ):
                     continue
                 relations[field_name] = spec
                 child_project = self._child_project(project, field_name)

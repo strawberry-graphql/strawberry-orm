@@ -656,7 +656,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 
 ### What the library does by default
 
-- `orm.input()`, `orm.filter()`, and `orm.order()` exclude sensitive-looking fields (`password_hash`, `api_key`, `role`, `is_admin`, etc.)
+- `orm.input()`, `orm.filter()`, `orm.order()` and node mutation inputs exclude sensitive-looking fields and relations (`password_hash`, `api_key`, `totp_seed`, `is_admin`, `roles`, `groups`, etc.) unless you name them
 - String regex filters are disabled by default
 - Filter depth is capped, and so are the branches and the listed values of a whole filter argument, every reference to a variable included
 - A connection reads at most one page, and so does each group's `items`: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
@@ -1922,6 +1922,8 @@ Rules:
 - Relations you do not declare are absent from the input, so the schema rejects them.
 - Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`. Even then the replaced row is deleted only if the caller could delete it by its key: one the related repo's `scope_query` hides, or whose deletion `authorize` denies, is disconnected and left in place.
 - Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
+- So are the relations it hides, and a link whose foreign key column it hides: `exclude=["author_id"]` leaves out `author`. Naming such a relation in `project=` raises `ValueError`, and so does declaring the type after an input that already writes it.
+- Relations with sensitive-looking names (`roles`, `groups`, `permissions`) are left out unless `project=` names them, as sensitive-looking columns are unless `_meta` lists them.
 
 #### Upserting with `_meta.upsert`
 
