@@ -98,6 +98,37 @@ class AbstractTestConnectionOrderScoping:
         with pytest.raises(ValueError, match="Cannot order by Comment.author"):
             orm.schema(query=Query)
 
+    def test_schema_build_checks_an_order_passed_to_a_field(self, orm, models, narrow):
+        """An order handed to a field with ``order=``, and to no type, sorts the
+        rows that field returns all the same."""
+        User, Comment = models.User, models.Comment
+        orm.order(User)
+        comment_order = orm.order(Comment)
+
+        @orm.type(User)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+            @classmethod
+            def scope_rows(cls, query, info):
+                return narrow.exclude(
+                    query, User, "name", "Bob"
+                )  # pragma: no cover - never queried
+
+        @orm.type(Comment)
+        class CommentNode(relay.Node):
+            id: relay.NodeID[int]
+            body: auto
+            author: UserNode | None
+
+        @strawberry.type
+        class Query:
+            comments: list[CommentNode] = orm.field.eager(order=comment_order)
+
+        with pytest.raises(ValueError, match="Cannot order by Comment.author"):
+            orm.schema(query=Query)
+
     async def test_a_relation_connection_refuses_to_order_by_a_hidden_row(
         self, orm, models, narrow, run
     ):

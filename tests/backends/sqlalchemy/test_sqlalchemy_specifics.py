@@ -32,6 +32,7 @@ from sqlalchemy import (
     union,
 )
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -991,6 +992,95 @@ def test_every_integer_column_is_an_int():
     )
     for aggregate in ("CountsSumAggregates", "CountsAvgAggregates"):
         assert set(names) <= set(types[aggregate].fields)
+
+
+class _RenamedBase(DeclarativeBase):
+    pass
+
+
+class Person(_RenamedBase):
+    """Columns the database names after something other than their attribute."""
+
+    __tablename__ = "person"
+
+    key: Mapped[int] = mapped_column("id", primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    _phone: Mapped[str] = mapped_column("phone", String(20))
+    password_hash: Mapped[str] = mapped_column("pw", String(100), default="x")
+
+    @hybrid_property
+    def phone(self) -> str:
+        return "***-" + self._phone[-4:]
+
+    @phone.inplace.expression
+    @classmethod
+    def _phone_expression(cls):
+        return cls._phone
+
+
+class TestAColumnIsNamedByItsAttribute:
+    """The inputs read a column through its attribute, so they are named by it.
+
+    The database's name can be another attribute's: here ``phone`` is a hybrid
+    masking the ``_phone`` column, and ``password_hash`` is stored as ``pw``.
+    """
+
+    def test_the_model_is_read_by_its_attributes(self):
+        backend = _orm().backend
+        assert [name for name, *_ in backend._introspect_model(Person)] == [
+            "key",
+            "name",
+            "_phone",
+            "password_hash",
+        ]
+        assert backend._get_pk_names(Person) == {"key"}
+
+    def test_a_sensitive_attribute_stays_out_whatever_its_column_is_called(self):
+        orm = _orm()
+        written = orm.input(Person).__strawberry_definition__.fields
+        filtered = orm.filter(Person)._field_type.__strawberry_definition__.fields
+        assert {field.python_name for field in written} == {"name", "_phone"}
+        assert {field.python_name for field in filtered} == {"key", "name", "_phone"}
+
+    def test_a_hybrid_named_like_the_column_does_not_open_it(self):
+        orm = _orm()
+
+        @orm.type(Person, filters=orm.filter(Person), group=orm.group(Person))
+        class PersonNode(relay.Node):
+            key: relay.NodeID[int]
+            name: auto
+            phone: str
+
+        @strawberry.type
+        class Query:
+            people: ORMListConnection[PersonNode] = orm.connection.eager()
+
+        schema = orm.schema(query=Query)
+        engine = create_engine("sqlite://")
+        _RenamedBase.metadata.create_all(engine)
+        with sessionmaker(bind=engine)() as session:
+            session.add(Person(key=1, name="Alice", _phone="+1-555-867-5309"))
+            session.commit()
+            context = {"session": session}
+            shown = schema.execute_sync(
+                "{ people { edges { node { phone } } } }", context_value=context
+            )
+            grouped = schema.execute_sync(
+                "{ people(groupBy: [{field: {phone: true}}]) "
+                "{ groups { key { phone } } } }",
+                context_value=context,
+            )
+        assert shown.errors is None, shown.errors
+        assert shown.data == {"people": {"edges": [{"node": {"phone": "***-5309"}}]}}
+        assert grouped.data is None
+        assert [error.message for error in grouped.errors] == [
+            "Expected value of type 'PersonGroupByField' not to include unknown "
+            "field 'phone', found: { phone: true }.",
+            "Cannot query field 'phone' on type 'PersonGroupKey'.",
+        ]
+        type_map = schema._schema.type_map
+        for name in ("PersonField", "PersonGroupByField", "PersonGroupKey"):
+            assert set(type_map[name].fields) == {"key", "name"}, name
 
 
 def test_an_order_with_no_clauses_keeps_the_statements(Post):

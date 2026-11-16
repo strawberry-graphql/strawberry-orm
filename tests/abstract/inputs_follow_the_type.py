@@ -11,6 +11,9 @@ Backends supply ``orm`` and ``models`` (``User`` and ``Post``, with
 ``User.posts``). Nothing here runs a query: the schema is the evidence.
 """
 
+from typing import Annotated
+
+import pytest
 import strawberry
 from strawberry import relay
 
@@ -28,6 +31,14 @@ def _users_schema(orm, UserNode, **schema_kwargs):
     @strawberry.type
     class Query:
         users: ORMListConnection[UserNode] = orm.connection()
+
+    return orm.schema(query=Query, **schema_kwargs)
+
+
+def _posts_schema(orm, PostNode, **schema_kwargs):
+    @strawberry.type
+    class Query:
+        posts: ORMListConnection[PostNode] = orm.connection()
 
     return orm.schema(query=Query, **schema_kwargs)
 
@@ -439,3 +450,273 @@ class AbstractTestInputsFollowTheType:
         internal = _users_schema(orm, UserNode, tags="internal")
         assert fields(public, "UserField") == {"id", "name"}
         assert fields(internal, "UserField") == {"id", "name", "email"}
+
+    def _post_by_card(self, orm, models):
+        """A Post type whose ``author`` is a plain Strawberry type, showing
+        ``name`` as stored and ``email`` only through a resolver of its own."""
+
+        @strawberry.type
+        class AuthorCard:
+            name: str
+
+            @strawberry.field
+            def email(self) -> str:
+                return "hidden"  # pragma: no cover - never resolved
+
+        @orm.type(
+            models.Post,
+            filters=orm.filter(models.Post),
+            order=orm.order(models.Post),
+            group=orm.group(models.Post),
+        )
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+            author: AuthorCard
+
+        return PostNode
+
+    def test_traversal_through_a_plain_type_covers_what_it_shows(self, orm, models):
+        """No type over User is in the schema, yet ``post.author`` shows users
+        as ``AuthorCard``, so ``name`` is all ``object: {author: …}`` reaches."""
+        orm.filter(models.User)
+        orm.order(models.User)
+        orm.group(models.User)
+        schema = _posts_schema(orm, self._post_by_card(orm, models))
+        for name in ("UserField", "UserOrderField", "UserGroupByField", "UserGroupKey"):
+            assert fields(schema, name) == {"name"}, name
+
+    def test_a_type_the_schema_does_not_reach_opens_nothing(self, orm, models):
+        """The User filter is attached to a staff type showing ``email``, which
+        this schema leaves out, so through ``post.author`` it covers only
+        ``AuthorCard``."""
+
+        @orm.type(models.User, name="StaffUser", filters=orm.filter(models.User))
+        class StaffUser:
+            id: auto
+            name: auto
+            email: auto
+
+        schema = _posts_schema(orm, self._post_by_card(orm, models))
+        assert fields(schema, "UserField") == {"name"}
+
+    def _post_by_interface(self, orm, models):
+        @strawberry.interface
+        class Named:
+            name: str
+
+        orm.filter(models.User)
+
+        @orm.type(models.Post, filters=orm.filter(models.Post))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+            author: Named
+
+        return Named, PostNode
+
+    def test_traversal_through_an_interface_covers_its_types_over_the_model(
+        self, orm, models
+    ):
+        Named, PostNode = self._post_by_interface(orm, models)
+
+        @orm.type(models.User, name="PublicUser")
+        class PublicUser(Named):
+            id: auto
+
+        schema = _posts_schema(orm, PostNode, types=[PublicUser])
+        assert fields(schema, "UserField") == {"id", "name"}
+
+    def test_traversal_through_a_union_covers_its_members_over_the_model(
+        self, orm, models
+    ):
+        """An author row takes the union's member over User, ``PublicUser``,
+        whatever the staff type the User filter is attached to shows."""
+
+        @orm.type(models.User, name="StaffUser", filters=orm.filter(models.User))
+        class StaffUser:
+            id: auto
+            name: auto
+            email: auto
+
+        @orm.type(models.User, name="PublicUser")
+        class PublicUser:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Robot:
+            serial: str
+
+        @orm.type(models.Post, filters=orm.filter(models.Post))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+            author: Annotated[PublicUser | Robot, strawberry.union("Author")]
+
+        schema = _posts_schema(orm, PostNode, types=[StaffUser])
+        assert fields(schema, "UserField") == {"id", "name"}
+
+    def test_traversal_into_rows_no_type_can_show_opens_nothing(self, orm, models):
+        """With no type over User implementing ``Named``, no author row can be
+        shown at all, so the User filter behind ``object:`` keeps no column."""
+        _, PostNode = self._post_by_interface(orm, models)
+        schema = _posts_schema(orm, PostNode)
+        assert fields(schema, "PostFilterObject") == {"author"}
+        assert fields(schema, "UserFilter") == {"all", "any", "not", "oneOf", "isNull"}
+
+    def _staff(self, orm, models):
+        """A User filter and order attached to a type showing ``email``."""
+        users = orm.filter(models.User)
+        ordered = orm.order(models.User)
+
+        @orm.type(models.User, name="StaffUser", filters=users, order=ordered)
+        class StaffUser:
+            id: auto
+            name: auto
+            email: auto
+
+        return users, ordered, StaffUser
+
+    def test_an_input_passed_to_a_field_covers_the_type_it_returns(self, orm, models):
+        """``people`` returns users as ``PublicUser``, so the filter and order
+        handed to it cannot reach ``email``, which only ``StaffUser`` shows."""
+        users, ordered, StaffUser = self._staff(orm, models)
+
+        @orm.type(models.User, name="PublicUser")
+        class PublicUser:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            staff: list[StaffUser] = orm.field.eager()
+            people: list[PublicUser] = orm.field.eager(filters=users, order=ordered)
+
+        schema = orm.schema(query=Query)
+        assert fields(schema, "UserField") == {"id", "name"}
+        assert fields(schema, "UserOrderField") == {"id", "name"}
+
+    def test_an_input_a_type_inherits_covers_that_type(self, orm, models):
+        """``PublicUser`` inherits StaffUser's filter but shows ``email`` through
+        a resolver of its own, so its rows cannot be filtered by the column."""
+        _, _, StaffUser = self._staff(orm, models)
+
+        @orm.type(models.User, name="PublicUser")
+        class PublicUser(StaffUser):
+            @strawberry.field
+            def email(self) -> str:
+                return "hidden"  # pragma: no cover - never resolved
+
+        @strawberry.type
+        class Query:
+            staff: list[StaffUser] = orm.field.eager()
+            people: list[PublicUser] = orm.field.eager()
+
+        schema = orm.schema(query=Query)
+        assert fields(schema, "UserField") == {"id", "name"}
+
+    @pytest.mark.parametrize("form", ["eager", "lazy"])
+    def test_an_input_passed_to_a_field_covers_a_plain_type_it_returns(
+        self, orm, models, form
+    ):
+        users, _, StaffUser = self._staff(orm, models)
+
+        @strawberry.type
+        class UserCard:
+            name: str
+
+        @strawberry.type
+        class Query:
+            staff: list[StaffUser] = orm.field.eager()
+            if form == "eager":
+                people: list[UserCard] = orm.field.eager(filters=users)
+            else:
+
+                @orm.field.lazy(filters=users)
+                def people(self, info: strawberry.Info) -> list[UserCard]:
+                    return []  # pragma: no cover - never resolved
+
+        schema = orm.schema(query=Query)
+        assert fields(schema, "UserField") == {"name"}
+
+    def test_a_resolver_of_the_apps_own_may_return_rows_inside_its_own_type(
+        self, orm, models
+    ):
+        """``search`` takes the filter but returns a type of the app's own, not
+        the rows themselves, so that type does not narrow the filter."""
+        users, _, StaffUser = self._staff(orm, models)
+
+        @strawberry.type
+        class Found:
+            total: int
+
+        @strawberry.type
+        class Query:
+            staff: list[StaffUser] = orm.field.eager()
+
+            @strawberry.field
+            def search(self, filter: users | None = None) -> Found:
+                return Found(total=0)  # pragma: no cover - never resolved
+
+        schema = orm.schema(query=Query)
+        assert fields(schema, "UserField") == {"id", "name", "email"}
+
+    def test_a_field_answering_with_a_value_leaves_the_types_over_the_model(
+        self, orm, models
+    ):
+        """``count`` takes the filter and answers with a number, which shows no
+        column, so the filter covers the types over User the schema reaches."""
+        user_filter = orm.filter(models.User)
+
+        @orm.type(models.User)
+        class UserNode:
+            id: auto
+            name: auto
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+
+            @strawberry.field
+            def count(self, filter: user_filter | None = None) -> int:
+                return 0  # pragma: no cover - never resolved
+
+        schema = orm.schema(query=Query)
+        assert fields(schema, "UserField") == {"id", "name"}
+
+    def test_a_relation_is_never_kept_as_a_column_of_its_name(
+        self, orm, models, monkeypatch
+    ):
+        """The model is read as having an ``author`` column besides the
+        relation, as a backend once misread some foreign keys. The type shows
+        ``author`` as a relation, so only ``object:`` may reach it."""
+        real = orm.backend._introspect_model
+
+        def misread(model):
+            found = real(model)
+            if model is models.Post:
+                return [*found, ("author", int, False, None)]
+            return found
+
+        monkeypatch.setattr(orm.backend, "_introspect_model", misread)
+        UserNode = self._node(orm, models.User)
+
+        @orm.type(
+            models.Post,
+            filters=orm.filter(models.Post),
+            order=orm.order(models.Post),
+            group=orm.group(models.Post),
+        )
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+            author: UserNode | None
+
+        schema = _posts_schema(orm, PostNode)
+        for name in ("PostField", "PostOrderField", "PostGroupByField"):
+            assert fields(schema, name) == {"id", "title"}, name
+        for name in ("PostFilterObject", "PostOrderObject", "PostGroupByObject"):
+            assert fields(schema, name) == {"author"}, name
+        assert fields(schema, "PostGroupKey") == {"id", "title", "author"}
+        assert fields(schema, "PostSumAggregates") == {"id"}

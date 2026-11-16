@@ -303,3 +303,58 @@ class AbstractTestDeclaredControls:
             @orm.type(models.User, exclude=["email"])
             class UserNode(Person):
                 id: auto
+
+    @pytest.mark.parametrize("declared", [auto, str], ids=["auto", "str"])
+    def test_including_fewer_fields_than_the_class_declares_is_refused(
+        self, orm, models, declared
+    ):
+        """``include=`` cannot take a declared field off the class, so ``email``
+        would be shown, and filtered on, whatever the list says."""
+        with pytest.raises(ValueError, match=r"UserNode declares \['email'\]"):
+
+            @orm.type(
+                models.User, include=["id", "name"], filters=orm.filter(models.User)
+            )
+            class UserNode:
+                id: auto
+                name: auto
+                email: declared
+
+    @pytest.mark.parametrize("declare", [strawberry.type, strawberry.interface])
+    def test_including_fewer_fields_than_a_base_type_declares_is_refused(
+        self, orm, models, declare
+    ):
+        @declare
+        class Person:
+            name: str
+            email: str
+
+        with pytest.raises(ValueError, match=r"inherits \['email'\] from Person"):
+
+            @orm.type(models.User, include=["id", "name"])
+            class UserNode(Person):
+                id: auto
+
+    def test_include_leaves_a_field_the_class_resolves_itself(self, orm, models):
+        """A resolver shows what it returns rather than the column, so the class
+        may redeclare an inherited field with one and leave it out of the list."""
+
+        @strawberry.interface
+        class Person:
+            name: str
+            email: str
+
+        @orm.type(models.User, include=["id", "name"])
+        class UserNode(Person):
+            id: auto
+
+            @strawberry.field
+            def email(self) -> str:
+                return "hidden"  # pragma: no cover - never resolved
+
+        definition = UserNode.__strawberry_definition__
+        assert {field.python_name for field in definition.fields} == {
+            "id",
+            "name",
+            "email",
+        }

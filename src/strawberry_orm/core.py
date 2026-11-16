@@ -873,10 +873,11 @@ class _AutoField:
         )
         field._orm_auto_field = True  # type: ignore[attr-defined]
         field._orm_reads_as_is = True  # type: ignore[attr-defined]
+        field._orm_returns_rows = True  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
-        return strawberry.field(
+        field = strawberry.field(
             resolver=resolver,
             description=self._description,
             deprecation_reason=self._deprecation_reason,
@@ -889,6 +890,8 @@ class _AutoField:
                 )
             ],
         )
+        field._orm_returns_rows = True  # type: ignore[attr-defined]
+        return field
 
 
 def _is_forward_reference(node_type: Any) -> bool:
@@ -1706,18 +1709,18 @@ class StrawberryORM:
             if not extensions_include_relation_connections(extensions):
                 extensions.insert(0, self.relation_connection_extension())
 
-        self._backend.check_scoped_order_traversal()
-
         from strawberry_orm.leaf_fields import leaf_skipping_schema_class
 
         schema_class = leaf_skipping_schema_class(schema_class, self._backend)
         if tags is not None:
             schema_class = tagged_schema_class(schema_class, tags)
         schema = schema_class(extensions=list(extensions), **kwargs)
+        reached = reached_types(schema)
+        self._backend.check_scoped_order_traversal(reached)
         # Which types each input serves is only known once the schema shows
         # what it reaches, so the inputs are cut in a second build.
         cuts = self._backend.input_cuts(
-            reached_types(schema), getattr(schema_class, "_orm_tags", None)
+            reached, getattr(schema_class, "_orm_tags", None)
         )
         if not cuts:
             return schema

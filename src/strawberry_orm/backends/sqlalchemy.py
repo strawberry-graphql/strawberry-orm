@@ -381,10 +381,7 @@ class SQLAlchemyBackend(BaseBackend):
         return ordered + list(by_name.values())
 
     def _get_pk_names(self, model: type) -> set[str]:
-        from sqlalchemy import inspect as sa_inspect
-
-        mapper = sa_inspect(model)
-        return {col.key for col in mapper.primary_key}
+        return _get_sa_pk_names(model)
 
     # -- Type generation -----------------------------------------------------
 
@@ -406,11 +403,12 @@ class SQLAlchemyBackend(BaseBackend):
             mapper = sa_inspect(model)
 
             col_types: dict[str, type] = {}
-            for col in mapper.columns:
+            for prop in mapper.column_attrs:
+                col = prop.columns[0]
                 py_type = _sa_python_type(col.type)
                 if col.nullable:
                     py_type = py_type | None
-                col_types[col.key] = py_type
+                col_types[prop.key] = py_type
 
             rel_names = {rel.key for rel in mapper.relationships}
 
@@ -2474,7 +2472,7 @@ def _get_sa_pk_names(model: type) -> set[str]:
     from sqlalchemy import inspect as sa_inspect
 
     mapper = sa_inspect(model)
-    return {col.key for col in mapper.primary_key}
+    return {mapper.get_property_by_column(col).key for col in mapper.primary_key}
 
 
 def _get_sa_pk_column(model: type) -> Any:
@@ -2672,7 +2670,11 @@ def _introspect_sa_model(
     mapper = sa_inspect(model)
     result: list[tuple[str, type, bool, type | None]] = []
 
-    for col in mapper.columns:
+    # Named by the attribute, which is what the inputs read through: the
+    # database's column name can belong to another attribute, such as a
+    # hybrid masking the column it is named after.
+    for prop in mapper.column_attrs:
+        col = prop.columns[0]
         py_type = _sa_python_type(col.type)
 
         fk_target = None
@@ -2685,7 +2687,7 @@ def _introspect_sa_model(
                         fk_target = rel_mapper.class_
                         break
 
-        result.append((col.key, py_type, False, fk_target))
+        result.append((prop.key, py_type, False, fk_target))
 
     for rel in mapper.relationships:
         target_model = rel.mapper.class_

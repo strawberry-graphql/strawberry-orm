@@ -139,10 +139,11 @@ class TestInternalSharedCoverage:
             Example,
             object,
             {"id": int, "name": str, "password_hash": str},
-            include=["name"],
+            include=["id", "name", "password_hash"],
             exclude=["password_hash"],
         )
         assert type_name == "Example"
+        assert Example.__annotations__ == {"id": int, "name": str}
 
         class ExcludedOnly:
             __annotations__ = {"id": auto, "name": auto}

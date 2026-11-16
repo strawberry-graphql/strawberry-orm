@@ -112,6 +112,8 @@ Class decorator mapping a model to a GraphQL type. `filters` / `order` / `group`
 
 `exclude=` cannot name a field the class inherits from a Strawberry type or interface, which Strawberry shows on every subclass; doing so raises `ValueError`. Declare such a column only on the types that show it.
 
+`include=` has to list every field the class declares or inherits, other than one with a resolver of its own: it cannot take a field off the class, so leaving one out raises `ValueError` rather than showing it anyway.
+
 ```python
 orm.input(model, *, name=None, include=None, exclude=None, exclude_pk=True)
 orm.partial(model, *, name=None, include=None, exclude=None, exclude_pk=True)

@@ -179,6 +179,49 @@ def _reads_as_is(value: Any) -> bool:
     return True
 
 
+def _field_reads_as_is(field: StrawberryField) -> bool:
+    """True when Strawberry reads *field* straight off the row, for every caller."""
+    return (
+        field.base_resolver is None
+        and not field.permission_classes
+        and not field.extensions
+    )
+
+
+def _plain_shown(graphql_type: Any) -> dict[str, frozenset[str] | None]:
+    """What a Strawberry type the library did not build shows of a row.
+
+    Strawberry reads a field with no resolver of its own off the row, so it
+    shows the column or relation of its name as stored. Any other field shows
+    what its own code says, which opens nothing.
+    """
+    from strawberry_orm.tags import tags_of
+
+    return {
+        field.python_name: tags_of(field)
+        for field in graphql_type.__strawberry_definition__.fields
+        if _field_reads_as_is(field)
+    }
+
+
+def _shows_rows(type_: Any) -> bool:
+    """True when a field of *type_* returns rows (an object, interface or union)."""
+    from strawberry.types.base import StrawberryObjectDefinition
+    from strawberry.types.union import StrawberryUnion
+
+    from strawberry_orm.cover import named_type
+
+    named = named_type(type_)
+    return isinstance(named, StrawberryUnion) or isinstance(
+        getattr(named, "__strawberry_definition__", None), StrawberryObjectDefinition
+    )
+
+
+def _same_rows(first: type, second: type) -> bool:
+    """Whether a type over one model can show rows of the other."""
+    return issubclass(first, second) or issubclass(second, first)
+
+
 def _inherited_reads_as_is(cls: type) -> frozenset[str]:
     """Fields a base Strawberry type shows as stored that *cls* does not redeclare.
 
@@ -198,11 +241,7 @@ def _inherited_reads_as_is(cls: type) -> frozenset[str]:
             name = field.python_name
             if not name or name in own_declared or name in found:
                 continue
-            if (
-                field.base_resolver is not None
-                or field.permission_classes
-                or field.extensions
-            ):
+            if not _field_reads_as_is(field):
                 continue
             found.add(name)
     return frozenset(found)
@@ -231,6 +270,42 @@ def _refuse_excluding_inherited(cls: type, type_name: str, excluded: set[str]) -
                 f"the types that show them instead of on {base.__name__}. To "
                 f"keep a shown column out of filters and orders only, pass "
                 f"exclude= to orm.filter() and orm.order()."
+            )
+
+
+def _refuse_outside_include(cls: type, type_name: str, included: set[str]) -> None:
+    """Raise if the class declares or inherits a field ``include=`` leaves out.
+
+    ``include=`` cannot take a field off the class: one declared there, or on
+    a base Strawberry type, is shown whatever the list says, and opens its
+    column to the inputs. A field with a resolver of its own shows what that
+    resolver returns, so only those are left alone.
+    """
+    declared = sorted(set(getattr(cls, "__annotations__", {})) - included)
+    if declared:
+        raise ValueError(
+            f"{type_name} declares {declared!r}, which include= leaves out. "
+            f"include= does not hide a field the class declares, so it would "
+            f"still be shown: add it to include=, or remove it from the class."
+        )
+    for base in cls.__mro__[1:]:
+        definition = getattr(base, "__strawberry_definition__", None)
+        if definition is None:
+            continue
+        inherited = sorted(
+            field.python_name
+            for field in definition.fields
+            if field.base_resolver is None
+            and field.python_name not in included
+            and field.python_name not in vars(cls)
+        )
+        if inherited:
+            raise ValueError(
+                f"{type_name} inherits {inherited!r} from {base.__name__}, which "
+                f"include= leaves out. Strawberry shows a base type's fields on "
+                f"every subclass, so include= cannot hide them: add them to "
+                f"include=, or declare them on the types that show them instead "
+                f"of on {base.__name__}."
             )
 
 
@@ -264,6 +339,20 @@ def _common_tags(
 
 def _in_schema(tags: frozenset[str] | None, schema_tags: frozenset[str] | None) -> bool:
     return schema_tags is None or tags is None or bool(tags & schema_tags)
+
+
+#: Names a type shows as they are, each with the tags of the field showing it.
+_Cover = dict[str, frozenset[str] | None]
+
+
+def _covered(field: Any, cover: _Cover, schema_tags: frozenset[str] | None) -> bool:
+    """Whether *cover* keeps *field* of a generated type in a schema of *schema_tags*."""
+    from strawberry_orm.tags import tags_of
+
+    name = field.python_name
+    return name in cover and _in_schema(
+        _common_tags(tags_of(field), cover[name]), schema_tags
+    )
 
 
 def _intersect(
@@ -312,6 +401,34 @@ def _input_parts(item: Any) -> list[tuple[str | None, Any, Any]]:
             for key in ("field", "object", "objects")
         ]
     return [(label, part, container) for label, part, container in parts if part]
+
+
+def _names_a_relation(label: str | None, field: Any) -> bool:
+    """Whether *field*, of the part *label* names, stands for a relation.
+
+    An ``object`` or ``objects`` part names relations, and a group key nests a
+    key for each relation it groups through. Every other part names columns.
+    """
+    if label in ("object", "objects"):
+        return True
+    return label is None and _shows_rows(field.type)
+
+
+def _relations_of(item: Any, reached: set[Any]) -> list[tuple[str, Any]]:
+    """Each relation *item* reaches through ``object:``, and the input behind it."""
+    from strawberry_orm.cover import named_type
+
+    if isinstance(item, AggregateMeta):
+        if item.group_key_type not in reached:
+            return []
+        return list(item.relation_keys.items())
+    relations = getattr(item, "_object_type", None)
+    if relations is None or relations not in reached:
+        return []
+    return [
+        (field.python_name, named_type(field.type))
+        for field in relations.__strawberry_definition__.fields
+    ]
 
 
 def _annotate_filter_relation_presence(FilterCls: type) -> None:
@@ -2423,11 +2540,13 @@ class BaseBackend:
             f"guaranteed to have a readable {related.__name__}."
         )
 
-    def check_scoped_order_traversal(self) -> None:
+    def check_scoped_order_traversal(self, reached: set[Any] | None = None) -> None:
         """Raise if any exposed order input can sort by rows scoping hides.
 
         Runs at schema build so the problem surfaces on startup rather than on
-        the first client query that happens to use that sort.
+        the first client query that happens to use that sort. Every type's own
+        order input is checked, and so is every order input in *reached*, the
+        types a schema reaches, such as one passed to a field with ``order=``.
         """
         problems: list[str] = []
         seen: set[tuple[int, int]] = set()
@@ -2452,6 +2571,12 @@ class BaseBackend:
         for model, graphql_types in self._types_by_model.items():
             for graphql_type in graphql_types:
                 walk(getattr(graphql_type, "__orm_order__", None), model)
+        for model, inputs in self._model_inputs.items():
+            for item in inputs:
+                if hasattr(item, "_scoped_ordering_allowed") and item in (
+                    reached or ()
+                ):
+                    walk(item, model)
 
         if problems:
             raise ValueError("\n".join(dict.fromkeys(problems)))
@@ -2564,11 +2689,14 @@ class BaseBackend:
     def _shown(self, graphql_type: type) -> dict[str, frozenset[str] | None]:
         """What *graphql_type* shows, with the column a Relay node serves as its id.
 
-        The id is encoded, not hidden, so its column counts as shown.
+        The id is encoded, not hidden, so its column counts as shown. A type
+        the library did not build shows what Strawberry reads off the row.
         """
         from strawberry_orm.tags import tags_of
 
-        shown = self._shown_by_type[graphql_type]
+        shown = self._shown_by_type.get(graphql_type)
+        if shown is None:
+            return _plain_shown(graphql_type)
         id_attr = _node_id_attr(graphql_type)
         reads_as_is = vars(graphql_type).get("_orm_reads_as_is", frozenset())
         if id_attr is None or id_attr in shown or id_attr not in reads_as_is:
@@ -2577,20 +2705,36 @@ class BaseBackend:
         global_id = next(f for f in definition.fields if f.graphql_name == "id")
         return {**shown, id_attr: tags_of(global_id)}
 
+    def _cover(self, graphql_type: type) -> tuple[_Cover, _Cover]:
+        """The columns, and the relations, *graphql_type* shows as they are.
+
+        Told apart by the type's own field rather than by the model: a field
+        returning rows opens the relation of its name, never a column of it.
+        """
+        shown = self._shown(graphql_type)
+        rows = {
+            field.python_name
+            for field in graphql_type.__strawberry_definition__.fields  # type: ignore[attr-defined]
+            if _shows_rows(field.type)
+        }
+        columns = {name: tags for name, tags in shown.items() if name not in rows}
+        relations = {name: tags for name, tags in shown.items() if name in rows}
+        return columns, relations
+
     def input_cuts(
         self, reached: set[Any], schema_tags: frozenset[str] | None = None
     ) -> dict[Any, Any]:
         """How a schema reaching *reached* cuts the generated inputs it reaches.
 
         Each input covers what the types it serves in that schema show: the
-        types it is attached to, and the types its relations lead to through
-        ``object:`` from the types its parent serves. One serving several types
-        covers what all of them show. An input nothing attaches, such as one
-        passed to a field directly, covers what every type of its model the
-        schema reaches shows.
+        types it is attached to, the types of the rows the fields taking it
+        return, and the types its relations lead to through ``object:`` from
+        the types its parent serves. One serving several types covers what
+        all of them show. An input serving none of those covers what every
+        type of its model the schema reaches shows, unless it is reached
+        through ``object:``, and one left serving nothing covers nothing.
         """
         from strawberry_orm.cover import InputCut
-        from strawberry_orm.tags import tags_of
 
         items = [
             (model, item)
@@ -2598,16 +2742,21 @@ class BaseBackend:
             for item in inputs
             if _reached_input(item, reached)
         ]
-        uses = self._input_uses(items, reached)
-        part_covers: dict[Any, list[dict[str, frozenset[str] | None]]] = {}
+        uses = self._input_uses(items, reached, schema_tags)
+        part_covers: dict[Any, list[tuple[_Cover, _Cover]]] = {}
+        part_labels: dict[Any, str | None] = {}
         holders: dict[Any, list[tuple[Any, str | None]]] = {}
         messages: dict[Any, str] = {}
         for model, item in items:
-            if not uses[id(item)]:
-                continue
-            cover = _intersect([self._shown(node) for node in uses[id(item)]])
+            covers = [self._cover(node) for node in uses[id(item)]]
+            cover: tuple[_Cover, _Cover] = (
+                (_intersect([c for c, _ in covers]), _intersect([r for _, r in covers]))
+                if covers
+                else ({}, {})
+            )
             for label, part, container in _input_parts(item):
                 part_covers.setdefault(part, []).append(cover)
+                part_labels[part] = label
                 holders.setdefault(part, []).append((container, label))
                 if container is None:
                     messages[part] = (
@@ -2626,19 +2775,19 @@ class BaseBackend:
         cuts: dict[Any, Any] = {}
         dropped: dict[Any, set[str]] = {}
         for part, covers in part_covers.items():
-            cover = _intersect(covers)
+            columns = _intersect([c for c, _ in covers])
+            relations = _intersect([r for _, r in covers])
             fields = part.__strawberry_definition__.fields
             uncut = getattr(part, "_orm_uncut", frozenset())
+            kind = part_labels[part]
             keep = frozenset(
                 field.python_name
                 for field in fields
                 if field.python_name in uncut
-                or (
-                    field.python_name in cover
-                    and _in_schema(
-                        _common_tags(tags_of(field), cover[field.python_name]),
-                        schema_tags,
-                    )
+                or _covered(
+                    field,
+                    relations if _names_a_relation(kind, field) else columns,
+                    schema_tags,
                 )
             )
             if len(keep) == len(fields):
@@ -2661,62 +2810,153 @@ class BaseBackend:
         return cuts
 
     def _input_uses(
-        self, items: list[tuple[type, Any]], reached: set[Any]
+        self,
+        items: list[tuple[type, Any]],
+        reached: set[Any],
+        schema_tags: frozenset[str] | None = None,
     ) -> dict[int, list[type]]:
-        """The types each input serves in a schema that reaches *reached*."""
+        """The types each input serves in a schema that reaches *reached*.
+
+        Only types the schema reaches count. One reached only behind
+        ``object:`` serves what its relations lead to and nothing else, so a
+        relation that leads nowhere opens nothing.
+        """
         uses = {
             id(item): [o for o in getattr(item, "_orm_owners", ()) if o in reached]
             for _, item in items
         }
-        self._follow_relations(items, uses, reached)
+        self._follow_arguments(items, uses, reached, schema_tags)
+        behind = self._follow_relations(items, uses, reached)
         for model, item in items:
-            if not uses[id(item)]:
+            if not uses[id(item)] and id(item) not in behind:
                 types = self._types_by_model.get(model, [])
-                uses[id(item)] = [t for t in types if t in reached] or list(types)
+                uses[id(item)] = [t for t in types if t in reached]
         self._follow_relations(items, uses, reached)
         return uses
+
+    def _follow_arguments(
+        self,
+        items: list[tuple[type, Any]],
+        uses: dict[int, list[type]],
+        reached: set[Any],
+        schema_tags: frozenset[str] | None,
+    ) -> None:
+        """Add, to each input a field takes, the type its rows are returned as.
+
+        An input handed to a field with ``filters=`` or ``order=``, or one a
+        type inherits from another, narrows the rows of whatever type that
+        field returns, which need not be a type it is attached to. A type the
+        library did not build counts only for a field ``orm.field`` built,
+        which returns the rows themselves; a resolver of the app's own may
+        return them inside a type of its own.
+        """
+        from strawberry.types.base import StrawberryObjectDefinition
+
+        from strawberry_orm.cover import named_type
+        from strawberry_orm.tags import tags_of
+
+        models = {id(item): model for model, item in items}
+        for graphql_type in reached:
+            definition = getattr(graphql_type, "__strawberry_definition__", None)
+            if (
+                not isinstance(definition, StrawberryObjectDefinition)
+                or definition.is_input
+            ):
+                continue
+            for field in definition.fields:
+                if not _in_schema(tags_of(field), schema_tags):
+                    continue
+                for argument in field.arguments:
+                    item = named_type(argument.type)
+                    model = models.get(id(item))
+                    if model is None or not _in_schema(tags_of(argument), schema_tags):
+                        continue
+                    plain = getattr(field, "_orm_returns_rows", False)
+                    target = named_type(field.type)
+                    for node in self._types_showing(target, model, reached, plain):
+                        if node not in uses[id(item)]:
+                            uses[id(item)].append(node)
 
     def _follow_relations(
         self,
         items: list[tuple[type, Any]],
         uses: dict[int, list[type]],
         reached: set[Any],
-    ) -> None:
+    ) -> set[int]:
         """Add, to each input behind ``object:``, the types its relation leads to.
 
         A parent serving ``PostNode`` reaches ``author`` as whatever type
         ``PostNode.author`` returns, so the input behind it serves that type.
+        Returns the inputs found behind one.
         """
-        from strawberry_orm.cover import named_type
-
-        inputs = {item for _, item in items if isinstance(item, type)}
+        models = {id(item): model for model, item in items}
+        behind: set[int] = set()
         changed = True
         while changed:
             changed = False
             for _, parent in items:
-                relations = getattr(parent, "_object_type", None)
-                if relations is None or relations not in reached:
-                    continue
-                for field in relations.__strawberry_definition__.fields:
-                    child = named_type(field.type)
-                    if child not in inputs:
+                for relation, child in _relations_of(parent, reached):
+                    model = models.get(id(child))
+                    if model is None:
                         continue
+                    behind.add(id(child))
                     for node in list(uses[id(parent)]):
-                        target = self._relation_target(node, field.python_name)
-                        if target in reached and target not in uses[id(child)]:
-                            uses[id(child)].append(target)
-                            changed = True
+                        for target in self._relation_targets(
+                            node, relation, model, reached
+                        ):
+                            if target not in uses[id(child)]:
+                                uses[id(child)].append(target)
+                                changed = True
+        return behind
 
-    def _relation_target(self, graphql_type: type, relation: str) -> type | None:
-        """The type *graphql_type* shows *relation* as, if it shows it as it is."""
+    def _relation_targets(
+        self, graphql_type: type, relation: str, model: type, reached: set[Any]
+    ) -> list[Any]:
+        """The types *graphql_type* shows *relation*'s rows as, if it shows it
+        as it is."""
         from strawberry_orm.cover import named_type
 
-        if relation not in self._shown_by_type.get(graphql_type, {}):
-            return None
+        if relation not in self._cover(graphql_type)[1]:
+            return []
         definition = graphql_type.__strawberry_definition__  # type: ignore[attr-defined]
         field = next(f for f in definition.fields if f.python_name == relation)
-        target = named_type(field.type)
-        return target if target in self._shown_by_type else None
+        return self._types_showing(named_type(field.type), model, reached, True)
+
+    def _types_showing(
+        self, target: Any, model: type, reached: set[Any], plain: bool
+    ) -> list[Any]:
+        """The types a field returning *target* shows rows of *model* as.
+
+        Only types the schema reaches count. Under an interface or union, a
+        row takes the type over its model that implements it, and with none
+        nothing shows it. A Strawberry type the library did not build shows
+        what Strawberry reads off the row, when *plain* says the rows are
+        returned as it.
+        """
+        from strawberry.types.union import StrawberryUnion
+
+        from strawberry_orm.cover import named_type
+
+        if isinstance(target, StrawberryUnion):
+            members = [named_type(member) for member in target.types]
+        elif target in self._shown_by_type:
+            members = [target]
+        else:
+            definition = getattr(target, "__strawberry_definition__", None)
+            if definition is None:
+                return []
+            if not definition.is_interface:
+                return [target] if plain and target in reached else []
+            members = [
+                t for t in reached if isinstance(t, type) and issubclass(t, target)
+            ]
+        return [
+            member
+            for member in members
+            if member in self._shown_by_type
+            and member in reached
+            and _same_rows(member.__orm_model__, model)
+        ]
 
     def _register_type_scope(self, cls: type, model: type, type_name: str) -> None:
         """Record ``scope_rows`` for *model*, refusing to silently replace it.
@@ -2992,10 +3232,10 @@ class BaseBackend:
         from strawberry_orm.types import FieldDefinition
 
         annotations = getattr(cls, "__annotations__", {}).copy()
+        if include:
+            _refuse_outside_include(cls, name or cls.__name__, set(include))
 
         for field_name in list(annotations):
-            if include and field_name not in include:
-                continue
             if exclude and field_name in exclude:
                 del annotations[field_name]
                 continue
