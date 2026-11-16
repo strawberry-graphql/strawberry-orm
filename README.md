@@ -2023,7 +2023,7 @@ Two repo hooks are specific to upserts:
 
 `authorize(action, model, pk, info)` sees `"upsert"` for a match and `"create"` for a miss, alongside `"update"`, `"unlink"` and `"delete"` for nested items. Unlike a plain `apply_ref_list` item, which is skipped when `authorize` returns `False`, every denial inside an upsert raises `PermissionError`, so a write is never partly applied. `authorize` runs in addition to the repo's hooks, never instead of them.
 
-Re-pointing a single link asks the target model's repo `can_link` for an existing row it now points at and `can_unlink` for the row it replaced.
+Re-pointing a single link asks the target model's repo `can_link` for an existing row it now points at and `can_unlink` for the row it replaced. On SQLAlchemy, a one-to-one written from the row without the foreign key (`User.profile`, with `Profile.user_id`) takes its new target from the row that held it, so that row's `can_unlink` is asked too.
 
 Validation failures raise `UpsertValidationError` (a `ValueError`); a missing row raises `UpsertNotFoundError` (a `LookupError`).
 

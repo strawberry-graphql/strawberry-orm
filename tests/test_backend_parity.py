@@ -32,6 +32,9 @@ EXCLUDED_FILES = {
     "test_insert_only_upserts_sqlalchemy.py",
     # Sessions, column types and statements only SQLAlchemy has.
     "test_sqlalchemy_specifics.py",
+    # A one-to-one written from the row without the foreign key, and a
+    # primaryjoin narrower than its keys: only SQLAlchemy's mapper declares them.
+    "test_relationship_shapes.py",
     # Only Django runs sync ORM reads from async resolvers, so only it has a
     # worker thread to keep loaded reads out of.
     "test_async_inline_reads.py",

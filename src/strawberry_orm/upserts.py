@@ -189,6 +189,11 @@ class UpsertWriter:
 
     def validate_refs(self, parent_model: type, spec: Any, refs: list[Any]) -> None:
         """Check every list item before ``apply_ref_list`` writes anything."""
+        if spec.kind != "many":
+            raise TypeError(
+                f"apply_ref_list() takes a to-many relation; "
+                f"{parent_model.__name__}.{spec.name} links a single row"
+            )
         parent = _Parent(parent_model, spec)
         for ref in refs:
             ref_cls = type(ref)
@@ -472,27 +477,33 @@ class UpsertWriter:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         fields = _declared_fields(cls)
         data = {**seed, **_scalars(payload, cls)}
-        existing: list[tuple[Any, Any]] = []
+        existing: list[tuple[Any, Any, Any]] = []
         for name, spec in cls.__orm_relations__.items():  # type: ignore[attr-defined]
             value = getattr(payload, name, strawberry.UNSET)
             if spec.kind == "single" and _is_set(value):
                 target, found = yield from self._link_target(value, fields[name])
                 data[name] = target
                 if found:
-                    existing.append((spec, target))
+                    # Looked up now: once the row is written, it holds the target.
+                    holder = yield from self._holder(model, spec, target)
+                    existing.append((spec, target, holder))
         if parent is not None:
             data.update(self._ops.parent_assignment(parent.instance, parent.spec))
 
         yield from self._check_authorize("create", model, None)
         repo = self._repo(model)
-        data = repo.on_before_create(data, self._info)
+        data = yield repo.on_before_create(data, self._info)
         yield from self._check_repo(model, "can_create", data)
         instance = yield self._ops.create(repo, model, data)
-        for spec, target in existing:
+        for spec, target, holder in existing:
             yield from self._check_repo(
                 spec.related_model, "can_link", instance, spec.name, target
             )
-        repo.on_after_create(instance, self._info)
+            if holder is not None:
+                yield from self._check_repo(
+                    spec.related_model, "can_unlink", holder, spec.name, target
+                )
+        yield repo.on_after_create(instance, self._info)
         yield from self._apply_to_many(instance, payload, cls, created=True)
         return instance
 
@@ -500,7 +511,7 @@ class UpsertWriter:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         fields = _declared_fields(cls)
         repo = self._repo(model)
-        data = repo.on_before_update(instance, _scalars(payload, cls), self._info)
+        data = yield repo.on_before_update(instance, _scalars(payload, cls), self._info)
         yield from self._check_repo(model, "can_update", instance, data)
         for name, value in data.items():
             setattr(instance, name, value)
@@ -517,6 +528,11 @@ class UpsertWriter:
                     yield from self._check_repo(
                         spec.related_model, "can_link", instance, name, target
                     )
+                    holder = yield from self._holder(model, spec, target)
+                    if holder is not None and not self._same_row(holder, instance):
+                        yield from self._check_repo(
+                            spec.related_model, "can_unlink", holder, name, target
+                        )
                 if previous is not None:
                     yield from self._check_repo(
                         spec.related_model, "can_unlink", instance, name, previous
@@ -529,7 +545,7 @@ class UpsertWriter:
         yield self._ops.save(repo, instance)
         for related_model, previous in replaced:
             yield from self._delete_replaced(related_model, previous)
-        repo.on_after_update(instance, self._info)
+        yield repo.on_after_update(instance, self._info)
         yield from self._apply_to_many(instance, payload, cls, created=False)
         return instance
 
@@ -595,10 +611,10 @@ class UpsertWriter:
                 **input_to_dict(value),
                 **self._ops.parent_assignment(parent.instance, parent.spec),
             }
-            data = repo.on_before_create(data, self._info)
+            data = yield repo.on_before_create(data, self._info)
             yield from self._check_repo(model, "can_create", data)
             child = yield self._ops.create(repo, model, data)
-            repo.on_after_create(child, self._info)
+            yield repo.on_after_create(child, self._info)
         elif operation == "update":
             data = input_to_dict(value)
             pk = self._pk(data.pop("id"), model)
@@ -607,14 +623,14 @@ class UpsertWriter:
             child = yield self._ops.get(repo, model, pk)
             if child is None:
                 return
-            data = repo.on_before_update(child, data, self._info)
+            data = yield repo.on_before_update(child, data, self._info)
             yield from self._check_repo(model, "can_update", child, data)
             yield from self._check_link(parent, child)
             if data:
                 for name, field_value in data.items():
                     setattr(child, name, field_value)
                 yield self._ops.save(repo, child)
-                repo.on_after_update(child, self._info)
+                yield repo.on_after_update(child, self._info)
         else:
             pk = self._pk(value.id, model)
             if not (yield from self._authorized(operation, model, pk)):
@@ -634,6 +650,16 @@ class UpsertWriter:
             yield from self._check_repo(
                 model, "can_unlink", previous, parent.spec.name, child
             )
+
+    def _holder(self, model: type, spec: Any, target: Any) -> Steps:
+        """The *model* row a single link's *target* is taken from, if any.
+
+        Only a reverse one-to-one moves its target: the foreign key is on the
+        target, so pointing a row at it takes it from the row it pointed at.
+        """
+        if spec.relation_mode != "reverse_fk":
+            return None
+        return (yield self._ops.holder(model, spec, target))
 
     def _remove_member(
         self, parent: _Parent, operation: str, pk: Any, model: type
@@ -666,7 +692,7 @@ class UpsertWriter:
         """
         repo = self._repo(model)
         yield from self._check_repo(model, "can_delete", instance)
-        repo.on_before_delete(instance, self._info)
+        yield repo.on_before_delete(instance, self._info)
         if parent is not None and parent.spec.relation_mode != "reverse_fk":
             # Out of the join table first, so no link row outlives the row.
             yield self._ops.unlink(parent.instance, parent.spec, instance)

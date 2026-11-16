@@ -136,6 +136,9 @@ class AbstractRepo(Generic[M]):
         return query
 
     # -- Lifecycle hooks (no-op by default) ----------------------------------
+    #
+    # Like the authorization hooks, these may be ``async`` where the write is,
+    # and a sync write refuses an awaitable rather than skip the hook's body.
 
     def on_before_create(self, data: dict[str, Any], info: Any) -> dict[str, Any]:
         """Transform / augment *data* before a new instance is persisted."""

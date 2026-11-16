@@ -1365,7 +1365,9 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
     mapper = sa_inspect(model)
     specs: dict[str, RelationSpec] = {}
     for rel in mapper.relationships:
-        direction = rel.direction.name
+        # Unlinking clears only the related row's keys; ``remote_side`` also
+        # holds columns a primaryjoin filters on, such as ``Task.done``.
+        keys_nullable = all(remote.nullable for _, remote in rel.local_remote_pairs)
         if rel.secondary is not None:
             specs[rel.key] = RelationSpec(
                 name=rel.key,
@@ -1381,7 +1383,17 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 kind="many",
                 relation_mode="reverse_fk",
                 remote_attr=rel.back_populates,
-                nullable=all(column.nullable for column in rel.remote_side),
+                nullable=keys_nullable,
+            )
+        elif rel.direction.name == "ONETOMANY":
+            # A one-to-one held by the related row's foreign key.
+            specs[rel.key] = RelationSpec(
+                name=rel.key,
+                related_model=rel.mapper.class_,
+                kind="single",
+                relation_mode="reverse_fk",
+                remote_attr=rel.back_populates,
+                nullable=keys_nullable,
             )
         else:
             fk_column = next(iter(rel.local_columns)).key if rel.local_columns else None
@@ -1389,9 +1401,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 name=rel.key,
                 related_model=rel.mapper.class_,
                 kind="single",
-                relation_mode="forward_fk"
-                if direction == "MANYTOONE"
-                else "forward_fk",
+                relation_mode="forward_fk",
                 fk_column=fk_column,
                 nullable=all(column.nullable for column in rel.local_columns)
                 if rel.local_columns

@@ -2190,25 +2190,51 @@ class _SQLAlchemyUpsertOps:
         )
 
     def is_member(self, parent: Any, spec: Any, child: Any) -> Any:
-        if spec.relation_mode == "reverse_fk":
-            return self._is_child(parent, spec, child)
-        return self._with_loaded(
-            parent, spec.name, lambda collection: child in collection
+        from sqlalchemy import exists, select
+        from sqlalchemy.orm import with_parent
+
+        if spec.relation_mode != "reverse_fk":
+            return self._with_loaded(
+                parent, spec.name, lambda collection: child in collection
+            )
+        if not self._is_child(parent, spec, child):
+            return False
+        # The relationship's primaryjoin may narrow it past the key columns
+        # (``Task.done == False``), so ask the database through it.
+        criteria = [
+            column == value
+            for column, value in zip(
+                sa_inspect(spec.related_model).primary_key,
+                sa_inspect(child).identity,
+                strict=True,
+            )
+        ]
+        statement = select(
+            exists()
+            .where(with_parent(parent, getattr(type(parent), spec.name)))
+            .where(*criteria)
         )
+        if self._async:
+            return self._scalar_async(statement)
+        return self._session.execute(statement).scalar()
 
     def previous_parent(self, parent: Any, spec: Any, child: Any) -> Any:
         """The other row whose reverse foreign key relation holds *child*, if any."""
-        from sqlalchemy import select
-
         if spec.relation_mode != "reverse_fk" or self._is_child(parent, spec, child):
             return None
+        return self.holder(type(parent), spec, child)
+
+    def holder(self, parent_model: type, spec: Any, child: Any) -> Any:
+        """The *parent_model* row whose reverse foreign key points at *child*."""
+        from sqlalchemy import select
+
         keys = {
             parent_key: getattr(child, child_key)
-            for parent_key, child_key in self._key_pairs(type(parent), spec)
+            for parent_key, child_key in self._key_pairs(parent_model, spec)
         }
         if None in keys.values():
             return None
-        statement = select(type(parent)).filter_by(**keys)
+        statement = select(parent_model).filter_by(**keys)
         if self._async:
             return self._first_async(statement)
         return self._session.execute(statement).scalars().first()
@@ -2216,6 +2242,10 @@ class _SQLAlchemyUpsertOps:
     async def _first_async(self, statement: Any) -> Any:
         result = await self._session.execute(statement)
         return result.scalars().first()
+
+    async def _scalar_async(self, statement: Any) -> Any:
+        result = await self._session.execute(statement)
+        return result.scalar()
 
     def back_reference(
         self, parent_model: type, spec: Any
@@ -3001,6 +3031,11 @@ def _build_sa_filter(
                     if scope_criteria is not None:
                         # "Has a related row" must mean "has a *visible* one".
                         present = relationship_prop.has(scope_criteria)
+                        return (not_(present) if is_null_val else present), query
+                    if relationship_prop.property.direction.name != "MANYTOONE":
+                        # A reverse one-to-one's local column is this row's
+                        # own key, which is never NULL.
+                        present = relationship_prop.has()
                         return (not_(present) if is_null_val else present), query
                     local_col = list(relationship_prop.property.local_columns)[0]
                     clause = (
