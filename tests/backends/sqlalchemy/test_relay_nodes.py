@@ -12,7 +12,7 @@ from strawberry import relay
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.types import auto
-from tests.backends.sqlalchemy.models import Post
+from tests.backends.sqlalchemy.models import Post, User
 
 
 def _gid(pk: int) -> str:
@@ -79,3 +79,58 @@ def test_a_required_hidden_row_fails_as_a_missing_one_does(sa_session, seed, opt
     hidden = _ask(schema, sa_session, "nodes", 1, 3)
     assert hidden == _ask(schema, sa_session, "nodes", 1, 99)
     assert hidden[1], hidden
+
+
+def test_the_cast_node_leaves_on_a_row_does_not_type_it_elsewhere(sa_session, seed):
+    """``node()`` casts the row it returns, and the session hands that row on.
+
+    The cast names a type ``Profile`` cannot return, so a row two types under
+    ``Profile`` read is still refused rather than given to either.
+    """
+    orm = StrawberryORM.for_sqlalchemy(
+        dialect="sqlite", lazy_resolution="off", warn_missing_scope=False
+    )
+
+    @strawberry.interface
+    class Profile:
+        name: str
+
+    @orm.type(User, name="StaffProfile")
+    class StaffProfile(Profile):
+        name: auto
+        email: auto
+
+    @orm.type(User, name="PublicProfile", exclude=["email"])
+    class PublicProfile(Profile):
+        name: auto
+
+    @orm.type(User, name="UserNode", exclude=["email"])
+    class UserNode(relay.Node):
+        id: relay.NodeID[int]
+        name: auto
+
+        @classmethod
+        def resolve_nodes(cls, *, info, node_ids, required=False):
+            rows = [info.context["session"].get(User, int(pk)) for pk in node_ids]
+            info.context["held"] = rows
+            return rows
+
+    @strawberry.type
+    class Query:
+        node: relay.Node | None = relay.node()
+
+        @strawberry.field
+        def people(self, info: strawberry.Info) -> list[Profile | None]:
+            statement = select(User).where(User.id == 1)
+            return list(info.context["session"].scalars(statement))
+
+    schema = orm.schema(query=Query, types=[StaffProfile, PublicProfile, UserNode])
+    node_id = str(relay.GlobalID("UserNode", "1"))
+    result = schema.execute_sync(
+        '{ node(id: "' + node_id + '") { id } '
+        "people { __typename ... on StaffProfile { email } } }",
+        context_value={"session": sa_session},
+    )
+    assert result.data == {"node": {"id": node_id}, "people": [None]}
+    assert [error.path for error in result.errors or ()] == [["people", 0]]
+    assert "strawberry.cast" in result.errors[0].message

@@ -10,7 +10,7 @@ import pytest
 import strawberry
 from django.db import connection, models
 
-from strawberry_orm import StrawberryORM
+from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.types import auto
 from tests.backends.django.models import Post, User
 
@@ -186,4 +186,76 @@ def test_a_filter_over_proxy_rows_keeps_the_relation_scope(seed):
     assert run(schema, by_title % "Draft Post") == {"featuredUserFilter": []}
     assert run(schema, by_title % "Hello World") == {
         "featuredUserFilter": [{"name": "Alice"}]
+    }
+
+
+class PostRepo(AbstractRepo[Post]):
+    pass
+
+
+class ArticleRepo(AbstractRepo[Article]):
+    def scope_query(self, query, info):
+        return query.filter(is_published=True)
+
+
+def test_a_proxy_or_child_model_takes_its_parents_repo():
+    class PinnedArticleRepo(ArticleRepo):
+        pass
+
+    inherited = StrawberryORM.for_django(
+        repos={Post: PostRepo, Article: ArticleRepo}
+    )._backend
+    assert type(inherited.get_repo(FeaturedPost)) is PostRepo
+    assert type(inherited.get_repo(PinnedArticle)) is ArticleRepo
+    assert inherited.get_repo(User) is None
+
+    explicit = StrawberryORM.for_django(
+        repos={Article: ArticleRepo, PinnedArticle: PinnedArticleRepo}
+    )._backend
+    assert type(explicit.get_repo(PinnedArticle)) is PinnedArticleRepo
+
+
+def test_a_child_models_row_is_found_for_a_write_through_its_parents_repo(articles):
+    orm = StrawberryORM.for_django(
+        warn_missing_scope=False, repos={Article: ArticleRepo}
+    )
+
+    @orm.type(PinnedArticle)
+    class PinnedType:
+        id: auto
+        note: auto
+
+    upsert = orm.mutations.upsert_node_input(
+        model=PinnedArticle,
+        project={
+            "_meta": {
+                "create": ["title"],
+                "update": ["note"],
+                "upsert": {"where": ["title"], "onMatch": "UPDATE"},
+            }
+        },
+        name="PinnedUpsert",
+    )
+
+    @strawberry.type
+    class Query:
+        ok: bool = True
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        def pin(self, info: strawberry.Info, input: upsert) -> PinnedType:
+            return orm.apply_upsert(input, info)
+
+    schema = orm.schema(query=Query, mutation=Mutation)
+    edit = 'mutation { pin(input: {where: {title: "%s"}, update: {note: "edited"}}) { note } }'
+    assert run(schema, edit % "Pinned article") == {"pin": {"note": "edited"}}
+    hidden = schema.execute_sync(edit % "Pinned draft")
+    assert hidden.data is None
+    assert [error.message for error in hidden.errors or ()] == [
+        "No PinnedArticle matches {'title': 'Pinned draft'} and no create was sent"
+    ]
+    assert dict(PinnedArticle.objects.values_list("title", "note")) == {
+        "Pinned draft": "",
+        "Pinned article": "edited",
     }

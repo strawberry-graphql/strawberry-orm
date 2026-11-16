@@ -148,7 +148,7 @@ def _then(value, then):
     return then(value)
 
 
-def _two_user_types_schema(orm, models, first, *, types: str, cast=False):
+def _two_user_types_schema(orm, models, first, *, types: str, cast: str | None = None):
     User = models.User
 
     @orm.type(User, name="PublicUser", exclude=["email"])
@@ -162,16 +162,23 @@ def _two_user_types_schema(orm, models, first, *, types: str, cast=False):
         name: auto
         email: auto
 
+    @orm.type(User, name="UserRow", exclude=["email"])
+    class UserRow:
+        name: auto
+
+    declared = {"Staff": StaffUser, "Public": PublicUser, "Row": UserRow}
+
     @strawberry.type
     class Query:
         @strawberry.field
         def someone(self) -> relay.Node:
-            row = first(User)
             return _then(
-                row, lambda row: strawberry.cast(PublicUser, row) if cast else row
+                first(User),
+                lambda row: (
+                    row if cast is None else strawberry.cast(declared[cast], row)
+                ),
             )
 
-    declared = {"Staff": StaffUser, "Public": PublicUser}
     return orm.schema(query=Query, types=[declared[name] for name in types.split()])
 
 
@@ -275,10 +282,23 @@ class AbstractTestDeclaredControls:
     async def test_a_cast_row_takes_the_type_it_was_cast_to(
         self, orm, models, first, run, types
     ):
-        schema = _two_user_types_schema(orm, models, first, types=types, cast=True)
+        schema = _two_user_types_schema(orm, models, first, types=types, cast="Public")
         result = await run(schema, SOMEONE)
         assert result.errors is None, result.errors
         assert result.data == {"someone": {"__typename": "PublicUser"}}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("types", ["Staff Public Row", "Public Staff Row"])
+    async def test_a_cast_to_a_type_the_field_cannot_return_does_not_choose(
+        self, orm, models, first, run, types
+    ):
+        """Relay's ``node()`` casts for good, so the next field can find the cast."""
+        schema = _two_user_types_schema(orm, models, first, types=types, cast="Row")
+        result = await run(schema, SOMEONE)
+        assert result.data is None, result.data
+        assert result.errors is not None
+        message = result.errors[0].message
+        assert "PublicUser" in message and "StaffUser" in message, message
 
     @pytest.mark.asyncio
     async def test_a_row_one_type_in_the_schema_reads_is_given_it(

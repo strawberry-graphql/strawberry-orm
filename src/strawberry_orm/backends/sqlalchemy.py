@@ -196,6 +196,37 @@ def _held(row: Any, name: str) -> Any:
     return sa_inspect(row).dict.get(name)
 
 
+def _keep_only(rows: list[Any], name: str, load: _PlannedLoad, kept: set[int]) -> None:
+    """Leave in *name* on each of *rows* only the related rows in *kept*.
+
+    A relation with changes the session has not flushed is the app's to keep;
+    its resolver reads it again under the scope instead. One marked as loaded
+    with its scope stays marked, for what it holds now.
+    """
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    from strawberry_orm.lazy_resolution import (
+        mark_relations_scoped,
+        relation_cache_is_scoped,
+    )
+
+    for row in rows:
+        state = sa_inspect(row)
+        held = state.dict.get(name)
+        if held is None or state.attrs[name].history.has_changes():
+            continue
+        items = list(held) if isinstance(held, (list, set, tuple)) else [held]
+        if all(id(item) in kept for item in items):
+            continue
+        marked = relation_cache_is_scoped(row, name, scope=load.token, held=_held)
+        remaining = [item for item in items if id(item) in kept]
+        set_committed_value(
+            row, name, remaining if load.uselist else next(iter(remaining), None)
+        )
+        if marked:
+            mark_relations_scoped([row], [name], scope=load.token, held=_held)
+
+
 def _holds(rows: list[Any], name: str, load: _PlannedLoad) -> bool:
     """Whether every row has *name* loaded, by a scoped load if it needs one."""
     from strawberry_orm.lazy_resolution import relation_cache_is_scoped
@@ -856,7 +887,19 @@ class SQLAlchemyBackend(BaseBackend):
                 items_by_key[key].append(found[0])
             return dict(items_by_key)
 
-        return self._execute_then(info, page, collect)
+        def steps() -> Steps:
+            items_by_key = yield self._execute_then(info, page, collect)
+            rows = [row for items in items_by_key.values() for row in items]
+            kept = yield from self._scope_apart(rows, model, {}, info)
+            if len(kept) < len(rows):
+                ids = {id(row) for row in kept}
+                items_by_key = {
+                    key: [row for row in items if id(row) in ids]
+                    for key, items in items_by_key.items()
+                }
+            return items_by_key
+
+        return _drive(steps())
 
     def group_memberships(
         self, query: Any, paths: list[Any], pks: list[Any], info: Any
@@ -1719,11 +1762,38 @@ class SQLAlchemyBackend(BaseBackend):
             window = (yield self._open_window(session, [])) if trusted else None
             rows = yield self._execute_in(session, loaded)
             yield from self._keyed_loads(session, rows, plan)
+            rows = yield from self._scope_apart(rows, entity, plan, info)
             if window is not None and window.kept():
                 self._mark_scoped_edges(rows, trusted, before=window.unloaded)
             return rows
 
         return _drive(steps())
+
+    def _scope_apart(
+        self, rows: list[Any], model: type, level: dict[str, _PlannedLoad], info: Any
+    ) -> Steps:
+        """*rows* read under *model*'s scope, less the subclass rows theirs hides.
+
+        A row of a mapped subclass whose type defines its own ``scope_rows``
+        is scoped by that, not by the scope the read ran under. The relations
+        *level* loaded onto the rows were read the same way, so each one gives
+        up the rows of such a subclass that its scope hides.
+        """
+        apart = self.rows_scoped_apart(rows, model)
+        if apart:
+            kept = {id(row) for row in (yield self.scope_instances(apart, info))}
+            hidden = {id(row) for row in apart if id(row) not in kept}
+            rows = [row for row in rows if id(row) not in hidden]
+        for name, load in level.items():
+            held = _related_rows(rows, name)
+            if not held:
+                continue
+            kept_held = yield from self._scope_apart(
+                held, load.mapper.class_, load.children, info
+            )
+            if len(kept_held) < len(held):
+                _keep_only(rows, name, load, {id(row) for row in kept_held})
+        return rows
 
     def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
         """Eager-load the selected relations onto instances already in memory.
@@ -1768,6 +1838,8 @@ class SQLAlchemyBackend(BaseBackend):
                     copies = yield self._execute_in(session, stmt.options(*options))
                     _adopt(rows, copies, pk_name, reread)
                 yield from self._keyed_loads(session, rows, level, every=True)
+                # The rows themselves were checked before anything was loaded.
+                yield from self._scope_apart(rows, model, level, info)
             if windows and all(window.kept() for window in windows):
                 before: dict[int, set[str]] = {}
                 for window in windows:

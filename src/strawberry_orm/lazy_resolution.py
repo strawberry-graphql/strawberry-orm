@@ -172,20 +172,50 @@ def relation_cache_is_scoped(
     )
 
 
-def mark_rows_scoped(instances: Iterable[Any]) -> None:
-    """Record that these instances already came from a scoped query."""
+#: The scope a row mark or check leaves unnamed. A mark that names none vouches
+#: for the scope of each row's own class; a check that names none takes any
+#: mark. When both name one, it must be the same class.
+ANY_SCOPE: Any = object()
+
+
+def row_mark(owner: Any = ANY_SCOPE) -> tuple[object, Any] | None:
+    """A row mark for the open execution: rows that passed *owner*'s ``scope_rows``.
+
+    ``None`` outside an execution, where a mark would hold for every request.
+    """
     mark = execution_mark()
-    if mark is None:
+    return None if mark is None else (mark, owner)
+
+
+def row_mark_holds(made: Any, owner: Any = ANY_SCOPE) -> bool:
+    """Whether the row mark *made* is this execution's and vouches for *owner*.
+
+    *owner* is the class that scopes the row's own class. A row of a subclass
+    whose type defines its own ``scope_rows`` is not scoped by its base's, so
+    a mark made by a read of the base does not vouch for it.
+    """
+    mark = execution_mark()
+    if mark is None or not isinstance(made, tuple) or made[0] is not mark:
+        return False
+    return owner is ANY_SCOPE or made[1] is ANY_SCOPE or made[1] is owner
+
+
+def mark_rows_scoped(instances: Iterable[Any], owner: Any = ANY_SCOPE) -> None:
+    """Record that these instances passed *owner*'s ``scope_rows``.
+
+    Left out, *owner* is the class scoping each row's own class.
+    """
+    made = row_mark(owner)
+    if made is None:
         return
     for instance in instances:
         with suppress(Exception):
-            setattr(instance, _ROW_SCOPED, mark)
+            setattr(instance, _ROW_SCOPED, made)
 
 
-def row_is_scoped(instance: Any) -> bool:
-    """Whether *instance* was read by a query that applied scope_rows in this execution."""
-    mark = execution_mark()
-    return mark is not None and getattr(instance, _ROW_SCOPED, None) is mark
+def row_is_scoped(instance: Any, owner: Any = ANY_SCOPE) -> bool:
+    """Whether *instance* passed *owner*'s ``scope_rows`` in this execution."""
+    return row_mark_holds(getattr(instance, _ROW_SCOPED, None), owner)
 
 
 def _query_mark() -> object:

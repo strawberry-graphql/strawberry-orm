@@ -19,6 +19,8 @@ from strawberry_orm.lazy_resolution import (
 )
 from strawberry_orm.optimizer.extension import (
     RowScopeExtension,
+    _is_prepared,
+    _mark_prepared,
     _without_rejected,
     extensions_include_row_scope,
     load_kept,
@@ -68,6 +70,36 @@ def test_row_and_relation_marks_hold_for_their_execution_only():
         assert row_is_scoped(row)
     assert not row_is_scoped(row)
     assert not relation_cache_is_scoped(row, "posts")
+
+
+class _Scoped:
+    pass
+
+
+class _ScopedApart(_Scoped):
+    pass
+
+
+def test_a_row_mark_vouches_only_for_the_scope_that_made_it():
+    row, prepared = _Row(), _Row()
+    _mark_prepared(prepared, _Scoped)
+    assert not _is_prepared(prepared, _Scoped)
+
+    with execution_scope():
+        mark_rows_scoped([row], _Scoped)
+        assert row_is_scoped(row, _Scoped)
+        assert row_is_scoped(row)
+        assert not row_is_scoped(row, _ScopedApart)
+        mark_rows_scoped([row])
+        assert row_is_scoped(row, _ScopedApart)
+
+        _mark_prepared(prepared, _Scoped)
+        assert _is_prepared(prepared, _Scoped)
+        assert not _is_prepared(prepared, _ScopedApart)
+        mark_rows_scoped([prepared], _ScopedApart)
+        assert _is_prepared(prepared, _ScopedApart)
+        _mark_prepared([_Slotted(), prepared])
+        assert _is_prepared(prepared, _ScopedApart)
 
 
 def test_query_marks_hold_for_their_execution_only():

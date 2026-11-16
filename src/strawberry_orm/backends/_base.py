@@ -81,6 +81,8 @@ def past_a_hop() -> Iterator[None]:
 
 #: Per interface or union, the types that take each row class returned raw.
 _ROW_TYPES: WeakKeyDictionary[Any, dict[type, list[type]]] = WeakKeyDictionary()
+#: Per interface or union, the classes of its possible types.
+_POSSIBLE_TYPES: WeakKeyDictionary[Any, frozenset[type]] = WeakKeyDictionary()
 
 
 def model_is_type_of(model: type) -> Any:
@@ -91,19 +93,36 @@ def model_is_type_of(model: type) -> Any:
     is first is an accident of declaration, and the other can show columns
     the first excludes. So there the type over the row's nearest model class
     takes it, and when more than one does the row is refused: the resolver
-    has to ``strawberry.cast`` it.
+    has to ``strawberry.cast`` it to one of the interface's or union's types.
+
+    A cast to any other type says nothing here. Rows are shared within a
+    request, and Strawberry's ``node()`` casts the row it returns for good,
+    so a cast can be left over from another field.
     """
 
     def is_type_of(cls: type, obj: object, info: Any) -> bool:
         if not isinstance(obj, model):
             return False
         abstract = get_named_type(info.return_type)
-        if not is_abstract_type(abstract) or get_strawberry_type_cast(obj):
+        if not is_abstract_type(abstract):
             return True
+        cast = get_strawberry_type_cast(obj)
+        if cast is not None and cast in _possible_types(info, abstract):
+            return cast is cls
         return cls in _row_types(info, abstract, type(obj))
 
     is_type_of.orm_model = model  # type: ignore[attr-defined]
     return classmethod(is_type_of)
+
+
+def _possible_types(info: Any, abstract: Any) -> frozenset[type]:
+    known = _POSSIBLE_TYPES.get(abstract)
+    if known is None:
+        known = _POSSIBLE_TYPES[abstract] = frozenset(
+            graphql_type.extensions["strawberry-definition"].origin
+            for graphql_type in info.schema.get_possible_types(abstract)
+        )
+    return known
 
 
 def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
@@ -822,8 +841,21 @@ class BaseBackend:
         )
 
     def get_repo(self, model: type) -> Any | None:
-        """Return an instantiated repo for *model*, or ``None``."""
-        repo_cls = self._repos.get(model)
+        """Return an instantiated repo for *model*, or ``None``.
+
+        A model with no repo of its own takes the repo of the nearest class
+        it inherits that has one, as its rows take that class's scope: a row
+        of a subclass is a row of its base, and writing it must not skip the
+        base's ``scope_query`` and ``can_*`` checks.
+        """
+        repo_cls = next(
+            (
+                found
+                for cls in getattr(model, "__mro__", (model,))
+                if (found := self._repos.get(cls)) is not None
+            ),
+            None,
+        )
         if repo_cls is None:
             return None
         repo = repo_cls(self)
@@ -2290,26 +2322,25 @@ class BaseBackend:
 
         Returns a list, or an awaitable of a list on async backends. Instances
         of models with no ``scope_rows`` pass through. A subclass's instance is
-        checked against the scope it inherits, by the class that declares it.
-        A scoped model whose instance has no primary key cannot be checked, so
-        that raises rather than returning the row.
+        checked against the scope it inherits, by the class that declares it,
+        and a mark another read left on it is trusted only if it was made by
+        that class's scope. A scoped model whose instance has no primary key
+        cannot be checked, so that raises rather than returning the row.
         """
         from inspect import isawaitable
 
         from strawberry_orm.lazy_resolution import mark_rows_scoped, row_is_scoped
 
         owners: dict[type, type | None] = {}
+        for row in rows:
+            if type(row) not in owners:
+                owners[type(row)] = self._type_querysets.owner(type(row))
         groups: dict[type, list[Any]] = {}
         # Read once: another execution sharing the row can mark it meanwhile.
-        scoped = {id(row) for row in rows if row_is_scoped(row)}
+        scoped = {id(row) for row in rows if row_is_scoped(row, owners[type(row)])}
         for row in rows:
-            if id(row) in scoped:
-                continue
-            cls = type(row)
-            if cls not in owners:
-                owners[cls] = self._type_querysets.owner(cls)
-            owner = owners[cls]
-            if owner is not None:
+            owner = owners[type(row)]
+            if id(row) not in scoped and owner is not None:
                 groups.setdefault(owner, []).append(row)
         if not groups:
             return list(rows)
@@ -2336,7 +2367,11 @@ class BaseBackend:
                 or owners[type(row)] is None
                 or self.instance_pk(row) in allowed[owners[type(row)]]
             ]
-            mark_rows_scoped(kept)
+            by_owner: dict[type | None, list[Any]] = {}
+            for row in kept:
+                by_owner.setdefault(owners[type(row)], []).append(row)
+            for owner, group in by_owner.items():
+                mark_rows_scoped(group, owner)
             return kept
 
         if any(isawaitable(pks) for _model, pks in pending):
@@ -2350,6 +2385,28 @@ class BaseBackend:
             return _await_allowed()
 
         return finish({model: pks for model, pks in pending})
+
+    def scope_owner(self, model: Any) -> type | None:
+        """The class whose ``scope_rows`` scopes *model*'s rows, if any."""
+        return self._type_querysets.owner(model)
+
+    def rows_scoped_apart(self, rows: Any, model: Any) -> list[Any]:
+        """The *rows* that a read scoped by *model*'s ``scope_rows`` did not scope.
+
+        A read is scoped by the model it is over, the one a query selects or a
+        relation targets. A row of a subclass whose type defines its own
+        ``scope_rows`` is scoped by that instead, and under an interface or
+        union it is shown as that type, so it has to be checked again.
+        """
+        owner = self._type_querysets.owner(model)
+        owners: dict[type, type | None] = {}
+        apart: list[Any] = []
+        for row in rows:
+            if type(row) not in owners:
+                owners[type(row)] = self._type_querysets.owner(type(row))
+            if owners[type(row)] not in (None, owner):
+                apart.append(row)
+        return apart
 
     # -- Scoping across relation traversal -----------------------------------
 

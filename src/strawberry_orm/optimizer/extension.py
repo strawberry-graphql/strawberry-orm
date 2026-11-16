@@ -15,10 +15,13 @@ from strawberry.extensions import SchemaExtension
 from strawberry_orm._async import await_maybe
 from strawberry_orm.batching import stash_parents
 from strawberry_orm.lazy_resolution import (
-    execution_mark,
+    ANY_SCOPE,
     execution_scope,
     open_subscription_event,
     relation_read_by,
+    row_is_scoped,
+    row_mark,
+    row_mark_holds,
 )
 from strawberry_orm.optimizer.selections import graphql_resolve_info
 
@@ -239,27 +242,48 @@ def returns_single_orm_object(backend: Backend, info: Any) -> bool:
 _RELATION_VERDICTS: dict[tuple[type, str], bool] = {}
 
 
-def _reads_a_relation_of_the_parent(backend: Backend, root: Any, info: Any) -> bool:
-    """True when the library's own resolver read this relation off a loaded row.
+def _relation_of_the_parent(backend: Backend, root: Any, info: Any) -> str | None:
+    """The relation the library's own resolver read off a loaded row, if it did.
 
     That resolver applied the scope itself, an ``on=`` view under a name of its
     own included. A field the app resolves is never taken on trust, whatever
     it is called: its rows can come from anywhere.
     """
     if root is None or not backend.is_model_instance(root):
-        return False
+        return None
     relation = relation_read_by(graphql_resolve_info(info))
     if relation is None:
-        return False
+        return None
     key = (type(root), relation)
     verdict = _RELATION_VERDICTS.get(key)
     if verdict is None:
         try:
             verdict = relation in backend.relation_names(type(root))
         except Exception:  # pragma: no cover - defensive; unmapped roots
-            return False
+            return None
         _RELATION_VERDICTS[key] = verdict
-    return verdict
+    return relation if verdict else None
+
+
+def _scope_rows_apart(backend: Backend, result: Any, model: Any, info: Any) -> Any:
+    """*result*, less the subclass rows the scope of *model* stood in for.
+
+    A relation is read under the scope of the model it targets; a row of a
+    subclass whose type has a scope of its own is checked against that one.
+    """
+    apart = backend.rows_scoped_apart(
+        result if isinstance(result, list) else [result], model
+    )
+    if not apart:
+        return result
+    scoped = backend.scope_instances(apart, info)
+    if isawaitable(scoped):
+
+        async def _await_scoped() -> Any:
+            return _without_rejected(result, apart, await scoped, info)[0]
+
+        return _await_scoped()
+    return _without_rejected(result, apart, scoped, info)[0]
 
 
 def _unwrap_single(result: Any, singular: bool) -> Any:
@@ -280,7 +304,8 @@ def _unwrap_single(result: Any, singular: bool) -> Any:
 # A prepared row is not scope-checked again, so a row is marked only once its
 # scope has run - a scoped query read it, or ``scope_instances`` kept it - and
 # the mark holds only for the execution that made it, like the scope marks in
-# ``lazy_resolution``.
+# ``lazy_resolution``. It names the class whose scope ran, as a query over a
+# base model reads rows of a subclass whose own type's scope it never applied.
 _PREPARED = "_strawberry_orm_relations_loaded"
 
 #: Exact types a resolved value can have that no branch below ``resolve``
@@ -291,19 +316,36 @@ _PREPARED = "_strawberry_orm_relations_loaded"
 _SCALAR_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
 
 
-def _mark_prepared(rows: Any) -> None:
-    mark = execution_mark()
-    if mark is None:
+def _mark_prepared(rows: Any, owner: Any = ANY_SCOPE) -> None:
+    """Mark *rows* loaded, and passed by the ``scope_rows`` of *owner*.
+
+    Left out, *owner* is the class scoping each row's own class.
+    """
+    made = row_mark(owner)
+    if made is None:
         return
     for row in rows if isinstance(rows, list) else [rows]:
         # Immutable or slotted rows simply go unmarked and take the slow path.
         with suppress(Exception):
-            setattr(row, _PREPARED, mark)
+            setattr(row, _PREPARED, made)
 
 
-def _is_prepared(row: Any) -> bool:
-    mark = execution_mark()
-    return mark is not None and getattr(row, _PREPARED, None) is mark
+def _is_prepared(row: Any, owner: Any = ANY_SCOPE) -> bool:
+    """Whether *row* is prepared, and passed *owner*'s scope, in this execution.
+
+    *owner* is the class scoping the row's own class. A row a query over its
+    base read is still prepared once ``scope_instances`` kept it by its own.
+    """
+    made = getattr(row, _PREPARED, None)
+    return row_mark_holds(made, owner) or (
+        row_mark_holds(made) and row_is_scoped(row, owner)
+    )
+
+
+def _query_scope(backend: Backend, query: Any) -> Any:
+    """The class whose ``scope_rows`` scopes *query*, if the backend can tell."""
+    model = backend.query_model(query)
+    return ANY_SCOPE if model is None else backend.scope_owner(model)
 
 
 def optimize_query_nodes(nodes: Any, info: Any) -> Any:
@@ -311,16 +353,17 @@ def optimize_query_nodes(nodes: Any, info: Any) -> Any:
     backend, store = get_configured_optimizer(info)
     if backend is None or store is None or not backend.is_query_object(nodes):
         return nodes
+    owner = _query_scope(backend, nodes)
     rows = backend.apply_optimizer_hints(store, nodes, info)
     if isawaitable(rows):
 
         async def _await_rows() -> Any:
             resolved = await rows
-            _mark_prepared(resolved)
+            _mark_prepared(resolved, owner)
             return resolved
 
         return _await_rows()
-    _mark_prepared(rows)
+    _mark_prepared(rows, owner)
     return rows
 
 
@@ -371,21 +414,23 @@ class OptimizerExtension(SchemaExtension):
         backend = self._backend
         singular = False
         optimized = False
+        owner = ANY_SCOPE
         if (
             backend is not None
             and self._store is not None
             and backend.is_query_object(result)
         ):
             singular = returns_single_orm_object(backend, info)
+            owner = _query_scope(backend, result)
             result = backend.apply_optimizer_hints(self._store, result, info)
             optimized = True
             if not isawaitable(result):
-                _mark_prepared(result)
+                _mark_prepared(result, owner)
         elif not isawaitable(result):
             result = self._load_rows(result, root, info)
 
         if isawaitable(result):
-            return self._resolve_async(result, root, info, singular, optimized)
+            return self._resolve_async(result, root, info, singular, optimized, owner)
 
         stash_parents(getattr(self, "execution_context", None), info, result)
         return _unwrap_single(result, singular)
@@ -408,19 +453,25 @@ class OptimizerExtension(SchemaExtension):
         # Reading a relation off a row that is already in memory: whatever
         # loaded the parent loaded this too, because the lookups are computed
         # for the whole subtree at once. Re-loading here would issue a query
-        # per parent to fetch rows that are already present.
-        if _reads_a_relation_of_the_parent(backend, root, info):
-            return result
+        # per parent to fetch rows that are already present. Only a row of a
+        # subclass with a scope of its own is owed a check.
+        relation = _relation_of_the_parent(backend, root, info)
+        if relation is not None:
+            target = backend._relation_target_model(type(root), relation)
+            return _scope_rows_apart(backend, result, target, info)
 
+        scope_owner = backend.scope_owner
         if backend.is_model_instance(result):
-            rows: list[Any] = [] if _is_prepared(result) else [result]
+            prepared = _is_prepared(result, scope_owner(type(result)))
+            rows: list[Any] = [] if prepared else [result]
             if not rows:
                 return result
         elif isinstance(result, list) and result:
             rows = [
                 row
                 for row in result
-                if backend.is_model_instance(row) and not _is_prepared(row)
+                if backend.is_model_instance(row)
+                and not _is_prepared(row, scope_owner(type(row)))
             ]
             if not rows:
                 return result
@@ -437,8 +488,8 @@ class OptimizerExtension(SchemaExtension):
             return self._load_rows(listed, root, info)
 
         # Relation fields of the parent returned above: those caches were
-        # scoped with the parent, and checking again would query once per
-        # parent.
+        # scoped with the parent, and checking every row again would query
+        # once per parent.
         return scope_then_load(backend, self._store, result, rows, info)
 
     async def _resolve_async(
@@ -448,6 +499,7 @@ class OptimizerExtension(SchemaExtension):
         info: Any,
         singular: bool = False,
         optimized: bool = False,
+        owner: Any = ANY_SCOPE,
     ) -> Any:
         result = await await_maybe(result)
 
@@ -455,17 +507,18 @@ class OptimizerExtension(SchemaExtension):
         if optimized:
             # The rows were only reachable once the awaitable resolved, so this
             # is the first chance to mark them.
-            _mark_prepared(result)
+            _mark_prepared(result, owner)
         elif (
             backend is not None
             and self._store is not None
             and backend.is_query_object(result)
         ):
             singular = returns_single_orm_object(backend, info)
+            owner = _query_scope(backend, result)
             result = await await_maybe(
                 backend.apply_optimizer_hints(self._store, result, info)
             )
-            _mark_prepared(result)
+            _mark_prepared(result, owner)
         else:
             result = await await_maybe(self._load_rows(result, root, info))
 

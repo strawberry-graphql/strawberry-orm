@@ -654,10 +654,16 @@ class UpsertWriter:
             )
             yield self._ops.unlink(parent.instance, parent.spec, child)
         else:
-            yield from self._delete_instance(child, parent)
+            yield from self._delete_instance(model, child, parent)
 
-    def _delete_instance(self, instance: Any, parent: _Parent | None = None) -> Steps:
-        model = type(instance)
+    def _delete_instance(
+        self, model: type, instance: Any, parent: _Parent | None = None
+    ) -> Steps:
+        """Delete *instance*, found as a *model* row, through *model*'s repo.
+
+        The row can be of a subclass, but its repo checked the lookup, so the
+        same repo decides the delete and runs it.
+        """
         repo = self._repo(model)
         yield from self._check_repo(model, "can_delete", instance)
         repo.on_before_delete(instance, self._info)
@@ -679,7 +685,7 @@ class UpsertWriter:
             return
         visible = yield self._ops.get(self._repo(model), model, pk)
         if visible is not None:
-            yield from self._delete_instance(visible)
+            yield from self._delete_instance(model, visible)
 
     def _update_by_id(self, payload: Any, cls: type) -> Steps:
         model = cls.__orm_model__  # type: ignore[attr-defined]
