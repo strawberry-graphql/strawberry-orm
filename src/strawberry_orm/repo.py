@@ -160,6 +160,23 @@ class AbstractRepo(Generic[M]):
         """Called just before the instance is deleted."""
 
     # -- Overridable CRUD (backend-aware defaults) ---------------------------
+    #
+    # Each ``*_async`` default calls an override of its sync counterpart, so a
+    # repo has to override only one of them. On an async SQLAlchemy session
+    # the override runs through ``AsyncSession.run_sync``, where the sync
+    # defaults it calls through ``super()`` can do IO.
+
+    async def _sync_override(self, name: str, info: Any, *args: Any) -> Any:
+        method = getattr(self, name)
+        backend = self._backend
+        session = None
+        if backend.__class__.__name__ == "SQLAlchemyBackend":
+            session = backend._get_session(info)
+        if session is not None and backend._is_async_session(session):
+            result = await session.run_sync(lambda _sync_session: method(*args))
+        else:
+            result = method(*args)
+        return await result if inspect.isawaitable(result) else result
 
     def _create(self, model: type, data: dict[str, Any], info: Any) -> Any:
         """Persist a new model instance and return it."""
@@ -174,7 +191,7 @@ class AbstractRepo(Generic[M]):
                 "Tortoise backend is async-only; override _create_async instead"
             )
 
-        session = backend._get_session(info)
+        session = _sa_sync_session(backend, info)
         instance = model(**data)
         session.add(instance)
         session.flush()
@@ -182,6 +199,8 @@ class AbstractRepo(Generic[M]):
 
     async def _create_async(self, model: type, data: dict[str, Any], info: Any) -> Any:
         """Async variant of :meth:`_create`."""
+        if _overrides(self, "_create"):
+            return await self._sync_override("_create", info, model, data, info)
         backend = self._backend
         name = backend.__class__.__name__
 
@@ -213,7 +232,7 @@ class AbstractRepo(Generic[M]):
                 "Tortoise backend is async-only; override _get_async instead"
             )
 
-        session = backend._get_session(info)
+        session = _sa_sync_session(backend, info)
         from sqlalchemy import select as sa_select
 
         pk_col = _get_sa_pk_column(model)
@@ -224,6 +243,8 @@ class AbstractRepo(Generic[M]):
 
     async def _get_async(self, model: type, pk: Any, info: Any) -> Any | None:
         """Async variant of :meth:`_get`."""
+        if _overrides(self, "_get"):
+            return await self._sync_override("_get", info, model, pk, info)
         backend = self._backend
         name = backend.__class__.__name__
 
@@ -259,7 +280,7 @@ class AbstractRepo(Generic[M]):
                 "Tortoise backend is async-only; override _save_async instead"
             )
 
-        session = backend._get_session(info)
+        session = _sa_sync_session(backend, info)
         from sqlalchemy.orm import object_session
 
         if object_session(instance) is None:
@@ -268,6 +289,9 @@ class AbstractRepo(Generic[M]):
 
     async def _save_async(self, instance: Any, info: Any) -> None:
         """Async variant of :meth:`_save`."""
+        if _overrides(self, "_save"):
+            await self._sync_override("_save", info, instance, info)
+            return
         backend = self._backend
         name = backend.__class__.__name__
 
@@ -298,12 +322,15 @@ class AbstractRepo(Generic[M]):
                 "Tortoise backend is async-only; override _delete_async instead"
             )
 
-        session = backend._get_session(info)
+        session = _sa_sync_session(backend, info)
         session.delete(instance)
         session.flush()
 
     async def _delete_async(self, instance: Any, info: Any) -> None:
         """Async variant of :meth:`_delete`."""
+        if _overrides(self, "_delete"):
+            await self._sync_override("_delete", info, instance, info)
+            return
         backend = self._backend
         name = backend.__class__.__name__
 
@@ -318,6 +345,29 @@ class AbstractRepo(Generic[M]):
                 return
 
         self._delete(instance, info)
+
+
+def _overrides(repo: AbstractRepo, name: str) -> bool:
+    return getattr(type(repo), name) is not getattr(AbstractRepo, name)
+
+
+def _sa_sync_session(backend: Any, info: Any) -> Any:
+    """The session a sync SQLAlchemy default works in.
+
+    An async session's sync session does IO only inside ``run_sync``, so a
+    sync default reached any other way on one raises rather than do nothing.
+    """
+    session = backend._get_session(info)
+    if not backend._is_async_session(session):
+        return session
+    from sqlalchemy.util.concurrency import in_greenlet
+
+    if not in_greenlet():
+        raise TypeError(
+            "A sync AbstractRepo method was called with an AsyncSession; call "
+            "its *_async variant, or reach it through one"
+        )
+    return session.sync_session
 
 
 def _check_auth(

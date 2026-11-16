@@ -73,6 +73,15 @@ class TestDjangoSplitParentPredicate:
         drafts = DjPost.objects.filter(is_published=False)
         assert backend.query_signature(published) != backend.query_signature(drafts)
 
+    def test_signature_distinguishes_databases(self):
+        """Rows a replica or a tenant's database holds are not the default's,
+        so a batch must not answer one database's query from the other's."""
+        backend = self._backend()
+        published = DjPost.objects.filter(is_published=True)
+        assert backend.query_signature(published) != backend.query_signature(
+            published.using("replica")
+        )
+
     def test_apply_key_filter_adds_an_in_clause(self):
         backend = self._backend()
         filtered = backend.apply_key_filter(

@@ -547,6 +547,61 @@ class TestRegexPatternGuard:
         with pytest.raises(ValueError, match="at most 100 characters"):
             check_regex("a" * (MAX_REGEX_LENGTH + 1))
 
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            ".*",
+            "^A.*",
+            r"[A-Z]+\d+$",
+            r"^[^@]+@[^@]+$",
+            r"\s*\S+",
+            "a*b+a*",
+            "(?:a|b*)c*",
+            ".*+.*+",
+            "(?>.*)(?>.*)",
+            "ß+S+",
+            "[\u4e00-\u9fff]+[a-z]+",
+            "(?:ab){2}c*",
+            "(?:a*){1}b*",
+            "(?:ab|cd)?x*",
+            r"[^a-c\dx]*\d+",
+        ],
+    )
+    def test_repeats_that_cannot_trade_characters_are_allowed(self, pattern):
+        check_regex(pattern)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            ".*" * 6 + "!",
+            ".*a.*!",
+            r"\w+\w+",
+            "a*b?a*",
+            "(?i)a*A*",
+            "[a-z]*[A-Z]*",
+            "[^a]*b*",
+            ".{0,30}.{0,30}",
+            "a?" * 30,
+            r"a*\ba*",
+            r"\D*\d*x\D*",
+            "(a*)(a*)",
+            "(?:a*a*)?",
+            "x*(?=x*)",
+            "x*(?!x*y)",
+            ".*(?>.*)!",
+            "a*(?:a*)?+",
+            "a*(?:b|a*)",
+            "[\u4e00-\u9fff]+[\u4e10-\u4e20]+",
+            "[^\u4e00]+\u4e01*",
+            "(?:a*){1}a*",
+            "(?:ab|cd)?[a-d]*",
+            r"[^a-c\dx]*y+",
+        ],
+    )
+    def test_repeats_that_can_trade_characters_are_refused(self, pattern):
+        with pytest.raises(ValueError, match="may not hold two repeats"):
+            check_regex(pattern)
+
 
 # =========================================================================
 # FIX 7 — permission_classes wired into generated fields

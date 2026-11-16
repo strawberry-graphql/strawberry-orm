@@ -96,6 +96,26 @@ class Task(Base):
     )
 
 
+class Keeper(Base):
+    __tablename__ = "shape_keeper"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    active: Mapped[bool] = mapped_column(Boolean)
+
+
+class Pet(Base):
+    __tablename__ = "shape_pet"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    keeper_id: Mapped[int | None] = mapped_column(ForeignKey("shape_keeper.id"))
+    active_keeper: Mapped[Keeper | None] = relationship(
+        primaryjoin=lambda: and_(Pet.keeper_id == Keeper.id, Keeper.active.is_(True)),
+        viewonly=True,
+    )
+
+
 class Album(Base):
     __tablename__ = "shape_album"
 
@@ -620,6 +640,64 @@ class TestANarrowedJoinIsNotRebuilt:
                 open_tasks: ORMListConnection[TaskNode] = orm.connection.eager()
 
 
+class TestANarrowedToOneIsFilteredThroughItsJoin:
+    """``Pet.active_keeper`` lists only an active keeper, so the key column
+    alone cannot say whom it lists: tom's keeper 7 is inactive."""
+
+    @pytest.fixture
+    def pets(self):
+        orm = new_orm()
+
+        @orm.type(Keeper, filters=orm.filter(Keeper))
+        class KeeperType:
+            id: auto
+            name: auto
+
+        @orm.type(Pet, filters=orm.filter(Pet))
+        class PetType:
+            name: auto
+            active_keeper: KeeperType | None
+
+        @strawberry.type
+        class Query:
+            pets: list[PetType] = orm.field.eager()
+
+        schema = orm.schema(query=Query)
+        engine = create_engine("sqlite://")
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        session.add_all(
+            [
+                Keeper(id=1, name="ann", active=True),
+                Keeper(id=7, name="former", active=False),
+                Pet(id=1, name="rex", keeper_id=1),
+                Pet(id=2, name="tom", keeper_id=7),
+                Pet(id=3, name="stray"),
+            ]
+        )
+        session.commit()
+
+        query = "{ pets(filter: {object: {activeKeeper: %s}}) { name } }"
+
+        def pets(keeper: str) -> list[str]:
+            result = schema.execute_sync(
+                query % keeper, context_value={"session": session}
+            )
+            assert result.errors is None, result.errors
+            return sorted(pet["name"] for pet in result.data["pets"])
+
+        yield pets
+        session.close()
+
+    def test_its_key_matches_only_the_row_it_lists(self, pets):
+        assert pets("{field: {id: {exact: 7}}}") == []
+        assert pets("{field: {id: {inList: [1, 7]}}}") == ["rex"]
+
+    def test_presence_counts_only_the_row_it_lists(self, pets):
+        assert pets("{isNull: false}") == ["rex"]
+        assert pets("{isNull: true}") == ["stray", "tom"]
+
+
 # -- A relationship that deletes orphans deletes the rows it lets go of ---------------
 
 WEARER = {
@@ -704,10 +782,16 @@ class TestOrphansGoAsDeletes:
         assert await stored_rows(db) == KEPT
 
     async def test_a_row_the_repo_hides_is_not_left_to_the_cascade(self, db):
+        """Refused without naming the row: its key is no more the caller's to
+        read than the row is."""
         calls: list[Any] = []
         orm = new_orm(repos={Badge: badge_repo(calls, hidden=("old",))})
-        with pytest.raises(PermissionError, match="Badge 1 .* cannot be deleted"):
+        with pytest.raises(PermissionError) as refused:
             await resolve(orm.apply_upsert(self.repoint(orm), db.info))
+        assert str(refused.value) == (
+            "The Badge the link held would be deleted by re-pointing it, and "
+            "cannot be deleted"
+        )
         assert calls == []
         assert await stored_rows(db) == KEPT
 

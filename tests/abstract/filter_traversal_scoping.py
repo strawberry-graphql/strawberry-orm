@@ -214,6 +214,18 @@ class AbstractTestScopedOrderTraversal:
         with pytest.raises(ValueError, match="Cannot order by Comment.author"):
             self.build_with_permissive_sibling()
 
+    def test_ordering_through_an_edge_scope_is_refused(self):
+        """A ``scope=`` on the relation hides authors as ``scope_rows`` would,
+        and filtering through it applies it, so ordering must not rank them."""
+        with pytest.raises(ValueError, match=r"Post\.author has a scope="):
+            self.build_with_edge_scope()
+
+    def test_query_time_backstop_covers_an_edge_scope(self):
+        schema = self.build_with_edge_scope(checked=False)
+        result = self.execute(schema, ORDER_TRAVERSAL)
+        assert result.data is None
+        assert "Cannot order by Post.author" in result.errors[0].message
+
 
 class AbstractTestScopedOrderTraversalAsync:
     """Async counterpart of :class:`AbstractTestScopedOrderTraversal`."""
@@ -252,6 +264,16 @@ class AbstractTestScopedOrderTraversalAsync:
     async def test_a_permissive_order_type_does_not_widen_a_different_one(self):
         with pytest.raises(ValueError, match="Cannot order by Comment.author"):
             self.build_with_permissive_sibling()
+
+    async def test_ordering_through_an_edge_scope_is_refused(self):
+        with pytest.raises(ValueError, match=r"Post\.author has a scope="):
+            self.build_with_edge_scope()
+
+    async def test_query_time_backstop_covers_an_edge_scope(self):
+        schema = self.build_with_edge_scope(checked=False)
+        result = await self.execute(schema, ORDER_TRAVERSAL)
+        assert result.data is None
+        assert "Cannot order by Post.author" in result.errors[0].message
 
 
 class AbstractTestJoinScopedTraversalAsync:

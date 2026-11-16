@@ -1,4 +1,5 @@
 from tests.abstract.write_path_hooks import (
+    AbstractTestAfterHooksWaitForTheChecks,
     AbstractTestAsyncLifecycleHooks,
     AbstractTestRefListNeedsAList,
 )
@@ -12,4 +13,8 @@ class TestAsyncLifecycleHooks(AbstractTestAsyncLifecycleHooks):
 
 
 class TestRefListNeedsAList(AbstractTestRefListNeedsAList):
+    pass
+
+
+class TestAfterHooksWaitForTheChecks(AbstractTestAfterHooksWaitForTheChecks):
     pass

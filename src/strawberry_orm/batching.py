@@ -18,6 +18,7 @@ implementations for the conditions.
 from __future__ import annotations
 
 import re
+import threading
 from asyncio import ensure_future
 from inspect import isawaitable
 from types import SimpleNamespace
@@ -523,8 +524,16 @@ def page_attr(field_name: str) -> str:
 
 
 def _occurrence(info: Any) -> tuple[Any, ...]:
-    """Where in the response this field is being read, list indices included."""
-    return tuple(info.path.as_list())
+    """This one read of the field: its execution, and where in the response.
+
+    Executions running at once can share a row and read it at the same path,
+    each under its own caller's scope.
+    """
+    return (execution_mark(), id(info.context), tuple(info.path.as_list()))
+
+
+#: Executions on other threads hand pages over on the same shared rows.
+_PAGES_LOCK = threading.Lock()
 
 
 def hand_over_page(root: Any, field_name: str, info: Any, page: Any) -> None:
@@ -532,25 +541,28 @@ def hand_over_page(root: Any, field_name: str, info: Any, page: Any) -> None:
 
     The row is shared: an ORM hands back the same instance wherever it is
     reached, so a page keyed only by the field would be read by an alias with
-    other arguments, or by a later request with another caller's scope.
+    other arguments, or by another request with another caller's scope.
     """
-    pages = getattr(root, page_attr(field_name), None)
-    if pages is None:
-        pages = {}
-        setattr(root, page_attr(field_name), pages)
-    pages[_occurrence(info)] = page
+    attr = page_attr(field_name)
+    with _PAGES_LOCK:
+        pages = getattr(root, attr, None)
+        if pages is None:
+            pages = {}
+            setattr(root, attr, pages)
+        pages[_occurrence(info)] = page
 
 
 def take_page(root: Any, field_name: str, info: Any) -> Any:
     """The page handed over for this occurrence, removed from the row."""
     attr = page_attr(field_name)
-    pages = getattr(root, attr, None)
-    if not pages:
-        return None
-    page = pages.pop(_occurrence(info), None)
-    if not pages:
-        delattr(root, attr)
-    return page
+    with _PAGES_LOCK:
+        pages = getattr(root, attr, None)
+        if not pages:
+            return None
+        page = pages.pop(_occurrence(info), None)
+        if not pages:
+            delattr(root, attr)
+        return page
 
 
 def _strawberry_field(info: Any) -> Any:

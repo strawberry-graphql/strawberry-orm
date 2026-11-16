@@ -4,14 +4,18 @@ A hop to the worker thread costs far more than reading a loaded value, so only
 a read that may query is sent there.
 """
 
+import asyncio
+import time
+
 import pytest
 import strawberry
 from asgiref.sync import sync_to_async
 from django.db import models
+from django.db.backends.sqlite3.base import SQLiteCursorWrapper
 from django.db.models.query_utils import DeferredAttribute
 from strawberry import relay
 
-from strawberry_orm import _async
+from strawberry_orm import StrawberryORM, _async
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
 
@@ -247,3 +251,62 @@ class TestAsyncInlineReads:
         assert result.errors is None, result.errors
         assert result.data == {"announcements": [{"text": "DOORS OPEN AT NINE"}]}
         assert hops == []
+
+    @pytest.mark.parametrize(
+        ("table", "query"),
+        [
+            ("user", "{ userPages(first: 2) { edges { node { name } } } }"),
+            ("post", "{ users { posts(first: 2) { edges { node { title } } } } }"),
+        ],
+    )
+    async def test_a_page_read_without_the_optimizer_leaves_the_loop_running(
+        self, seed, User, Post, monkeypatch, table, query
+    ):
+        """The page is read in the worker thread and awaited, not waited on."""
+        delay = 0.3
+        execute = SQLiteCursorWrapper.execute
+
+        def slow(self, sql, params=None):
+            if f'FROM "{table}"' in sql:
+                time.sleep(delay)
+            return execute(self, sql, params)
+
+        monkeypatch.setattr(SQLiteCursorWrapper, "execute", slow)
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+        @orm.type(Post)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @orm.type(User)
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+        @strawberry.type
+        class Query:
+            users: list[UserNode] = orm.field.eager()
+            user_pages: ORMListConnection[UserNode] = orm.connection.eager()
+
+        schema = orm.schema(query=Query, optimizer=False)
+        gaps = []
+        done = asyncio.Event()
+
+        async def tick():
+            last = time.perf_counter()
+            while not done.is_set():
+                await asyncio.sleep(0.01)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0.02)
+        result = await schema.execute(query)
+        done.set()
+        await ticker
+
+        assert result.errors is None, result.errors
+        assert max(gaps) < delay / 2

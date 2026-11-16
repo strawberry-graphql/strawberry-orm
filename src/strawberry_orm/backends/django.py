@@ -912,7 +912,9 @@ class DjangoBackend(BaseBackend):
         except Exception:  # pragma: no cover - defensive
             return None
         typed = tuple((type(param).__name__, repr(param)) for param in params)
-        return repr((sql, typed))
+        # The same SQL read from two databases (a tenant's, a replica) reads
+        # different rows, so the alias is part of what the query is.
+        return repr((query.db, sql, typed))
 
     def apply_key_filter(
         self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]

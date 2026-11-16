@@ -6,15 +6,17 @@ import json
 import threading
 import time
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 
 import pytest
 import strawberry
-from graphql import ValidationRule
+from graphql import NoSchemaIntrospectionCustomRule, ValidationRule
 from graphql.language.parser import Parser
 from mcp import Client
 from mcp.server.mcpserver.tools import Tool
 from strawberry.extensions import (
     AddValidationRules,
+    DisableIntrospection,
     MaskErrors,
     MaxTokensLimiter,
     ParserCache,
@@ -24,7 +26,7 @@ from strawberry.extensions import (
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
-from strawberry_orm.contrib.mcp.checks import check_operation
+from strawberry_orm.contrib.mcp.checks import check_operation, refuses_introspection
 
 from .fakes import OPERATIONS, RUNS, Mutation, Query, relay_schema, schema
 
@@ -627,6 +629,59 @@ async def test_the_schema_can_leave_out_descriptions():
 
     assert "Where a post is in its life." not in sdl
     assert "enum Status" in sdl
+
+
+@pytest.mark.parametrize(
+    "refusing",
+    [
+        DisableIntrospection,
+        lambda: AddValidationRules([NoSchemaIntrospectionCustomRule]),
+    ],
+    ids=["DisableIntrospection", "a factory of the rule"],
+)
+def test_a_schema_that_refuses_introspection_must_say_to_share_it(refusing):
+    closed = strawberry.Schema(query=Query, mutation=Mutation, extensions=[refusing])
+    with pytest.raises(ValueError, match="refuses introspection"):
+        mcp_server(closed, graphql_tool=True)
+
+
+def test_a_schema_without_strawberrys_extensions_refuses_nothing():
+    assert not refuses_introspection(SimpleNamespace(_schema=schema._schema))
+    assert not refuses_introspection(schema)
+
+
+async def test_a_schema_that_refuses_introspection_can_leave_its_sdl_out():
+    closed = strawberry.Schema(
+        query=Query, mutation=Mutation, extensions=[DisableIntrospection]
+    )
+    server = mcp_server(closed, graphql_tool=GraphQLTool(schema_tool=False))
+
+    async with Client(server) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+        ran = await client.call_tool(
+            "graphql", {"query": "{ posts(first: 1) { title } }"}
+        )
+        asked = await client.call_tool(
+            "graphql", {"query": "{ __schema { types { name } } }"}
+        )
+
+    assert list(tools) == ["graphql"]
+    assert "graphql_schema" not in tools["graphql"].description
+    assert ran.structured_content == {"data": {"posts": [{"title": "Hello"}]}}
+    assert asked.is_error
+    assert asked.content[0].text.endswith(": Introspection is not available here.")
+
+
+async def test_a_schema_that_refuses_introspection_can_share_its_sdl_anyway():
+    closed = strawberry.Schema(
+        query=Query, mutation=Mutation, extensions=[DisableIntrospection]
+    )
+    server = mcp_server(closed, graphql_tool=GraphQLTool(schema_tool=True))
+
+    async with Client(server) as client:
+        sdl = (await client.call_tool("graphql_schema", {})).content[0].text
+
+    assert "type Query {" in sdl
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import typing as _typing
+import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property, partial, wraps
 from inspect import Parameter, isawaitable, iscoroutinefunction, signature
@@ -29,7 +30,6 @@ from strawberry_orm._async import (
     converting_resolver,
     in_async_context,
     keep_annotations,
-    materialize_result,
     run_orm_work,
     run_orm_work_blocking,
 )
@@ -379,12 +379,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             self._stash_context(info, result, group_by=group_by, order=order)
             result = _ordered(self._backend, result, self._model, info, order)
             if not self._defer_query_materialization(info):
-                result = materialize_result(
-                    self._backend,
-                    result,
-                    info,
-                    sync=True,
-                )
+                result = self._backend.materialize_query(result, info)
 
         return result
 
@@ -444,6 +439,10 @@ class _AutoFilterOrderExtension(FieldExtension):
         **kwargs: Any,
     ) -> Any:
         result = next_(source, info, **self._resolver_kwargs(kwargs))
+        if in_async_context() and not self._defer_query_materialization(info):
+            # Under async execution a sync field still resolves on the event
+            # loop: rows waited on here would hold the loop up while they load.
+            return self._resolve_on_the_loop(result, info, kwargs)
         if isawaitable(result) and not self._is_query(result):
             # An async-safe Django resolver hands its query back from a worker
             # thread. Filtered and stashed only once it is a query, or the
@@ -473,8 +472,18 @@ class _AutoFilterOrderExtension(FieldExtension):
         result = next_(source, info, **self._resolver_kwargs(kwargs))
         if isawaitable(result):
             result = await await_maybe(result)
+        return await self._filtered_async(result, info, kwargs)
 
-        self._resolver_kwargs(kwargs)
+    async def _resolve_on_the_loop(
+        self, result: Any, info: Any, kwargs: dict[str, Any]
+    ) -> Any:
+        if isawaitable(result) and not self._is_query(result):
+            result = await result
+        return await self._filtered_async(result, info, kwargs)
+
+    async def _filtered_async(
+        self, result: Any, info: Any, kwargs: dict[str, Any]
+    ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
             materialize = self._backend.materialize_query
             if iscoroutinefunction(materialize):
@@ -507,6 +516,8 @@ class _AutoFilterOrderExtension(FieldExtension):
                     thread_sensitive=True,
                 )
             )
+            if isawaitable(result) and not self._is_query(result):
+                result = await result
             return self._cast_result(result)
 
         result = self._apply(
@@ -1321,6 +1332,17 @@ def _build_grouped_connection(
     return NewConnection
 
 
+def _warn_writes_nothing(name: str) -> None:
+    warnings.warn(
+        f"orm.{name}() is deprecated: it builds a field with no resolver, which "
+        f"writes nothing and asks no AbstractRepo. Write a @strawberry.mutation "
+        f"that writes through orm.apply_upsert() or orm.apply_ref_list(), which "
+        f"hold the write to the model's repo.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
 class StrawberryORM:
     """Main entry point for strawberry-orm.
 
@@ -1474,12 +1496,18 @@ class StrawberryORM:
     # -- Mutations -----------------------------------------------------------
 
     def create(self, input_type: type, **kwargs: Any) -> Any:
+        """Deprecated: a field with no resolver, which writes nothing."""
+        _warn_writes_nothing("create")
         return self._backend.create(input_type, **kwargs)
 
     def update(self, input_type: type, **kwargs: Any) -> Any:
+        """Deprecated: a field with no resolver, which writes nothing."""
+        _warn_writes_nothing("update")
         return self._backend.update(input_type, **kwargs)
 
     def delete(self, **kwargs: Any) -> Any:
+        """Deprecated: a field with no resolver, which writes nothing."""
+        _warn_writes_nothing("delete")
         return self._backend.delete(**kwargs)
 
     # -- Query application ----------------------------------------------------

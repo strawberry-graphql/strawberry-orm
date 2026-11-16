@@ -175,6 +175,45 @@ class TestScopedOrderTraversal(AbstractTestScopedOrderTraversal):
     def execute(self, schema, query):
         return schema.execute_sync(query)
 
+    def build_with_edge_scope(self, checked=True):
+        """The user type is unscoped; ``PT.author`` shows only Alice."""
+        orm = StrawberryORM.for_django(
+            lazy_resolution="off",
+            warn_missing_scope=False,
+        )
+
+        @orm.order_type(DjangoUser)
+        class UserOrder:
+            name: auto
+
+        @orm.order_type(DjangoPost)
+        class PostOrder:
+            title: auto
+            author: auto
+
+        @orm.type(DjangoUser)
+        class UT:
+            id: auto
+            name: auto
+
+        @orm.type(DjangoPost, order=PostOrder)
+        class PT:
+            id: auto
+            title: auto
+            author: UT | None = orm.field.auto(
+                scope=lambda qs, info: qs.filter(name="Alice")
+            )
+
+        @strawberry.type
+        class Query:
+            posts: list[PT] = orm.field.auto()
+
+        if not checked:
+            return strawberry.Schema(
+                query=Query, extensions=[orm.optimizer_extension()]
+            )
+        return orm.schema(query=Query)
+
     def build_with_permissive_sibling(self):
         """``PostOrder`` captures the strict comment order; a permissive one is
         registered for the same model afterwards."""

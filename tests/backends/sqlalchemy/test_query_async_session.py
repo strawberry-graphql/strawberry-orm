@@ -1,12 +1,18 @@
 """AsyncSession-specific tests for the SQLAlchemy backend."""
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 import strawberry
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from strawberry import relay
 
-from strawberry_orm import StrawberryORM
+from strawberry_orm import AbstractRepo, StrawberryORM
+from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
+from strawberry_orm.upserts import _declared_fields
 from tests.backends.sqlalchemy.fixtures import main_schema
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
@@ -241,6 +247,38 @@ class TestAsyncSessionExecution:
             "GraphQL Guide",
         ]
 
+    async def test_a_page_without_the_optimizer_is_read_on_an_async_session(
+        self, async_seed
+    ):
+        """With no optimizer, the field reads its own rows: on an async
+        session a coroutine, awaited on the loop the session belongs to."""
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite",
+            session_getter=lambda info: info.context["session"],
+            warn_missing_scope=False,
+        )
+
+        @orm.type(SAPost, filters=orm.filter(SAPost))
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        @strawberry.type
+        class Query:
+            posts: ORMListConnection[PostNode] = orm.connection.eager()
+
+        schema = orm.schema(query=Query, optimizer=False)
+        result = await schema.execute(
+            '{ posts(first: 5, filter: {field: {title: {contains: "o"}}}) '
+            "{ edges { node { title } } } }",
+            context_value={"session": async_seed},
+        )
+        assert result.errors is None, result.errors
+        assert [e["node"]["title"] for e in result.data["posts"]["edges"]] == [
+            "Hello World",
+            "Draft Post",
+        ]
+
 
 class TestAsyncSessionMutations:
     @pytest.mark.asyncio
@@ -464,3 +502,69 @@ class TestAsyncSessionMutations:
         all_tag_names = sorted(tag["name"] for tag in query_result.data["tags"])
         assert "python" not in all_tag_names
         assert "patched-async" in all_tag_names
+
+
+class SyncCrudTagRepo(AbstractRepo[SATag]):
+    """Overrides only the sync CRUD, calling the defaults through ``super()``."""
+
+    saved: list[str] = []
+
+    def _create(self, model, data, info):
+        return super()._create(model, {**data, "name": f"{data['name']}!"}, info)
+
+    def _get(self, model, pk, info):
+        row = super()._get(model, pk, info)
+        return None if row is not None and row.name == "rust" else row
+
+    def _save(self, instance, info):
+        self.saved.append(instance.name)
+        super()._save(instance, info)
+
+    def _delete(self, instance, info):
+        instance.name = f"deleted:{instance.name}"
+        self._save(instance, info)
+
+
+class TestSyncRepoOverridesOnAnAsyncSession:
+    @pytest.mark.asyncio
+    async def test_a_ref_list_creates_and_deletes_through_them(self, async_seed):
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite", repos={SATag: SyncCrudTagRepo}
+        )
+
+        @strawberry.input
+        class CreateTagInput:
+            name: str
+
+        ref = orm.ref(SATag, create=CreateTagInput, delete=True)
+        post = await async_seed.get(SAPost, 1)
+        info = SimpleNamespace(context={"session": async_seed})
+        delete = _declared_fields(ref)["delete"]
+        await orm.apply_ref_list(
+            post,
+            "tags",
+            [ref(delete=delete(id="1")), ref(create=CreateTagInput(name="new"))],
+            info,
+        )
+        await async_seed.commit()
+        names = await async_seed.scalars(select(SATag.name).order_by(SATag.id))
+        assert list(names) == ["deleted:python", "graphql", "rust", "new!"]
+
+    @pytest.mark.asyncio
+    async def test_the_async_defaults_call_them(self, async_seed):
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        repo = SyncCrudTagRepo(orm.backend)
+        info = SimpleNamespace(context={"session": async_seed})
+        assert await repo._get_async(SATag, 3, info) is None
+        python = await repo._get_async(SATag, 1, info)
+        await repo._save_async(python, info)
+        assert SyncCrudTagRepo.saved[-1:] == ["python"]
+
+    @pytest.mark.asyncio
+    async def test_a_sync_default_outside_them_refuses_an_async_session(
+        self, async_seed
+    ):
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")
+        info = SimpleNamespace(context={"session": async_seed})
+        with pytest.raises(TypeError, match="call its \\*_async variant"):
+            AbstractRepo(orm.backend)._get(SATag, 1, info)

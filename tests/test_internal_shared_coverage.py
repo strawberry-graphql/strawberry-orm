@@ -69,9 +69,13 @@ class TestInternalSharedCoverage:
         class NameInput:
             name: str
 
-        assert orm.create(NameInput) is not None
-        assert orm.update(NameInput) is not None
-        assert orm.delete() is not None
+        for build in (
+            lambda: orm.create(NameInput),
+            lambda: orm.update(NameInput),
+            lambda: orm.delete(),
+        ):
+            with pytest.warns(DeprecationWarning, match="writes nothing"):
+                assert build() is not None
 
     @pytest.mark.asyncio
     async def test_auto_field_and_extension_defensive_paths(self):
@@ -113,7 +117,8 @@ class TestInternalSharedCoverage:
             None,
             None,
         )
-        assert resolved == ["value"]
+        # On a running loop the read is awaited there, not waited on.
+        assert await resolved == ["value"]
 
     def test_base_backend_has_a_connection_read_pages_whole(self):
         base = BaseBackend(warn_missing_scope=False)

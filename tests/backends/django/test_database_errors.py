@@ -213,6 +213,65 @@ def test_a_relation_read_without_the_optimizer_is_reported_plainly(ledgers, quer
     assert_refused(build(refuse_lines=True, optimized=False).execute_sync(query))
 
 
+def build_pages():
+    """Connections that read their own pages, in a schema with no optimizer."""
+    orm = StrawberryORM.for_django(warn_missing_scope=False, enable_regex_filters=True)
+
+    @orm.type(LedgerLine, filters=orm.filter(LedgerLine))
+    class LineNode(relay.Node):
+        id: relay.NodeID[int]
+        memo: auto
+
+    @orm.type(Ledger, filters=orm.filter(Ledger))
+    class LedgerNode(relay.Node):
+        id: relay.NodeID[int]
+        memo: auto
+        lines: ORMListConnection[LineNode] = orm.connection.eager()
+
+    @strawberry.type
+    class Query:
+        ledgers: list[LedgerNode] = orm.field.eager()
+        ledger_pages: ORMListConnection[LedgerNode] = orm.connection.eager()
+
+    return orm.schema(query=Query, optimizer=False)
+
+
+PAGES = {
+    "a page": "{ ledgerPages(first: 2, filter: %s) { edges { node { memo } } } }",
+    "a relation's page": (
+        "{ ledgers { lines(first: 2, filter: %s) { edges { node { memo } } } } }"
+    ),
+}
+
+
+@pytest.mark.parametrize("read", list(PAGES))
+def test_a_page_read_without_the_optimizer_is_reported_plainly(ledgers, read):
+    assert_refused(build_pages().execute_sync(PAGES[read] % BAD))
+
+
+@pytest.mark.parametrize("read", list(PAGES))
+async def test_an_async_page_read_without_the_optimizer_is_reported_plainly(
+    ledgers, read
+):
+    assert_refused(await build_pages().execute(PAGES[read] % BAD))
+
+
+async def test_an_async_page_on_a_missing_table_is_reported_plainly(ledgers):
+    def rename(old, new):
+        with connection.cursor() as cursor:
+            cursor.execute(f'ALTER TABLE "{old}" RENAME TO "{new}"')
+
+    table = LedgerLine._meta.db_table
+    await sync_to_async(rename)(table, f"moved_{table}")
+    try:
+        result = await build_pages().execute(
+            "{ ledgers { lines(first: 2) { edges { node { memo } } } } }"
+        )
+    finally:
+        await sync_to_async(rename)(f"moved_{table}", table)
+    assert_refused(result)
+
+
 @pytest.mark.parametrize(
     "query", ["{ ledgers { lines { memo } } }", "{ lines { ledger { memo } } }"]
 )

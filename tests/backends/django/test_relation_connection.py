@@ -5,6 +5,7 @@ Built from the annotation alone it would query the whole table, because
 loop rebuilds it once the model is known.
 """
 
+import asyncio
 import base64
 
 import pytest
@@ -13,6 +14,7 @@ from django.db import connection
 from django.db.models.signals import post_init
 from django.test.utils import CaptureQueriesContext
 from strawberry import relay
+from strawberry.permission import BasePermission, PermissionExtension
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.relay import ORMListConnection
@@ -249,6 +251,68 @@ class TestRelationConnection:
         assert all(
             not k.startswith("_orm_connection_page") for u in users for k in vars(u)
         )
+
+    def test_executions_at_once_each_take_their_own_page(self, seed, User, Post):
+        """Rows the app keeps between requests are shared, and an async
+        permission lets another execution hand its page over on the same row
+        and path before this one takes its own."""
+        kept = list(User.objects.order_by("id"))
+        waiting = []
+        all_handed_over = asyncio.Event()
+
+        class SignedIn(BasePermission):
+            message = "sign in"
+
+            async def has_permission(self, source, info, **kwargs) -> bool:
+                waiting.append(source)
+                if len(waiting) == 2 * len(kept):
+                    all_handed_over.set()
+                await all_handed_over.wait()
+                return True
+
+        orm = _orm()
+
+        @orm.type(Post)
+        class PostNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+            @classmethod
+            def scope_rows(cls, qs, info):
+                return qs if info.context["admin"] else qs.filter(is_published=True)
+
+        @orm.type(User)
+        class UserNode:
+            name: auto
+            posts: ORMListConnection[PostNode] = orm.connection.eager(
+                extensions=[PermissionExtension(permissions=[SignedIn()])]
+            )
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def users(self) -> list[UserNode]:
+                return kept
+
+        schema = orm.schema(query=Query)
+        query = "{ users { name posts { totalCount edges { node { title } } } } }"
+
+        async def both():
+            return await asyncio.gather(
+                *(
+                    schema.execute(query, context_value={"admin": admin})
+                    for admin in (False, True)
+                )
+            )
+
+        def bob(result):
+            assert result.errors is None, result.errors
+            posts = next(u for u in result.data["users"] if u["name"] == "Bob")["posts"]
+            return posts["totalCount"], [e["node"]["title"] for e in posts["edges"]]
+
+        guest, admin = asyncio.run(both())
+        assert bob(guest) == (0, [])
+        assert bob(admin) == (1, ["Draft Post"])
 
     def test_a_page_size_over_the_limit_reads_no_rows(self, seed, User, Post):
         result, posts = self._built(

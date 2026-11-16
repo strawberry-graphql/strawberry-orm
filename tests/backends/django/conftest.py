@@ -9,7 +9,12 @@ if not settings.configured:
             "default": {
                 "ENGINE": "django.db.backends.sqlite3",
                 "NAME": ":memory:",
-            }
+            },
+            # Only compiled against, to tell one database's queries from another's.
+            "replica": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": ":memory:",
+            },
         },
         INSTALLED_APPS=[
             "django.contrib.contenttypes",

@@ -159,6 +159,15 @@ def _equates_only(join: Any, pairs: Any) -> bool:
     )
 
 
+def _sa_joins_on_keys(prop: Any) -> bool:
+    """Whether relationship *prop*'s join compares its key columns and no more."""
+    if prop.secondary is None:
+        return _equates_only(prop.primaryjoin, list(prop.local_remote_pairs))
+    return _equates_only(prop.primaryjoin, prop.synchronize_pairs) and (
+        _equates_only(prop.secondaryjoin, prop.secondary_synchronize_pairs)
+    )
+
+
 def _join_keys(rel: Any) -> tuple[Any, Any, tuple[Any, Any] | None] | None:
     """The columns a relation joins on, if that is all its join says.
 
@@ -212,6 +221,23 @@ def _related_rows(rows: list[Any], name: str) -> list[Any]:
 def _held(row: Any, name: str) -> Any:
     """What *name* holds on *row*: the collection, the related row or ``None``."""
     return sa_inspect(row).dict.get(name)
+
+
+def _members(loaded: dict[str, Any], name: str) -> Any:
+    """The rows relation *name* holds in *loaded*, whatever its collection."""
+    value = loaded.get(name)
+    if isinstance(value, dict):
+        return value.values()
+    if isinstance(value, (list, set, tuple)):
+        return value
+    return (value,)
+
+
+def _mark_scoped(marks: list[tuple[Any, str, Any]]) -> None:
+    from strawberry_orm.lazy_resolution import mark_relations_scoped
+
+    for row, name, token in marks:
+        mark_relations_scoped([row], [name], scope=token, held=_held)
 
 
 def _keep_only(rows: list[Any], name: str, load: _PlannedLoad, kept: set[int]) -> None:
@@ -631,7 +657,58 @@ class SQLAlchemyBackend(BaseBackend):
             for name, value in query.items()
         ]
         stmt = repo.scope_query(select(model).where(*conditions), info)
-        return stmt.limit(2)
+        return self._scope_subclass_writes(stmt, repo, model, info).limit(2)
+
+    def _scope_subclass_writes(
+        self, stmt: Any, repo: Any, model: type, info: Any
+    ) -> Any:
+        """*stmt* over *model*, less the rows of a subclass its own repo hides.
+
+        Such a row is written through its own model's repo (see
+        ``UpsertWriter._owner``), so counting a match on one that repo hides
+        would answer for a row the caller cannot reach. A subclass of it with
+        a repo of its own answers for its own rows.
+        """
+        from sqlalchemy import or_, select
+
+        mapper = sa_inspect(model)
+        if mapper.polymorphic_on is None:
+            return stmt
+        returned = set(mapper.polymorphic_map.values())
+        apart: dict[type, Any] = {}
+        for sub in mapper.self_and_descendants:
+            if sub is mapper or sub not in returned or sub.concrete:
+                continue
+            own = self.get_repo(sub.class_)
+            if own is not None and not (
+                type(own) is type(repo) and own.model is repo.model
+            ):
+                apart[sub.class_] = own
+
+        def rows_of(cls: type) -> Any:
+            return getattr(cls, _get_sa_pk_column(cls).key)
+
+        key = _get_sa_pk_column(model)
+        for cls, own in apart.items():
+            scoped = own.scope_query(select(cls), info)
+            nearer = [
+                other for other in apart if other is not cls and issubclass(other, cls)
+            ]
+            stmt = stmt.where(
+                or_(
+                    key.not_in(select(rows_of(cls)).correlate(None)),
+                    key.in_(
+                        scoped.with_only_columns(rows_of(cls))
+                        .correlate(None)
+                        .scalar_subquery()
+                    ),
+                    *(
+                        key.in_(select(rows_of(other)).correlate(None))
+                        for other in nearer
+                    ),
+                )
+            )
+        return stmt
 
     def _find_for_upsert(
         self, repo: Any, model: type, query: dict[str, Any], info: Any
@@ -723,12 +800,16 @@ class SQLAlchemyBackend(BaseBackend):
 
         subq = _unordered(query).subquery()
         agg_cols: list[Any] = []
+        # The subquery's columns are keyed by their names in the database,
+        # which can belong to another attribute than the one of that name.
+        attrs = sa_inspect(self.query_model(query)).mapper.column_attrs
 
         if requested.get("count"):
             agg_cols.append(func.count().label("_count"))
         for func_name in _AGGREGATES:
             for fname in requested.get(func_name, []):
-                col = subq.c.get(fname)
+                prop = attrs.get(fname)
+                col = prop and subq.corresponding_column(prop.columns[0])
                 if col is not None:
                     agg_cols.append(
                         _sa_aggregate(func_name, col, self._dialect).label(
@@ -778,12 +859,7 @@ class SQLAlchemyBackend(BaseBackend):
         )
 
     def relation_joins_on_keys(self, model: type, relation: str) -> bool:
-        prop = sa_inspect(model).relationships[relation]
-        if prop.secondary is None:
-            return _equates_only(prop.primaryjoin, list(prop.local_remote_pairs))
-        return _equates_only(prop.primaryjoin, prop.synchronize_pairs) and (
-            _equates_only(prop.secondaryjoin, prop.secondary_synchronize_pairs)
-        )
+        return _sa_joins_on_keys(sa_inspect(model).relationships[relation])
 
     def apply_grouping(
         self,
@@ -1852,9 +1928,14 @@ class SQLAlchemyBackend(BaseBackend):
             window = (yield self._open_window(session, [])) if trusted else None
             rows = yield self._execute_in(session, loaded)
             yield from self._keyed_loads(session, rows, plan)
+            marks = (
+                self._scoped_marks([(rows, plan)], trusted, before=window.unloaded)
+                if window is not None
+                else []
+            )
             rows = yield from self._scope_apart(rows, entity, plan, info)
             if window is not None and window.kept():
-                self._mark_scoped_edges(rows, trusted, before=window.unloaded)
+                _mark_scoped(marks)
             return rows
 
         return _drive(steps())
@@ -1900,7 +1981,8 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy import select
 
-        planned, groups, edges = self._relation_load_groups(store, instances, info)
+        walks, groups, edges = self._relation_load_groups(store, instances, info)
+        planned = [row for rows, _plan in walks for row in rows]
         if not planned:
             return []
 
@@ -1911,6 +1993,9 @@ class SQLAlchemyBackend(BaseBackend):
             if _marks_some(edges):
                 for session in sessions.values():
                     windows.append((yield self._open_window(session, planned)))
+            before: dict[int, set[str]] = {}
+            for window in windows:
+                before.update(window.unloaded)
             for session, model, rows, level in groups:
                 reread = {
                     name: load
@@ -1928,26 +2013,30 @@ class SQLAlchemyBackend(BaseBackend):
                     copies = yield self._execute_in(session, stmt.options(*options))
                     _adopt(rows, copies, pk_name, reread)
                 yield from self._keyed_loads(session, rows, level, every=True)
+            marks = self._scoped_marks(walks, edges, before=before) if windows else []
+            for _session, model, rows, level in groups:
                 # The rows themselves were checked before anything was loaded.
                 yield from self._scope_apart(rows, model, level, info)
             if windows and all(window.kept() for window in windows):
-                before: dict[int, set[str]] = {}
-                for window in windows:
-                    before.update(window.unloaded)
-                self._mark_scoped_edges(planned, edges, before=before)
+                _mark_scoped(marks)
             return planned
 
         return _drive(steps())
 
     def _relation_load_groups(
         self, store: Any, instances: list[Any], info: Any
-    ) -> tuple[list[Any], list[tuple[Any, type, list[Any], Any]], list[Any]]:
+    ) -> tuple[
+        list[tuple[list[Any], dict[str, _PlannedLoad]]],
+        list[tuple[Any, type, list[Any], Any]],
+        list[Any],
+    ]:
         """What each session's rows still need loaded.
 
         Rows are grouped by the session they belong to; only rows in none fall
         back to the request's. Each group's plan is cut down to the relations
         some row has not loaded, so a group whose rows hold everything already
-        costs nothing.
+        costs nothing. Also returns the rows with a plan, each with the whole
+        of it.
         """
         fallback: list[Any] = []
         by_session: dict[tuple[int, type], tuple[Any, list[Any]]] = {}
@@ -1960,18 +2049,18 @@ class SQLAlchemyBackend(BaseBackend):
             key = (id(session), type(instance))
             by_session.setdefault(key, (session, []))[1].append(instance)
 
-        planned: list[Any] = []
+        walks: list[tuple[list[Any], dict[str, _PlannedLoad]]] = []
         groups: list[tuple[Any, type, list[Any], Any]] = []
         edges: list[Any] = []
         for (_session_id, model), (session, rows) in by_session.items():
             plan, scoped = self._plan_relation_loads(store, model, info)
             if not plan:
                 continue
-            planned.extend(rows)
+            walks.append((rows, plan))
             edges.extend(scoped)
             for level_model, level_rows, level in _unloaded_levels(model, rows, plan):
                 groups.append((session, level_model, level_rows, level))
-        return planned, groups, edges
+        return walks, groups, edges
 
     def _row_session(self, row: Any) -> Any:
         """The session *row* belongs to, as the caller holds it, or ``None``."""
@@ -2034,19 +2123,25 @@ class SQLAlchemyBackend(BaseBackend):
             add(obj)
         return snap
 
-    def _mark_scoped_edges(
+    def _scoped_marks(
         self,
-        roots: Any,
+        walks: list[tuple[list[Any], dict[str, _PlannedLoad]]],
         edges: list[tuple[type, str, Any]],
         *,
         before: dict[int, set[str]],
-    ) -> None:
-        """Mark relations a scoped loader populated during this query.
+    ) -> list[tuple[Any, str, Any]]:
+        """The relations a scoped loader populated during this query, and its scope.
 
-        An object missing from *before* was created by the load, so every
-        relation it now holds came from that loader. An object that was
-        already persistent is marked only for relations that moved from
-        unloaded to loaded.
+        Each of *walks* is rows and the plan they were loaded by. An object
+        missing from *before* was created by the load, so every relation it
+        now holds came from a loader. An object that was already persistent
+        counts only relations that moved from unloaded to loaded.
+
+        Only the planned loader's own relations count: ones planned on every
+        path that reaches the object. Reached where the plan leaves the
+        relation out, the object may have had it filled there by SQLAlchemy's
+        own loader (a ``lazy="joined"`` mapping), unscoped, and a planned
+        loader leaves alone an object that already holds the relation.
 
         Each edge comes with the scope it was loaded with. One relation planned
         in two places under different scopes cannot tell which load filled an
@@ -2056,42 +2151,52 @@ class SQLAlchemyBackend(BaseBackend):
 
         from sqlalchemy import inspect as sa_inspect
 
-        from strawberry_orm.lazy_resolution import mark_relations_scoped
-
         by_model: dict[type, dict[str, Any]] = defaultdict(dict)
         for model, name, token in edges:
             names = by_model[model]
             names[name] = token if names.get(name, token) is token else _UNMARKED
-        seen: set[int] = set()
-
-        def walk(obj: Any) -> None:
-            if obj is None or id(obj) in seen or not self.is_model_instance(obj):
-                return
-            seen.add(id(obj))
+        # The plan's level each object is reached at; ``None`` past its end.
+        pending: list[tuple[Any, dict[str, _PlannedLoad] | None]] = [
+            (row, plan) for rows, plan in walks for row in rows
+        ]
+        seen: set[tuple[int, int]] = set()
+        reached: dict[int, tuple[Any, Any]] = {}
+        unplanned: set[tuple[int, str]] = set()
+        while pending:
+            obj, level = pending.pop()
+            if (
+                obj is None
+                or (id(obj), id(level)) in seen
+                or not self.is_model_instance(obj)
+            ):
+                continue
+            seen.add((id(obj), id(level)))
             state = sa_inspect(obj)
-            # Computed afresh on every read, so read once per object.
-            unloaded = state.unloaded
-            was = before.get(id(obj))
+            if id(obj) not in reached:
+                # Computed afresh on every read, so read once per object.
+                reached[id(obj)] = (obj, state.unloaded)
+            unloaded = reached[id(obj)][1]
+            # Iterating this namespace yields relationship objects, not names.
+            for name in state.mapper.relationships.keys():  # noqa: SIM118
+                if name in unloaded:
+                    continue
+                load = level.get(name) if level is not None else None
+                if load is None:
+                    unplanned.add((id(obj), name))
+                below = load.children if load is not None else None
+                pending.extend((child, below) for child in _members(state.dict, name))
+        marks: list[tuple[Any, str, Any]] = []
+        for key, (obj, unloaded) in reached.items():
+            was = before.get(key)
             for name, token in by_model.get(type(obj), {}).items():
                 if (
                     token is not _UNMARKED
                     and name not in unloaded
                     and (was is None or name in was)
+                    and (key, name) not in unplanned
                 ):
-                    mark_relations_scoped([obj], [name], scope=token, held=_held)
-            # Iterating this namespace yields relationship objects, not names.
-            for name in state.mapper.relationships.keys():  # noqa: SIM118
-                if name in unloaded:
-                    continue
-                value = state.dict.get(name)
-                if isinstance(value, list):
-                    for child in value:
-                        walk(child)
-                else:
-                    walk(value)
-
-        for root in roots:
-            walk(root)
+                    marks.append((obj, name, token))
+        return marks
 
     # -- Helpers -------------------------------------------------------------
 
@@ -3177,9 +3282,12 @@ def _build_sa_filter(
                         # "Has a related row" must mean "has a *visible* one".
                         present = relationship_prop.has(scope_criteria)
                         return (not_(present) if is_null_val else present), query
-                    if relationship_prop.property.direction.name != "MANYTOONE":
+                    if relationship_prop.property.direction.name != "MANYTOONE" or (
+                        not _sa_joins_on_keys(relationship_prop.property)
+                    ):
                         # A reverse one-to-one's local column is this row's
-                        # own key, which is never NULL.
+                        # own key, which is never NULL. A join that says more
+                        # than its keys can leave out the row a key names.
                         present = relationship_prop.has()
                         return (not_(present) if is_null_val else present), query
                     local_col = list(relationship_prop.property.local_columns)[0]
@@ -3306,13 +3414,18 @@ def _sa_custom_filter_clause(
 def _sa_reference_key(relationship_prop: Any) -> tuple[Any, str] | None:
     """The parent's foreign key column and the related key it holds.
 
-    Only a many-to-one whose foreign key holds the related primary key: the
-    key is then on the parent's own row, and comparing it needs no join.
+    Only a many-to-one whose foreign key holds the related primary key, and
+    whose join says nothing more: the key is then on the parent's own row,
+    and comparing it needs no join.
     """
     from sqlalchemy.orm import MANYTOONE
 
     prop = relationship_prop.property
-    if prop.direction is not MANYTOONE or len(prop.local_remote_pairs) != 1:
+    if (
+        prop.direction is not MANYTOONE
+        or len(prop.local_remote_pairs) != 1
+        or not _sa_joins_on_keys(prop)
+    ):
         return None
     local_col, remote_col = prop.local_remote_pairs[0]
     primary_key = prop.mapper.primary_key

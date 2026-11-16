@@ -69,6 +69,28 @@ def exposed_schema(
     )
 
 
+def refuses_introspection(schema: Any) -> bool:
+    """Whether the Strawberry *schema* refuses ``__schema`` and ``__type``.
+
+    Strawberry's ``DisableIntrospection`` is ``AddValidationRules`` with
+    graphql-core's ``NoSchemaIntrospectionCustomRule``.
+    """
+    from graphql.validation import NoSchemaIntrospectionCustomRule
+    from strawberry.extensions import AddValidationRules
+
+    get_extensions = getattr(schema, "get_extensions", None)
+    if get_extensions is None:
+        return False
+    return any(
+        isinstance(extension, AddValidationRules)
+        and any(
+            issubclass(rule, NoSchemaIntrospectionCustomRule)
+            for rule in extension.validation_rules
+        )
+        for extension in get_extensions()
+    )
+
+
 def exposed_sdl(schema: GraphQLSchema, *, descriptions: bool = True) -> str:
     """*schema* printed as SDL, without its descriptions unless asked."""
     sdl = print_schema(schema)
@@ -150,6 +172,7 @@ def check_operation(
     allowed: set[OperationType],
     max_depth: int,
     max_tokens: int,
+    schema_tool: bool = True,
 ) -> tuple[list[str], OperationType | None]:
     """Errors that stop ``query`` from running, and the kind of operation it is.
 
@@ -187,6 +210,8 @@ def check_operation(
     finder = _FindIntrospection()
     visit(document, finder)
     if finder.found:
+        if not schema_tool:
+            return ["Introspection is not available here."], kind
         return [
             "Introspection is not available here; call graphql_schema for the schema."
         ], kind

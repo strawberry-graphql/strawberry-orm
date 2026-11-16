@@ -102,10 +102,11 @@ class AbstractTestAsyncLifecycleHooks(Blog):
             assert await tag_names(writes) == ["python", "rust", "go"]
             return
         await apply()
+        # The after hooks wait for the whole list to pass its checks.
         assert log == [
+            ("deleting", "GOLANG"),
             ("created", "NEW"),
             ("updated", "GOLANG"),
-            ("deleting", "GOLANG"),
         ]
         assert await names(writes, blog.hello, "tags") == ["python", "NEW"]
 
@@ -143,6 +144,52 @@ class AbstractTestAsyncLifecycleHooks(Blog):
             await writes.upsert(orm, payload)
         assert log == [("created", "ZIG"), ("updated", "RUSTLANG")]
         assert await tag_names(writes) == ["python", "RUSTLANG", "go", "ZIG"]
+
+
+# -- After hooks wait for every check ---------------------------------------------
+
+
+def notifying_repo(outbox: list[tuple[str, str]]) -> type:
+    """Sends its news from ``on_after_*``; a tag named ``spam`` may not be linked."""
+
+    class NotifyingRepo(AbstractRepo):
+        def can_link(self, parent, field, instance, info):
+            return instance.name != "spam"
+
+        def on_after_create(self, instance, info):
+            outbox.append(("created", instance.name))
+
+        def on_after_update(self, instance, info):
+            outbox.append(("updated", instance.name))
+
+    return NotifyingRepo
+
+
+class AbstractTestAfterHooksWaitForTheChecks(Blog):
+    async def test_a_write_a_later_check_refuses_sends_nothing(self, writes, blog):
+        outbox: list[tuple[str, str]] = []
+        orm = writes.new_orm(repos={writes.m.Tag: notifying_repo(outbox)})
+        ref = orm.ref(writes.m.Tag, create=TagCreate, update=TagUpdate)
+        refs = [
+            item(ref, "create", name="fine"),
+            item(ref, "update", id="3", name="golang"),
+            item(ref, "create", name="spam"),
+        ]
+        with pytest.raises(PermissionError, match="can_link denied"):
+            await writes.refs(orm, blog.hello, "tags", refs)
+        assert outbox == []
+        assert await tag_names(writes) == ["python", "rust", "go"]
+
+    async def test_a_write_that_passes_sends_in_order(self, writes, blog):
+        outbox: list[tuple[str, str]] = []
+        orm = writes.new_orm(repos={writes.m.Tag: notifying_repo(outbox)})
+        ref = orm.ref(writes.m.Tag, create=TagCreate, update=TagUpdate)
+        refs = [
+            item(ref, "create", name="fine"),
+            item(ref, "update", id="3", name="golang"),
+        ]
+        await writes.refs(orm, blog.hello, "tags", refs)
+        assert outbox == [("created", "fine"), ("updated", "golang")]
 
 
 # -- apply_ref_list() manages lists ------------------------------------------------

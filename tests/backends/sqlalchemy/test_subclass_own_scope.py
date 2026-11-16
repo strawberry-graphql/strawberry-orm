@@ -8,6 +8,7 @@ of the nearest class that has one, so a subclass row is held to its base's
 ``scope_query`` and ``can_*`` checks.
 """
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,7 @@ from sqlalchemy.orm import (
 )
 from strawberry import relay
 
-from strawberry_orm import AbstractRepo, StrawberryORM
+from strawberry_orm import AbstractRepo, MutationPolicy, StrawberryORM
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
 from strawberry_orm.upserts import UpsertNotFoundError, _declared_fields
@@ -381,6 +382,51 @@ def test_a_relation_page_drops_the_subclass_rows_their_type_hides(session):
     }
 
 
+def test_ordering_through_a_base_whose_subclass_is_scoped_apart_is_refused(session):
+    """A contract read through ``Comment.document`` is scoped by its own type,
+    so ordering comments by their document's title would rank hidden ones."""
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+
+    @orm.type(Document, order=orm.order(Document))
+    class DocumentType:
+        id: auto
+        title: auto
+
+    @orm.type(Contract)
+    class ContractType:
+        id: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return a_party_to(stmt, info)
+
+    @orm.type(Comment, order=orm.order(Comment))
+    class CommentType:
+        body: auto
+        document: DocumentType | None
+
+    @strawberry.type
+    class Query:
+        comments: list[CommentType] = orm.field.eager()
+
+    refusal = (
+        r"Cannot order by Comment\.document: Document has subclasses scoped by "
+        r"their own types' scope_rows \(Contract\)"
+    )
+    with pytest.raises(ValueError, match=refusal):
+        orm.schema(query=Query, types=[ContractType])
+
+    unchecked = strawberry.Schema(
+        query=Query, types=[ContractType], extensions=[orm.optimizer_extension()]
+    )
+    result = unchecked.execute_sync(
+        "{ comments(order: [{object: {document: {field: {title: ASC}}}}]) { body } }",
+        context_value={"session": session, "me": ME},
+    )
+    assert result.data is None
+    assert "Cannot order by Comment.document" in result.errors[0].message
+
+
 def build_counted():
     orm = StrawberryORM.for_sqlalchemy(
         dialect="sqlite", warn_missing_scope=False, lazy_resolution="off"
@@ -733,6 +779,133 @@ def test_an_upsert_through_the_base_is_held_to_the_rows_own_repo(session, party_
         (3, "CEO contract", False, 1),
     ]
     assert party_calls == ["can_update 2"]
+
+
+class PermRepo(AbstractRepo):
+    """One repo class for every model, keyed on ``self.model`` as Django's perms are."""
+
+    def scope_query(self, query, info):
+        query = query.where(Document.owner_id == info.context["me"])
+        if issubclass(self.model, Contract):
+            query = query.where(Contract.party_id == info.context["me"])
+        return query
+
+    def can_delete(self, instance, info):
+        return f"delete_{self.model.__name__.lower()}" in info.context["perms"]
+
+
+def test_one_repo_class_for_both_models_answers_for_the_rows_own(session):
+    schema = build_writes({Document: PermRepo, Contract: PermRepo})
+    deleted = 'mutation { editDocuments(documents: [{delete: {id: "%d"}}]) }'
+
+    def delete(pk, *perms):
+        return schema.execute_sync(
+            deleted % pk,
+            context_value={"session": session, "me": ME, "perms": set(perms)},
+        )
+
+    hidden = delete(3, "delete_document", "delete_contract")
+    assert [error.message for error in hidden.errors] == [
+        "No Document 3 in Folder.documents"
+    ]
+    refused = delete(2, "delete_document")
+    assert [error.message for error in refused.errors] == [
+        "AbstractRepo.can_delete denied the operation"
+    ]
+    assert stored(session, 2, 3) == [
+        (2, "my contract", False, 1),
+        (3, "CEO contract", False, 1),
+    ]
+    assert delete(2, "delete_document", "delete_contract").errors is None
+    assert stored(session, 2) == []
+
+
+def test_a_policy_is_told_the_rows_own_model(session):
+    class NoContractDeletes(MutationPolicy):
+        def can_delete(self, model, instance, info):
+            return model is not Contract
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        orm = StrawberryORM.for_sqlalchemy(
+            dialect="sqlite", warn_missing_scope=False, policy=NoContractDeletes()
+        )
+    ref = orm.ref(Document, delete=True)
+    delete = _declared_fields(ref)["delete"]
+    info = SimpleNamespace(context={"session": session, "me": ME})
+    with pytest.raises(PermissionError, match="can_delete denied"):
+        orm.apply_ref_list(
+            session.get(Folder, 1), "documents", [ref(delete=delete(id="2"))], info
+        )
+    orm.apply_ref_list(
+        session.get(Folder, 1), "documents", [ref(delete=delete(id="1"))], info
+    )
+    assert stored(session, 1, 2) == [(2, "my contract", False, 1)]
+
+
+def test_authorize_is_asked_about_a_subclass_row_as_its_own_model(session):
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+    seen = []
+
+    def authorize(action, model, pk, info):
+        seen.append((action, model.__name__, pk))
+        return model is not Contract
+
+    ref = orm.ref(Document, delete=True)
+    delete = _declared_fields(ref)["delete"]
+    info = SimpleNamespace(context={"session": session, "me": ME})
+    with pytest.raises(
+        UpsertNotFoundError, match=r"No Document 2 in Folder\.documents"
+    ):
+        orm.apply_ref_list(
+            session.get(Folder, 1),
+            "documents",
+            [ref(delete=delete(id="2"))],
+            info,
+            authorize=authorize,
+        )
+    assert seen == [("delete", "Document", 2), ("delete", "Contract", 2)]
+    assert stored(session, 2) == [(2, "my contract", False, 1)]
+
+
+def document_upsert(orm):
+    return orm.mutations.upsert_node_input(
+        model=Document,
+        project={"_meta": {"upsert": {"where": ["title"], "onMatch": "IGNORE"}}},
+        name="DocumentByTitle",
+    )
+
+
+def test_an_upsert_match_leaves_out_subclass_rows_their_own_repo_hides(session):
+    """Counted, the hidden contract would make a match on its title ambiguous,
+    which would tell the caller a hidden row has that title."""
+    orm = StrawberryORM.for_sqlalchemy(
+        dialect="sqlite", warn_missing_scope=False, repos=OWN_REPOS
+    )
+    session.add(Document(id=20, title="CEO contract", owner_id=ME))
+    session.flush()
+    upsert = document_upsert(orm)
+    where = _declared_fields(upsert)["where"]
+    info = SimpleNamespace(context={"session": session, "me": ME})
+    matched = orm.apply_upsert(upsert(where=where(title="CEO contract")), info)
+    assert matched.id == 20
+
+
+def test_an_override_of_find_for_upsert_is_held_to_scope_query(session):
+    class FindsAnyDocument(DocumentRepo):
+        def find_for_upsert(self, model, query, info):
+            statement = select(Document).where(Document.title == query["title"])
+            return info.context["session"].scalars(statement).first()
+
+    orm = StrawberryORM.for_sqlalchemy(
+        dialect="sqlite", warn_missing_scope=False, repos={Document: FindsAnyDocument}
+    )
+    upsert = document_upsert(orm)
+    where = _declared_fields(upsert)["where"]
+    info = SimpleNamespace(context={"session": session, "me": ME})
+    with pytest.raises(UpsertNotFoundError, match="No Document matches"):
+        orm.apply_upsert(upsert(where=where(title="their notes")), info)
+    assert orm.apply_upsert(upsert(where=where(title="handbook")), info).id == 1
 
 
 def test_a_subclass_takes_the_repo_of_its_nearest_class_with_one():

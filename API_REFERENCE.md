@@ -13,7 +13,7 @@ This is a lookup table, not a guide. For what the pieces are *for* and how they 
 - [Filters, ordering, grouping](#filters-ordering-and-grouping) — generators and custom-field decorators
 - [Relay](#relay) — `orm.connection.eager` / `.lazy`, `orm.node`, connection types
 - [Payloads](#payloads) — `orm.payload`, `PayloadPolicy`
-- [Mutations](#mutations) — `orm.create` / `update` / `delete`, node inputs, `AbstractRepo`
+- [Mutations](#mutations) — node inputs, `AbstractRepo`, the deprecated `orm.create` / `update` / `delete`
 - [Query helpers](#query-helpers) — `orm.optimize`, `apply_filters`, `apply_ordering`
 - [Class hooks](#class-hooks-you-implement) — `scope_rows`, `resolve_node`
 - [Types and enums](#types-and-enums) — `auto`, `Ordering`, `FieldHints`, lookups
@@ -354,7 +354,7 @@ orm.update(input_type, **kwargs)
 orm.delete(**kwargs)
 ```
 
-Generated mutation fields. See [Mutations](README.md#mutations).
+**Deprecated.** Each builds a field with no resolver: it writes nothing and asks no `AbstractRepo`, so it authorizes nothing either. Write a `@strawberry.mutation` that writes through `orm.apply_upsert()` or `orm.apply_ref_list()`, which hold the write to the model's repo. Each call raises a `DeprecationWarning`. See [Mutations](README.md#mutations).
 
 ```python
 orm.mutations.create_node_input(*, models=None, project=None, name=None) -> type
@@ -410,6 +410,8 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | `on_before_delete` | `(instance, info) -> None` |
 
 A `can_*` hook allows with `True` and denies with `False` or `None`. Any other truthy value still allows but emits a `DeprecationWarning`. On an async SQLAlchemy session and on Tortoise a `can_*` hook may be `async`; a sync write that gets an awaitable raises `TypeError` instead of allowing. An `authorize=` callback on `apply_ref_list` or `apply_upsert` is checked in addition to these hooks, and follows the same rules.
+
+The writes create, load, save and delete rows through `_create`, `_get`, `_save` and `_delete`, or their `*_async` variants. Override one of a pair: each `*_async` default calls an override of its sync counterpart, on an async SQLAlchemy session through `AsyncSession.run_sync`, so the override's `super()` calls work there too. A sync default called with an async session outside one raises `TypeError`; on Tortoise the sync defaults always do.
 
 `MutationPolicy` is the deprecated predecessor. Pass `policy=` or `repos=`, not both; together they raise `ValueError`.
 

@@ -1117,9 +1117,23 @@ class AbstractTestPolicyWithRepos:
 # -- A ref-list delete goes through the repo ---------------------------------------------
 
 
+class ArchivingRepo(AbstractRepo):
+    """Overrides only the sync ``_delete``: an async write must not go around it."""
+
+    def _delete(self, instance, info):
+        raise PermissionError("tags are archived, not deleted")
+
+
 class AbstractTestRefListDeleteUsesTheRepo(Blog):
     async def test_a_soft_delete_override_is_honoured(self, writes, blog):
         orm = writes.new_orm(repos={writes.m.Tag: SoftDeleteRepo})
         ref = orm.ref(writes.m.Tag, delete=True)
         await writes.refs(orm, blog.hello, "tags", [item(ref, "delete", id="1")])
         assert await tag_names(writes) == ["deleted:python", "rust", "go"]
+
+    async def test_an_override_of_the_sync_delete_alone_is_honoured(self, writes, blog):
+        orm = writes.new_orm(repos={writes.m.Tag: ArchivingRepo})
+        ref = orm.ref(writes.m.Tag, delete=True)
+        with pytest.raises(PermissionError, match="archived, not deleted"):
+            await writes.refs(orm, blog.hello, "tags", [item(ref, "delete", id="1")])
+        assert await tag_names(writes) == ["python", "rust", "go"]

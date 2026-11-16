@@ -160,15 +160,21 @@ _SENSITIVE_ANYWHERE = (
 #: which leaves ``pin_count`` alone. Words that also name ordinary data
 #: (``is_active``, ``group``, ``scope``, ``plan``, ``balance``) are left out.
 _SENSITIVE_WORDS = (
-    r"pwd|pass[_-]?(?:phrase|code)s?|salt|[th]?otps?|mfa|"
+    r"pwd?s?|pass[_-]?(?:phrase|code)s?|salt|[th]?otps?|mfa|creds?|"
     r"(?:recovery|backup)[_-]?codes?|pin[_-]?(?:code|number)s?|pin$|jwts?|"
-    r"(?:api|access|signing|encryption|auth|license|master|session)[_-]?keys?|"
-    r"credentials?|priv[_-]?keys?|mnemonics?|seed[_-]?phrases?|bearer|csrf|"
-    r"(?:verification|reset|invite|one[_-]?time)[_-]?codes?|magic[_-]?links?|"
-    r"security[_-]?answers?|"
+    r"(?:api|access|signing|encryption|auth|license|master|session|hmac|"
+    r"shared|client|app|activation|product|serial|webhook|stripe|ssh|gpg|pgp)"
+    r"[_-]?keys?|"
+    r"credentials?|priv[_-]?keys?|mnemonics?|(?:seed|recovery)[_-]?phrases?|"
+    r"wallet[_-]?seeds?|bearer|csrf|code[_-]?verifiers?|"
+    r"(?:verification|reset|invite|one[_-]?time|two[_-]?factor|2fa|sms|"
+    r"login|auth|unlock|activation|confirmation)[_-]?codes?|magic[_-]?links?|"
+    r"security[_-]?answers?|mothers?[_-]?maiden[_-]?names?|"
+    r"ciphertexts?|encrypted[_-]?(?:data|values?|payloads?|blobs?|bytes|text)|"
     r"social[_-]?security|national[_-]?ids?|tax[_-]?ids?|passports?|"
-    r"card[_-]?numbers?|cvv|cvc|ibans?|bank[_-]?accounts?|"
-    r"(?:routing|account)[_-]?numbers?|"
+    r"driv(?:er|ers|ing)[_-]?licen[cs]es?|"
+    r"card[_-]?numbers?|cc[_-]?(?:num|number|no)s?|cvv|cvc|ibans?|"
+    r"bank[_-]?accounts?|(?:routing|account)[_-]?numbers?|"
     r"groups|scopes|acls?|privileges?"
 )
 _WORD_START = r"(?:(?<![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
@@ -2650,18 +2656,44 @@ class BaseBackend:
         check.
         """
         related = self._relation_target_model(model, relation)
-        if related is None or related not in self._type_querysets:
+        if related is None or scoped_ordering_allowed(order_type, relation):
             return
-        if scoped_ordering_allowed(order_type, relation):
-            return
-        raise ValueError(self._scoped_order_message(model, relation, related))
+        reason = self._order_scope_reason(model, relation, related)
+        if reason is not None:
+            raise ValueError(
+                self._scoped_order_message(model, relation, related, reason)
+            )
+
+    def _order_scope_reason(
+        self, model: type, relation: str, related: type
+    ) -> str | None:
+        """What hides rows on the far side of *relation*, as filtering sees it.
+
+        The same layers :meth:`relation_scope` applies to a filter: the
+        related type's ``scope_rows``, a subclass's own, and the edge's
+        ``scope=`` on any type over *model*.
+        """
+        if related in self._type_querysets:
+            return f"{related.__name__} is scoped by scope_rows"
+        apart = self.classes_scoped_apart(related)
+        if apart:
+            names = ", ".join(sorted(cls.__name__ for cls in apart))
+            return (
+                f"{related.__name__} has subclasses scoped by their own "
+                f"types' scope_rows ({names})"
+            )
+        if self._field_scope(model, relation) is not None:
+            return f"{model.__name__}.{relation} has a scope="
+        return None
 
     @staticmethod
-    def _scoped_order_message(model: type, relation: str, related: type) -> str:
+    def _scoped_order_message(
+        model: type, relation: str, related: type, reason: str
+    ) -> str:
         return (
-            f"Cannot order by {model.__name__}.{relation}: {related.__name__} is "
-            f"scoped by scope_rows, so ordering would rank rows the caller "
-            f"cannot read. Order by a column on {model.__name__}, or pass "
+            f"Cannot order by {model.__name__}.{relation}: {reason}, so "
+            f"ordering would rank rows the caller cannot read. Order by a "
+            f"column on {model.__name__}, or pass "
             f"allow_scoped_ordering=['{relation}'] when building the order type "
             f"for {model.__name__} if every readable {model.__name__} is "
             f"guaranteed to have a readable {related.__name__}."
@@ -2687,11 +2719,12 @@ class BaseBackend:
             for relation, related in getattr(
                 order_type, "_relation_models", {}
             ).items():
-                if related in self._type_querysets and not scoped_ordering_allowed(
-                    order_type, relation
-                ):
+                reason = None
+                if not scoped_ordering_allowed(order_type, relation):
+                    reason = self._order_scope_reason(model, relation, related)
+                if reason is not None:
                     problems.append(
-                        self._scoped_order_message(model, relation, related)
+                        self._scoped_order_message(model, relation, related, reason)
                     )
                 walk(nested.get(relation), related)
 

@@ -18,7 +18,12 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import ConfigDict
 from strawberry.types.graphql import OperationType
 
-from .checks import check_operation, exposed_schema, exposed_sdl
+from .checks import (
+    check_operation,
+    exposed_schema,
+    exposed_sdl,
+    refuses_introspection,
+)
 from .execution import Execute, Executor
 from .operations import Operation, read_operations
 
@@ -42,6 +47,11 @@ class GraphQLTool:
     ``graphql_schema`` describes what it may use. ``descriptions=False``
     leaves the schema's descriptions out of ``graphql_schema``.
 
+    ``schema_tool=False`` leaves ``graphql_schema`` out. A schema that refuses
+    introspection (Strawberry's ``DisableIntrospection``) keeps its SDL from
+    clients, so ``mcp_server`` will not hand it out unless ``schema_tool`` says
+    which: ``True`` gives every MCP client the SDL all the same.
+
     The token limit is checked as the operation is parsed, before anything
     else reads it; the schema's own extensions, such as Strawberry's
     ``MaxTokensLimiter``, only run once it executes. Checking the operation,
@@ -55,6 +65,7 @@ class GraphQLTool:
     max_depth: int = 10
     descriptions: bool = True
     max_tokens: int = 2_000
+    schema_tool: bool | None = None
 
 
 def mcp_server(
@@ -130,6 +141,12 @@ def mcp_server(
         options = (
             graphql_tool if isinstance(graphql_tool, GraphQLTool) else GraphQLTool()
         )
+        if options.schema_tool is None and refuses_introspection(schema):
+            raise ValueError(
+                "The schema refuses introspection, and graphql_schema would give "
+                "every MCP client its SDL. Pass GraphQLTool(schema_tool=True) to "
+                "give it all the same, or schema_tool=False to leave it out."
+            )
         _add_graphql_tools(server, schema._schema, options, executor, build_context)
     return server
 
@@ -194,7 +211,7 @@ def _add_graphql_tools(
     exposed = exposed_schema(
         schema, allow_mutations=options.allow_mutations, root_fields=allowlist
     )
-    sdl = exposed_sdl(exposed, descriptions=options.descriptions)
+    schema_tool = options.schema_tool is not False
     allowed = {OperationType.QUERY}
     if options.allow_mutations:
         allowed.add(OperationType.MUTATION)
@@ -209,6 +226,7 @@ def _add_graphql_tools(
             allowed=allowed,
             max_depth=options.max_depth,
             max_tokens=options.max_tokens,
+            schema_tool=schema_tool,
         )
         if errors:
             raise ToolError("\n".join(errors))
@@ -222,17 +240,18 @@ def _add_graphql_tools(
         )
         return _result(result)
 
-    def graphql_schema() -> str:
-        return sdl
-
     kinds = "query or mutation" if options.allow_mutations else "query"
+    first = (
+        f"Call {_SCHEMA_TOOL} first for the types and fields it may use, and pass "
+        if schema_tool
+        else "Pass "
+    )
     server.add_tool(
         graphql,
         name=_RUN_TOOL,
         description=(
             f"Run one GraphQL {kinds} you write against this API, with your "
-            f"permissions. Call {_SCHEMA_TOOL} first for the types and fields "
-            "it may use, and pass values as variables. Prefer this server's "
+            f"permissions. {first}values as variables. Prefer this server's "
             f"other tools when one fits. Nesting is limited to "
             f"{options.max_depth} levels."
         ),
@@ -243,6 +262,13 @@ def _add_graphql_tools(
         ),
         structured_output=False,
     )
+    if not schema_tool:
+        return
+    sdl = exposed_sdl(exposed, descriptions=options.descriptions)
+
+    def graphql_schema() -> str:
+        return sdl
+
     server.add_tool(
         graphql_schema,
         name=_SCHEMA_TOOL,

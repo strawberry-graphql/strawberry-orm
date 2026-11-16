@@ -156,6 +156,15 @@ def has_upsert(ref: Any) -> bool:
     return _is_set(getattr(ref, "upsert", strawberry.UNSET))
 
 
+def _finds_its_own(repo: AbstractRepo) -> bool:
+    """Whether *repo* overrides how an upsert finds the row it matches."""
+    cls = type(repo)
+    return (
+        cls.find_for_upsert is not AbstractRepo.find_for_upsert
+        or cls.find_for_upsert_async is not AbstractRepo.find_for_upsert_async
+    )
+
+
 class UpsertWriter:
     """Validates and applies one nested write for a single call."""
 
@@ -171,6 +180,7 @@ class UpsertWriter:
         self._info = info
         self._authorize = authorize
         self._repos: dict[type, AbstractRepo] = {}
+        self._after: list[tuple[Callable[..., Any], Any]] = []
 
     # -- Entry points ----------------------------------------------------------
 
@@ -185,6 +195,7 @@ class UpsertWriter:
 
     def apply_root(self, payload: Any) -> Steps:
         instance, _matched = yield from self._upsert(payload, type(payload), None)
+        yield from self._run_after_hooks()
         return instance
 
     def validate_refs(self, parent_model: type, spec: Any, refs: list[Any]) -> None:
@@ -229,6 +240,20 @@ class UpsertWriter:
                 yield self._ops.link(parent_instance, spec, child)
             else:
                 yield from self._apply_plain_ref(parent, *_plain_operation(ref))
+        yield from self._run_after_hooks()
+
+    def _after_write(self, hook: Callable[..., Any], instance: Any) -> None:
+        """Run an ``on_after_*`` *hook* once the whole write has passed its checks.
+
+        A check later in the same write can still refuse it and roll it back,
+        and the side effects the hooks are for cannot be rolled back with it.
+        """
+        self._after.append((hook, instance))
+
+    def _run_after_hooks(self) -> Steps:
+        after, self._after = self._after, []
+        for hook, instance in after:
+            yield hook(instance, self._info)
 
     # -- Validation (no I/O) ---------------------------------------------------
 
@@ -426,11 +451,16 @@ class UpsertWriter:
     def _owner(self, model: type, row: Any) -> type:
         """The model whose repo governs *row*, a row read as a *model* row.
 
-        A row of a subclass that has a repo of its own is that repo's: its
-        type scopes it apart from the base, and so does its repo.
+        A row of a subclass is its own model's, unless that model's repo is
+        *model*'s exactly: the same class, for the same model. One repo class
+        registered for both, or the one ``policy=`` makes, can answer for
+        each model differently, so its ``self.model`` must be the row's.
         """
         row_model = type(row)
-        if row_model is model or type(self._repo(row_model)) is type(self._repo(model)):
+        if row_model is model:
+            return model
+        mine, base = self._repo(row_model), self._repo(model)
+        if type(mine) is type(base) and mine.model is base.model:
             return model
         return row_model
 
@@ -448,10 +478,25 @@ class UpsertWriter:
         pk = self._ops.pk_value(row)
         return owner, (yield self._ops.get(self._repo(owner), owner, pk))
 
-    def _get(self, model: type, pk: Any) -> Generator[Any, Any, tuple[type, Any]]:
-        """The *model* row *pk* names, if the repos let the caller see it, and its owner."""
+    def _get(
+        self, model: type, pk: Any, action: str | None = None
+    ) -> Generator[Any, Any, tuple[type, Any]]:
+        """The *model* row *pk* names, if the repos let the caller see it, and its owner.
+
+        ``authorize`` was asked about *action* on a *model* row before the row
+        was read. A row of a subclass is asked about again as its own model's,
+        and reads as absent if that is denied.
+        """
         row = yield self._ops.get(self._repo(model), model, pk)
-        return (yield from self._owned(model, row))
+        owner, row = yield from self._owned(model, row)
+        if (
+            row is not None
+            and action is not None
+            and type(row) is not model
+            and not (yield from self._authorized(action, type(row), pk))
+        ):
+            return owner, None
+        return owner, row
 
     def _check_repo(self, model: type, method: str, *args: Any) -> Steps:
         allowed = yield getattr(self._repo(model), method)(*args, self._info)
@@ -480,8 +525,14 @@ class UpsertWriter:
         if parent is not None:
             query.update(self._ops.parent_scope(parent.instance, parent.spec))
 
-        found = yield self._ops.find(self._repo(model), model, query)
-        owner, instance = yield from self._owned(model, found)
+        repo = self._repo(model)
+        found = yield self._ops.find(repo, model, query)
+        if found is not None and _finds_its_own(repo):
+            # Every row a write finds goes through scope_query, the rows an
+            # override of find_for_upsert finds included.
+            owner, instance = yield from self._get(model, self._ops.pk_value(found))
+        else:
+            owner, instance = yield from self._owned(model, found)
         if instance is None:
             create = getattr(payload, "create", strawberry.UNSET)
             if not _is_set(create):
@@ -492,7 +543,9 @@ class UpsertWriter:
             created = yield from self._create(create, fields["create"], parent, seed)
             return created, False
 
-        yield from self._check_authorize("upsert", owner, self._ops.pk_value(instance))
+        yield from self._check_authorize(
+            "upsert", type(instance), self._ops.pk_value(instance)
+        )
         yield from self._check_repo(owner, "can_upsert", instance)
         yield self._repo(owner).on_match(instance, self._info)
 
@@ -549,7 +602,7 @@ class UpsertWriter:
             )
             if holder is not None:
                 yield from self._check_taken(model, spec, holder, target)
-        yield repo.on_after_create(instance, self._info)
+        self._after_write(repo.on_after_create, instance)
         yield from self._apply_to_many(instance, payload, cls, created=True)
         return instance
 
@@ -600,7 +653,7 @@ class UpsertWriter:
         yield self._ops.save(repo, instance)
         for related_model, previous in replaced:
             yield from self._delete_replaced(related_model, previous)
-        yield repo.on_after_update(instance, self._info)
+        self._after_write(repo.on_after_update, instance)
         yield from self._apply_to_many(instance, payload, cls, created=False)
         return instance
 
@@ -672,14 +725,14 @@ class UpsertWriter:
             data = yield repo.on_before_create(data, self._info)
             yield from self._check_repo(model, "can_create", data)
             child = yield self._ops.create(repo, model, data)
-            yield repo.on_after_create(child, self._info)
+            self._after_write(repo.on_after_create, child)
             yield from self._check_joined(parent, child)
         elif operation == "update":
             data = input_to_dict(value)
             pk = self._pk(data.pop("id"), model)
             if not (yield from self._authorized("update", model, pk)):
                 return
-            owner, child = yield from self._get(model, pk)
+            owner, child = yield from self._get(model, pk, "update")
             if child is None:
                 return
             repo = self._repo(owner)
@@ -690,7 +743,7 @@ class UpsertWriter:
                 for name, field_value in data.items():
                     setattr(child, name, field_value)
                 yield self._ops.save(repo, child)
-                yield repo.on_after_update(child, self._info)
+                self._after_write(repo.on_after_update, child)
         else:
             pk = self._pk(value.id, model)
             if not (yield from self._authorized(operation, model, pk)):
@@ -766,7 +819,7 @@ class UpsertWriter:
     def _remove_member(
         self, parent: _Parent, operation: str, pk: Any, model: type
     ) -> Steps:
-        owner, child = yield from self._get(model, pk)
+        owner, child = yield from self._get(model, pk, operation)
         if child is not None:
             is_member = yield self._ops.is_member(parent.instance, parent.spec, child)
             if not is_member:
@@ -817,7 +870,7 @@ class UpsertWriter:
         pk = self._ops.pk_value(previous)
         if not (yield from self._authorized("delete", model, pk)):
             return
-        owner, visible = yield from self._get(model, pk)
+        owner, visible = yield from self._get(model, pk, "delete")
         if visible is not None:
             yield from self._delete_instance(owner, visible)
 
@@ -830,11 +883,12 @@ class UpsertWriter:
         """
         pk = self._ops.pk_value(previous)
         yield from self._check_authorize("delete", model, pk)
-        owner, visible = yield from self._get(model, pk)
+        owner, visible = yield from self._get(model, pk, "delete")
         if visible is None:
+            # The key is the row's, which the caller may not be able to read.
             raise PermissionError(
-                f"{model.__name__} {pk!r} would be deleted by re-pointing the "
-                f"link, and cannot be deleted"
+                f"The {model.__name__} the link held would be deleted by "
+                f"re-pointing it, and cannot be deleted"
             )
         yield from self._check_repo(owner, "can_delete", visible)
         yield self._repo(owner).on_before_delete(visible, self._info)
@@ -843,7 +897,7 @@ class UpsertWriter:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         pk = self._pk(payload.id, model)
         yield from self._check_authorize("update", model, pk)
-        _owner, instance = yield from self._get(model, pk)
+        _owner, instance = yield from self._get(model, pk, "update")
         if instance is None:
             raise UpsertNotFoundError(f"No {model.__name__} {pk!r}")
         return (yield from self._update(instance, payload, cls))

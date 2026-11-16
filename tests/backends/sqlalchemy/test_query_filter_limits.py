@@ -79,6 +79,7 @@ class TestQueryFilterLimits:
         [
             ("(a+)+$", "may not repeat a group"),
             ("(a|aa)+$", "may not repeat a group"),
+            (".*" * 6 + "!", "may not hold two repeats"),
             ("a" * 101, "at most 100 characters"),
         ],
     )

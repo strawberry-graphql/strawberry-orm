@@ -1018,6 +1018,17 @@ class Person(_RenamedBase):
         return cls._phone
 
 
+class Employee(_RenamedBase):
+    """Raw pay is private, in the column ``salary``; ``salary`` shows a band."""
+
+    __tablename__ = "employee"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    _salary: Mapped[int] = mapped_column("salary")
+    salary: Mapped[int] = mapped_column("salary_band")
+
+
 class TestAColumnIsNamedByItsAttribute:
     """The inputs read a column through its attribute, so they are named by it.
 
@@ -1088,6 +1099,42 @@ class TestAColumnIsNamedByItsAttribute:
         type_map = schema._schema.type_map
         for name in ("PersonField", "PersonGroupByField", "PersonGroupKey"):
             assert set(type_map[name].fields) == {"key", "name"}, name
+
+    def test_connection_aggregates_read_the_attribute_not_its_column_name(self):
+        orm = _orm()
+
+        @orm.type(Employee, group=orm.group(Employee))
+        class EmployeeNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+            salary: auto
+
+        @strawberry.type
+        class Query:
+            employees: ORMListConnection[EmployeeNode] = orm.connection.eager()
+
+        schema = orm.schema(query=Query)
+        engine = create_engine("sqlite://")
+        _RenamedBase.metadata.create_all(engine)
+        with sessionmaker(bind=engine)() as session:
+            session.add_all(
+                [
+                    Employee(id=1, name="ann", _salary=51234, salary=50000),
+                    Employee(id=2, name="ceo", _salary=987654, salary=980000),
+                ]
+            )
+            session.commit()
+            result = schema.execute_sync(
+                "{ employees { aggregates "
+                "{ max { salary } min { salary } sum { salary } } } }",
+                context_value={"session": session},
+            )
+        assert result.errors is None, result.errors
+        assert result.data["employees"]["aggregates"] == {
+            "max": {"salary": 980000},
+            "min": {"salary": 50000},
+            "sum": {"salary": 1030000},
+        }
 
 
 def test_an_order_with_no_clauses_keeps_the_statements(Post):
@@ -1489,3 +1536,164 @@ class TestARelationshipsOwnJoinAndOrder:
             {"kept": ["Gamma", "Alpha"], "byTitle": ["Gamma", "Beta", "Alpha"]},
             {"kept": ["Delta"], "byTitle": ["Delta"]},
         ]
+
+
+class _EagerBase(DeclarativeBase):
+    pass
+
+
+class Member(_EagerBase):
+    __tablename__ = "eager_member"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    mentor_id: Mapped[int | None] = mapped_column(ForeignKey("eager_member.id"))
+    mentees: Mapped[list["Member"]] = relationship()
+    articles: Mapped[list["Article"]] = relationship(lazy="joined")
+
+
+class Article(_EagerBase):
+    __tablename__ = "eager_article"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(50))
+    published: Mapped[bool] = mapped_column(Boolean)
+    author_id: Mapped[int] = mapped_column(ForeignKey("eager_member.id"))
+
+
+class Owner(_EagerBase):
+    __tablename__ = "eager_owner"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    hidden: Mapped[bool] = mapped_column(Boolean)
+
+
+class Doc(_EagerBase):
+    __tablename__ = "eager_doc"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(50))
+    owner_id: Mapped[int] = mapped_column(ForeignKey("eager_owner.id"))
+    owner: Mapped[Owner] = relationship(lazy="joined")
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("eager_doc.id"))
+    children: Mapped[list["Doc"]] = relationship()
+    remarks: Mapped[list["Remark"]] = relationship(back_populates="doc")
+
+
+class Remark(_EagerBase):
+    __tablename__ = "eager_remark"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    doc_id: Mapped[int] = mapped_column(ForeignKey("eager_doc.id"))
+    doc: Mapped[Doc] = relationship(back_populates="remarks")
+
+
+_eager_orm = StrawberryORM.for_sqlalchemy(
+    dialect="sqlite", lazy_resolution="off", warn_missing_scope=False
+)
+
+
+@_eager_orm.type(Article)
+class ArticleNode:
+    title: auto
+
+    @classmethod
+    def scope_rows(cls, query, info):
+        return query.where(Article.published.is_(True))
+
+
+@_eager_orm.type(Member)
+class MemberNode:
+    name: auto
+    articles: list[ArticleNode]
+    mentees: list["MemberNode"]
+
+
+@_eager_orm.type(Owner)
+class OwnerNode:
+    name: auto
+
+    @classmethod
+    def scope_rows(cls, query, info):
+        return query.where(Owner.hidden.is_(False))
+
+
+@_eager_orm.type(Doc)
+class DocNode:
+    title: auto
+    owner: OwnerNode | None
+    children: list["DocNode"]
+    remarks: list["RemarkNode"]
+
+
+@_eager_orm.type(Remark)
+class RemarkNode:
+    doc: DocNode
+
+
+@strawberry.type
+class _EagerQuery:
+    members: list[MemberNode] = _eager_orm.field.eager()
+    docs: list[DocNode] = _eager_orm.field.eager()
+
+
+class TestAMappersOwnEagerLoad:
+    """A relation mapped ``lazy="joined"`` is loaded, unscoped, wherever the
+    plan leaves it out. A planned path that reaches the same row finds it
+    loaded already, so its own scoped loader leaves the row alone."""
+
+    @pytest.fixture
+    def run(self):
+        engine = create_engine("sqlite://")
+        _EagerBase.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        session.add_all(
+            [
+                Member(id=1, name="alice"),
+                Member(id=2, name="bob", mentor_id=1),
+                Article(id=1, title="alice's", published=True, author_id=1),
+                Article(id=2, title="bob's", published=True, author_id=2),
+                Article(id=3, title="bob's draft", published=False, author_id=2),
+                Owner(id=1, name="visible", hidden=False),
+                Owner(id=2, name="hidden", hidden=True),
+                Doc(id=1, title="d1", owner_id=1),
+                Doc(id=2, title="d2", owner_id=2, parent_id=1),
+                Remark(id=1, doc_id=2),
+            ]
+        )
+        session.commit()
+        schema = _eager_orm.schema(query=_EagerQuery)
+
+        def run(query):
+            session.expunge_all()
+            result = schema.execute_sync(query, context_value={"session": session})
+            assert result.errors is None, result.errors
+            return result.data
+
+        yield run
+        session.close()
+        engine.dispose()
+
+    def test_a_to_many_relation_reached_again_below(self, run):
+        data = run("{ members { name mentees { name articles { title } } } }")
+        alice = next(m for m in data["members"] if m["name"] == "alice")
+        assert alice["mentees"] == [{"name": "bob", "articles": [{"title": "bob's"}]}]
+
+    def test_a_to_one_relation_reached_again_below(self, run):
+        data = run("{ docs { title children { title owner { name } } } }")
+        d1 = next(d for d in data["docs"] if d["title"] == "d1")
+        assert d1["children"] == [{"title": "d2", "owner": None}]
+
+    def test_a_to_one_relation_reached_again_through_a_back_reference(self, run):
+        data = run("{ docs { title remarks { doc { owner { name } } } } }")
+        d2 = next(d for d in data["docs"] if d["title"] == "d2")
+        assert d2["remarks"] == [{"doc": {"owner": None}}]
+
+    def test_the_relation_planned_where_the_row_is_read(self, run):
+        data = run("{ members { name articles { title } } docs { owner { name } } }")
+        assert [m["articles"] for m in data["members"]] == [
+            [{"title": "alice's"}],
+            [{"title": "bob's"}],
+        ]
+        assert [d["owner"] for d in data["docs"]] == [{"name": "visible"}, None]

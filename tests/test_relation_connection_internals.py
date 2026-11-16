@@ -99,6 +99,7 @@ def _info(path="users.posts", parent_type="UserNode"):
         field_name=parts[-1],
         field_nodes=[],
         parent_type=types.SimpleNamespace(name=parent_type, fields={parts[-1]: field}),
+        context={},
     )
 
 
