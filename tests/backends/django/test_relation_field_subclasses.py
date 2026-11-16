@@ -19,6 +19,7 @@ from strawberry_orm import StrawberryORM
 from strawberry_orm.mutations import _django_relation_specs
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
+from strawberry_orm.upserts import _declared_fields
 
 
 class TreeForeignKey(models.ForeignKey):
@@ -277,3 +278,25 @@ class TestRelationFieldSubclasses:
         }
         assert input_fields(schema, "DossierField") == ["title"]
         assert "object" not in input_fields(schema, "DossierFilter")
+
+    def test_a_generic_keys_column_is_not_written_or_matched_on(self):
+        """``object_id`` would point the remark at any row of its content type."""
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+        meta = {"create": True, "update": True}
+        upsert = orm.mutations.upsert_node_input(
+            model=Remark,
+            project={
+                "_meta": {**meta, "upsert": {"where": ["id"], "onMatch": "UPDATE"}}
+            },
+            name="RemarkUpsert",
+        )
+        for operation in ("create", "update"):
+            assert list(_declared_fields(upsert)[operation].__dataclass_fields__) == [
+                "text"
+            ]
+        with pytest.raises(ValueError, match="object_id"):
+            orm.mutations.upsert_node_input(
+                model=Remark,
+                project={"_meta": {**meta, "upsert": {"where": ["object_id"]}}},
+                name="RemarkByTarget",
+            )

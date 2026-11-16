@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from typing import Any
 
 from graphql import (
@@ -11,11 +11,15 @@ from graphql import (
     FragmentDefinitionNode,
     FragmentSpreadNode,
     GraphQLError,
+    GraphQLInterfaceType,
+    GraphQLNamedType,
     GraphQLObjectType,
     GraphQLSchema,
+    GraphQLUnionType,
     InlineFragmentNode,
     OperationDefinitionNode,
     SelectionSetNode,
+    get_named_type,
     parse,
     print_ast,
     print_schema,
@@ -27,6 +31,9 @@ from strawberry.types.graphql import OperationType
 #: The meta fields that describe the schema an operation runs on.
 _INTROSPECTION = frozenset({"__schema", "__type"})
 
+#: How many fields an operation may merge into one place in its result.
+_MAX_REPEATS = 20
+
 
 def exposed_schema(
     schema: GraphQLSchema,
@@ -37,35 +44,29 @@ def exposed_schema(
     """The schema as the ``graphql`` tool shows it and lets it be used.
 
     No mutations unless they are allowed, and with ``root_fields`` only those
-    root fields and the types they reach. Implementations of a reached
-    interface count as reached, since a fragment on one is valid there.
+    root fields and the types they reach. A field that returns an interface
+    reaches its implementations, since a fragment on one is valid there, but
+    a type is not reached by sharing an interface with one that is.
     """
     query = _narrow(schema.query_type, root_fields)
     mutation = schema.mutation_type if allow_mutations else None
     if mutation is not None:
         mutation = _narrow(mutation, root_fields)
-    implementations = [
+    exposed = GraphQLSchema(
+        query=query, mutation=mutation, directives=schema.directives
+    )
+    # ``types`` print first, so only implementations nothing else reaches go
+    # there.
+    missing = [
         named
-        for named in schema.type_map.values()
-        if isinstance(named, GraphQLObjectType) and named.interfaces
+        for named in _implementations(schema, (query, mutation))
+        if named.name not in exposed.type_map
     ]
-    types: list[GraphQLObjectType] = []
-    while True:
-        exposed = GraphQLSchema(
-            query=query,
-            mutation=mutation,
-            types=types,
-            directives=schema.directives,
-        )
-        added = [
-            named
-            for named in implementations
-            if named.name not in exposed.type_map
-            and any(i.name in exposed.type_map for i in named.interfaces)
-        ]
-        if not added:
-            return exposed
-        types += added
+    if not missing:
+        return exposed
+    return GraphQLSchema(
+        query=query, mutation=mutation, types=missing, directives=schema.directives
+    )
 
 
 def exposed_sdl(schema: GraphQLSchema, *, descriptions: bool = True) -> str:
@@ -79,6 +80,39 @@ def exposed_sdl(schema: GraphQLSchema, *, descriptions: bool = True) -> str:
 def strip_descriptions(node: Node) -> Node:
     """*node* without the descriptions on it or anything inside it."""
     return visit(node, _StripDescriptions())
+
+
+def _implementations(
+    schema: GraphQLSchema, roots: Iterable[GraphQLObjectType | None]
+) -> list[GraphQLObjectType]:
+    """The implementations of each interface that a field reached from
+    *roots* returns, in *schema*'s order.
+
+    Only object types' fields are followed. A value has the type its own
+    parent's field gives, so an interface's field, which may name a wider
+    type, and an interface a type implements reach nothing more.
+    """
+    found: set[str] = set()
+    seen: set[str] = set()
+    pending: list[GraphQLNamedType] = [root for root in roots if root is not None]
+    while pending:
+        named = pending.pop()
+        if named.name in seen:
+            continue
+        seen.add(named.name)
+        if isinstance(named, GraphQLObjectType):
+            pending.extend(get_named_type(f.type) for f in named.fields.values())
+        elif isinstance(named, GraphQLInterfaceType):
+            possible = schema.get_possible_types(named)
+            found.update(t.name for t in possible)
+            pending.extend(possible)
+        elif isinstance(named, GraphQLUnionType):
+            pending.extend(named.types)
+    return [
+        named
+        for named in schema.type_map.values()
+        if isinstance(named, GraphQLObjectType) and named.name in found
+    ]
 
 
 def _narrow(
@@ -144,6 +178,12 @@ def check_operation(
     depth = _depth(operations[0].selection_set, fragments, {}, set())
     if depth > max_depth:
         return [f"The query is {depth} levels deep; the limit is {max_depth}."], kind
+    repeats = _repeats(operations[0].selection_set, fragments, {}, set())
+    if repeats > _MAX_REPEATS:
+        return [
+            f"The query selects a field up to {repeats} times in one place; "
+            f"the limit is {_MAX_REPEATS}."
+        ], kind
     finder = _FindIntrospection()
     visit(document, finder)
     if finder.found:
@@ -189,3 +229,66 @@ def _depth(
             depth = depths[name]
         deepest = max(deepest, depth)
     return deepest
+
+
+def _repeats(
+    selection_set: SelectionSetNode | None,
+    fragments: dict[str, FragmentDefinitionNode],
+    tables: dict[str, dict[str, tuple[int, int]]],
+    entered: set[str],
+) -> int:
+    """At most how many fields *selection_set* merges into one place in its
+    result, fragments included.
+
+    Fields that share a response name merge, and validation compares every
+    pair of them and of the fields below them, so its cost grows with the
+    square of this. Counts multiply down the tree, which can overstate a
+    merge but never understates one. Each fragment is counted once, in
+    *tables*, and a fragment spread twice in one selection set once, as
+    GraphQL does.
+    """
+    if selection_set is None:
+        return 1
+    table = _merged(selection_set, fragments, tables, entered)
+    return max((count * below for count, below in table.values()), default=1)
+
+
+def _merged(
+    selection_set: SelectionSetNode,
+    fragments: dict[str, FragmentDefinitionNode],
+    tables: dict[str, dict[str, tuple[int, int]]],
+    entered: set[str],
+) -> dict[str, tuple[int, int]]:
+    """Each response name in *selection_set*, with how many fields have it
+    and the most :func:`_repeats` below one of them."""
+    table: dict[str, tuple[int, int]] = {}
+    spread: set[str] = set()
+
+    def add(name: str, count: int, below: int) -> None:
+        seen, deepest = table.get(name, (0, 1))
+        table[name] = (seen + count, max(deepest, below))
+
+    pending = list(selection_set.selections)
+    while pending:
+        selection = pending.pop()
+        if isinstance(selection, FieldNode):
+            below = _repeats(selection.selection_set, fragments, tables, entered)
+            add((selection.alias or selection.name).value, 1, below)
+        elif isinstance(selection, InlineFragmentNode):
+            pending.extend(selection.selection_set.selections)
+        else:
+            assert isinstance(selection, FragmentSpreadNode)
+            name = selection.name.value
+            fragment = fragments.get(name)
+            if fragment is None or name in entered or name in spread:
+                continue
+            spread.add(name)
+            if name not in tables:
+                entered.add(name)
+                tables[name] = _merged(
+                    fragment.selection_set, fragments, tables, entered
+                )
+                entered.discard(name)
+            for field, (count, below) in tables[name].items():
+                add(field, count, below)
+    return table

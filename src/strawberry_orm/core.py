@@ -110,6 +110,30 @@ def _resolve_orm_metadata(
     )
 
 
+def _scope_then_filter(
+    backend: Backend, query: Any, model: type, info: Any, filter: Any
+) -> Any:
+    """*query* under *model*'s ``scope_rows``, then the client's *filter*.
+
+    Scoped first, so a database that evaluates conditions in the order written
+    never runs a client's condition, a regex say, on a row the scope hides.
+    """
+    from strawberry_orm.lazy_resolution import narrowed_from
+
+    query = backend.apply_type_scope(query, model, info)
+    if filter is None:
+        return query
+    return narrowed_from(query, backend.apply_filters(query, filter, model, info=info))
+
+
+def _ordered(backend: Backend, query: Any, model: type, info: Any, order: Any) -> Any:
+    from strawberry_orm.lazy_resolution import narrowed_from
+
+    if order is None:
+        return query
+    return narrowed_from(query, backend.apply_ordering(query, order, model, info=info))
+
+
 def _make_query_resolver(
     backend: Backend,
     model: type,
@@ -129,8 +153,10 @@ def _make_query_resolver(
 
     info_type = strawberry.types.Info
 
-    def scoped(query: Any, info: Any) -> Any:
-        query = backend.apply_type_scope(query, model, info)
+    def read(info: Any, filter: Any = None, order: Any = None) -> Any:
+        query = backend.get_default_queryset(model, limited=False)
+        query = _scope_then_filter(backend, query, model, info, filter)
+        query = _ordered(backend, query, model, info, order)
         if limit is None:
             return query
         return backend.apply_page(query, 0, limit)
@@ -144,12 +170,7 @@ def _make_query_resolver(
             order: Any = None,
             group_by: Any = None,
         ) -> Any:
-            query = backend.get_default_queryset(model, limited=False)
-            if filter is not None:
-                query = backend.apply_filters(query, filter, model, info=info)
-            if order is not None:
-                query = backend.apply_ordering(query, order, model, info=info)
-            return scoped(query, info)
+            return read(info, filter, order)
 
         annotations: dict[str, Any] = {"info": info_type}
         if filter_type:
@@ -169,12 +190,7 @@ def _make_query_resolver(
         def resolver(
             self: Any, info: Any, filter: Any = None, order: Any = None
         ) -> Any:
-            query = backend.get_default_queryset(model, limited=False)
-            if filter is not None:
-                query = backend.apply_filters(query, filter, model, info=info)
-            if order is not None:
-                query = backend.apply_ordering(query, order, model, info=info)
-            return scoped(query, info)
+            return read(info, filter, order)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -184,10 +200,7 @@ def _make_query_resolver(
     elif filter_type:
 
         def resolver(self: Any, info: Any, filter: Any = None) -> Any:
-            query = backend.get_default_queryset(model, limited=False)
-            if filter is not None:
-                query = backend.apply_filters(query, filter, model, info=info)
-            return scoped(query, info)
+            return read(info, filter)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -196,10 +209,7 @@ def _make_query_resolver(
     elif order_type:
 
         def resolver(self: Any, info: Any, order: Any = None) -> Any:
-            query = backend.get_default_queryset(model, limited=False)
-            if order is not None:
-                query = backend.apply_ordering(query, order, model, info=info)
-            return scoped(query, info)
+            return read(info, order=order)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -208,7 +218,7 @@ def _make_query_resolver(
     else:
 
         def resolver(self: Any, info: Any) -> Any:
-            return scoped(backend.get_default_queryset(model, limited=False), info)
+            return read(info)
 
         resolver.__annotations__ = {"info": info_type}
 
@@ -363,19 +373,12 @@ class _AutoFilterOrderExtension(FieldExtension):
         group_by: Any = None,
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
-            if filter is not None:
-                result = self._backend.apply_filters(
-                    result, filter, self._model, info=info
-                )
-
+            result = _scope_then_filter(
+                self._backend, result, self._model, info, filter
+            )
             self._stash_context(info, result, group_by=group_by, order=order)
-
-            if order is not None:
-                result = self._backend.apply_ordering(
-                    result, order, self._model, info=info
-                )
+            result = _ordered(self._backend, result, self._model, info, order)
             if not self._defer_query_materialization(info):
-                result = self._backend.apply_type_scope(result, self._model, info)
                 result = materialize_result(
                     self._backend,
                     result,
@@ -405,19 +408,12 @@ class _AutoFilterOrderExtension(FieldExtension):
                     group_by=group_by,
                 )
 
-            if filter is not None:
-                result = self._backend.apply_filters(
-                    result, filter, self._model, info=info
-                )
-
+            result = _scope_then_filter(
+                self._backend, result, self._model, info, filter
+            )
             self._stash_context(info, result, group_by=group_by, order=order)
-
-            if order is not None:
-                result = self._backend.apply_ordering(
-                    result, order, self._model, info=info
-                )
+            result = _ordered(self._backend, result, self._model, info, order)
             if not self._defer_query_materialization(info):
-                result = self._backend.apply_type_scope(result, self._model, info)
                 result = self._backend.materialize_query(result, info)
 
         return result
@@ -482,28 +478,19 @@ class _AutoFilterOrderExtension(FieldExtension):
         if self._model is not None and self._backend.is_query_object(result):
             materialize = self._backend.materialize_query
             if iscoroutinefunction(materialize):
-                if kwargs.get("filter") is not None:
-                    result = self._backend.apply_filters(
-                        result,
-                        kwargs["filter"],
-                        self._model,
-                        info=info,
-                    )
+                result = _scope_then_filter(
+                    self._backend, result, self._model, info, kwargs.get("filter")
+                )
                 self._stash_context(
                     info,
                     result,
                     group_by=kwargs.get("group_by"),
                     order=kwargs.get("order"),
                 )
-                if kwargs.get("order") is not None:
-                    result = self._backend.apply_ordering(
-                        result,
-                        kwargs["order"],
-                        self._model,
-                        info=info,
-                    )
+                result = _ordered(
+                    self._backend, result, self._model, info, kwargs.get("order")
+                )
                 if not self._defer_query_materialization(info):
-                    result = self._backend.apply_type_scope(result, self._model, info)
                     result = await materialize(result, info)
                 return self._cast_result(result)
 
@@ -1709,9 +1696,11 @@ class StrawberryORM:
             if not extensions_include_relation_connections(extensions):
                 extensions.insert(0, self.relation_connection_extension())
 
+        from strawberry_orm.cover import rebuildable_schema_class
         from strawberry_orm.leaf_fields import leaf_skipping_schema_class
 
         schema_class = leaf_skipping_schema_class(schema_class, self._backend)
+        schema_class = rebuildable_schema_class(schema_class)
         if tags is not None:
             schema_class = tagged_schema_class(schema_class, tags)
         schema = schema_class(extensions=list(extensions), **kwargs)

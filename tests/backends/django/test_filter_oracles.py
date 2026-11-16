@@ -12,6 +12,7 @@ from tests.abstract.filter_oracles import (
     AbstractTestForeignKeyShortcutReadsOnlyTheKey,
     AbstractTestNegationAcrossAToManyRelation,
     AbstractTestReferenceLookupsKeepTheKeysType,
+    AbstractTestTheScopeIsWrittenFirst,
 )
 from tests.backends.django.custom_pk_fixtures import (
     _ensure_publisher_book_tables,
@@ -88,4 +89,8 @@ class TestReferenceLookupsKeepTheKeysType(AbstractTestReferenceLookupsKeepTheKey
 
 
 class TestFiltersThroughAReverseRelation(AbstractTestFiltersThroughAReverseRelation):
+    pass
+
+
+class TestTheScopeIsWrittenFirst(AbstractTestTheScopeIsWrittenFirst):
     pass

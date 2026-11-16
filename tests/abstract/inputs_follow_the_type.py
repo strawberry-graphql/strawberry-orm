@@ -266,6 +266,30 @@ class AbstractTestInputsFollowTheType:
         # name is neither numeric nor comparable, so no sub-aggregate is left.
         assert fields(schema, "UserAggregates") == {"count"}
 
+    def test_a_node_id_served_by_its_own_resolve_id_does_not_show_the_column(
+        self, orm, models
+    ):
+        """The column ``NodeID`` names is never read when ``resolve_id`` says otherwise."""
+
+        @orm.type(
+            models.User,
+            filters=orm.filter(models.User),
+            order=orm.order(models.User),
+            group=orm.group(models.User),
+        )
+        class UserNode(relay.Node):
+            id: relay.NodeID[int]
+            name: auto
+
+            @classmethod
+            def resolve_id(cls, root, *, info):
+                return root.name  # pragma: no cover - never resolved
+
+        schema = _users_schema(orm, UserNode)
+        for input_type in ("UserField", "UserOrderField", "UserGroupKey"):
+            assert fields(schema, input_type) == {"name"}, input_type
+        assert fields(schema, "UserAggregates") == {"count"}
+
     def test_fields_inherited_from_an_interface_stay_in_the_inputs(self, orm, models):
         """Columns an interface declares still open the type's filters and orders."""
         import datetime

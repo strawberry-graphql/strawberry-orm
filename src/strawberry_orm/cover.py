@@ -10,6 +10,7 @@ alone, the way tags are, leaving the shared input classes as they were built.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,3 +87,65 @@ def build_covered(schema_class: type, cuts: dict[Any, InputCut], **kwargs: Any) 
         if isinstance(error.__cause__, InputCutError):
             raise error.__cause__ from None
         raise
+
+
+def rebuildable_schema_class(base: type) -> type:
+    """A subclass of *base* converting its own copy of each Relay ``node()`` field."""
+    return type(base.__name__, (_RebuildableSchema, base), {})
+
+
+class _RebuildableSchema:
+    """Mixed in ahead of a ``strawberry.Schema`` by :func:`rebuildable_schema_class`.
+
+    Relay's ``node()`` gives its field a resolver as a schema converts it, and
+    refuses a field that has one, so a field one schema converted could not be
+    converted for the next: the second build that cuts the inputs, or a schema
+    for other tags. Each schema converts a copy of its own, one copy per field,
+    so every lookup in the schema sees the same field.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            # Strawberry and the input cut read the arguments of the fields a
+            # type declares too, and Strawberry keeps the first list it reads:
+            # none, off a field no schema converted. The field keeps its
+            # copy's instead, for a later plain strawberry.Schema to convert.
+            for field, clone in self.__dict__.get("_orm_node_copies", {}).values():
+                if clone.base_resolver is not None:
+                    field.arguments = clone.arguments
+
+    def get_fields(self, type_definition: Any) -> list[Any]:
+        fields = super().get_fields(type_definition)  # type: ignore[misc]
+        return [
+            self._orm_own_copy(field) if _is_node_field(field) else field
+            for field in fields
+        ]
+
+    def _orm_own_copy(self, field: Any) -> Any:
+        copies = self.__dict__.setdefault("_orm_node_copies", {})
+        if id(field) not in copies:
+            clone = copy_field(field)
+            # Strawberry's copy keeps arguments read off the field before any
+            # schema converted it, which are none.
+            clone.arguments = None
+            copies[id(field)] = (field, clone)
+        return copies[id(field)][1]
+
+
+def _is_node_field(field: Any) -> bool:
+    from strawberry.relay.fields import NodeExtension
+
+    return any(isinstance(extension, NodeExtension) for extension in field.extensions)
+
+
+def copy_field(field: Any) -> Any:
+    """A copy of *field* for one schema."""
+    clone = copy.copy(field)
+    # The optimizer and resolvers read the library's own markers off the
+    # field, which Strawberry's copy does not carry.
+    for name, value in vars(field).items():
+        if name.startswith("_orm"):
+            setattr(clone, name, value)
+    return clone

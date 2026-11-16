@@ -19,6 +19,8 @@ import inspect
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from strawberry_orm.cover import copy_field
+
 #: The field-metadata key tags are stored under.
 TAGS_KEY = "strawberry_orm.tags"
 
@@ -102,7 +104,8 @@ class _TaggedSchema:
 
         One copy per field, so every lookup in this schema sees the same field.
         """
-        hidden = [arg for arg in field.arguments if not self._orm_includes(arg)]
+        arguments = _arguments(field)
+        hidden = [arg for arg in arguments if not self._orm_includes(arg)]
         if not hidden:
             return field
         copies = self.__dict__.setdefault("_orm_field_copies", {})
@@ -117,15 +120,19 @@ class _TaggedSchema:
                     f"schema for {_listed(self._orm_tags)} could never call it. "
                     f"Give the argument a default, or tag the field instead."
                 )
-        clone = copy.copy(field)
-        # The optimizer and resolvers read the library's own markers off the
-        # field, which Strawberry's copy does not carry.
-        for name, value in vars(field).items():
-            if name.startswith("_orm"):
-                setattr(clone, name, value)
-        clone.arguments = [arg for arg in field.arguments if self._orm_includes(arg)]
+        clone = copy_field(field)
+        clone.arguments = [arg for arg in arguments if self._orm_includes(arg)]
         copies[id(field)] = (field, clone)
         return clone
+
+
+def _arguments(field: Any) -> list[Any]:
+    """*field*'s arguments, read off a copy if an extension may yet set them.
+
+    Strawberry keeps the list it reads first, and Relay's ``node()`` gives its
+    field the resolver that declares ``id`` only as the schema converts it.
+    """
+    return copy.copy(field).arguments if field.extensions else field.arguments
 
 
 def _required_input_field(field: Any) -> bool:

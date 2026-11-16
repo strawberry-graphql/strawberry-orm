@@ -1,10 +1,8 @@
 """Filter limits as a budget for the whole filter (SQLAlchemy)."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event
 
 from strawberry_orm import StrawberryORM
 from tests.abstract.filter_budget import AbstractTestFilterBudget
@@ -34,26 +32,6 @@ def run(sa_session, seed):
         )
 
     return _run
-
-
-@pytest.fixture
-def statements(sa_session):
-    engine = sa_session.get_bind()
-
-    @contextmanager
-    def _statements():
-        sent: list[str] = []
-
-        def before(conn, cursor, statement, params, context, executemany):
-            sent.append(statement)
-
-        event.listen(engine, "before_cursor_execute", before)
-        try:
-            yield sent
-        finally:
-            event.remove(engine, "before_cursor_execute", before)
-
-    return _statements
 
 
 class TestFilterBudget(AbstractTestFilterBudget):

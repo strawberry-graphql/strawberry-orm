@@ -5,6 +5,8 @@ and ``select(Contract)`` reads only contracts. Both are documents, so
 ``DocumentType.scope_rows`` has to apply to them as it does to any document.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import strawberry
 from sqlalchemy import ForeignKey, String, create_engine, select
@@ -12,8 +14,10 @@ from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
     Session,
+    aliased,
     mapped_column,
     relationship,
+    with_polymorphic,
 )
 
 from strawberry_orm import StrawberryORM
@@ -235,6 +239,74 @@ def test_a_row_under_an_interface_takes_the_type_of_its_nearest_class(
         )
         assert result.errors is None, result.errors
         assert result.data["titled"]["__typename"] == typename, id
+
+
+ENTITIES = {
+    "aliased": lambda: aliased(Document),
+    "with_polymorphic": lambda: with_polymorphic(Document, [Contract, Invoice]),
+    "aliased with_polymorphic": lambda: with_polymorphic(
+        Document, [Contract, Invoice], aliased=True, flat=True
+    ),
+}
+
+
+@pytest.mark.parametrize("entity", sorted(ENTITIES))
+def test_a_read_through_an_alias_is_scoped_as_its_class(session, entity):
+    """The scope names ``Document``'s table, which an alias reads a copy of."""
+    orm, _schema = build()
+
+    @orm.type(Document, name="Listed")
+    class Listed:
+        title: auto
+
+    @strawberry.type
+    class Query:
+        @orm.field.lazy
+        def listed(self, info: strawberry.Info) -> list[Listed]:
+            read = ENTITIES[entity]()
+            return select(read).order_by(read.id)
+
+    data = run(orm.schema(query=Query), session, "{ listed { title } }")
+    assert titles(data["listed"]) == sorted(MINE)
+
+
+def test_an_alias_is_scoped_once_and_only_when_its_class_has_a_scope(session):
+    orm, _schema = build()
+    info = SimpleNamespace(context={"session": session, "me": ME})
+    read = aliased(Document)
+    scoped = orm.backend.apply_type_scope(select(read), Document, info)
+    assert orm.backend.apply_type_scope(scoped, Document, info) is scoped
+    rows = session.scalars(scoped.order_by(read.id))
+    assert sorted(row.title for row in rows) == sorted(MINE)
+
+    unscoped = select(aliased(Note))
+    assert orm.backend.apply_type_scope(unscoped, Note, info) is unscoped
+
+
+def test_a_joined_subclass_with_its_own_scope_is_read_through_the_base(session):
+    """Its rows answer to its scope, checked in a statement over its own table."""
+    orm, _schema = build()
+
+    @orm.type(Document, name="Listed")
+    class Listed:
+        title: auto
+
+    @orm.type(Invoice)
+    class InvoiceType:
+        id: auto
+        title: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return stmt.where(Document.owner_id == ME, Invoice.amount == 1)
+
+    @strawberry.type
+    class Query:
+        listed: list[Listed] = orm.field.eager()
+
+    schema = orm.schema(query=Query, types=[InvoiceType])
+    data = run(schema, session, "{ listed { title } }")
+    assert titles(data["listed"]) == sorted(MINE)
 
 
 def public_notes(stmt, info):

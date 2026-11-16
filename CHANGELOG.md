@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.33.0
+
+### Security
+
+- **On Django, filtering or ordering a nested relation dropped the scoped `using=` loads below it.** A relation given `filter:` or `order:` was read again as plain rows, so `@orm.field.lazy(using=["notes"])` below it read the relation unscoped: `{ accounts { articles(filter: …) { noteBodies } } }` returned another writer's note that `NoteType.scope_rows` hides. The paths below a filtered or ordered relation are now loaded under their scopes, as they are without the filter.
+- **On Tortoise, and Django from async code, concurrent requests over rows the app keeps read each other's relation loads.** Rows that outlive a request (an app cache, a module-level list) were marked as read under one request's scope, and a request that replaced the relation afterwards left the mark trusted, so a guest's `posts` came back with an admin's drafts. A mark is now trusted only while the row still holds the rows that request loaded, and a load marks only the rows it fetched, as on SQLAlchemy since 0.31.0.
+- **SQLAlchemy: pointing a one-to-one at a row from the foreign-key side took it from its partner past that partner's checks.** Setting `Profile.member` to a member who already had a profile cleared the other profile's key, or deleted it under `delete-orphan`, asking only the caller's `can_update` and the member's `can_link`. The partner must now be one the repo's `scope_query` shows and whose `can_unlink` allows it, and one the cascade would delete is held to `authorize`, `can_delete` and `on_before_delete` first, on create and update alike.
+- **SQLAlchemy: a subclass row with a repo of its own was written by the base model's repo** when the write named the base. An upsert or `{delete: {id}}` through `Document` reached a `Contract` its `ContractRepo` hides, past its `scope_query`, `can_*`, hooks and `_delete`. The row's own repo now decides once the row is loaded.
+- **SQLAlchemy: unlinking through a many-to-many relationship with `delete-orphan` deleted the row past `can_delete`.** Such a relationship is now treated like a one-to-many one: unlinking from it is refused (send `delete`), and a delete goes through the repo.
+- **SQLAlchemy: a foreign key whose database column is named apart from its attribute escaped the hidden-key check.** With `author_id = mapped_column("author_fk", …)` and `exclude=["author_id"]`, node inputs still offered `author` and wrote the key. Keys are now compared by attribute.
+- **Node inputs did not inherit `exclude=` from a base model's type.** `@orm.type(Document, exclude=["internal_notes"])` left `internalNotes` writable on `Contract(Document)` rows. Excludes now apply along the model's bases, as scopes and repos already did.
+- **With regex filters on, a client's filter ran before `scope_rows`,** so on SQLite, which evaluates leftover conditions in the order written, a slow pattern ran on hidden rows and its running time told one hidden value from another, at the root and through `object:`. The scope is now written first, everywhere a client's filter is applied.
+- **Regex patterns were unguarded.** SQLite matches with Python's `re` in the server's process, holding the GIL, so one pattern such as `(a+)+$` froze every request. With `enable_regex_filters=True`, a pattern is now held to 100 characters, and one that repeats a group which itself repeats a variable number of times or offers a choice, or that refers back to a group, is refused before the query runs.
+- **Relation connections matched related rows by the parent's primary key, not the column the relation joins on.** With a foreign key to a unique column other than the key (SQLAlchemy, or Tortoise `to_field=`), an org's `members` connection listed another org's members. Pages and counts are now keyed by the joined column, and on SQLAlchemy a connection over a relation that is not one-to-many over its keys is refused when its type is declared.
+- **SQLAlchemy: connections, `groupBy` keys and `objects:` orders ignored a narrowed `primaryjoin` or `secondaryjoin`.** Through `open_tasks` (`done == False`) they listed done tasks the relation does not. Such a relation is now left out of group keys and `objects:` orders, and a connection over it is refused.
+- **On Django, a to-one cache holding the row it was reached from skipped that edge's `scope=`.** `{ accounts { articles { author { email } } } }` showed an author the `author` field's `scope=` hides, because Django had filled the cache with the account already loaded. Such a row is now checked against the edge's scope.
+- **A Relay type with its own `resolve_id` still counted its key column as shown,** so filters, `groupBy` and `min`/`max` read the integer key behind slug IDs. The column now counts only when the ID is Relay's default.
+- **On Django, a `GenericForeignKey`'s `object_id` was a writable plain column** in node and upsert inputs, so an update could point a row at another tenant's object. It is now left out of generated inputs and `where`.
+- **`orm.input()` and `orm.partial()` offered foreign key columns.** Written through `orm.apply_ref_list()`, `author_id` linked whichever user it named without the user repo's `scope_query` or `can_link`. They are now left out unless `include=` names them.
+- **A row created into a relation was never asked `can_link`.** Through a many-to-many list `can_create` is not told the parent, so nothing could refuse a new tag its place on a post. `can_link` is now asked for every row that joins a relation, created or existing, once it exists.
+- **The MCP `graphql` tool validated a client's operation on the event loop.** Its check ran in a worker thread, but `schema.execute` then parsed and validated the operation again on the loop: `{ posts { author { name } … ×447 } }`, under the token limit, held the loop for over half a second, and eight such calls for over five. Parsing and validation now run in a worker thread, with the schema's own parse options and validation rules, and an operation selecting one field more than 20 times in one place of its result is refused.
+- **MCP `root_fields` showed types only a hidden root field reaches,** through an interface they share with a reached type; in a Relay schema that is every type. Implementations are now added only for an interface an exposed field returns.
+- **On Django and Tortoise, a filter value the ORM refuses for its column reached the client in the ORM's words** (`“%(value)s” is not a valid UUID.`, `'str' object has no attribute 'days'`). It is now `Invalid filter expression`, with the original as the cause. On SQLAlchemy, a statement it cannot compile is reported the same way, where it reached the client with SQLAlchemy's description of the statement.
+- **More names count as sensitive**, as whole words: `privkey`, `mnemonic`, seed phrases, `bearer`, `csrf`, verification, reset, invite and one-time codes, magic links, security answers, and routing and account numbers.
+- **`README.md` documents what the app keeps.** Generated write inputs follow the model, not the type, and a `where: True` field is one a caller can test; an app's own resolver taking a generated filter does not narrow it; repo `on_before_*` hooks run before `can_*` checks with unapproved data; nothing caps how many items a write's lists carry.
+
+### Changed
+
+- **`orm.input()` and `orm.partial()` leave out foreign key columns** unless `include=` names them.
+- **`can_link` is asked for a row a write creates into a relation**, once it exists, as for an existing row.
+- **Regex filter patterns are held to 100 characters**, and one that can backtrack for exponential time is refused with `ValueError`.
+- **The MCP `graphql` tool refuses an operation that merges one field into one place more than 20 times**, and `graphql_schema` under `root_fields` leaves out types reached only through a shared interface.
+- **SQLAlchemy relation connections must be one-to-many over the relation's keys**, and a relation with a narrowed join is left out of `groupBy` and `objects:` orders.
+- **A type's scope is applied before the client's filter**, which changes the order of conditions in the statement.
+
+### Fixed
+
+- **`orm.schema()` could not build a query with Relay's `node()` when it cut an input or took `tags=`.** The build that cuts inputs, and any later schema from the same types, raised `Query fields cannot be resolved`, and a tagged schema's `node` lost its `id` argument (`nodes` its `ids`). Each schema now sets up its own copy of a `node()` field.
+- **SQLAlchemy: a joined-table subclass with its own `scope_rows` broke every read of the base** with SQLAlchemy's auto-correlation error, and a read through `aliased()` or `with_polymorphic()` failed or went unscoped. The scope now applies through an alias as for its class.
+- **A filter's second hop across a self-referential relation was dropped.** `object: { parent: { object: { parent: … } } }` matched every row with a parent, since the inner filter lacked `object:`. A self-relation now takes the filter it belongs to.
+
 ## 0.32.0
 
 ### Security

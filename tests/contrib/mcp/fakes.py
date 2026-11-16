@@ -7,6 +7,7 @@ import enum
 from typing import Annotated
 
 import strawberry
+from strawberry import relay
 
 
 @strawberry.enum(description="Where a post is in its life.")
@@ -135,6 +136,45 @@ class Mutation:
 
 
 schema = strawberry.Schema(query=Query, mutation=Mutation)
+
+
+@strawberry.type
+class Note(relay.Node):
+    id: relay.NodeID[int]
+    text: str
+
+    @classmethod
+    def resolve_nodes(cls, *, info, node_ids, required=False):
+        return [Note(id=int(pk), text="Hi") for pk in node_ids]
+
+
+@strawberry.type
+class SigningKey:
+    private_pem: str
+
+
+@strawberry.type
+class AuditEntry(relay.Node):
+    id: relay.NodeID[int]
+    actor_email: str
+    signing_key: SigningKey
+
+
+@strawberry.type
+class NodeQuery:
+    node: relay.Node = relay.node()
+
+    @strawberry.field
+    def notes(self) -> list[Note]:
+        return [Note(id=1, text="Hi")]
+
+    @strawberry.field
+    def audit_log(self) -> list[AuditEntry]:
+        return []
+
+
+#: A Relay schema, where every type implements ``Node``.
+relay_schema = strawberry.Schema(query=NodeQuery)
 
 OPERATIONS = '''
 """Published posts, or drafts too when asked."""

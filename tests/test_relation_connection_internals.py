@@ -9,6 +9,7 @@ import types
 
 import pytest
 
+from strawberry_orm.backends._base import RelationConnectionSpec
 from strawberry_orm.batching import (
     _CONNECTION_KEY,
     _UNBATCHABLE,
@@ -27,6 +28,16 @@ from strawberry_orm.batching import (
 class _Parent:
     def __init__(self, pk):
         self.pk = pk
+
+
+def _spec():
+    return RelationConnectionSpec(
+        model=object,
+        field_name="posts",
+        relation="posts",
+        related_model=object,
+        key_field="author_id",
+    )
 
 
 class _Backend:
@@ -139,14 +150,14 @@ class TestFetchGuards:
     def test_a_parent_without_a_key_cannot_be_grouped(self):
         ext = _extension(_Backend())
         with pytest.raises(_Bail):
-            ext._fetch_pages(ext._backend, object(), [_Parent(None)], _info())
+            ext._fetch_pages(ext._backend, _spec(), [_Parent(None)], _info())
 
     def test_last_without_first_is_not_windowed(self):
         """Where the last page starts depends on each parent's own count."""
         ext = _extension(_Backend())
         with pytest.raises(_Bail, match="last"):
             ext._fetch_pages(
-                ext._backend, object(), [_Parent(1)], _info(), kwargs={"last": 2}
+                ext._backend, _spec(), [_Parent(1)], _info(), kwargs={"last": 2}
             )
 
     @pytest.mark.parametrize(
@@ -174,7 +185,7 @@ class TestFetchGuards:
 
         backend = _Recording()
         ext = _extension(backend)
-        spec = types.SimpleNamespace(key_field="author_id", related_model=object)
+        spec = _spec()
         ext._fetch_pages(backend, spec, [_Parent(1)], _info(), kwargs=kwargs)
         assert seen == {"limit": limit}
 
@@ -182,7 +193,7 @@ class TestFetchGuards:
         """An async backend windows too; the reads are just awaited."""
         backend = _Backend(awaitable=True, rows={("1",): ["row"]}, totals={1: 4})
         ext = _extension(backend)
-        spec = types.SimpleNamespace(key_field="author_id", related_model=object)
+        spec = _spec()
         pending = ext._fetch_pages(
             backend, spec, [_Parent(1)], _info(), kwargs={"first": 1}
         )
@@ -205,9 +216,7 @@ class TestFetchGuards:
         import asyncio
 
         backend = _Counting(totals={1: 1, 2: 1})
-        backend.relation_connection_spec = lambda info: types.SimpleNamespace(
-            key_field="author_id", related_model=object, field_name="posts"
-        )
+        backend.relation_connection_spec = lambda info: _spec()
         ext = _extension(backend)
         parents = [_Parent(1), _Parent(2)]
         _stash(ext.execution_context, parents)
@@ -234,7 +243,7 @@ class TestFetchGuards:
         )
         with pytest.raises(_Bail, match="not a connection"):
             ext._fetch_pages(
-                ext._backend, object(), [_Parent(1)], info, kwargs={"first": 1}
+                ext._backend, _spec(), [_Parent(1)], info, kwargs={"first": 1}
             )
 
     def test_a_cursor_before_the_first_row_is_not_windowed(self):
@@ -246,7 +255,7 @@ class TestFetchGuards:
         with pytest.raises(_Bail, match="before the first row"):
             ext._fetch_pages(
                 ext._backend,
-                object(),
+                _spec(),
                 [_Parent(1)],
                 _info(),
                 kwargs={"first": 1, "after": cursor},
@@ -264,7 +273,7 @@ class TestFetchGuards:
 
         backend = _Recording(totals={1: 7})
         ext = _extension(backend)
-        spec = types.SimpleNamespace(key_field="author_id", related_model=object)
+        spec = _spec()
         import base64
 
         cursor = base64.b64encode(b"arrayconnection:2").decode()

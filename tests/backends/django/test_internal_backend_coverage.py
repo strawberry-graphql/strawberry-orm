@@ -625,6 +625,7 @@ class TestScopedRelationHelpers:
             _clear_django_relation_cache,
             _clear_scoped_relation_caches,
             _django_related_children,
+            _held,
             _mark_scoped_prefetches,
             _scoped_prefetch,
             _scoped_related_instance,
@@ -716,8 +717,12 @@ class TestScopedRelationHelpers:
         _clear_django_relation_cache(alice, "not_a_field")
         post.author = alice
         with execution_scope():
-            mark_relations_scoped([post], ["author"])
+            mark_relations_scoped([post], ["author"], held=_held)
             assert _scoped_related_instance(orm._backend, post, "author", info) is alice
+            # Holding another row, the mark no longer vouches for the cache.
+            post.author = User.objects.get(name="Bob")
+            assert _scoped_related_instance(orm._backend, post, "author", info) is None
+            post.author = alice
         # Out of the execution that marked it, the cache is read again.
         reread = _scoped_related_instance(orm._backend, post, "author", info)
         assert reread == alice

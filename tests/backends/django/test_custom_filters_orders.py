@@ -6,6 +6,7 @@ from django.db.models import Count, Q
 
 from strawberry_orm import StrawberryORM, filter_field, order_field
 from strawberry_orm.types import Ordering, auto
+from tests.backends.django.models import Post as DjPost
 from tests.backends.django.models import User as DjUser
 
 
@@ -92,6 +93,34 @@ class TestCustomFilterType:
         )
         assert result.errors is None
         assert result.data == {"users": [{"name": "Bob"}]}
+
+    def test_a_relation_takes_the_filter_of_its_model(self, seed):
+        orm = StrawberryORM.for_django(warn_missing_scope=False)
+        post_filter = orm.filter(DjPost)
+
+        @orm.filter_type(DjUser)
+        class UserFilter:
+            name: auto
+            posts: auto
+
+        @orm.type(DjPost, filters=post_filter)
+        class PostType:
+            title: auto
+
+        @orm.type(DjUser, filters=UserFilter)
+        class UserType:
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field.auto()
+
+        result = orm.schema(query=Query).execute_sync(
+            '{ users(filter: {object: {posts: {field: {title: {exact: "Hello World"}}}}}) { name } }'
+        )
+        assert result.errors is None, result.errors
+        assert result.data == {"users": [{"name": "Alice"}]}
 
 
 class TestCustomOrderType:

@@ -1,6 +1,5 @@
 """Filter limits as a budget for the whole filter (Tortoise)."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -33,30 +32,6 @@ async def run(seed):
         return await schema.execute(query, variable_values=variables, context_value={})
 
     return _run
-
-
-@pytest.fixture
-def statements(monkeypatch, tortoise_db):
-    from tortoise import connections
-
-    @contextmanager
-    def _statements():
-        sent: list[str] = []
-        client = connections.get("default")
-
-        def recording(original):
-            async def run(sql, *args, **kwargs):
-                sent.append(sql)
-                return await original(sql, *args, **kwargs)
-
-            return run
-
-        with monkeypatch.context() as patch:
-            for name in ("execute_query", "execute_query_dict"):
-                patch.setattr(client, name, recording(getattr(client, name)))
-            yield sent
-
-    return _statements
 
 
 class TestFilterBudget(AbstractTestFilterBudget):

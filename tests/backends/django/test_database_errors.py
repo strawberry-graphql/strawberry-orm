@@ -47,6 +47,16 @@ class LedgerLine(models.Model):
         db_table = "internal_ledger_line_v2"
 
 
+class Stamp(models.Model):
+    on = models.DateField()
+    key = models.UUIDField(null=True)
+    took = models.DurationField()
+
+    class Meta:
+        app_label = "testapp"
+        db_table = "internal_stamp_v1"
+
+
 REFUSED = "Invalid filter expression"
 BAD = '{field: {memo: {regex: "["}}}'
 
@@ -240,6 +250,65 @@ def test_rechecking_loaded_rows_is_reported_plainly(ledgers):
     with pytest.raises(ValueError, match=f"^{REFUSED}$") as caught:
         orm.backend.filter_scoped_pks(Ledger, [1], SimpleNamespace(context={}))
     assert isinstance(caught.value.__cause__, OperationalError)
+
+
+@pytest.fixture
+def stamps(setup_tables):
+    if Stamp._meta.db_table not in connection.introspection.table_names():
+        with connection.schema_editor() as editor:
+            editor.create_model(Stamp)
+    yield
+    Stamp.objects.all().delete()
+
+
+def build_stamps():
+    orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+    @orm.type(Stamp, filters=orm.filter(Stamp))
+    class StampNode(relay.Node):
+        id: relay.NodeID[int]
+        on: auto
+        key: auto
+        took: auto
+
+    @strawberry.type
+    class Query:
+        stamps: list[StampNode] = orm.field.eager()
+        stamp_pages: ORMListConnection[StampNode] = orm.connection.eager()
+
+    return orm.schema(query=Query)
+
+
+UNHELD = [
+    # Refused as the filter is added, in Django's words for the column.
+    '{on: {exact: "garbage"}}',
+    '{key: {exact: "not-a-uuid"}}',
+    # Refused as the statement compiles, by a Python error converting it.
+    '{took: {exact: "zz"}}',
+]
+STAMP_READS = [
+    "{ stamps(filter: {field: %s}) { id } }",
+    "{ stampPages(first: 2, filter: {field: %s}) { totalCount } }",
+]
+
+
+def assert_unheld(result):
+    assert [error.message for error in result.errors] == [REFUSED]
+    assert result.errors[0].original_error.__cause__ is not None
+
+
+@pytest.mark.parametrize("value", UNHELD)
+@pytest.mark.parametrize("read", STAMP_READS)
+def test_a_value_the_column_cannot_hold_is_reported_plainly(stamps, value, read):
+    assert_unheld(build_stamps().execute_sync(read % value))
+
+
+@pytest.mark.parametrize("value", UNHELD)
+@pytest.mark.parametrize("read", STAMP_READS)
+async def test_an_async_value_the_column_cannot_hold_is_reported_plainly(
+    stamps, value, read
+):
+    assert_unheld(await build_stamps().execute(read % value))
 
 
 def raising(error, *, raw):

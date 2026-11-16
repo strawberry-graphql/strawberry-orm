@@ -11,7 +11,16 @@ from typing import Any
 import pytest
 import pytest_asyncio
 import strawberry
-from sqlalchemy import Boolean, ForeignKey, String, and_, create_engine, select
+from sqlalchemy import (
+    Boolean,
+    Column,
+    ForeignKey,
+    String,
+    Table,
+    and_,
+    create_engine,
+    select,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -20,6 +29,7 @@ from sqlalchemy.orm import (
     relationship,
     sessionmaker,
 )
+from strawberry import relay
 
 from strawberry_orm import (
     AbstractRepo,
@@ -28,6 +38,7 @@ from strawberry_orm import (
     UpsertValidationError,
 )
 from strawberry_orm.mutations import _sqlalchemy_relation_specs
+from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
 from tests.abstract.write_path_authorization import (
     fields_of,
@@ -104,6 +115,26 @@ class Photo(Base):
     album: Mapped[Album | None] = relationship(back_populates="photos")
 
 
+class Desk(Base):
+    __tablename__ = "shape_desk"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    chair: Mapped["Chair | None"] = relationship(
+        back_populates="desk", cascade="all, delete-orphan"
+    )
+
+
+class Chair(Base):
+    __tablename__ = "shape_chair"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    # Not unique: the database would refuse the take before the cascade's delete.
+    desk_id: Mapped[int | None] = mapped_column(ForeignKey("shape_desk.id"))
+    desk: Mapped[Desk | None] = relationship(back_populates="chair")
+
+
 class Badge(Base):
     __tablename__ = "shape_badge"
 
@@ -120,6 +151,31 @@ class Wearer(Base):
     badge: Mapped[Badge | None] = relationship(
         cascade="all, delete-orphan", single_parent=True
     )
+
+
+shelf_book = Table(
+    "shape_shelf_book",
+    Base.metadata,
+    Column("shelf_id", ForeignKey("shape_shelf.id"), primary_key=True),
+    Column("book_id", ForeignKey("shape_book.id"), primary_key=True),
+)
+
+
+class Shelf(Base):
+    __tablename__ = "shape_shelf"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    books: Mapped[list["Book"]] = relationship(
+        secondary=shelf_book, cascade="all, delete-orphan", single_parent=True
+    )
+
+
+class Book(Base):
+    __tablename__ = "shape_book"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(50))
+    withdrawn: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 def new_orm(**kwargs: Any) -> Any:
@@ -173,6 +229,12 @@ async def db(session):
             Badge(id=1, name="old"),
             Badge(id=2, name="new"),
             Wearer(id=1, name="Me", badge_id=1),
+            Desk(id=1, name="my desk"),
+            Desk(id=2, name="their desk"),
+            Chair(id=1, name="my chair", desk_id=1),
+            Chair(id=2, name="their chair", desk_id=2),
+            Chair(id=3, name="spare chair"),
+            Shelf(id=1, books=[Book(id=1, title="atlas"), Book(id=2, title="diary")]),
         ]
     )
     await resolve(session.commit())
@@ -297,6 +359,187 @@ class TestReverseOneToOneLinks:
         assert await held_by(db) == UNTOUCHED
 
 
+# -- A forward link to a one-to-one takes its target from the row that held it -------
+
+PROFILE = {
+    "_meta": {
+        "create": ["name"],
+        "update": ["name"],
+        "upsert": {"where": ["name"], "onMatch": "UPDATE"},
+    },
+    "member": {"_meta": {"upsert": {"where": ["id"], "onMatch": "IGNORE"}}},
+}
+
+CHAIR = {
+    "_meta": {
+        "create": ["name"],
+        "update": ["name"],
+        "upsert": {"where": ["name"], "onMatch": "UPDATE"},
+    },
+    "desk": {"_meta": {"upsert": {"where": ["id"], "onMatch": "IGNORE"}}},
+}
+
+
+def point(
+    orm: Any,
+    model: type,
+    project: dict,
+    name: str,
+    link: str,
+    target: str,
+    *,
+    create: bool = False,
+) -> Any:
+    upsert = orm.mutations.upsert_node_input(
+        model=model, project=project, name=f"{model.__name__}UpsertInput"
+    )
+    operation = "create" if create else "update"
+    link_type = member(upsert, operation, link)
+    upsert_type = member(link_type, "upsert")
+    value = link_type(upsert=upsert_type(where=member(upsert_type, "where")(id=target)))
+    return upsert(
+        where=member(upsert, "where")(name=name),
+        **{operation: member(upsert, operation)(name=name, **{link: value})},
+    )
+
+
+def holder_repo(
+    calls: list[Any],
+    *,
+    locked: set[str] = frozenset(),
+    hidden: tuple[str, ...] = (),
+    column: Any = Profile.name,
+) -> type:
+    class HolderRepo(link_recorder(calls, locked=set(locked))):
+        def scope_query(self, query, info):
+            return query.where(column.not_in(hidden))
+
+        def can_delete(self, instance, info):
+            calls.append(("can_delete", instance.name))
+            return instance.name not in locked
+
+        def on_before_delete(self, instance, info):
+            calls.append(("on_before_delete", instance.name))
+
+    return HolderRepo
+
+
+async def chairs(db: Any) -> dict[str, int | None]:
+    statement = select(Chair.name, Chair.desk_id).order_by(Chair.id)
+    return dict((await resolve(db.session.execute(statement))).all())
+
+
+SEATED = {"my chair": 1, "their chair": 2, "spare chair": None}
+
+
+class TestForwardOneToOneLinks:
+    @pytest.fixture
+    def calls(self):
+        return []
+
+    @staticmethod
+    def orm(calls: list[Any], **holder: Any) -> Any:
+        return new_orm(
+            repos={
+                Profile: holder_repo(calls, **holder),
+                Member: link_recorder(calls, locked=set()),
+            }
+        )
+
+    async def test_the_specs_name_the_relation_a_target_is_taken_from(self):
+        profile = _sqlalchemy_relation_specs(Profile)["member"]
+        chair = _sqlalchemy_relation_specs(Chair)["desk"]
+        badge = _sqlalchemy_relation_specs(Wearer)["badge"]
+        assert (profile.taken_from, profile.orphans_holder) == ("profile", False)
+        assert (chair.taken_from, chair.orphans_holder) == ("chair", True)
+        assert (badge.taken_from, badge.orphans_holder) == (None, False)
+
+    @pytest.mark.parametrize("create", [False, True])
+    async def test_taking_a_member_asks_the_profile_that_holds_it(
+        self, db, calls, create
+    ):
+        orm = self.orm(calls, locked={"their profile"})
+        who = "new profile" if create else "spare profile"
+        payload = point(orm, Profile, PROFILE, who, "member", "2", create=create)
+        with pytest.raises(PermissionError, match="can_unlink denied"):
+            await resolve(orm.apply_upsert(payload, db.info))
+        asked = ("can_unlink", "Victim", "profile", "their profile")
+        assert calls[-1] == asked
+        assert await held_by(db) == UNTOUCHED
+
+    @pytest.mark.parametrize("create", [False, True])
+    async def test_a_holder_the_repo_hides_is_not_written(self, db, calls, create):
+        orm = self.orm(calls, hidden=("their profile",))
+        who = "new profile" if create else "spare profile"
+        payload = point(orm, Profile, PROFILE, who, "member", "2", create=create)
+        with pytest.raises(
+            PermissionError, match="Member 2 cannot be taken from the Profile"
+        ):
+            await resolve(orm.apply_upsert(payload, db.info))
+        assert ("can_unlink", "Victim", "profile", "their profile") not in calls
+        assert await held_by(db) == UNTOUCHED
+
+    async def test_an_allowed_take_clears_the_holders_key(self, db, calls):
+        orm = self.orm(calls)
+        payload = point(orm, Profile, PROFILE, "spare profile", "member", "2")
+        await resolve(orm.apply_upsert(payload, db.info))
+        await resolve(db.session.commit())
+        assert calls == [
+            ("can_link", "spare profile", "member", "Victim"),
+            ("can_unlink", "Victim", "profile", "their profile"),
+        ]
+        assert await held_by(db) == {
+            "my profile": 1,
+            "their profile": None,
+            "spare profile": 2,
+        }
+
+    async def test_a_new_row_taking_a_member_clears_the_holders_key(self, db, calls):
+        """The holder lets go before the new row is built; the link is asked
+        once the row exists."""
+        orm = self.orm(calls)
+        payload = point(
+            orm, Profile, PROFILE, "new profile", "member", "2", create=True
+        )
+        await resolve(orm.apply_upsert(payload, db.info))
+        await resolve(db.session.commit())
+        assert calls == [
+            ("can_unlink", "Victim", "profile", "their profile"),
+            ("can_link", "new profile", "member", "Victim"),
+        ]
+        assert await held_by(db) == {
+            "my profile": 1,
+            "their profile": None,
+            "spare profile": None,
+            "new profile": 2,
+        }
+
+    @pytest.mark.parametrize("create", [False, True])
+    async def test_a_holder_the_cascade_would_delete_asks_to_be_deleted(
+        self, db, calls, create
+    ):
+        orm = new_orm(
+            repos={Chair: holder_repo(calls, locked={"their chair"}, column=Chair.name)}
+        )
+        who = "new chair" if create else "spare chair"
+        payload = point(orm, Chair, CHAIR, who, "desk", "2", create=create)
+        with pytest.raises(PermissionError, match="denied"):
+            await resolve(orm.apply_upsert(payload, db.info))
+        assert await chairs(db) == SEATED
+
+    async def test_an_allowed_take_deletes_the_orphaned_holder_once(self, db, calls):
+        orm = new_orm(repos={Chair: holder_repo(calls, column=Chair.name)})
+        payload = point(orm, Chair, CHAIR, "spare chair", "desk", "2")
+        await resolve(orm.apply_upsert(payload, db.info))
+        await resolve(db.session.commit())
+        assert calls == [
+            ("can_unlink", "their desk", "chair", "their chair"),
+            ("can_delete", "their chair"),
+            ("on_before_delete", "their chair"),
+        ]
+        assert await chairs(db) == {"my chair": 1, "spare chair": 2}
+
+
 # -- A primaryjoin narrower than its keys bounds unlink and delete --------------------
 
 
@@ -339,6 +582,42 @@ class TestPrimaryjoinMembership:
             orm.apply_ref_list(await self.project(db), "tasks", refs, db.info)
         )
         assert await tasks(db) == [(1, 1), (3, 1)]
+
+
+# -- A join narrower than its keys is not rebuilt from them ---------------------------
+
+
+class TestANarrowedJoinIsNotRebuilt:
+    """Grouping and ``objects:`` join on the keys alone, so ``done`` tasks would count."""
+
+    def test_grouping_leaves_the_relation_out(self):
+        orm = new_orm()
+        orm.group(Task)
+        group = orm.group(Project)
+        assert set(group._object_type.__annotations__) == {"tasks"}
+        assert set(group._objects_type.__annotations__) == {"tasks"}
+
+    def test_ordering_by_the_related_rows_together_leaves_it_out(self):
+        orm = new_orm()
+        orm.order(Task)
+        order = orm.order(Project)
+        assert set(order._object_type.__annotations__) == {"tasks", "open_tasks"}
+        assert set(order._objects_type.__annotations__) == {"tasks"}
+
+    def test_a_connection_over_it_is_refused(self):
+        orm = new_orm()
+
+        @orm.type(Task)
+        class TaskNode(relay.Node):
+            id: relay.NodeID[int]
+            title: auto
+
+        with pytest.raises(ValueError, match="join says more than that column"):
+
+            @orm.type(Project)
+            class ProjectNode(relay.Node):
+                id: relay.NodeID[int]
+                open_tasks: ORMListConnection[TaskNode] = orm.connection.eager()
 
 
 # -- A relationship that deletes orphans deletes the rows it lets go of ---------------
@@ -397,6 +676,7 @@ class TestOrphansGoAsDeletes:
     async def test_the_specs_say_which_relations_delete_orphans(self):
         assert _sqlalchemy_relation_specs(Album)["photos"].deletes_orphans
         assert _sqlalchemy_relation_specs(Wearer)["badge"].deletes_orphans
+        assert _sqlalchemy_relation_specs(Shelf)["books"].deletes_orphans
         assert not _sqlalchemy_relation_specs(Member)["profile"].deletes_orphans
         assert not _sqlalchemy_relation_specs(Photo)["album"].deletes_orphans
 
@@ -452,6 +732,54 @@ class TestOrphansGoAsDeletes:
         await resolve(db.session.commit())
         assert calls == [("can_delete", "old"), ("on_before_delete", "old")]
         assert await stored_rows(db) == {**KEPT, "badges": ["new"], "worn": 2}
+
+
+class WithdrawingBookRepo(AbstractRepo):
+    def _delete(self, instance, info):
+        instance.withdrawn = True
+        self._save(instance, info)
+
+    async def _delete_async(self, instance, info):
+        instance.withdrawn = True
+        await self._save_async(instance, info)
+
+
+async def shelved(db: Any) -> dict[str, Any]:
+    books = await resolve(db.session.execute(select(Book.title, Book.withdrawn)))
+    links = await resolve(db.session.execute(select(shelf_book.c.book_id)))
+    return {"books": sorted(books.all()), "shelved": sorted(links.scalars())}
+
+
+SHELVED = {"books": [("atlas", False), ("diary", False)], "shelved": [1, 2]}
+
+
+class TestManyToManyOrphans:
+    async def edit(self, db: Any, orm: Any, operation: str) -> None:
+        ref = orm.ref(Book, unlink=True, delete=True)
+        shelf = await resolve(db.session.get(Shelf, 1))
+        await resolve(
+            orm.apply_ref_list(shelf, "books", [item(ref, operation, id="1")], db.info)
+        )
+        await resolve(db.session.commit())
+        db.session.expunge_all()
+
+    async def test_unlinking_from_it_is_refused(self, db):
+        with pytest.raises(
+            UpsertValidationError, match=r"Shelf\.books deletes .* send delete"
+        ):
+            await self.edit(db, new_orm(), "unlink")
+        assert await shelved(db) == SHELVED
+
+    async def test_a_delete_is_left_to_the_repo(self, db):
+        await self.edit(db, new_orm(repos={Book: WithdrawingBookRepo}), "delete")
+        assert await shelved(db) == {
+            **SHELVED,
+            "books": [("atlas", True), ("diary", False)],
+        }
+
+    async def test_a_deleted_row_takes_its_link_rows_with_it(self, db):
+        await self.edit(db, new_orm(), "delete")
+        assert await shelved(db) == {"books": [("diary", False)], "shelved": [2]}
 
 
 # -- isNull on a reverse one-to-one -----------------------------------------------------

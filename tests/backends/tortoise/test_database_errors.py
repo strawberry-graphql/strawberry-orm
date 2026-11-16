@@ -50,6 +50,14 @@ class Doc(Model):
         table = "internal_documents_v2"
 
 
+class Stamp(Model):
+    id = fields.IntField(primary_key=True)
+    took = fields.TimeDeltaField()
+
+    class Meta:
+        table = "internal_stamps_v1"
+
+
 def _docs_schema(**options):
     """Docs from the root, and from each folder."""
     orm = StrawberryORM.for_tortoise(lazy_resolution="off", warn_missing_scope=False)
@@ -204,3 +212,25 @@ async def test_a_relations_counts_are_sanitized(client):
     with pytest.raises(ValueError, match="^Invalid filter expression$") as caught:
         await backend.group_counts(Doc.all(), "folder_id", info)
     assert isinstance(caught.value.__cause__, OperationalError)
+
+
+async def test_a_value_the_column_cannot_hold_is_reported_plainly(client):
+    """Tortoise converts a filter's value as it resolves the filter, and one
+    it cannot convert fails with a Python error of the conversion's own."""
+    orm = StrawberryORM.for_tortoise(lazy_resolution="off", warn_missing_scope=False)
+
+    @orm.type(Stamp, filters=orm.filter(Stamp))
+    class StampType:
+        id: auto
+        took: auto
+
+    @strawberry.type
+    class Query:
+        stamps: list[StampType] = orm.field.eager()
+
+    schema = orm.schema(query=Query)
+    result = await schema.execute(
+        '{ stamps(filter: {field: {took: {exact: "zz"}}}) { id } }'
+    )
+    assert [error.message for error in result.errors] == ["Invalid filter expression"]
+    assert isinstance(result.errors[0].original_error.__cause__, AttributeError)

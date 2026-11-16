@@ -8,10 +8,73 @@ whereclause, Tortoise Q objects).
 from __future__ import annotations
 
 import datetime
+import re
+import warnings
 from decimal import Decimal
 from typing import Any
 
 import strawberry
+
+#: The longest pattern a ``regex`` or ``iRegex`` filter takes.
+MAX_REGEX_LENGTH = 100
+
+
+def check_regex(pattern: str) -> None:
+    """Refuse a pattern whose matching can take time exponential in the value.
+
+    SQLite matches a regex with Python's ``re``, in the server's process and
+    holding the GIL, so one such pattern stalls every request the process
+    serves. A repeat that holds a repeat of no fixed length, or a choice
+    between alternatives, as in ``(a+)+`` or ``(a|aa)+``, backtracks through
+    every way of splitting the value; a back-reference can as well. A pattern
+    Python cannot parse is left to the database, which refuses it or reads it
+    in a dialect of its own.
+    """
+    from re import _constants as sre
+    from re import _parser
+
+    if len(pattern) > MAX_REGEX_LENGTH:
+        raise ValueError(f"A regex filter takes at most {MAX_REGEX_LENGTH} characters.")
+    try:
+        with warnings.catch_warnings():
+            # PostgreSQL's ``[[:alpha:]]`` reads to Python as a nested set.
+            warnings.simplefilter("ignore")
+            parsed = _parser.parse(pattern)
+    except (re.error, RecursionError, OverflowError):
+        return
+    if _backtracks(parsed, sre, repeated=False):
+        raise ValueError(
+            "A regex filter may not repeat a group that repeats or offers a "
+            "choice, nor refer back to a group."
+        )
+
+
+def _backtracks(pattern: Any, sre: Any, *, repeated: bool) -> bool:
+    repeats = (sre.MAX_REPEAT, sre.MIN_REPEAT, sre.POSSESSIVE_REPEAT)
+    for op, av in pattern:
+        if op in (sre.GROUPREF, sre.GROUPREF_EXISTS):
+            return True
+        if op in repeats:
+            low, high, inner = av
+            if (repeated and low != high) or _backtracks(
+                inner, sre, repeated=repeated or high > 1
+            ):
+                return True
+        elif op is sre.BRANCH:
+            if repeated or any(
+                _backtracks(branch, sre, repeated=False) for branch in av[1]
+            ):
+                return True
+        elif op is sre.SUBPATTERN:
+            if _backtracks(av[-1], sre, repeated=repeated):
+                return True
+        elif op in (sre.ASSERT, sre.ASSERT_NOT):
+            if _backtracks(av[1], sre, repeated=repeated):
+                return True
+        elif op is sre.ATOMIC_GROUP and _backtracks(av, sre, repeated=repeated):
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Base lookups

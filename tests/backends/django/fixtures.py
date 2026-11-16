@@ -7,9 +7,12 @@ NOTE: Django must be configured before this module is imported.
 conftest.py handles that via settings.configure() + django.setup().
 """
 
+from contextlib import contextmanager
+
 import pytest
 import strawberry
 from django.db import connection
+from django.db.backends.sqlite3.base import SQLiteCursorWrapper
 from strawberry import relay
 from strawberry.types.cast import cast as strawberry_cast
 
@@ -702,3 +705,23 @@ def user_brief_type():
 @pytest.fixture
 def user_full_type():
     return UserFull
+
+
+@pytest.fixture
+def statements(monkeypatch):
+    """SQL from whichever thread runs it: async execution reads on a worker."""
+
+    @contextmanager
+    def _statements():
+        sent: list[str] = []
+        original = SQLiteCursorWrapper.execute
+
+        def execute(self, query, params=None):
+            sent.append(query)
+            return original(self, query, params)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(SQLiteCursorWrapper, "execute", execute)
+            yield sent
+
+    return _statements

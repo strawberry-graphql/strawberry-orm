@@ -4,6 +4,8 @@ Module-level objects:  orm instances, type classes, schemas.
 Pytest fixtures:       session, seed, model classes, execute helpers, orm factory.
 """
 
+from contextlib import contextmanager
+
 import pytest
 import strawberry
 from sqlalchemy import create_engine, event, select
@@ -742,3 +744,24 @@ def query_counter(sa_session):
     event.listen(engine, "before_cursor_execute", _before_cursor_execute)
     yield queries
     event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+
+
+@pytest.fixture
+def statements(sa_session):
+    """A context manager yielding the SQL statements sent while it is open."""
+    engine = sa_session.get_bind()
+
+    @contextmanager
+    def _statements():
+        sent: list[str] = []
+
+        def before(conn, cursor, statement, params, context, executemany):
+            sent.append(statement)
+
+        event.listen(engine, "before_cursor_execute", before)
+        try:
+            yield sent
+        finally:
+            event.remove(engine, "before_cursor_execute", before)
+
+    return _statements

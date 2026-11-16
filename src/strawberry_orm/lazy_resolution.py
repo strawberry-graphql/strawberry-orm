@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import warnings
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
@@ -172,6 +173,47 @@ def relation_cache_is_scoped(
     )
 
 
+#: On a row: the loads onto it still in flight.
+_LOADS_IN_FLIGHT = "_strawberry_orm_loads_in_flight"
+_LOADS_LOCK = threading.Lock()
+
+
+class _Load:
+    __slots__ = ("crossed",)
+
+    def __init__(self) -> None:
+        self.crossed = False
+
+
+@contextmanager
+def load_alone(rows: Iterable[Any]) -> Iterator[Callable[[], bool]]:
+    """Track a load onto *rows*; yields whether it has had them to itself so far.
+
+    A row the app keeps between requests can be loaded onto by two at once,
+    and one load's caches replaced by the other's before it marks them. Its
+    mark would then vouch for rows another scope allowed, so a load that
+    crossed another one marks nothing, and the resolvers read again.
+    """
+    load = _Load()
+    unique = list({id(row): row for row in rows}.values())
+    with _LOADS_LOCK:
+        for row in unique:
+            loads = getattr(row, _LOADS_IN_FLIGHT, None)
+            if loads is None:
+                loads = []
+                setattr(row, _LOADS_IN_FLIGHT, loads)
+            for other in loads:
+                other.crossed = load.crossed = True
+            loads.append(load)
+    try:
+        yield lambda: not load.crossed
+    finally:
+        with _LOADS_LOCK:
+            for row in unique:
+                loads = getattr(row, _LOADS_IN_FLIGHT)
+                loads[:] = [other for other in loads if other is not load]
+
+
 #: The scope a row mark or check leaves unnamed. A mark that names none vouches
 #: for the scope of each row's own class; a check that names none takes any
 #: mark. When both name one, it must be the same class.
@@ -241,6 +283,16 @@ def query_is_scoped(query: Any) -> bool:
         return _SCOPED_QUERIES.get(query) is mark
     except TypeError:
         return False
+
+
+def narrowed_from(query: Any, narrowed: Any) -> Any:
+    """*narrowed*, a filter or ordering of *query*, scoped if *query* was.
+
+    A clone, as Django's querysets make, forgets the mark.
+    """
+    if narrowed is not query and query_is_scoped(query):
+        mark_query_scoped(narrowed)
+    return narrowed
 
 
 def extensions_include_lazy_resolution(extensions: list[Any]) -> bool:

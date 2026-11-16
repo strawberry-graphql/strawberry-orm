@@ -6,6 +6,7 @@ from tortoise.queryset import Q
 
 from strawberry_orm import StrawberryORM, filter_field, order_field
 from strawberry_orm.types import Ordering, auto
+from tests.backends.tortoise.models import Post as TortPost
 from tests.backends.tortoise.models import User as TortUser
 
 
@@ -91,6 +92,35 @@ class TestCustomFilterType:
         )
         assert result.errors is None
         assert result.data == {"users": [{"name": "Bob"}]}
+
+    @pytest.mark.asyncio
+    async def test_a_relation_takes_the_filter_of_its_model(self, seed):
+        orm = StrawberryORM.for_tortoise(warn_missing_scope=False)
+        post_filter = orm.filter(TortPost)
+
+        @orm.filter_type(TortUser)
+        class UserFilter:
+            name: auto
+            posts: auto
+
+        @orm.type(TortPost, filters=post_filter)
+        class PostType:
+            title: auto
+
+        @orm.type(TortUser, filters=UserFilter)
+        class UserType:
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field.auto()
+
+        result = await orm.schema(query=Query).execute(
+            '{ users(filter: {object: {posts: {field: {title: {exact: "Hello World"}}}}}) { name } }'
+        )
+        assert result.errors is None, result.errors
+        assert result.data == {"users": [{"name": "Alice"}]}
 
 
 class TestCustomOrderType:

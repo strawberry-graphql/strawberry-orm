@@ -20,7 +20,11 @@ from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
 from strawberry_orm.fields import call_scope
-from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.filters import (
+    check_regex,
+    is_fk_shortcut_lookup,
+    is_reference_lookup,
+)
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.leaf_fields import is_default_relay_id
 from strawberry_orm.optimizer import OptimizerExtension
@@ -207,6 +211,15 @@ class DjangoBackend(BaseBackend):
         if meta.pk is None:
             return set()
         return {meta.pk.name}
+
+    def _generic_key_columns(self, model: type) -> set[str]:
+        # contenttypes is not imported: an app without it installed has no
+        # GenericForeignKey, and importing it would refuse to load.
+        return {
+            field.fk_field
+            for field in model._meta.private_fields  # type: ignore[attr-defined]
+            if hasattr(field, "ct_field") and hasattr(field, "fk_field")
+        }
 
     # -- Type generation -----------------------------------------------------
 
@@ -428,7 +441,7 @@ class DjangoBackend(BaseBackend):
             max_branches=self._max_filter_branches,
             max_values=self._max_in_list_size,
         )
-        with self.filtering(model, info):
+        with self.filtering(model, info), _refused_values():
             q_obj, query = _build_django_filter(
                 filter_input,
                 query=query,
@@ -440,15 +453,17 @@ class DjangoBackend(BaseBackend):
                 enable_regex=self._enable_regex_filters,
                 max_in_list_size=self._max_in_list_size,
             )
-        if q_obj is not None:
-            if self.filter_crosses_to_many(filter_input, model):
-                # Matched in a subquery, so the outer query keeps each row once.
-                from django.db.models import Q
+        if q_obj is None:
+            return query
+        if self.filter_crosses_to_many(filter_input, model):
+            # Matched in a subquery, so the outer query keeps each row once.
+            from django.db.models import Q
 
+            with _refused_values():
                 matching = model._base_manager.filter(q_obj)  # type: ignore[attr-defined]
-                q_obj = Q(pk__in=matching.values("pk"))
-            query = query.filter(q_obj)
-        return query
+            q_obj = Q(pk__in=matching.values("pk"))
+        with _refused_values():
+            return query.filter(q_obj)
 
     def apply_ordering(
         self, query: Any, order_input: Any, model: type, info: Any = None
@@ -1072,9 +1087,9 @@ class DjangoBackend(BaseBackend):
             key_field=fk.attname if fk.target_field.primary_key else f"{fk.name}__pk",
         )
 
-    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+    def relation_base_query(self, spec: Any, keys: list[Any], info: Any) -> Any:
         queryset = spec.related_model._default_manager.filter(
-            **{f"{spec.key_field}__in": pks}
+            **{f"{spec.key_field}__in": keys}
         )
         restrict = self.relation_scope(
             spec.model, spec.field_name, info, on=spec.relation
@@ -1340,36 +1355,33 @@ class DjangoBackend(BaseBackend):
                 model = query.model
             except AttributeError:
                 return query
-
-            optimized_query = self.apply_type_scope(query, model, info)
-
-            select_related, prefetch_related = self._relation_lookups(
-                store, model, info
+            return self._read_with_relations(
+                store, self.apply_type_scope(query, model, info), info
             )
-            # One relation can be reached twice - two aliases, or the same
-            # field under sibling fragments of an interface - and each pass
-            # builds its own queryset. Django compares those by identity, so
-            # duplicates have to be collapsed before they reach it.
-            if select_related:
-                optimized_query = optimized_query.select_related(
-                    *_dedupe_lookups(select_related)
-                )
-            # select_related wins over a later Prefetch of the same relation
-            # and would keep the unscoped row. Strip it after the optimizer's
-            # own select_related so a scoped prefetch actually runs.
-            optimized_query = _strip_conflicting_select_related(
-                optimized_query, prefetch_related
-            )
-            if prefetch_related:
-                optimized_query = optimized_query.prefetch_related(
-                    *_dedupe_lookups(prefetch_related)
-                )
-
-            rows = _listed(optimized_query)
-            _mark_scoped_prefetches(rows, _dedupe_lookups(prefetch_related))
-            return rows
 
         return run_sync(optimize, thread_sensitive=True)
+
+    def _read_with_relations(self, store: Any, query: Any, info: Any) -> list[Any]:
+        """Read *query*, already scoped, with the relations the selection needs."""
+        select_related, prefetch_related = self._relation_lookups(
+            store, query.model, info
+        )
+        # One relation can be reached twice - two aliases, or the same
+        # field under sibling fragments of an interface - and each pass
+        # builds its own queryset. Django compares those by identity, so
+        # duplicates have to be collapsed before they reach it.
+        if select_related:
+            query = query.select_related(*_dedupe_lookups(select_related))
+        # select_related wins over a later Prefetch of the same relation
+        # and would keep the unscoped row. Strip it after the optimizer's
+        # own select_related so a scoped prefetch actually runs.
+        query = _strip_conflicting_select_related(query, prefetch_related)
+        if prefetch_related:
+            query = query.prefetch_related(*_dedupe_lookups(prefetch_related))
+
+        rows = _listed(query)
+        _mark_scoped_prefetches(rows, _dedupe_lookups(prefetch_related))
+        return rows
 
     def load_relations(self, store: Any, instances: list[Any], info: Any) -> list[Any]:
         """Eager-load the selected relations onto instances already in memory.
@@ -1473,6 +1485,7 @@ def _make_on_resolver(
                 self,
                 field_name,
                 scope=backend._field_scope(type(self), field_name, info),
+                held=_held,
             )
         ):
             return prefetched
@@ -1654,13 +1667,30 @@ def _django_related_children(instances: list[Any], name: str) -> list[Any]:
     return children
 
 
+def _held(instance: Any, name: str) -> Any:
+    """What relation *name* holds on *instance*: its prefetched queryset, row or list.
+
+    A prefetch or a ``select_related`` replaces it, so a mark made with this
+    stops holding once another load replaces what it vouched for.
+    """
+    prefetched = getattr(instance, "_prefetched_objects_cache", None)
+    if isinstance(prefetched, dict) and name in prefetched:
+        return prefetched[name]
+    fields_cache = instance._state.fields_cache
+    if name in fields_cache:
+        return fields_cache[name]
+    return instance.__dict__.get(name)
+
+
 def _mark_scoped_prefetches(instances: list[Any], lookups: list[Any]) -> None:
     """Mark caches filled by scoped prefetches so resolvers can trust them.
 
     Django skips a prefetch where the relation is already cached - by a
     ``select_related``, a manager's or the scope's own - so a cache is marked
-    only when every row in it was read by that prefetch, or is the row it was
-    reached from, which Django caches as the far side of the relation.
+    only when every row in it was read by that prefetch. Django also caches
+    the row a relation was reached from as the far side of a to-one, and that
+    row was read under its own type's scope, not this relation's: it is kept
+    if the prefetch's queryset reads it, and read as absent if not.
     """
     from strawberry_orm.lazy_resolution import mark_relations_scoped
 
@@ -1680,17 +1710,37 @@ def _mark_scoped_prefetches(instances: list[Any], lookups: list[Any]) -> None:
                 for child in _django_related_children([node], segment)
             ]
         attr = getattr(lookup, "to_attr", None) or path[-1]
-        filled = [
-            node
-            for parent, node in pairs
-            if all(
-                row is parent or getattr(row, _LOADED_BY, None) is tag
+        filled = []
+        returned = []
+        for parent, node in pairs:
+            if parent is not None and node._state.fields_cache.get(attr) is parent:
+                returned.append((parent, node))
+            elif all(
+                getattr(row, _LOADED_BY, None) is tag
                 for row in _django_related_children([node], attr)
-            )
-        ]
+            ):
+                filled.append(node)
+        if returned:
+            seen = _read_by(lookup, [parent for parent, _node in returned])
+            for parent, node in returned:
+                if parent.pk not in seen:
+                    node._state.fields_cache[attr] = None
+                filled.append(node)
         mark_relations_scoped(
-            filled, [attr], scope=getattr(lookup, "_strawberry_orm_token", None)
+            filled,
+            [attr],
+            scope=getattr(lookup, "_strawberry_orm_token", None),
+            held=_held,
         )
+
+
+def _read_by(lookup: Any, rows: list[Any]) -> set[Any]:
+    """The primary keys of *rows* that *lookup*'s scoped queryset reads."""
+    queryset = lookup.queryset.using(_instance_db(rows[0])).prefetch_related(None)
+    found = queryset.filter(pk__in={row.pk for row in rows}).values_list(
+        "pk", flat=True
+    )
+    return set(_listed(found))
 
 
 def _scoped_related_queryset(
@@ -1721,6 +1771,7 @@ def _scoped_related_queryset(
             instance,
             field_name,
             scope=backend._field_scope(type(instance), field_name, info),
+            held=_held,
         )
     ):
         return manager.all()
@@ -1759,6 +1810,7 @@ def _scoped_related_instance(
             instance,
             field_name,
             scope=backend._field_scope(type(instance), field_name, info),
+            held=_held,
         ):
             return getattr(instance, field_name, None)
         related = getattr(instance, field_name, None)
@@ -1866,7 +1918,9 @@ def _make_dj_rel_resolver(
                 return list(_scoped_related_queryset(backend, self, fname, info))
 
         # Filtering or ordering re-runs the query, so a prefetched result
-        # cannot carry the scope through - it has to be reapplied here.
+        # cannot carry the scope through - it has to be reapplied here, and
+        # the relations below loaded onto the new rows, ``using=`` paths
+        # included, or a field reading one would read it unscoped.
         restrict = backend.relation_scope(type(self), fname, info)
         qs = getattr(self, fname).all()
         if restrict is not None:
@@ -1875,7 +1929,7 @@ def _make_dj_rel_resolver(
             qs = backend.apply_filters(qs, filter, rel_model, info=info)
         if order is not None:
             qs = backend.apply_ordering(qs, order, rel_model, info=info)
-        return _listed(qs)
+        return backend._read_with_relations(backend._store, qs, info)
 
     if filter_type and order_type:
 
@@ -1943,6 +1997,7 @@ def _relation_in_memory(backend: Any, field_name: str) -> Any:
                 instance,
                 field_name,
                 scope=backend._field_scope(type(instance), field_name, info),
+                held=_held,
             )
             or backend.relation_scope(type(instance), field_name, info) is None
         )
@@ -2392,7 +2447,7 @@ def _build_django_filter(
                     )
                     if fk_clause is not None:
                         if scope_q is not None:
-                            fk_clause = fk_clause & scope_q
+                            fk_clause = scope_q & fk_clause
                         return fk_clause, query
                 with past_a_hop():
                     nested_clause, query = _build_django_filter(
@@ -2411,17 +2466,18 @@ def _build_django_filter(
                     )
                 if nested_clause is None or link is None:
                     if nested_clause is not None and scope_q is not None:
-                        nested_clause = nested_clause & scope_q
+                        nested_clause = scope_q & nested_clause
                     return nested_clause, query
                 # One correlated condition per parent, so a negation negates
                 # "a readable related row matches" rather than each part of it.
                 from django.db.models import Exists, OuterRef
 
-                related = rel_model._base_manager.filter(  # type: ignore[union-attr]
-                    nested_clause, **{f"{link}__pk": OuterRef(f"{_prefix}pk")}
-                )
+                conditions = [nested_clause]
                 if scoped is not None:
-                    related = related.filter(pk__in=scoped)
+                    conditions.insert(0, Q(pk__in=scoped))
+                related = rel_model._base_manager.filter(  # type: ignore[union-attr]
+                    *conditions, **{f"{link}__pk": OuterRef(f"{_prefix}pk")}
+                )
                 return Exists(related), query
         elif key == "all":
             if len(val) > max_branches:
@@ -2640,6 +2696,7 @@ def _build_django_lookup(
                     "Regex filters are disabled. Pass enable_regex_filters=True "
                     "to enable."
                 )
+            check_regex(val)
             django_lookup = _LOOKUP_TO_DJANGO[op_name]
             q &= Q(**{f"{col_name}__{django_lookup}": val})
         elif op_name in _LOOKUP_TO_DJANGO:
@@ -3059,7 +3116,8 @@ def _read_errors(using: str | None = None) -> Any:
     )
 
     try:
-        yield
+        with _refused_values(TypeError, AttributeError):
+            yield
     except Error as exc:
         raw = connections[using or DEFAULT_DB_ALIAS].connection
         if isinstance(exc, InterfaceError) or (
@@ -3067,6 +3125,23 @@ def _read_errors(using: str | None = None) -> Any:
             and (raw is None or getattr(raw, "closed", False))
         ):
             raise ConnectionError("Database connection failed") from exc
+        raise ValueError(_READ_REFUSED) from exc
+
+
+@contextmanager
+def _refused_values(*errors: type[BaseException]) -> Any:
+    """Raise what a client may see in place of Django refusing a filter value.
+
+    Django checks a value against its column as a filter is added, saying what
+    the column holds with its template unfilled (``“%(value)s” is not a valid
+    UUID``); and some only as the statement compiles, failing with a Python
+    error of its own, in *errors*.
+    """
+    from django.core.exceptions import ValidationError
+
+    try:
+        yield
+    except (ValidationError, *errors) as exc:
         raise ValueError(_READ_REFUSED) from exc
 
 

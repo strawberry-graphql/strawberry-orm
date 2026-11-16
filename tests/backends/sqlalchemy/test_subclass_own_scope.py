@@ -8,6 +8,8 @@ of the nearest class that has one, so a subclass row is held to its base's
 ``scope_query`` and ``can_*`` checks.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 import strawberry
@@ -25,6 +27,7 @@ from strawberry import relay
 from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.relay import ORMListConnection
 from strawberry_orm.types import auto
+from strawberry_orm.upserts import UpsertNotFoundError, _declared_fields
 
 
 class Base(DeclarativeBase):
@@ -648,6 +651,88 @@ def test_a_relation_to_a_subclass_is_written_through_its_base_models_repo(sessio
         (2, "renamed", False, 1),
         (8, "their contract", False, 3),
     ]
+
+
+class PartyContractRepo(DocumentRepo):
+    """A contract is its parties' alone: others cannot see, edit or delete it."""
+
+    calls: list[str] = []
+
+    def scope_query(self, query, info):
+        party = Contract.party_id == info.context["me"]
+        return super().scope_query(query, info).where(party)
+
+    def can_update(self, instance, data, info):
+        self.calls.append(f"can_update {instance.id}")
+        return True
+
+    def _delete(self, instance, info):
+        self.calls.append(f"_delete {instance.id}")
+        AbstractRepo._delete(self, instance, info)
+
+
+@pytest.fixture
+def party_calls():
+    PartyContractRepo.calls = []
+    return PartyContractRepo.calls
+
+
+OWN_REPOS = {Document: DocumentRepo, Contract: PartyContractRepo}
+
+
+def test_a_subclass_row_its_own_repo_hides_cannot_be_deleted_through_the_base(
+    session, party_calls
+):
+    schema = build_writes(OWN_REPOS)
+    deleted = 'mutation { editDocuments(documents: [{delete: {id: "3"}}]) }'
+    result = schema.execute_sync(deleted, context_value={"session": session, "me": ME})
+    assert [error.message for error in result.errors or ()] == [
+        "No Document 3 in Folder.documents"
+    ]
+    assert stored(session, 3) == [(3, "CEO contract", False, 1)]
+    assert party_calls == []
+
+
+def test_a_subclass_row_is_deleted_by_its_own_repo_through_the_base(
+    session, party_calls
+):
+    schema = build_writes(OWN_REPOS)
+    deleted = 'mutation { editDocuments(documents: [{delete: {id: "2"}}]) }'
+    assert run(schema, session, deleted) == {"editDocuments": True}
+    assert stored(session, 1, 2) == [(1, "handbook", False, 1)]
+    assert party_calls == ["_delete 2"]
+
+
+def test_an_upsert_through_the_base_is_held_to_the_rows_own_repo(session, party_calls):
+    orm = StrawberryORM.for_sqlalchemy(
+        dialect="sqlite", warn_missing_scope=False, repos=OWN_REPOS
+    )
+    upsert = orm.mutations.upsert_node_input(
+        model=Document,
+        project={
+            "_meta": {
+                "update": ["title"],
+                "upsert": {"where": ["id"], "onMatch": "UPDATE"},
+            }
+        },
+        name="DocumentUpsert",
+    )
+    where, update = (
+        _declared_fields(upsert)["where"],
+        _declared_fields(upsert)["update"],
+    )
+    info = SimpleNamespace(context={"session": session, "me": ME})
+
+    with pytest.raises(UpsertNotFoundError, match="No Document matches"):
+        orm.apply_upsert(upsert(where=where(id="3"), update=update(title="x")), info)
+    orm.apply_upsert(upsert(where=where(id="2"), update=update(title="ours")), info)
+    session.commit()
+
+    assert stored(session, 2, 3) == [
+        (2, "ours", False, 1),
+        (3, "CEO contract", False, 1),
+    ]
+    assert party_calls == ["can_update 2"]
 
 
 def test_a_subclass_takes_the_repo_of_its_nearest_class_with_one():

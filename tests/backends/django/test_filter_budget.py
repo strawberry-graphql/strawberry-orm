@@ -1,10 +1,8 @@
 """Filter limits as a budget for the whole filter (Django)."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from django.db.backends.sqlite3.base import SQLiteCursorWrapper
 
 from strawberry_orm import StrawberryORM
 from tests.abstract.filter_budget import AbstractTestFilterBudget
@@ -32,26 +30,6 @@ def run(seed):
         return await schema.execute(query, variable_values=variables, context_value={})
 
     return _run
-
-
-@pytest.fixture
-def statements(monkeypatch):
-    """SQL from whichever thread runs it: async execution reads on a worker."""
-
-    @contextmanager
-    def _statements():
-        sent: list[str] = []
-        original = SQLiteCursorWrapper.execute
-
-        def execute(self, query, params=None):
-            sent.append(query)
-            return original(self, query, params)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(SQLiteCursorWrapper, "execute", execute)
-            yield sent
-
-    return _statements
 
 
 class TestFilterBudget(AbstractTestFilterBudget):

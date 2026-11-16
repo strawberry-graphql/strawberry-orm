@@ -5,6 +5,7 @@ import pytest
 from strawberry_orm import StrawberryORM
 from tests.abstract.mutation_node_input_relations import (
     AbstractTestExcludedRelations,
+    AbstractTestPlainInputKeys,
     AbstractTestSensitiveRelations,
 )
 from tests.backends.django.account_models import Account, Role
@@ -28,4 +29,8 @@ class TestExcludedRelations(AbstractTestExcludedRelations):
 
 
 class TestSensitiveRelations(AbstractTestSensitiveRelations):
+    pass
+
+
+class TestPlainInputKeys(AbstractTestPlainInputKeys):
     pass

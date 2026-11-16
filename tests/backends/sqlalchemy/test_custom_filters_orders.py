@@ -111,6 +111,37 @@ class TestCustomFilterType:
         assert result.errors is None
         assert result.data == {"users": [{"name": "Bob"}]}
 
+    def test_a_relation_takes_the_filter_of_its_model(
+        self, sa_session, seed, User, Post
+    ):
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+        post_filter = orm.filter(Post)
+
+        @orm.filter_type(User)
+        class UserFilter:
+            name: auto
+            posts: auto
+
+        @orm.type(Post, filters=post_filter)
+        class PostType:
+            title: auto
+
+        @orm.type(User, filters=UserFilter)
+        class UserType:
+            name: auto
+            posts: list[PostType]
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field.auto()
+
+        result = orm.schema(query=Query).execute_sync(
+            '{ users(filter: {object: {posts: {field: {title: {exact: "Hello World"}}}}}) { name } }',
+            context_value={"session": sa_session},
+        )
+        assert result.errors is None, result.errors
+        assert result.data == {"users": [{"name": "Alice"}]}
+
 
 class TestCustomOrderType:
     def _build_schema(self, User, Post):

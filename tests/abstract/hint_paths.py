@@ -242,6 +242,54 @@ class AbstractTestHintPaths:
 
         assert _by_title(data, "commenters")["Hello World"] == ["Bob"]
 
+    async def test_a_filtered_or_ordered_relation_loads_the_paths_below_it(
+        self, orm, models
+    ):
+        """A ``filter:`` or ``order:`` re-reads the relation; its new rows still
+        get the scoped loads their ``using=`` fields read."""
+        read = self.read
+        hide = self.hide
+
+        @orm.type(models.Comment)
+        class CommentType:
+            id: auto
+            body: auto
+
+            @classmethod
+            def scope_rows(cls, qs, info):
+                return hide(qs, models.Comment, "body", "Thanks!")
+
+        @orm.type(
+            models.Post, filters=orm.filter(models.Post), order=orm.order(models.Post)
+        )
+        class PostType:
+            id: auto
+            title: auto
+
+            @orm.field.lazy(using=["comments"])
+            def comment_bodies(self, info: strawberry.Info) -> list[str]:
+                return sorted(c.body for c in read(self, "comments"))
+
+        UserType = self.user_type(orm, models, posts=list[PostType])
+
+        @strawberry.type
+        class Query:
+            users: list[UserType] = orm.field.eager()
+
+        schema = orm.schema(query=Query)
+        for arguments in (
+            "(filter: {field: {id: {gt: 0}}})",
+            "(order: [{field: {id: ASC}}])",
+        ):
+            data = await self.execute(
+                schema,
+                f"{{ users {{ name posts{arguments} {{ title commentBodies }} }} }}",
+            )
+            alice = next(user for user in data["users"] if user["name"] == "Alice")
+            assert {
+                post["title"]: post["commentBodies"] for post in alice["posts"]
+            } == {"Hello World": ["Nice post!"], "GraphQL Guide": ["Great guide"]}
+
     async def test_hint_alone_sees_the_scoped_rows(self, orm, models):
         read = self.read
         self.user_type(orm, models, hide_alice=True)

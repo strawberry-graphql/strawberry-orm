@@ -821,8 +821,8 @@ class RelationConnectionExtension(SchemaExtension):
         """One windowed query for the pages, one grouped query for the totals."""
         from strawberry_orm.relay.connection import _LAST_POSITION
 
-        pks = [backend.instance_pk(parent) for parent in parents]
-        if any(pk is None for pk in pks):
+        keys = [spec.key_of(backend, parent) for parent in parents]
+        if any(key is None for key in keys):
             raise _Bail("a parent has no key to group its rows by")
 
         execution_context = getattr(self, "execution_context", None)
@@ -838,7 +838,7 @@ class RelationConnectionExtension(SchemaExtension):
         filter_input, order_input = _connection_inputs(
             execution_context, info, kwargs or {}
         )
-        base = backend.relation_base_query(spec, pks, info)
+        base = backend.relation_base_query(spec, keys, info)
         if filter_input is not None:
             base = backend.apply_filters(
                 base, filter_input, spec.related_model, info=info
@@ -855,17 +855,17 @@ class RelationConnectionExtension(SchemaExtension):
         )
         if isawaitable(rows_by_key):
             return self._fetch_pages_async(
-                backend, spec, parents, pks, info, base, rows_by_key, start
+                backend, spec, parents, keys, info, base, rows_by_key, start
             )
         totals = backend.group_counts(base, spec.key_field, info)
-        return self._assemble(parents, pks, rows_by_key, totals, start)
+        return self._assemble(parents, keys, rows_by_key, totals, start)
 
     async def _fetch_pages_async(
         self,
         backend: Backend,
         spec: Any,
         parents: list[Any],
-        pks: list[Any],
+        keys: list[Any],
         info: Any,
         base: Any,
         rows_by_key: Any,
@@ -876,12 +876,12 @@ class RelationConnectionExtension(SchemaExtension):
 
         rows = await rows_by_key
         totals = await await_maybe(backend.group_counts(base, spec.key_field, info))
-        return self._assemble(parents, pks, rows, totals, start)
+        return self._assemble(parents, keys, rows, totals, start)
 
     @staticmethod
     def _assemble(
         parents: list[Any],
-        pks: list[Any],
+        keys: list[Any],
         rows_by_key: dict[tuple, list[Any]],
         totals: dict[Any, int],
         start: int,
@@ -894,10 +894,10 @@ class RelationConnectionExtension(SchemaExtension):
         # compared in the same form. The window already applied scope_rows, so
         # the page must not be checked again one row at a time.
         pages: dict[int, tuple[Any, Any]] = {}
-        for parent, pk in zip(parents, pks, strict=True):
-            page = rows_by_key.get((str(pk),), [])
+        for parent, key in zip(parents, keys, strict=True):
+            page = rows_by_key.get((str(key),), [])
             mark_rows_scoped(page)
-            pages[id(parent)] = (parent, PreslicedRows(page, totals.get(pk, 0), start))
+            pages[id(parent)] = (parent, PreslicedRows(page, totals.get(key, 0), start))
         return pages
 
 

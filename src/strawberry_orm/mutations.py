@@ -116,6 +116,12 @@ class RelationSpec:
     #: The ORM deletes a row this relation lets go of (SQLAlchemy's
     #: ``delete-orphan`` cascade), so letting go of one is deleting it.
     deletes_orphans: bool = False
+    #: A forward link to a row whose own relation back holds one row at most
+    #: (SQLAlchemy's ``uselist=False``): that relation's name. Linking a row
+    #: takes it from the row that held it, whose key the ORM clears.
+    taken_from: str | None = None
+    #: The ``taken_from`` relation deletes the row it lets go of.
+    orphans_holder: bool = False
 
 
 @dataclass(frozen=True)
@@ -637,7 +643,7 @@ class MutationNamespace:
 
     def _hidden_fields(self, model: type) -> set[str]:
         """Columns the model's GraphQL type excludes, which no input may write."""
-        return self._backend._type_excludes.get(model, set())
+        return self._backend._excluded_columns(model)
 
     def _refuse_hidden(self, model: type, names: tuple[str, ...], key: str) -> None:
         hidden = sorted(self._hidden_fields(model) & set(names))
@@ -681,7 +687,7 @@ class MutationNamespace:
             spec.fk_column
             for spec in relation_specs.values()
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
-        }
+        } | self._backend._generic_key_columns(model)
         pk_names = self._backend._get_pk_names(model)
         names: set[str] = set()
         for (
@@ -1054,7 +1060,7 @@ class MutationNamespace:
             spec.fk_column
             for spec in relation_specs.values()
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
-        }
+        } | self._backend._generic_key_columns(model)
         pk_names = self._backend._get_pk_names(model)
         allowed_scalars = None if op_fields.fields is None else set(op_fields.fields)
         hidden = self._hidden_fields(model)
@@ -1379,6 +1385,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 kind="many",
                 relation_mode="many_to_many",
                 nullable=True,
+                deletes_orphans=deletes_orphans,
             )
         elif rel.uselist:
             specs[rel.key] = RelationSpec(
@@ -1402,7 +1409,15 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 deletes_orphans=deletes_orphans,
             )
         else:
-            fk_column = next(iter(rel.local_columns)).key if rel.local_columns else None
+            # The attribute, which ``exclude=`` names, not the database column.
+            fk_column = (
+                rel.parent.get_property_by_column(rel.local_remote_pairs[0][0]).key
+                if rel.local_columns
+                else None
+            )
+            back = next(
+                (prop for prop in rel._reverse_property if not prop.uselist), None
+            )
             specs[rel.key] = RelationSpec(
                 name=rel.key,
                 related_model=rel.mapper.class_,
@@ -1413,6 +1428,8 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 if rel.local_columns
                 else True,
                 deletes_orphans=deletes_orphans,
+                taken_from=None if back is None else back.key,
+                orphans_holder=back is not None and bool(back.cascade.delete_orphan),
             )
     return specs
 

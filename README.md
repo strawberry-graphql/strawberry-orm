@@ -479,6 +479,8 @@ orm = StrawberryORM.for_sqlalchemy(enable_optimizer=False, …)  # or globally
 
 `schema_class=` builds your own `strawberry.Schema` subclass instead, with the same extensions mounted.
 
+Relay's `node()` fields work in every schema `orm.schema()` builds, tagged or with cut inputs, and one `Query` can go into any number of them; Strawberry's own `strawberry.Schema` cannot build a `node()` field twice. Build a plain `strawberry.Schema` from the same `Query` only after `orm.schema()`: once Strawberry has set up the field, `orm.schema()` raises `Query fields cannot be resolved`.
+
 #### Several schemas from one set of types: `tags`
 
 When several GraphQL APIs share types, tag what belongs to only some of them, and build one schema per API from the same classes. A field without tags is in every schema. A tagged field is in each schema built for one of its tags.
@@ -559,7 +561,7 @@ class PostType:
         return [comment.author.name for comment in self.comments]
 ```
 
-Rows loaded through `using=` are scoped exactly as if the client had selected them: each hop applies the related type's `scope_rows` and any `scope=` on the field of that name. A row the resolver may not see reads as absent, `None` for a to-one relation and missing from a list. On Django a hidden row behind a non-nullable foreign key raises `RelatedObjectDoesNotExist` instead, because that is how Django's descriptor reports an empty cache, so read it with `getattr(self, "author", None)`. When the client also selects a relation on the path, the two share one load.
+Rows loaded through `using=` are scoped exactly as if the client had selected them: each hop applies the related type's `scope_rows` and any `scope=` on the field of that name. A row the resolver may not see reads as absent, `None` for a to-one relation and missing from a list. On Django a hidden row behind a non-nullable foreign key raises `RelatedObjectDoesNotExist` instead, because that is how Django's descriptor reports an empty cache, so read it with `getattr(self, "author", None)`. When the client also selects a relation on the path, the two share one load, and a relation the client filters or orders still loads the `using=` paths below it under their scopes. Rows the app keeps between requests, in a module-level cache say, are loaded in place; a relation one request loaded onto them is trusted by that request only while the row still holds the rows it loaded.
 
 A `scope=` callable receives `(qs, info)` and never the parent instance, which is exactly what lets the optimizer hoist it. When the query really does depend on the parent row, write a resolver instead.
 
@@ -656,16 +658,19 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 
 ### What the library does by default
 
-- `orm.input()`, `orm.filter()`, `orm.order()` and node mutation inputs exclude sensitive-looking fields and relations (`password_hash`, `api_key`, `totp_seed`, `is_admin`, `roles`, `groups`, etc.), and attributes private to the model (a name starting with `_`), unless you name them
-- String regex filters are disabled by default
+- `orm.input()`, `orm.filter()`, `orm.order()` and node mutation inputs exclude sensitive-looking fields and relations (`password_hash`, `api_key`, `totp_seed`, `reset_code`, `security_answer`, `is_admin`, `roles`, `groups`, etc.), and attributes private to the model (a name starting with `_`), unless you name them
+- `orm.input()` and `orm.partial()` leave out the foreign key column a link sets (`author_id`) unless `include=` names it, since writing it as a value skips the related repo's `scope_query` and `can_link`
+- String regex filters are disabled by default; once enabled, a pattern is held to 100 characters and one that can backtrack for exponential time is refused — see [Filter shape](#filter-shape)
 - Filter depth is capped, and so are the branches and the listed values of a whole filter argument, every reference to a variable included
 - A connection reads at most one page, and so does each group's `items`: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
 - `order` and `groupBy` lists, the groups a connection answers with, and the related rows in an `objects:` group key are capped (`max_order_entries`, `max_group_by_entries`, `max_groups`, `max_group_key_rows`)
-- On every backend, an error running a statement the library reads with reaches the client as `Invalid filter expression` (or `Database connection failed`), never with its SQL or parameters. The database refusing a statement that `orm.apply_upsert()` or `orm.apply_ref_list()` runs reaches it as `The database refused the write`, without the table, columns or values. Either way the original is the exception's `__cause__`, for your logs
+- On every backend, an error running a statement the library reads with reaches the client as `Invalid filter expression` (or `Database connection failed`), never with its SQL or parameters, and so does a filter value the ORM refuses for its column (a malformed UUID, a string for a duration) rather than the ORM's own message. The database refusing a statement that `orm.apply_upsert()` or `orm.apply_ref_list()` runs reaches it as `The database refused the write`, without the table, columns or values. Either way the original is the exception's `__cause__`, for your logs
 - `orm.ref()` provides explicit `unlink` and `delete` operations — both opt-in via `unlink=True` and `delete=True`
 - When you use `orm.schema()` (optimizer enabled by default), nested relation loads honor each type's `scope_rows` — but **only for types where you define it** (the ORM warns at type registration when `scope_rows` is missing)
-- Filters, ordering, group-by and aggregates cover only the columns and relations the GraphQL types they serve show: the types they are attached to, the type a field taking them returns, and through `object:`, the type the relation returns, a plain `@strawberry.type` included. A column those types leave out, or show through a resolver of your own, `on=`, `compute=`, permission classes or field `extensions=` (a `PermissionExtension`, say), cannot be filtered on, sorted by, grouped by, or read through `min`/`max` — any of which would reveal it. `orm.schema()` works this out for the types each schema reaches, and a kept field carries the tags of the type field it mirrors, so a tagged schema drops both together
+- Filters, ordering, group-by and aggregates cover only the columns and relations the GraphQL types they serve show: the types they are attached to, the type an `orm.field` or `orm.connection` taking them returns, and through `object:`, the type the relation returns, a plain `@strawberry.type` included. A `@strawberry.field` resolver of your own that takes one is not counted, since what it returns need not be the rows it filtered: the input still covers the types it is attached to, so a filter attached to a staff type and handed to a resolver returning a plain `UserCard { name }` can still filter on the staff type's `email`. Give such a resolver an input of its own, attached to a type that shows only what it returns. A column those types leave out, or show through a resolver of your own, `on=`, `compute=`, permission classes or field `extensions=` (a `PermissionExtension`, say), cannot be filtered on, sorted by, grouped by, or read through `min`/`max` — any of which would reveal it. `orm.schema()` works this out for the types each schema reaches, and a kept field carries the tags of the type field it mirrors, so a tagged schema drops both together
 - Filtering through a relation (`filter: { object: { author: … } }`) is restricted to the rows the related type's `scope_rows` and the relation's `scope=` allow, so a filter cannot confirm values on rows the caller cannot read. The `scope=` is the one on the type the field returns; past an `object:` hop, where that type is not known, every type over the model contributes its `scope=`. Through a to-many relation, `object:` asks whether some readable related row matches, and `not:` negates that whole question
+- A type's `scope_rows`, and a relation's scope, are written into the statement before the client's filter, so a database that evaluates conditions in the order written runs a costly condition only on rows the caller can read, and its running time says nothing of the others
+- On SQLAlchemy, a relation whose `primaryjoin` or `secondaryjoin` says more than its key columns (`open_tasks`, with `done == False`) is left out of `groupBy` keys and `objects:` orders, and a connection over it is refused when its type is declared, since each would rebuild the join from its keys and reach rows the relation does not list
 - Ordering through a relation into a scoped type is **rejected when `orm.schema()` builds**, because the resulting sequence would itself rank hidden rows — see [Ordering into a scoped type](#ordering-into-a-scoped-type)
 - Connection `aggregates` and `groups` are computed with the type's `scope_rows` applied, so counts and sums cover only readable rows
 
@@ -676,7 +681,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 | ---------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | Authentication   | —                             | middleware, `info.context`, permission classes                                                                                           |
 | Row access       | `scope_rows` per exposed type | define on **every** model type clients can reach — [parent scoping does not flow to children](#parent-scoping-does-not-flow-to-children) |
-| Column exposure  | inputs follow the type's fields | `exclude=[...]` on `@orm.type`, or `orm.field.eager(permission_classes=…)`                                                                |
+| Column exposure  | filters, ordering, group-by and aggregates follow the type's fields; write inputs leave out what `exclude=` hides | `exclude=[...]` on `@orm.type` for a column no input may write or match on, or `orm.field.eager(permission_classes=…)` — [write inputs follow the model](#write-inputs-follow-the-model) |
 | Query size       | page size, `order`/`groupBy` length, group count | `default_query_limit` for root lists; a query budget (Strawberry's `MaxAliasesLimiter`, `MaxTokensLimiter`, `QueryDepthLimiter`)              |
 | Mutations        | —                             | auth in resolvers; `authorize` callback on `apply_ref_list`                                                                              |
 | Write access     | a repo's `scope_query` and `can_*` hooks on every generated write | a repo per writable model whose `scope_query` mirrors its `scope_rows` — [writes do not apply `scope_rows`](#writes-do-not-apply-scope_rows) |
@@ -687,6 +692,14 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 `scope_rows` narrows what a caller reads. `orm.apply_upsert()` and `orm.apply_ref_list()` find the rows they write through the model's repo instead, so a model clients can write needs an `AbstractRepo` whose `scope_query` narrows the query as its `scope_rows` does. Without one, a caller can update, link or re-point any row by its ID: taking another user's post into their own `posts` list makes it theirs, and readable. An upsert's match on `where` answers too, telling a caller whether a hidden row with those values exists. A subclass of the model (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) with no repo of its own is written through the model's.
 
 A unique constraint compares every row in the table, the ones the caller cannot read included. Creating a row with an email another tenant's user already has comes back as `The database refused the write`, and any other email succeeds, so a caller can test whether a value is taken anywhere. Where that is sensitive, make the constraint per tenant (unique on `tenant_id` and `email` together), so the values it compares are only the tenant's own.
+
+#### Write inputs follow the model
+
+A generated create, update or `where` input is built from the model, not from a type, so it offers every column `exclude=` does not hide, including one the type simply leaves undeclared. Writing such a column is the input's purpose, but matching on it is a read: with `where: True`, a caller who can reach a row through the repo can send `salary` in `where` and learn from match or no match whether the row's salary is that value, though no filter offers it. List the fields `_meta.create`, `_meta.update` and `_meta.upsert.where` may use, or `exclude=` the column on the type, which leaves it out of every generated input.
+
+#### Write hooks run before the checks
+
+A repo's `on_before_create` and `on_before_update` run before `can_create` and `can_update`, so a hook can fill in what the check reads, such as the caller's tenant. They are handed the client's data before anything has approved it: keep side effects, such as sending mail, for `on_after_*`. Nothing caps how many items a write's lists carry, and `_meta.maxVisits` is unbounded unless you set it, so bound the size of a request (Strawberry's `MaxTokensLimiter`, or your server's body limit) and set `maxVisits` on a projection that recurses.
 
 
 ### Ordering into a scoped type
@@ -856,6 +869,8 @@ UpdateUserInput = orm.partial(User, include=["name", "email"])
 ```
 
 `input()` and `partial()` share the same signature: `include`, `exclude`, `exclude_pk` (default `True`), `name`. Fields are optional (defaulting to `strawberry.UNSET`), skip relations, exclude primary keys by default, and exclude sensitive-looking fields, and attributes whose name starts with `_`, unless explicitly included.
+
+They also leave out the foreign key column a link sets, such as `author_id`, unless `include=` names it. As a plain value it links whichever row it names: `orm.apply_ref_list()` writes it without asking the related repo's `scope_query` or `can_link`, as a link written through the relation would. Name it only where your resolver checks the row it points at, or use a [node mutation input](#node-mutation-inputs), whose links go through the related repo.
 
 ---
 
@@ -1084,7 +1099,7 @@ List fields returning `UserType` then accept a `filter` argument:
 }
 ```
 
-The filter covers what `UserType` shows — `id`, `name` and `email` here — and `object:` reaches only the relations it shows. A column the type leaves out is not filterable, because a filter on it would read it one `startsWith` probe at a time; to filter on a column, show it on the type. The same holds for `orm.order()`, `orm.group()` and aggregates. Through `object:`, a filter covers the type the relation returns: under `posts(filter: {object: {author: …}})`, whatever `PostType.author`'s type shows. `orm.schema()` works this out for the types each schema reaches, so an admin schema can filter on a column a public schema hides even when both use the same filter; within one schema, an input serving several types covers what all of them show. A schema built with `strawberry.Schema` directly gets the inputs uncut.
+The filter covers what `UserType` shows — `id`, `name` and `email` here — and `object:` reaches only the relations it shows. A column the type leaves out is not filterable, because a filter on it would read it one `startsWith` probe at a time; to filter on a column, show it on the type. The same holds for `orm.order()`, `orm.group()` and aggregates. Through `object:`, a filter covers the type the relation returns: under `posts(filter: {object: {author: …}})`, whatever `PostType.author`'s type shows. `orm.schema()` works this out for the types each schema reaches, so an admin schema can filter on a column a public schema hides even when both use the same filter; within one schema, an input serving several types covers what all of them show. A `@strawberry.field` resolver of your own that takes the filter does not narrow it to what it returns, because it may return anything; the filter covers the types it is attached to there too. A schema built with `strawberry.Schema` directly gets the inputs uncut.
 
 #### Filter shape
 
@@ -1116,6 +1131,8 @@ Built-in lookup types
 Typical string lookups: `exact`, `neq`, `contains`, `iContains`, `startsWith`, `iStartsWith`, `endsWith`, `iEndsWith`, `inList`, `notInList`, `isNull`.
 
 Regex lookups (`regex`, `iRegex`) are disabled by default. Enable with `enable_regex_filters=True`.
+
+An enabled pattern is held to 100 characters, and one that repeats a group which itself repeats a variable number of times or offers a choice (`(a+)+`, `(\w+\s?)+`, `(cat|dog)+`), or that refers back to a group (`(a)\1`), is refused. Matching such a pattern can backtrack through every way of splitting a value, and SQLite matches regexes with Python's `re` inside the server's process, so one request could stall every other. A repeat of fixed length (`(\d{3})+`) and a choice outside a repeat (`^(foo|bar)$`) are allowed; a pattern Python cannot parse is left to the database.
 
 
 
@@ -1857,7 +1874,7 @@ All list mutations use **patch semantics**: only the items you mention are affec
 
 Apply ref operations with `orm.apply_ref_list(parent, "relation_name", refs, info)`. The list is one unit of work, the same as [an upsert's](#applying-an-upsert), so a refusal part-way through leaves nothing written. `unlink` and `delete` act only on rows currently in `parent`'s relation; any other id raises `UpsertNotFoundError`, and unlinking from a relation whose foreign key is not nullable is a validation error. A `delete` goes through the repo's `_delete`, so a soft-delete override is honoured.
 
-An optional `authorize` callback `(action, model, obj_id, info) -> bool` adds a per-item check on top of the model's repo. `obj_id` is the row's primary key as the model stores it (`1`, never `"01"` or a Relay global ID), or `None` for a `create`. An item it denies is skipped, and an item it allows must still pass the repo's `scope_query` and `can_*` hooks. An `update` that takes a row from another parent asks that parent's `can_unlink` as well as this one's `can_link`.
+An optional `authorize` callback `(action, model, obj_id, info) -> bool` adds a per-item check on top of the model's repo. `obj_id` is the row's primary key as the model stores it (`1`, never `"01"` or a Relay global ID), or `None` for a `create`. An item it denies is skipped, and an item it allows must still pass the repo's `scope_query` and `can_*` hooks. An `update` that takes a row from another parent asks that parent's `can_unlink` as well as this one's `can_link`. `authorize` is not told which parent an item joins or leaves; `can_link(parent, field, instance, info)` and `can_unlink` are, and a row a `create` makes is asked `can_link` too, once it exists, since through a many-to-many list `can_create`'s data does not name the parent.
 
 ```graphql
 mutation {
@@ -1923,14 +1940,15 @@ Rules:
 - `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `unlink`, `delete`, `onReplace`, `immutable`, `maxVisits`, `name`).
 - Relations you do not declare are absent from the input, so the schema rejects them.
 - Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`. Even then the replaced row is deleted only if the caller could delete it by its key: one the related repo's `scope_query` hides, or whose deletion `authorize` denies, is disconnected and left in place.
-- A SQLAlchemy relationship with a `delete-orphan` cascade deletes every row it lets go of, so letting go of one is a delete. Unlinking from one is refused (send `delete`, which goes through the repo), and re-pointing a single link of that kind is refused unless the caller could delete the row it held: `authorize`, the related repo's `scope_query` and `can_delete` decide, and `on_before_delete` runs, before the cascade deletes it.
-- Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
+- A SQLAlchemy relationship with a `delete-orphan` cascade, a many-to-many one included, deletes every row it lets go of, so letting go of one is a delete. Unlinking from one is refused (send `delete`, which goes through the repo), and re-pointing a single link of that kind is refused unless the caller could delete the row it held: `authorize`, the related repo's `scope_query` and `can_delete` decide, and `on_before_delete` runs, before the cascade deletes it.
+- Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input, and so are those a type over one of its base models hides, since a subclass row (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) is a row of its base too. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
+- Foreign key columns are written through their relation, so they are left out, and so is the `object_id` of a Django `GenericForeignKey`: no relation reaches the row it names to ask that row's repo, and it cannot be matched on in `where` either.
 - So are the relations it hides, and a link whose foreign key column it hides: `exclude=["author_id"]` leaves out `author`. Naming such a relation in `project=` raises `ValueError`, and so does declaring the type after an input that already writes it.
 - Relations with sensitive-looking names (`roles`, `groups`, `permissions`) are left out unless `project=` names them, as sensitive-looking columns are unless `_meta` lists them.
 
 #### Upserting with `_meta.upsert`
 
-`_meta.upsert.where` adds an `upsert` arm made of `where`, `create` and `update`. A list of field names makes those fields required, and a row matches only when all of them do. `where: True` exposes every writable scalar plus `id` as optional fields, so the caller chooses which fields to match on and the match uses the ones that were sent:
+`_meta.upsert.where` adds an `upsert` arm made of `where`, `create` and `update`. A list of field names makes those fields required, and a row matches only when all of them do. `where: True` exposes every writable scalar plus `id` as optional fields, so the caller chooses which fields to match on and the match uses the ones that were sent. Each is a column a caller can test the value of, whether or not the type shows it ([write inputs follow the model](#write-inputs-follow-the-model)):
 
 ```python
 project = {
@@ -2026,7 +2044,7 @@ Two repo hooks are specific to upserts:
 
 `authorize(action, model, pk, info)` sees `"upsert"` for a match and `"create"` for a miss, alongside `"update"`, `"unlink"` and `"delete"` for nested items. Unlike a plain `apply_ref_list` item, which is skipped when `authorize` returns `False`, every denial inside an upsert raises `PermissionError`, so a write is never partly applied. `authorize` runs in addition to the repo's hooks, never instead of them.
 
-Re-pointing a single link asks the target model's repo `can_link` for an existing row it now points at and `can_unlink` for the row it replaced. On SQLAlchemy, a one-to-one written from the row without the foreign key (`User.profile`, with `Profile.user_id`) takes its new target from the row that held it, so that row's `can_unlink` is asked too.
+Re-pointing a single link asks the target model's repo `can_link` for the row it now points at, whether it existed or the write creates it, and `can_unlink` for the row it replaced. A row created into a to-many list is asked `can_link` as well. On SQLAlchemy, a one-to-one written from the row without the foreign key (`User.profile`, with `Profile.user_id`) takes its new target from the row that held it, so that row's `can_unlink` is asked too. So does one written from the side with the key: pointing a new or existing profile's `user` at a user who has a profile takes the user from that profile, which must be one the repo's `scope_query` shows and whose `can_unlink` allows it, and where `User.profile` deletes orphans, the profile left behind is held to the delete checks before the cascade deletes it.
 
 Validation failures raise `UpsertValidationError` (a `ValueError`); a missing row raises `UpsertNotFoundError` (a `LookupError`).
 
@@ -2284,9 +2302,9 @@ server = mcp_server(
 ```
 
 - **Queries only, unless you opt in.** `graphql` runs only queries, and `graphql_schema` shows no mutations. `allow_mutations=True` shows and allows them, and marks `graphql` destructive.
-- **Checked before it runs.** An operation must be a single operation of at most `max_tokens` tokens (default 2,000) and `max_depth` levels (default 10) that passes validation. The token limit is applied as the operation is parsed, so it bounds the work of checking it too; the check runs off the event loop. The schema's own extensions, such as Strawberry's `MaxAliasesLimiter` and `MaxTokensLimiter`, apply when the operation executes, as for any request.
+- **Checked before it runs.** An operation must be a single operation of at most `max_tokens` tokens (default 2,000) and `max_depth` levels (default 10) that passes validation, and may select one field at most 20 times in one place of its result, fragments included, since validation compares every pair of such fields. The token limit is applied as the operation is parsed, so it bounds the work of checking it too. The check, and the parsing and validation `schema.execute` does before resolvers run, happen in a worker thread, unless an extension of the schema's own, such as `ParserCache` or `ValidationCache`, does them; keep `max_tokens` no higher than a `MaxTokensLimiter`'s limit. The schema's own extensions, such as Strawberry's `MaxAliasesLimiter` and `MaxTokensLimiter`, apply when the operation executes, as for any request.
 - **No introspection.** An operation asking for `__schema` or `__type` is refused, since it would describe the whole schema, mutations and fields `root_fields` leaves out included. `graphql_schema` describes what `graphql` may use; `__typename` still works.
-- **`root_fields`** limits the root fields `graphql` may use, and `graphql_schema` shows only those and the types they reach. `descriptions=False` leaves the schema's descriptions out of `graphql_schema`. To expose only part of the schema in the first place, build it with `orm.schema(query=Query, tags="mcp")`.
+- **`root_fields`** limits the root fields `graphql` may use, and `graphql_schema` shows only those and the types they reach. A type implementing an interface is reached only through a field that returns that interface, so in a Relay schema `Node`'s other implementations stay hidden unless `node` is one of the root fields. `descriptions=False` leaves the schema's descriptions out of `graphql_schema`. To expose only part of the schema in the first place, build it with `orm.schema(query=Query, tags="mcp")`.
 
 To try it locally, `python cli.py mcp` serves a few operations on the seeded SQLAlchemy test schema at `http://localhost:8421/mcp`. Add `--graphql-tool` for the `graphql` and `graphql_schema` tools, and `--allow-mutations` to let `graphql` run mutations.
 

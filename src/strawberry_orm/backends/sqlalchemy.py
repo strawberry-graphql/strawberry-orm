@@ -36,7 +36,11 @@ from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
 from strawberry_orm.fields import call_scope
-from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.filters import (
+    check_regex,
+    is_fk_shortcut_lookup,
+    is_reference_lookup,
+)
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
 from strawberry_orm.types import DateGroupByInterval
@@ -138,6 +142,21 @@ _UNMARKED = object()
 
 def _equates(join: Any, left: Any, right: Any) -> bool:
     return (left == right).compare(join) or (right == left).compare(join)
+
+
+def _equates_only(join: Any, pairs: Any) -> bool:
+    """Whether *join* says that each of *pairs* match, and nothing more."""
+    from sqlalchemy.sql import operators
+    from sqlalchemy.sql.elements import BooleanClauseList
+
+    terms = (
+        join.clauses
+        if isinstance(join, BooleanClauseList) and join.operator is operators.and_
+        else (join,)
+    )
+    return len(terms) == len(pairs) and all(
+        any(_equates(term, *pair) for pair in pairs) for term in terms
+    )
 
 
 def _join_keys(rel: Any) -> tuple[Any, Any, tuple[Any, Any] | None] | None:
@@ -413,6 +432,17 @@ class SQLAlchemyBackend(BaseBackend):
     def _get_pk_names(self, model: type) -> set[str]:
         return _get_sa_pk_names(model)
 
+    def _link_key_columns(self, model: type) -> set[str]:
+        from sqlalchemy import inspect as sa_inspect
+
+        mapper = sa_inspect(model)
+        return {
+            mapper.get_property_by_column(column).key
+            for rel in mapper.relationships
+            if rel.direction.name == "MANYTOONE"
+            for column in rel.local_columns
+        }
+
     # -- Type generation -----------------------------------------------------
 
     def type(self, model: type, **kwargs: Any) -> Any:
@@ -527,38 +557,6 @@ class SQLAlchemyBackend(BaseBackend):
             return self._finalize_type(cls, model, type_name, name)
 
         return decorator
-
-    def input(self, model: type, **kwargs: Any) -> Any:
-        include = kwargs.get("include")
-        exclude = kwargs.get("exclude")
-        exclude_pk = kwargs.get("exclude_pk", True)
-        name = kwargs.get("name")
-
-        pk_names = _get_sa_pk_names(model) if exclude_pk else set()
-
-        fields_meta = self._introspect_model(model)
-        annotations: dict[str, Any] = {}
-        defaults: dict[str, Any] = {}
-        for fname, ftype, is_relation, _rel_model in fields_meta:
-            if fname in pk_names:
-                continue
-            if include and fname not in include:
-                continue
-            if exclude and fname in exclude:
-                continue
-            if self._exclude_generated_sensitive_field(fname, include):
-                continue
-            if is_relation:
-                continue
-            annotations[fname] = ftype | None
-            defaults[fname] = strawberry.UNSET
-
-        type_name = name or f"{model.__name__}Input"
-        self._check_input_does_not_expose_excluded(model, type_name, annotations)
-        ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
-        cls = type(type_name, (), ns)
-        self._input_registry.setdefault(model, []).append((type_name, set(annotations)))
-        return strawberry.input(cls)
 
     def apply_ref_list(
         self,
@@ -777,6 +775,14 @@ class SQLAlchemyBackend(BaseBackend):
             model=model,
             target=prop.mapper.class_,
             many=bool(prop.uselist),
+        )
+
+    def relation_joins_on_keys(self, model: type, relation: str) -> bool:
+        prop = sa_inspect(model).relationships[relation]
+        if prop.secondary is None:
+            return _equates_only(prop.primaryjoin, list(prop.local_remote_pairs))
+        return _equates_only(prop.primaryjoin, prop.synchronize_pairs) and (
+            _equates_only(prop.secondaryjoin, prop.secondary_synchronize_pairs)
         )
 
     def apply_grouping(
@@ -1181,6 +1187,32 @@ class SQLAlchemyBackend(BaseBackend):
         except (AttributeError, IndexError, KeyError, TypeError):
             return None
 
+    def apply_type_scope(self, query: Any, model: type | None, info: Any) -> Any:
+        from sqlalchemy import select
+
+        from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+
+        entity = self.query_model(query)
+        read, alias = _read_entity(entity)
+        if alias is None or model not in (read, alias):
+            return super().apply_type_scope(
+                query, read if model is entity else model, info
+            )
+        if query_is_scoped(query):
+            return query
+        # The scope names the class's own tables, which do not narrow the rows
+        # an alias reads; the alias keeps the keys of the rows they narrow to.
+        every = select(read)
+        scoped = super().apply_type_scope(every, read, info)
+        if scoped is every:
+            return query
+        keys = _get_sa_pk_columns(read)
+        through = [getattr(alias, key.key) for key in keys]
+        rows = scoped.with_only_columns(*keys).correlate(None)
+        narrowed = _carrying(query.where(_whole_key_in(through, rows)), scoped)
+        mark_query_scoped(narrowed)
+        return narrowed
+
     def classes_scoped_apart(self, model: type) -> list[type]:
         from sqlalchemy import inspect as sa_inspect
 
@@ -1256,7 +1288,11 @@ class SQLAlchemyBackend(BaseBackend):
         # to load what a selection reads are not run for a membership check.
         stmt = _carrying(
             select(pk_column).where(
-                pk_column.in_(scoped.with_only_columns(pk_column).scalar_subquery())
+                pk_column.in_(
+                    scoped.with_only_columns(pk_column)
+                    .correlate(None)
+                    .scalar_subquery()
+                )
             ),
             scoped,
         )
@@ -1422,12 +1458,10 @@ class SQLAlchemyBackend(BaseBackend):
     def _make_relation_query_resolver(
         self, model: type, field_name: str, relation: str
     ) -> Any:
-        from sqlalchemy import inspect as sa_inspect
 
         backend = self
-        rel = sa_inspect(model).relationships[relation]
+        attribute = getattr(model, relation)
         rel_model = self._relation_target_model(model, relation)
-        pairs = list(rel.local_remote_pairs or ())
 
         def resolver(self: Any, info: Any) -> Any:
             from strawberry_orm.batching import take_page
@@ -1436,8 +1470,11 @@ class SQLAlchemyBackend(BaseBackend):
             if page is not None:
                 return page
             from sqlalchemy import select
+            from sqlalchemy.orm import with_parent
 
-            stmt = select(rel_model).where(pairs[0][1] == backend.instance_pk(self))
+            # The relationship's own join: its key may be another column than
+            # the primary key, and its primaryjoin may say more than its keys.
+            stmt = select(rel_model).where(with_parent(self, attribute))
             restrict = backend.relation_scope(model, field_name, info, on=relation)
             return stmt if restrict is None else restrict(stmt, info)
 
@@ -1469,26 +1506,28 @@ class SQLAlchemyBackend(BaseBackend):
         from strawberry_orm.backends._base import RelationConnectionSpec
 
         rel = sa_inspect(model).relationships[relation]
-        pairs = list(rel.local_remote_pairs or ())
-        # An association table keeps the parent key off the related row, so
-        # there is nothing for a window to partition by.
-        if rel.secondary is not None or len(pairs) != 1:
+        keys = _join_keys(rel)
+        # An association table keeps the parent key off the related row, and a
+        # join that says more than its keys is not one a key can partition.
+        if keys is None or keys[2] is not None:
             return None
+        parent_column, related_column, _link = keys
         return RelationConnectionSpec(
             model=model,
             field_name=field_name,
             relation=relation,
             related_model=self._relation_target_model(model, relation),
-            key_field=pairs[0][1].key,
+            key_field=related_column.key,
+            parent_key=rel.parent.get_property_by_column(parent_column).key,
         )
 
-    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
+    def relation_base_query(self, spec: Any, keys: list[Any], info: Any) -> Any:
         from sqlalchemy import inspect as sa_inspect
         from sqlalchemy import select
 
         rel = sa_inspect(spec.model).relationships[spec.relation]
-        fk_column = list(rel.local_remote_pairs)[0][1]
-        stmt = select(spec.related_model).where(fk_column.in_(pks))
+        key_column = list(rel.local_remote_pairs)[0][1]
+        stmt = select(spec.related_model).where(key_column.in_(keys))
         restrict = self.relation_scope(
             spec.model, spec.field_name, info, on=spec.relation
         )
@@ -1788,7 +1827,7 @@ class SQLAlchemyBackend(BaseBackend):
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         try:
-            entity = query.column_descriptions[0]["entity"]
+            entity, alias = _read_entity(query.column_descriptions[0]["entity"])
         except (AttributeError, IndexError, KeyError):
             return query
 
@@ -1797,7 +1836,13 @@ class SQLAlchemyBackend(BaseBackend):
         # those caches as trusted; the resolver re-checks them.
         caller_had_options = bool(getattr(query, "_with_options", ()))
         query = self.apply_type_scope(query, entity, info)
-        plan, edges = self._plan_relation_loads(store, entity, info)
+        # Loader options name the class's attributes, which an alias does not
+        # take; its relations load as they are resolved.
+        plan, edges = (
+            self._plan_relation_loads(store, entity, info)
+            if alias is None
+            else ({}, [])
+        )
         options = _loader_options(plan)
         loaded = query.options(*options) if options else query
         session = self._get_session(info)
@@ -2234,6 +2279,41 @@ class _SQLAlchemyUpsertOps:
             parent, spec.name, lambda collection: collection.remove(child)
         )
 
+    def drop_link(self, parent: Any, spec: Any, child: Any) -> Any:
+        """Delete the join rows linking *child* to *parent*, once *child* is deleted.
+
+        Taking it out of a collection that deletes orphans would delete it,
+        soft-deleted or not, and the ORM leaves the link rows of a deleted row
+        whose own mapper has no relationship back.
+        """
+        from sqlalchemy import delete
+
+        state = sa_inspect(child)
+        if not (state.deleted or state.was_deleted or child in self._session.deleted):
+            return None
+        prop = sa_inspect(type(parent)).relationships[spec.name]
+        statement = delete(prop.secondary).where(
+            *(
+                link == getattr(row, mapper.get_property_by_column(column).key)
+                for row, mapper, pairs in (
+                    (parent, prop.parent, prop.synchronize_pairs),
+                    (child, prop.mapper, prop.secondary_synchronize_pairs),
+                )
+                for column, link in pairs
+            )
+        )
+        if self._async:
+            return self._drop_link_async(parent, spec.name, statement)
+        self._session.flush()
+        self._session.execute(statement)
+        self._session.expire(parent, [spec.name])
+        return None
+
+    async def _drop_link_async(self, parent: Any, name: str, statement: Any) -> None:
+        await self._session.flush()
+        await self._session.execute(statement)
+        self._session.expire(parent, [name])
+
     def is_member(self, parent: Any, spec: Any, child: Any) -> Any:
         from sqlalchemy import exists, select
         from sqlalchemy.orm import with_parent
@@ -2622,6 +2702,17 @@ def _get_sa_pk_names(model: type) -> set[str]:
     return {mapper.get_property_by_column(col).key for col in mapper.primary_key}
 
 
+def _read_entity(entity: Any) -> tuple[Any, Any]:
+    """The mapped class *entity* reads, and *entity* itself if it is an alias:
+    ``aliased()`` or ``with_polymorphic()``."""
+    from sqlalchemy import inspect as sa_inspect
+
+    found = sa_inspect(entity, raiseerr=False)
+    if not getattr(found, "is_aliased_class", False):
+        return entity, None
+    return found.mapper.class_, entity
+
+
 def _get_sa_pk_column(model: type) -> Any:
     """Return the primary-key column attribute for scoped queries."""
     from sqlalchemy import inspect as sa_inspect
@@ -2711,13 +2802,22 @@ def _database_errors(refused: str = _READ_REFUSED) -> Generator[None]:
 
     ``StatementError`` covers the driver's errors and SQLAlchemy's own, such
     as a value the column's type cannot bind; each carries the statement.
+    A statement SQLAlchemy cannot compile raises before it has one, with a
+    message that describes the statement all the same.
     """
-    from sqlalchemy.exc import StatementError
+    from sqlalchemy.exc import (
+        ArgumentError,
+        CompileError,
+        InvalidRequestError,
+        StatementError,
+    )
 
     try:
         yield
     except StatementError as exc:
         raise _sanitized(exc, refused) from exc
+    except (ArgumentError, CompileError, InvalidRequestError) as exc:
+        raise ValueError(refused) from exc
 
 
 def _sanitizing(work: Callable[..., Any], *args: Any) -> Any:
@@ -3106,7 +3206,7 @@ def _build_sa_filter(
                     if fk_clause is not None:
                         if scope_criteria is not None:
                             fk_clause = and_(
-                                fk_clause, relationship_prop.has(scope_criteria)
+                                relationship_prop.has(scope_criteria), fk_clause
                             )
                         return fk_clause, query
                 with past_a_hop():
@@ -3117,7 +3217,7 @@ def _build_sa_filter(
                     )
                 if inner is not None:
                     if scope_criteria is not None:
-                        inner = and_(inner, scope_criteria)
+                        inner = and_(scope_criteria, inner)
                     if relationship_prop.property.uselist:
                         return relationship_prop.any(inner), query
                     else:
@@ -3420,12 +3520,14 @@ def _build_lookup_clauses(
                 raise ValueError(
                     "Regex filters are disabled. Pass enable_regex_filters=True to enable."
                 )
+            check_regex(val)
             clauses.append(column.regexp_match(val))
         elif op_name == "i_regex":
             if not enable_regex:
                 raise ValueError(
                     "Regex filters are disabled. Pass enable_regex_filters=True to enable."
                 )
+            check_regex(val)
             clauses.append(column.regexp_match(val, flags="i"))
         elif op_name in ("exact", "neq", "gt", "gte", "lt", "lte"):
             sa_op = _LOOKUP_TO_SA_OP[op_name]

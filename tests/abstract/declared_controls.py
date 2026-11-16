@@ -89,6 +89,33 @@ def _scoped_connection_schema(orm, models, narrow):
     return orm.schema(query=Query)
 
 
+def _reached_back_schema(orm, models, narrow):
+    """Each post's author shown only if it is Alice, read from its author's posts."""
+    User, Post = models.User, models.Post
+
+    @orm.type(User, name="AuthorCard")
+    class AuthorCard:
+        name: auto
+
+    @orm.type(Post)
+    class PostType:
+        title: auto
+        author: AuthorCard | None = orm.field.eager(
+            scope=lambda query, info: narrow.only(query, User, "name", "Alice")
+        )
+
+    @orm.type(User)
+    class UserType:
+        name: auto
+        posts: list[PostType]
+
+    @strawberry.type
+    class Query:
+        users: list[UserType] = orm.field.eager()
+
+    return orm.schema(query=Query)
+
+
 def _guarded_connection_schema(orm, models):
     User, Post = models.User, models.Post
 
@@ -221,6 +248,25 @@ class AbstractTestDeclaredControls:
         schema = _scoped_connection_schema(orm, models, narrow)
         result = await run(schema, "{ users { name " + selection + " } }")
         assert _by_name(result)["Bob"] == bob, result.data
+
+    @pytest.mark.asyncio
+    async def test_a_to_one_reached_back_to_its_row_holds_its_scope(
+        self, orm, models, narrow, run
+    ):
+        schema = _reached_back_schema(orm, models, narrow)
+        result = await run(schema, "{ users { name posts { title author { name } } } }")
+        authors = {
+            name: sorted((post["title"], post["author"]) for post in posts)
+            for name, posts in _by_name(result).items()
+        }
+        assert authors == {
+            "Alice": [
+                ("GraphQL Guide", {"name": "Alice"}),
+                ("Hello World", {"name": "Alice"}),
+            ],
+            "Bob": [("Draft Post", None)],
+            "Charlie": [("Rust Adventures", None)],
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("positional", [False, True])

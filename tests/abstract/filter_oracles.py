@@ -16,12 +16,16 @@ Backends supply:
 ``numeric_text_keys``               seeds publishers ``00123`` (Zero Padded)
                                     and ``123`` (Plain), with the books
                                     "Padded" and "Plain Book"
+``statements()``                    context manager yielding the list of SQL
+                                    statements sent while it is open
 
 The seed: Alice wrote posts 1 and 2, Bob post 3 (a draft), Charlie post 4.
 Post 1 is tagged python; post 2 python and graphql; post 4 rust. Bob wrote
 "Nice post!" and Alice "Thanks!" on post 1; Charlie "Great guide" on post 2.
 Posts have word counts 100, 250, 40 and 310.
 """
+
+import re
 
 import strawberry
 from strawberry import relay
@@ -293,6 +297,73 @@ class AbstractTestCustomFiltersFollowTheirOperator:
         schema = _custom_filter_schema(orm, models, narrow)
         query = '{ users(filter: { any: [{ emailStarts: "bob@" }] }) { name } }'
         assert names(await run(schema, query)) == []
+
+
+# ---------------------------------------------------------------------------
+# The scope is written before the client's conditions
+# ---------------------------------------------------------------------------
+
+
+def _scope_first_schema(orm, models, narrow):
+    """Users are read without Bob, at the root and as a post's author."""
+    User, Post = models.User, models.Post
+    user_filter = orm.filter(User)
+    post_filter = orm.filter(Post)
+
+    @orm.type(User, filters=user_filter)
+    class UserType:
+        id: auto
+        name: auto
+        email: auto
+
+        @classmethod
+        def scope_rows(cls, query, info):
+            return narrow.exclude(query, User, "name", "Bob")
+
+    @orm.type(Post, filters=post_filter)
+    class PostType:
+        id: auto
+        title: auto
+        author: UserType | None
+
+    @strawberry.type
+    class Query:
+        users: list[UserType] = orm.field.auto()
+        posts: list[PostType] = orm.field.auto()
+
+    return orm.schema(query=Query)
+
+
+def compared_in(sent, first, then):
+    """The columns of the statement comparing *then*, as its WHERE first names them."""
+    conditions = [s[s.upper().index("WHERE") :] for s in sent if "WHERE" in s.upper()]
+    where = next(c for c in conditions if re.search(rf"\b{then}\b", c))
+    return sorted([first, then], key=lambda c: re.search(rf"\b{c}\b", where).start())
+
+
+class AbstractTestTheScopeIsWrittenFirst:
+    """A database that runs conditions in the order written, as SQLite does,
+    runs a client's condition - a costly regex, say - only on rows the scope
+    lets through, so its cost cannot time a hidden row."""
+
+    async def test_at_the_root(self, orm, models, narrow, run, statements):
+        schema = _scope_first_schema(orm, models, narrow)
+        query = '{ users(filter: { field: { email: { startsWith: "%s" } } }) { name } }'
+        with statements() as sent:
+            assert names(await run(schema, query % "bob")) == []
+        assert compared_in(sent, "name", "email") == ["name", "email"]
+        assert names(await run(schema, query % "alice")) == ["Alice"]
+
+    async def test_through_a_relation(self, orm, models, narrow, run, statements):
+        schema = _scope_first_schema(orm, models, narrow)
+        query = (
+            "{ posts(filter: { object: { author: { field: { email: "
+            '{ startsWith: "%s" } } } } }) { title } }'
+        )
+        with statements() as sent:
+            assert titles(await run(schema, query % "bob")) == []
+        assert compared_in(sent, "name", "email") == ["name", "email"]
+        assert titles(await run(schema, query % "charlie")) == ["Rust Adventures"]
 
 
 # ---------------------------------------------------------------------------

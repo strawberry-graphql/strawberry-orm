@@ -13,6 +13,7 @@ from tests.abstract.filter_oracles import (
     AbstractTestForeignKeyShortcutReadsOnlyTheKey,
     AbstractTestNegationAcrossAToManyRelation,
     AbstractTestReferenceLookupsKeepTheKeysType,
+    AbstractTestTheScopeIsWrittenFirst,
 )
 from tests.backends.tortoise.models import Book, Comment, Post, Publisher, Tag, User
 
@@ -82,4 +83,8 @@ class TestReferenceLookupsKeepTheKeysType(AbstractTestReferenceLookupsKeepTheKey
 
 
 class TestFiltersThroughAReverseRelation(AbstractTestFiltersThroughAReverseRelation):
+    pass
+
+
+class TestTheScopeIsWrittenFirst(AbstractTestTheScopeIsWrittenFirst):
     pass

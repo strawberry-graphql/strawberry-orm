@@ -973,6 +973,101 @@ class AbstractTestLinkChecks(Blog):
         assert calls == [("can_link", "mine", "replies", "loose")]
         assert await ids(writes, blog.mine, "replies") == [3, 5]
 
+    async def test_a_ref_list_creating_a_tag_asks_can_link(self, writes, blog, calls):
+        """``can_create`` is not told which post a new tag joins; ``can_link`` is."""
+        m = writes.m
+        orm = writes.new_orm(repos={m.Tag: link_recorder(calls, locked={"secret"})})
+        ref = orm.ref(m.Tag, create=TagCreate)
+        with pytest.raises(PermissionError, match="can_link denied"):
+            await writes.refs(
+                orm, blog.hello, "tags", [item(ref, "create", name="secret")]
+            )
+        await writes.refs(orm, blog.hello, "tags", [item(ref, "create", name="kept")])
+        assert calls == [
+            ("can_link", "Hello", "tags", "secret"),
+            ("can_link", "Hello", "tags", "kept"),
+        ]
+        assert await tag_names(writes) == ["python", "rust", "go", "kept"]
+        assert await names(writes, blog.hello, "tags") == ["python", "go", "kept"]
+
+    async def test_a_node_input_creating_a_tag_asks_can_link(self, writes, blog, calls):
+        m = writes.m
+        orm = writes.new_orm(repos={m.Tag: link_recorder(calls, locked={"secret"})})
+        upsert = orm.mutations.upsert_node_input(
+            model=m.Post,
+            project={
+                "_meta": {
+                    "update": ["title"],
+                    "upsert": {"where": ["title"], "onMatch": "UPDATE"},
+                },
+                "tags": {"_meta": {"create": ["name"], "upsert": {"where": ["name"]}}},
+            },
+            name="PostTagsUpsertInput",
+        )
+        tags = member(upsert, "update", "tags")
+        tag_upsert = member(tags, "upsert")
+        for sent in (
+            item(tags, "create", name="secret"),
+            tags(
+                upsert=tag_upsert(
+                    where=member(tag_upsert, "where")(name="secret"),
+                    create=member(tag_upsert, "create")(name="secret"),
+                )
+            ),
+        ):
+            with pytest.raises(PermissionError, match="can_link denied"):
+                await writes.upsert(orm, self.edit_post(upsert, "Hello", tags=[sent]))
+        assert calls == [("can_link", "Hello", "tags", "secret")] * 2
+        assert await tag_names(writes) == ["python", "rust", "go"]
+
+    async def test_a_new_link_target_asks_can_link(self, writes, blog, calls):
+        m = writes.m
+        orm = writes.new_orm(repos={m.User: link_recorder(calls, locked={"Mallory"})})
+        upsert = orm.mutations.upsert_node_input(
+            model=m.Post,
+            project={
+                "_meta": {
+                    "create": ["title", "body"],
+                    "update": ["title"],
+                    "upsert": {"where": ["title"], "onMatch": "UPDATE"},
+                },
+                "author": {"_meta": {"create": ["name", "email"]}},
+            },
+            name="PostNewAuthorUpsertInput",
+        )
+        link = member(upsert, "create", "author")
+        new_author = link(create=member(link, "create")(name="Mallory", email="m@x"))
+        with pytest.raises(PermissionError, match="can_link denied"):
+            await writes.upsert(
+                orm,
+                upsert(
+                    where=member(upsert, "where")(title="New"),
+                    create=member(upsert, "create")(body="B", author=new_author),
+                ),
+            )
+        relink = member(upsert, "update", "author")
+        with pytest.raises(PermissionError, match="can_link denied"):
+            await writes.upsert(
+                orm,
+                self.edit_post(
+                    upsert,
+                    "Hello",
+                    author=relink(
+                        create=member(relink, "create")(name="Mallory", email="m@x")
+                    ),
+                ),
+            )
+        assert calls == [
+            ("can_link", "New", "author", "Mallory"),
+            ("can_link", "Hello", "author", "Mallory"),
+        ]
+        assert [user.name for user in await writes.rows(m.User)] == [
+            "Alice",
+            "Bob",
+            "Carol",
+        ]
+        assert (await writes.reload(blog.hello)).author_id == 1
+
 
 # -- A ref list is one unit of work ----------------------------------------------------
 

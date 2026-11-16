@@ -17,9 +17,15 @@ import pytest
 import pytest_asyncio
 import strawberry
 from sqlalchemy import Integer, String, TypeDecorator, Uuid, create_engine, select
-from sqlalchemy.exc import StatementError
+from sqlalchemy.exc import ArgumentError, InvalidRequestError, StatementError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    defer,
+    mapped_column,
+    sessionmaker,
+)
 from sqlalchemy.pool import StaticPool
 from strawberry import relay
 
@@ -216,6 +222,22 @@ async def test_an_async_load_that_fails_as_its_rows_are_read_is_sanitized():
     with pytest.raises(ValueError, match="^Invalid filter expression$") as caught:
         await backend._execute_stmt_async(SimpleNamespace(execute=execute), select(Doc))
     assert isinstance(caught.value.__cause__, StatementError)
+
+
+@pytest.mark.parametrize(
+    ("stmt", "refusal"),
+    [
+        (lambda: select(Doc).join(Doc), InvalidRequestError),
+        (lambda: select(Doc.id).options(defer(Doc.title)), ArgumentError),
+    ],
+    ids=["join", "option"],
+)
+def test_a_statement_sqlalchemy_cannot_compile_is_not_described(session, stmt, refusal):
+    """It is refused before there is a statement, in words that describe one."""
+    backend = SQLAlchemyBackend(dialect="sqlite")
+    with pytest.raises(ValueError, match="^Invalid filter expression$") as caught:
+        backend._execute_stmt_sync(session, stmt())
+    assert isinstance(caught.value.__cause__, refusal)
 
 
 def test_a_relations_counts_are_sanitized(session):

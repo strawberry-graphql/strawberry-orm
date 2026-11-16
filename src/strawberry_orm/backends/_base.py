@@ -163,9 +163,12 @@ _SENSITIVE_WORDS = (
     r"pwd|pass[_-]?(?:phrase|code)s?|salt|[th]?otps?|mfa|"
     r"(?:recovery|backup)[_-]?codes?|pin[_-]?(?:code|number)s?|pin$|jwts?|"
     r"(?:api|access|signing|encryption|auth|license|master|session)[_-]?keys?|"
-    r"credentials?|"
+    r"credentials?|priv[_-]?keys?|mnemonics?|seed[_-]?phrases?|bearer|csrf|"
+    r"(?:verification|reset|invite|one[_-]?time)[_-]?codes?|magic[_-]?links?|"
+    r"security[_-]?answers?|"
     r"social[_-]?security|national[_-]?ids?|tax[_-]?ids?|passports?|"
     r"card[_-]?numbers?|cvv|cvc|ibans?|bank[_-]?accounts?|"
+    r"(?:routing|account)[_-]?numbers?|"
     r"groups|scopes|acls?|privileges?"
 )
 _WORD_START = r"(?:(?<![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
@@ -746,6 +749,15 @@ class RelationConnectionSpec:
     #: Column on the related rows holding the parent key, so a window can
     #: partition by it and a grouped count can total by it.
     key_field: str
+    #: The parent's attribute holding what ``key_field`` holds, when that is
+    #: not its primary key: a foreign key to another unique column.
+    parent_key: str | None = None
+
+    def key_of(self, backend: Any, parent: Any) -> Any:
+        """What *parent*'s related rows hold in ``key_field``."""
+        if self.parent_key is None:
+            return backend.instance_pk(parent)
+        return getattr(parent, self.parent_key)
 
 
 class ScopeHooks(dict):
@@ -991,6 +1003,7 @@ class BaseBackend:
         pk_names = self._get_pk_names(model) if exclude_pk else set()
 
         fields_meta = self._introspect_model(model)
+        link_keys = self._link_key_columns(model)
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         for fname, ftype, is_relation, _rel_model in fields_meta:
@@ -1003,6 +1016,8 @@ class BaseBackend:
             if self._exclude_generated_sensitive_field(fname, include):
                 continue
             if is_relation:
+                continue
+            if fname in link_keys and not (include and fname in include):
                 continue
             annotations[fname] = ftype | None
             defaults[fname] = strawberry.UNSET
@@ -1022,6 +1037,26 @@ class BaseBackend:
             if fname == "id" or fname.endswith("_id"):
                 pk_candidates.add(fname)
         return {"id"} if "id" in pk_candidates else set()
+
+    def _link_key_columns(self, model: type) -> set[str]:
+        """Columns holding the key a link to another model's row sets.
+
+        Written through the link, the related repo's ``scope_query`` and
+        ``can_link`` ask whether the row may be linked; written as a value,
+        nothing does.
+        """
+        return {
+            fname
+            for fname, _ftype, is_relation, related in self._introspect_model(model)
+            if self._is_forward_fk_attname_field(is_relation, related)
+        }
+
+    def _generic_key_columns(self, model: type) -> set[str]:
+        """Columns keying a row of whichever model another column names.
+
+        No relation reaches that row to ask its repo, so no input writes them.
+        """
+        return set()
 
     @staticmethod
     def _is_forward_fk_attname_field(
@@ -1087,7 +1122,7 @@ class BaseBackend:
         object_annotations: dict[str, Any] = {}
         object_defaults: dict[str, Any] = {}
         relation_models: dict[str, type] = {}
-        pending_self_relations: list[str] = []
+        self_relations: list[str] = []
         pk_names = self._get_pk_names(model)
 
         for fname, ftype, is_relation, rel_model in fields_meta:
@@ -1112,7 +1147,9 @@ class BaseBackend:
                     object_defaults[fname] = strawberry.UNSET
                     relation_models[fname] = rel_model
                 elif rel_model == model:
-                    pending_self_relations.append(fname)
+                    # Holds its place until the filter it takes, this one, exists.
+                    object_annotations[fname] = None
+                    self_relations.append(fname)
                     object_defaults[fname] = strawberry.UNSET
                     relation_models[fname] = rel_model
                 continue
@@ -1162,6 +1199,8 @@ class BaseBackend:
         FilterCls.one_of = strawberry.UNSET
         _annotate_filter_relation_presence(FilterCls)
 
+        for fname in self_relations:
+            object_annotations[fname] = FilterCls | None
         if object_annotations:
             obj_type_name = f"{model.__name__}FilterObject{suffix}"
             obj_ns: dict[str, Any] = {
@@ -1180,16 +1219,6 @@ class BaseBackend:
             FilterType._object_type = ObjectType  # type: ignore[attr-defined]
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
         self._cover_shown_fields(model, FilterType)
-
-        if pending_self_relations:
-            if project is None:
-                self._register_model_filter(model, FilterType)
-            return self.filter(
-                model,
-                include=include,
-                exclude=exclude,
-                project=project,
-            )
 
         if project is None:
             self._register_model_filter(model, FilterType)
@@ -1379,7 +1408,7 @@ class BaseBackend:
         object_annotations: dict[str, Any] = {}
         object_defaults: dict[str, Any] = {}
         relation_models: dict[str, type] = {}
-        pending_self_relations: list[str] = []
+        self_relations: list[str] = []
         custom_filter_annotations: dict[str, Any] = {}
         custom_filter_defaults: dict[str, Any] = {}
         custom_filters: dict[str, Callable[..., Any]] = {}
@@ -1411,7 +1440,10 @@ class BaseBackend:
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
                     elif rel_model == model:
-                        pending_self_relations.append(fname)
+                        # Holds its place until the filter it takes, this one,
+                        # exists.
+                        object_annotations[fname] = None
+                        self_relations.append(fname)
                         object_defaults[fname] = strawberry.UNSET
                         relation_models[fname] = rel_model
 
@@ -1458,6 +1490,10 @@ class BaseBackend:
         for cname, cann in custom_filter_annotations.items():
             filter_ns["__annotations__"][cname] = cann
             filter_ns[cname] = custom_filter_defaults[cname]
+        if object_annotations:
+            # Set once the object type, which may take this filter, exists.
+            filter_ns["__annotations__"]["object"] = None
+            filter_ns["object"] = strawberry.UNSET
 
         FilterCls = type(filter_type_name, (), filter_ns)
 
@@ -1473,6 +1509,8 @@ class BaseBackend:
 
         ObjectType = None
         if object_annotations:
+            for fname in self_relations:
+                object_annotations[fname] = FilterCls | None
             obj_type_name = f"{model.__name__}FilterObject"
             obj_ns: dict[str, Any] = {
                 "__annotations__": object_annotations,
@@ -1480,18 +1518,7 @@ class BaseBackend:
             }
             obj_cls = type(obj_type_name, (), obj_ns)
             ObjectType = strawberry.input(obj_cls, one_of=True)
-            filter_ns["__annotations__"]["object"] = ObjectType | None
-            filter_ns["object"] = strawberry.UNSET
-            FilterCls = type(filter_type_name, (), filter_ns)
-            FilterCls.__annotations__["all"] = list[FilterCls] | None
-            FilterCls.__annotations__["any"] = list[FilterCls] | None
-            FilterCls.__annotations__["not_"] = FilterCls | None
-            FilterCls.__annotations__["one_of"] = list[FilterCls] | None
-            FilterCls.all = strawberry.UNSET
-            FilterCls.any = strawberry.UNSET
-            FilterCls.not_ = strawberry.field(default=strawberry.UNSET, name="not")
-            FilterCls.one_of = strawberry.UNSET
-            _annotate_filter_relation_presence(FilterCls)
+            FilterCls.__annotations__["object"] = ObjectType | None
 
         FilterType = strawberry.input(FilterCls, one_of=True)
         FilterType.__orm_model__ = model  # type: ignore[attr-defined]
@@ -1503,12 +1530,6 @@ class BaseBackend:
         if custom_filters:
             FilterType._custom_filters = custom_filters  # type: ignore[attr-defined]
         self._cover_shown_fields(model, FilterType)
-
-        if pending_self_relations:
-            self._filter_registry[model] = FilterType
-            return self._build_custom_filter_type(
-                cls, model, include=include, exclude=exclude
-            )
 
         self._filter_registry[model] = FilterType
         return FilterType
@@ -1764,7 +1785,7 @@ class BaseBackend:
             if self._exclude_generated_sensitive_field(fname, include):
                 continue
             rel_group = self._group_registry.get(rel_model)
-            if rel_group is None:
+            if rel_group is None or not self.relation_joins_on_keys(model, fname):
                 continue
             annotations[fname] = rel_group | None
             defaults[fname] = strawberry.UNSET
@@ -1795,6 +1816,7 @@ class BaseBackend:
             relation: object_annotations[relation]
             for relation in relation_models
             if self.relation_hop(model, relation).many
+            and self.relation_joins_on_keys(model, relation)
         }
         if not annotations:
             return None
@@ -1828,6 +1850,14 @@ class BaseBackend:
         raise NotImplementedError(
             f"{type(self).__name__} cannot group through relations"
         )
+
+    def relation_joins_on_keys(self, model: type, relation: str) -> bool:
+        """Whether *relation*'s join says no more than that its key columns match.
+
+        Grouping and ``objects:`` rebuild the join from those columns, so a
+        relation whose join says more is not offered there.
+        """
+        return True
 
     def filter_crosses_to_many(self, filter_input: Any, model: type | None) -> bool:
         """True when *filter_input* reaches across a relation a row has many of.
@@ -2678,6 +2708,16 @@ class BaseBackend:
         if problems:
             raise ValueError("\n".join(dict.fromkeys(problems)))
 
+    def _excluded_columns(self, model: type) -> set[str]:
+        """What a type over *model*, or over a model it inherits from, excludes.
+
+        A subclass row carries its base's columns, so a column the base's type
+        hides is hidden on the subclass too.
+        """
+        return set().union(
+            *(self._type_excludes.get(base, ()) for base in model.__mro__)
+        )
+
     def _check_input_does_not_expose_excluded(
         self, model: type, type_name: str, fields: dict[str, Any]
     ) -> None:
@@ -2687,7 +2727,7 @@ class BaseBackend:
         touch the generated input, so the field stays writable. That is mass
         assignment: a caller can set a value they are not allowed to read back.
         """
-        hidden = self._type_excludes.get(model)
+        hidden = self._excluded_columns(model)
         if not hidden:
             return
         leaked = sorted(hidden & set(fields))
@@ -2709,7 +2749,13 @@ class BaseBackend:
         if not exclude:
             return
         excluded = set(exclude)
-        for input_name, fields in self._input_registry.get(model, []):
+        written = [
+            entry
+            for input_model, entries in self._input_registry.items()
+            if issubclass(input_model, model)
+            for entry in entries
+        ]
+        for input_name, fields in written:
             leaked = sorted(excluded & fields)
             if leaked:
                 raise ValueError(
@@ -2786,9 +2832,12 @@ class BaseBackend:
     def _shown(self, graphql_type: type) -> dict[str, frozenset[str] | None]:
         """What *graphql_type* shows, with the column a Relay node serves as its id.
 
-        The id is encoded, not hidden, so its column counts as shown. A type
-        the library did not build shows what Strawberry reads off the row.
+        The id is encoded, not hidden, so its column counts as shown - unless
+        the type serves its id through a ``resolve_id`` of its own, which may
+        never read that column. A type the library did not build shows what
+        Strawberry reads off the row.
         """
+        from strawberry_orm.leaf_fields import is_default_relay_id
         from strawberry_orm.tags import tags_of
 
         shown = self._shown_by_type.get(graphql_type)
@@ -2800,6 +2849,12 @@ class BaseBackend:
             return shown
         definition = graphql_type.__strawberry_definition__  # type: ignore[attr-defined]
         global_id = next(f for f in definition.fields if f.graphql_name == "id")
+        resolver = global_id.base_resolver
+        if not getattr(global_id, "_orm_relay_id", False) and (
+            resolver is None
+            or not is_default_relay_id(graphql_type, resolver.wrapped_func)
+        ):
+            return shown
         return {**shown, id_attr: tags_of(global_id)}
 
     def _cover(self, graphql_type: type) -> tuple[_Cover, _Cover]:
@@ -3449,8 +3504,9 @@ class BaseBackend:
             raise ValueError(
                 f"{type_name}.{field_name}: a connection over {relation!r} cannot "
                 f"take each parent's page in one query, because those rows carry "
-                f"no column tying them to a parent for a window to partition by. "
-                f"Give it a resolver with @orm.connection.lazy instead."
+                f"no column tying them to a parent for a window to partition by, "
+                f"or the relation's join says more than that column. Give it a "
+                f"resolver with @orm.connection.lazy instead."
             )
         # Resolution hands the extension a raw graphql-core info, which knows
         # the camelCase field name and not the Python one, so register both.
@@ -3471,8 +3527,11 @@ class BaseBackend:
                 return spec
         return None
 
-    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
-        """Every parent's related rows in one scoped query, ready to window."""
+    def relation_base_query(self, spec: Any, keys: list[Any], info: Any) -> Any:
+        """Every parent's related rows in one scoped query, ready to window.
+
+        *keys* are the parents' values of ``spec.key_field``.
+        """
         raise NotImplementedError
 
     def _rebuild_relation_connection(

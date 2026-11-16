@@ -12,6 +12,7 @@ from django.db import connection, models
 
 from strawberry_orm import AbstractRepo, StrawberryORM
 from strawberry_orm.types import auto
+from tests.abstract.mutation_node_input_relations import _schema, shape
 from tests.backends.django.models import Post, User
 
 
@@ -259,3 +260,19 @@ def test_a_child_models_row_is_found_for_a_write_through_its_parents_repo(articl
         "Pinned draft": "",
         "Pinned article": "edited",
     }
+
+
+def test_inputs_for_a_child_model_leave_out_what_its_parents_type_hides():
+    orm = StrawberryORM.for_django(warn_missing_scope=False)
+
+    @orm.type(Article, exclude=["is_published"])
+    class ArticleType:
+        id: auto
+        title: auto
+
+    schema = _schema(
+        create=orm.mutations.create_node_input(models=[PinnedArticle], name="Create")
+    )
+    assert "isPublished" not in shape(schema, "CreatePinnedArticleNodeInput")
+    with pytest.raises(ValueError, match=r"can write \['is_published'\]"):
+        orm.input(PinnedArticle, name="PinnedInput")

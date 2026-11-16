@@ -37,13 +37,17 @@ class GraphQLTool:
     root fields it may use, and the schema shows only those and the types
     they reach. An operation must be a single operation of at most
     ``max_tokens`` tokens and ``max_depth`` levels that passes validation,
-    and may not ask for ``__schema`` or ``__type``: ``graphql_schema``
-    describes what it may use. ``descriptions=False``
+    may not select one field more than 20 times in one place of its result,
+    fragments included, and may not ask for ``__schema`` or ``__type``:
+    ``graphql_schema`` describes what it may use. ``descriptions=False``
     leaves the schema's descriptions out of ``graphql_schema``.
 
     The token limit is checked as the operation is parsed, before anything
     else reads it; the schema's own extensions, such as Strawberry's
-    ``MaxTokensLimiter``, only run once it executes.
+    ``MaxTokensLimiter``, only run once it executes. Checking the operation,
+    and the parsing and validation ``schema.execute`` does before its
+    resolvers run, happen in a worker thread, unless an extension of the
+    schema's own, such as ``ParserCache`` or ``ValidationCache``, does them.
     """
 
     allow_mutations: bool = False
@@ -210,7 +214,11 @@ def _add_graphql_tools(
             raise ToolError("\n".join(errors))
         assert kind is not None
         result = await executor.run(
-            query, variables or {}, await build_context(ctx), {kind}
+            query,
+            variables or {},
+            await build_context(ctx),
+            {kind},
+            prepare_off_loop=True,
         )
         return _result(result)
 

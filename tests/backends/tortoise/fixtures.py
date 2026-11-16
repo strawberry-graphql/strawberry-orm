@@ -1,5 +1,7 @@
 """All fixtures for Tortoise backend tests."""
 
+from contextlib import contextmanager
+
 import pytest
 import pytest_asyncio
 import strawberry
@@ -650,3 +652,28 @@ def user_brief_type():
 @pytest.fixture
 def user_full_type():
     return UserFull
+
+
+@pytest.fixture
+def statements(monkeypatch, tortoise_db):
+    """A context manager yielding the SQL statements sent while it is open."""
+    from tortoise import connections
+
+    @contextmanager
+    def _statements():
+        sent: list[str] = []
+        client = connections.get("default")
+
+        def recording(original):
+            async def run(sql, *args, **kwargs):
+                sent.append(sql)
+                return await original(sql, *args, **kwargs)
+
+            return run
+
+        with monkeypatch.context() as patch:
+            for name in ("execute_query", "execute_query_dict"):
+                patch.setattr(client, name, recording(getattr(client, name)))
+            yield sent
+
+    return _statements

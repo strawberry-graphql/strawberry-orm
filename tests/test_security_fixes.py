@@ -30,6 +30,7 @@ from sqlalchemy.orm import (
 )
 
 from strawberry_orm import StrawberryORM
+from strawberry_orm.filters import MAX_REGEX_LENGTH, check_regex
 from strawberry_orm.types import auto
 
 # =========================================================================
@@ -495,6 +496,56 @@ class TestFix6_RegexValidation:
             }}
         """)
         assert result.errors is not None
+
+
+class TestRegexPatternGuard:
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            r"^\w+@\w+\.\w+$",
+            r"(\d{3})+",
+            "^(foo|bar)$",
+            "(a|b)+",
+            "(?=a)b+",
+            "(?!a)b",
+            "(?>a+)b",
+            "a+?",
+            "a++",
+            "[[:alpha:]]+",
+            "(unclosed",
+            "a" * MAX_REGEX_LENGTH,
+        ],
+    )
+    def test_a_pattern_that_cannot_backtrack_for_long_is_allowed(self, pattern):
+        check_regex(pattern)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "(a+)+$",
+            "(a*)*",
+            "(a?)+",
+            r"(\w+\s?)+$",
+            "(?:x+x+)+y",
+            "((ab)*c)*",
+            "(a|aa)+$",
+            "x(a|(b+)+)",
+            "(a+?)+?",
+            "(a+)++",
+            "(?=(a+)+)",
+            "(?!(a+)+)b",
+            "(?>(a+)+)",
+            r"(a)\1",
+            "(a)?(?(1)b|c)",
+        ],
+    )
+    def test_a_pattern_that_can_backtrack_for_long_is_refused(self, pattern):
+        with pytest.raises(ValueError, match="may not repeat a group"):
+            check_regex(pattern)
+
+    def test_a_pattern_past_the_length_cap_is_refused(self):
+        with pytest.raises(ValueError, match="at most 100 characters"):
+            check_regex("a" * (MAX_REGEX_LENGTH + 1))
 
 
 # =========================================================================

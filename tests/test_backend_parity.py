@@ -41,12 +41,12 @@ EXCLUDED_FILES = {
     # Only Django skips a prefetch whose relation a select_related in the
     # query one level up has already cached.
     "test_scoped_prefetch_trust.py",
+    # Django and Tortoise load onto rows the app keeps between requests in
+    # place; a SQLAlchemy row belongs to a session, whose turn window covers it.
+    "test_shared_rows.py",
     # Subclasses of Django's relation fields, as django-mptt and modelcluster
     # declare, and contenttypes' GenericRelation.
     "test_relation_field_subclasses.py",
-    # Django's to_field keys, which its grouping and relation connections
-    # compared with the related row's primary key.
-    "test_to_field_keys.py",
 }
 
 EXCLUDED_METHODS = {

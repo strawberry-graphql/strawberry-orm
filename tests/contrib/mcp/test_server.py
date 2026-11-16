@@ -9,15 +9,24 @@ from collections.abc import AsyncGenerator
 
 import pytest
 import strawberry
+from graphql import ValidationRule
+from graphql.language.parser import Parser
 from mcp import Client
 from mcp.server.mcpserver.tools import Tool
-from strawberry.extensions import MaskErrors
+from strawberry.extensions import (
+    AddValidationRules,
+    MaskErrors,
+    MaxTokensLimiter,
+    ParserCache,
+    QueryDepthLimiter,
+    ValidationCache,
+)
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
 from strawberry_orm.contrib.mcp.checks import check_operation
 
-from .fakes import OPERATIONS, RUNS, Mutation, Query, schema
+from .fakes import OPERATIONS, RUNS, Mutation, Query, relay_schema, schema
 
 HELLO = {
     "title": "Hello",
@@ -415,6 +424,105 @@ async def test_the_graphql_tool_checks_an_operation_off_the_event_loop(monkeypat
     assert threads[0] is not threading.main_thread()
 
 
+async def test_the_graphql_tool_parses_and_validates_off_the_event_loop(monkeypatch):
+    loop = threading.current_thread()
+    seen = []
+
+    class Recording(ValidationRule):
+        def enter_document(self, *_):
+            seen.append(("validate", threading.current_thread() is loop))
+
+    parse_document = Parser.parse_document
+
+    def recording(self):
+        seen.append(("parse", threading.current_thread() is loop))
+        return parse_document(self)
+
+    recorded = strawberry.Schema(
+        query=Query, extensions=[lambda: AddValidationRules([Recording])]
+    )
+    server = mcp_server(
+        recorded, operations="query Named { named { name } }", graphql_tool=True
+    )
+    monkeypatch.setattr(Parser, "parse_document", recording)
+    async with Client(server) as client:
+        await client.call_tool("graphql", {"query": "{ named { name } }"})
+        written, seen[:] = seen[:], []
+        await client.call_tool("Named", {})
+
+    assert written == [("parse", False), ("parse", False), ("validate", False)]
+    assert seen == [("parse", True), ("validate", True)]
+
+
+@pytest.mark.parametrize(
+    ("extension", "error"),
+    [
+        (lambda: MaxTokensLimiter(max_token_count=5), "more than 5 tokens"),
+        (lambda: QueryDepthLimiter(max_depth=1), "exceeds maximum operation depth"),
+    ],
+)
+async def test_the_schemas_own_extensions_still_check_the_graphql_tool(
+    extension, error
+):
+    limited = strawberry.Schema(query=Query, extensions=[extension])
+
+    async with Client(mcp_server(limited, graphql_tool=True)) as client:
+        result = await client.call_tool(
+            "graphql", {"query": "{ posts { title author { name } } }"}
+        )
+
+    assert result.is_error is True
+    assert error in result.content[0].text
+
+
+async def test_the_graphql_tool_runs_with_the_schemas_own_caches():
+    cached = strawberry.Schema(query=Query, extensions=[ParserCache, ValidationCache])
+
+    async with Client(mcp_server(cached, graphql_tool=True)) as client:
+        result = await client.call_tool("graphql", {"query": "{ named { name } }"})
+
+    assert result.structured_content == {"data": {"named": {"name": "Alice"}}}
+
+
+@pytest.mark.parametrize(
+    ("query", "times"),
+    [
+        ("{ posts { " + "author { name } " * 447 + "} }", 447),
+        ("{ posts { " + "author { name name name name name } " * 5 + "} }", 25),
+        (
+            "{ posts { ...A ...B ...C } } "
+            + " ".join(f"fragment {f} on Post {{ {'title ' * 7}}}" for f in "ABC"),
+            21,
+        ),
+        ("{ posts { " + "... on Post { title title title } " * 7 + "} }", 21),
+    ],
+    ids=["siblings", "nested", "fragments", "inline fragments"],
+)
+async def test_the_graphql_tool_refuses_a_field_merged_too_often(query, times):
+    async with Client(_server(graphql_tool=True)) as client:
+        result = await client.call_tool("graphql", {"query": query})
+
+    assert result.is_error is True
+    assert (
+        f"The query selects a field up to {times} times in one place; "
+        "the limit is 20." in result.content[0].text
+    )
+
+
+async def test_a_field_merged_up_to_the_limit_still_runs():
+    query = (
+        "{ posts { " + "author { name } " * 20 + "...F " * 30 + "} } "
+        "fragment F on Post { title }"
+    )
+
+    async with Client(_server(graphql_tool=True)) as client:
+        result = await client.call_tool("graphql", {"query": query})
+
+    assert result.structured_content == {
+        "data": {"posts": [{"author": {"name": "Alice"}, "title": "Hello"}]}
+    }
+
+
 async def test_the_graphql_tool_may_run_mutations_when_allowed():
     server = _server(operations=None, graphql_tool=GraphQLTool(allow_mutations=True))
 
@@ -459,6 +567,37 @@ async def test_root_fields_limit_what_the_graphql_tool_shows_and_runs():
     assert "type Post " not in sdl
     assert refused.is_error is True
     assert "Cannot query field 'missing'" in refused.content[0].text
+
+
+async def test_root_fields_leave_out_types_that_only_share_an_interface():
+    server = mcp_server(relay_schema, graphql_tool=GraphQLTool(root_fields=["notes"]))
+    query = "{ notes { ... on Node { ... on AuditEntry { actorEmail } } } }"
+
+    async with Client(server) as client:
+        sdl = (await client.call_tool("graphql_schema", {})).content[0].text
+        refused = await client.call_tool("graphql", {"query": query})
+
+    assert "type Note implements Node" in sdl
+    assert "interface Node" in sdl
+    for hidden in ("AuditEntry", "SigningKey", "privatePem", "auditLog"):
+        assert hidden not in sdl
+    assert refused.is_error is True
+    assert "Unknown type 'AuditEntry'" in refused.content[0].text
+
+
+async def test_a_field_returning_an_interface_reaches_its_implementations():
+    server = mcp_server(relay_schema, graphql_tool=GraphQLTool(root_fields=["node"]))
+    query = '{ node(id: "Tm90ZTox") { id ... on Note { text } } }'
+
+    async with Client(server) as client:
+        sdl = (await client.call_tool("graphql_schema", {})).content[0].text
+        result = await client.call_tool("graphql", {"query": query})
+
+    assert "type Note implements Node" in sdl
+    assert "type AuditEntry implements Node" in sdl
+    assert result.structured_content == {
+        "data": {"node": {"id": "Tm90ZTox", "text": "Hi"}}
+    }
 
 
 async def test_root_fields_may_name_allowed_mutations():

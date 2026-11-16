@@ -139,3 +139,22 @@ class AbstractTestToOnePresenceOfAReadableRow:
             schema, NOT_PARENT % '{ field: { body: { startsWith: "Nice" } } }'
         )
         assert result.data == bodies("Nice post!")
+
+    async def test_a_second_hop_through_the_relation_is_applied(
+        self, orm, models, narrow, run
+    ):
+        """However deep, each hop takes the whole filter, ``object`` included.
+
+        No comment here has a grandparent, let alone a great-grandparent; a
+        hop left without ``object`` would match every comment with a parent.
+        """
+        schema = _schema(orm, models, narrow, CHARLIE)
+        hop = "{ object: { parent: %s } }"
+        for depth in (1, 2):
+            deepest = "{ isNull: false }"
+            for _ in range(depth):
+                deepest = hop % deepest
+            result = await run(schema, PARENT % deepest)
+            assert result.data == bodies()
+        result = await run(schema, PARENT % (hop % "{ isNull: true }"))
+        assert result.data == bodies("Thanks!")

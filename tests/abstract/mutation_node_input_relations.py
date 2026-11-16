@@ -259,3 +259,22 @@ class AbstractTestSensitiveRelations:
             "id": "ID!",
             "roles": "[AdminRolesItem!]",
         }
+
+
+class AbstractTestPlainInputKeys:
+    """``orm.input()`` and ``orm.partial()`` leave out a link's foreign key
+    column, as node inputs do: written as a plain value, it would link a row
+    the related repo's ``scope_query`` and ``can_link`` never see."""
+
+    def test_the_foreign_key_a_link_sets_is_left_out(self, orm, models):
+        schema = _schema(create=orm.input(models.Post), patch=orm.partial(models.Post))
+        assert shape(schema, "PostInput") == POST_COLUMNS
+        assert shape(schema, "PostPartialInput") == POST_COLUMNS
+
+    def test_include_naming_it_keeps_it(self, orm, models):
+        schema = _schema(
+            create=orm.input(models.Post, include=["title", "author_id"]),
+            patch=orm.partial(models.Post, include=["author_id"]),
+        )
+        assert shape(schema, "PostInput") == {"title": "String", "authorId": "Int"}
+        assert shape(schema, "PostPartialInput") == {"authorId": "Int"}

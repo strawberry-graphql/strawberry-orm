@@ -7,6 +7,7 @@ import importlib
 import inspect
 import re
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable
 from contextlib import contextmanager
 from decimal import Decimal
 from functools import wraps
@@ -24,7 +25,11 @@ from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
 from strawberry_orm.fields import call_scope
-from strawberry_orm.filters import is_fk_shortcut_lookup, is_reference_lookup
+from strawberry_orm.filters import (
+    check_regex,
+    is_fk_shortcut_lookup,
+    is_reference_lookup,
+)
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
 
@@ -259,6 +264,18 @@ def _cached_related(rows: list[Any], name: str) -> list[Any]:
     return list(related.values())
 
 
+def _held(row: Any, name: str) -> Any:
+    """What relation *name* holds on *row*: its loaded list, the related row or ``None``.
+
+    Each prefetch gives a relation a new list, so a mark made with this stops
+    holding once another load replaces what it vouched for.
+    """
+    value = row.__dict__.get(f"_{name}")
+    return (
+        value if isinstance(value, Model) else getattr(value, "related_objects", None)
+    )
+
+
 async def _hide_scoped_out(rows: list[Any], name: str, load: _PlannedPrefetch) -> None:
     """Drop cached forward rows *load*'s scope rejects, leaving the FK alone."""
     cache_attr = f"_{name}"
@@ -470,6 +487,7 @@ class TortoiseBackend(BaseBackend):
                                     self,
                                     fname,
                                     scope=backend._field_scope(type(self), fname, info),
+                                    held=_held,
                                 )
                             ):
                                 return list(rel_value)
@@ -979,10 +997,12 @@ class TortoiseBackend(BaseBackend):
             relation=relation,
             related_model=self._relation_target_model(model, relation),
             key_field=key_field,
+            # ``to_field=`` points the key at another unique column.
+            parent_key=field.to_field_instance.model_field_name,
         )
 
-    def relation_base_query(self, spec: Any, pks: list[Any], info: Any) -> Any:
-        qs = spec.related_model.filter(**{f"{spec.key_field}__in": pks})
+    def relation_base_query(self, spec: Any, keys: list[Any], info: Any) -> Any:
+        qs = spec.related_model.filter(**{f"{spec.key_field}__in": keys})
         restrict = self.relation_scope(
             spec.model, spec.field_name, info, on=spec.relation
         )
@@ -1001,7 +1021,7 @@ class TortoiseBackend(BaseBackend):
             if page is not None:
                 return page
             qs = spec.related_model.filter(
-                **{spec.key_field: backend.instance_pk(self)}
+                **{spec.key_field: spec.key_of(backend, self)}
             )
             restrict = backend.relation_scope(model, field_name, info, on=relation)
             return qs if restrict is None else restrict(qs, info)
@@ -1202,19 +1222,25 @@ class TortoiseBackend(BaseBackend):
         for instance in instances:
             by_model.setdefault(type(instance), []).append(instance)
 
+        from strawberry_orm.lazy_resolution import load_alone
+
         loaded: list[Any] = []
         for model, rows in by_model.items():
             plan = self._relation_prefetches(store, model, info)
             if not plan:
                 continue
-            await _prefetch_onto(model, rows, _prefetch_lookups(plan))
-            await self._finish_prefetches(rows, plan)
+            with load_alone(rows) as alone:
+                await _prefetch_onto(model, rows, _prefetch_lookups(plan))
+                await self._finish_prefetches(rows, plan, alone)
             loaded.extend(rows)
 
         return loaded
 
     async def _finish_prefetches(
-        self, rows: list[Any], plan: dict[str, _PlannedPrefetch]
+        self,
+        rows: list[Any],
+        plan: dict[str, _PlannedPrefetch],
+        alone: Callable[[], bool] = lambda: True,
     ) -> None:
         """Hide scoped-out forward rows, then mark every scoped cache.
 
@@ -1222,6 +1248,9 @@ class TortoiseBackend(BaseBackend):
         foreign key column when a filtered prefetch finds nothing, which a later
         save would write back. The rows the scope rejects are dropped from the
         cache here instead, leaving the column alone.
+
+        *alone* says whether the rows' caches still hold this load's rows; once
+        another load crossed it, nothing more is marked.
         """
         from strawberry_orm.lazy_resolution import mark_relations_scoped
 
@@ -1229,7 +1258,8 @@ class TortoiseBackend(BaseBackend):
             if load.scope is not None:
                 if load.forward:
                     await _hide_scoped_out(rows, name, load)
-                mark_relations_scoped(rows, [name], scope=load.token)
+                if alone():
+                    mark_relations_scoped(rows, [name], scope=load.token, held=_held)
             if not load.children:
                 continue
             related = _cached_related(rows, name)
@@ -1237,7 +1267,7 @@ class TortoiseBackend(BaseBackend):
                 await _prefetch_onto(
                     load.related_model, related, _prefetch_lookups(load.children)
                 )
-            await self._finish_prefetches(related, load.children)
+            await self._finish_prefetches(related, load.children, alone)
 
 
 class _TortoiseUpsertOps:
@@ -1376,7 +1406,10 @@ def _make_tortoise_to_one_resolver(
         if restrict is None or (
             _tortoise_relation_prefetched(self, fname)
             and relation_cache_is_scoped(
-                self, fname, scope=backend._field_scope(type(self), fname, info)
+                self,
+                fname,
+                scope=backend._field_scope(type(self), fname, info),
+                held=_held,
             )
         ):
             related = getattr(self, fname, None)
@@ -1422,7 +1455,7 @@ def _make_tortoise_rel_resolver(
         if not getattr(rel_value, "_fetched", False):
             return None
         if not relation_cache_is_scoped(
-            self, fname, scope=backend._field_scope(type(self), fname, info)
+            self, fname, scope=backend._field_scope(type(self), fname, info), held=_held
         ) and (backend.relation_scope(type(self), fname, info) is not None):
             return None
         return list(rel_value.related_objects)
@@ -1436,10 +1469,14 @@ def _make_tortoise_rel_resolver(
         )
         return backend._apply_nested_queryset(qs, type(self), fname, rel_model, info)
 
-    async def _read(qs: Any) -> list[Any]:
+    async def _read(qs: Any, info: Any) -> list[Any]:
         with _read_errors():
             rows = list(await qs)
-        return _apply_python_ordering(rows, _query_orderings(qs))
+        rows = _apply_python_ordering(rows, _query_orderings(qs))
+        # New rows: nothing loaded the relations below them, ``using=``
+        # paths included, which a field would otherwise find missing.
+        await backend.load_relations(backend._store, rows, info)
+        return rows
 
     if filter_type and order_type:
 
@@ -1455,7 +1492,7 @@ def _make_tortoise_rel_resolver(
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model, info=info)
-            return await _read(qs)
+            return await _read(qs, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1472,7 +1509,7 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
-            return await _read(qs)
+            return await _read(qs, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1488,7 +1525,7 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model, info=info)
-            return await _read(qs)
+            return await _read(qs, info)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1696,7 +1733,7 @@ def _build_tortoise_filter(
                         if scope_q is None:
                             return fk_clause, query
                         return _tortoise_matching_rows(
-                            model, fk_clause & scope_q, _prefix
+                            model, scope_q & fk_clause, _prefix
                         ), query
                 with past_a_hop():
                     nested_clause, query = _build_tortoise_filter(
@@ -1720,7 +1757,7 @@ def _build_tortoise_filter(
                 if nested_clause is None or not by_key:
                     return nested_clause, query
                 if scope_q is not None:
-                    nested_clause = nested_clause & scope_q
+                    nested_clause = scope_q & nested_clause
                 return _tortoise_matching_rows(model, nested_clause, _prefix), query
         elif key == "all":
             if len(val) > max_branches:
@@ -1840,7 +1877,9 @@ def _tortoise_checked_q(model: Any, q: Any) -> Any:
 
     Tortoise rejects an unknown filter name only when the query runs, in a
     message listing every column of the model. Checked here, the client gets
-    the short message the other backends give.
+    the short message the other backends give. A value its column cannot
+    convert, such as a string for a duration, fails here too, with a Python
+    error of the conversion's own.
     """
     from tortoise.exceptions import FieldError
     from tortoise.expressions import ResolveContext
@@ -1856,6 +1895,8 @@ def _tortoise_checked_q(model: Any, q: Any) -> Any:
         )
     except FieldError:
         raise ValueError(_READ_REFUSED) from None
+    except (TypeError, AttributeError, ValueError) as exc:
+        raise ValueError(_READ_REFUSED) from exc
     return q
 
 
@@ -2011,6 +2052,7 @@ def _build_tortoise_lookup(
                     "Regex filters are disabled. Pass enable_regex_filters=True "
                     "to enable."
                 )
+            check_regex(val)
             suffix = {"regex": "__regex", "i_regex": "__iregex"}.get(op_name, "")
             q = q & Q(**{f"{col_name}{suffix}": val})
         elif op_name in _LOOKUP_TO_TORTOISE:
