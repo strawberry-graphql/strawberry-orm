@@ -322,7 +322,7 @@ Define it on the `@orm.type` class for the model **being loaded**. A nested quer
 | `users { posts { … } }`  | `UserType.scope_rows` | `PostType.scope_rows` |
 | `posts { author { … } }` | `PostType.scope_rows` | `UserType.scope_rows` |
 
-A row of a subclass of the model (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) is a row of the model too, and is scoped by the model's `scope_rows` unless a type over the subclass defines its own.
+A row of a subclass of the model (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) is a row of the model too, and is scoped by the model's `scope_rows` unless a type over the subclass defines its own. On SQLAlchemy, where a polymorphic read of the model returns such a row as the subclass, that type's scope applies to the read as well, so the rows it hides are left out of the model's lists, pages, counts, aggregates, groups and filters through relations.
 
 On SQLAlchemy the hook may return more than a `.where()`: joins, nested selects and `with_loader_criteria` hold wherever the rows are read, in counts, aggregates, groups, orders and filters through relations included. A `with_loader_criteria` applies to every place its entity is read in the statement the scope runs inside. A scope that is more than a `.where()` on the related table's own columns is loaded onto a relation one statement per relation, by the relation's join key; a relation that does not join on one column (a composite key, a `primaryjoin` that says more than the key comparison) cannot be loaded that way and raises.
 
@@ -656,7 +656,7 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 
 ### What the library does by default
 
-- `orm.input()`, `orm.filter()`, `orm.order()` and node mutation inputs exclude sensitive-looking fields and relations (`password_hash`, `api_key`, `totp_seed`, `is_admin`, `roles`, `groups`, etc.) unless you name them
+- `orm.input()`, `orm.filter()`, `orm.order()` and node mutation inputs exclude sensitive-looking fields and relations (`password_hash`, `api_key`, `totp_seed`, `is_admin`, `roles`, `groups`, etc.), and attributes private to the model (a name starting with `_`), unless you name them
 - String regex filters are disabled by default
 - Filter depth is capped, and so are the branches and the listed values of a whole filter argument, every reference to a variable included
 - A connection reads at most one page, and so does each group's `items`: `first`, `last` and `before` alone are held to `max_results` (and `default_query_limit` when smaller), and a cursor before the first row is refused — see [Connection fields](#connection-fields)
@@ -685,6 +685,8 @@ For `{ users { name posts { title } } }` the order is always `PostType.scope_row
 #### Writes do not apply `scope_rows`
 
 `scope_rows` narrows what a caller reads. `orm.apply_upsert()` and `orm.apply_ref_list()` find the rows they write through the model's repo instead, so a model clients can write needs an `AbstractRepo` whose `scope_query` narrows the query as its `scope_rows` does. Without one, a caller can update, link or re-point any row by its ID: taking another user's post into their own `posts` list makes it theirs, and readable. An upsert's match on `where` answers too, telling a caller whether a hidden row with those values exists. A subclass of the model (an inherited SQLAlchemy mapping, a Django proxy or multi-table child) with no repo of its own is written through the model's.
+
+A unique constraint compares every row in the table, the ones the caller cannot read included. Creating a row with an email another tenant's user already has comes back as `The database refused the write`, and any other email succeeds, so a caller can test whether a value is taken anywhere. Where that is sensitive, make the constraint per tenant (unique on `tenant_id` and `email` together), so the values it compares are only the tenant's own.
 
 
 ### Ordering into a scoped type
@@ -853,7 +855,7 @@ CreateUserInput = orm.input(User, include=["name", "email"])
 UpdateUserInput = orm.partial(User, include=["name", "email"])
 ```
 
-`input()` and `partial()` share the same signature: `include`, `exclude`, `exclude_pk` (default `True`), `name`. Fields are optional (defaulting to `strawberry.UNSET`), skip relations, exclude primary keys by default, and exclude sensitive-looking fields unless explicitly included.
+`input()` and `partial()` share the same signature: `include`, `exclude`, `exclude_pk` (default `True`), `name`. Fields are optional (defaulting to `strawberry.UNSET`), skip relations, exclude primary keys by default, and exclude sensitive-looking fields, and attributes whose name starts with `_`, unless explicitly included.
 
 ---
 
@@ -1921,6 +1923,7 @@ Rules:
 - `_meta` configures behavior for that relation subtree (`create`, `update`, `upsert`, `unlink`, `delete`, `onReplace`, `immutable`, `maxVisits`, `name`).
 - Relations you do not declare are absent from the input, so the schema rejects them.
 - Destructive operations are opt-in. A to-many relation offers `create` and `update` unless its `_meta` sets `unlink: True` or `delete: True`, and a re-pointed single link disconnects the row it replaces unless `onReplace` offers `"DELETE"`. Even then the replaced row is deleted only if the caller could delete it by its key: one the related repo's `scope_query` hides, or whose deletion `authorize` denies, is disconnected and left in place.
+- A SQLAlchemy relationship with a `delete-orphan` cascade deletes every row it lets go of, so letting go of one is a delete. Unlinking from one is refused (send `delete`, which goes through the repo), and re-pointing a single link of that kind is refused unless the caller could delete the row it held: `authorize`, the related repo's `scope_query` and `can_delete` decide, and `on_before_delete` runs, before the cascade deletes it.
 - Columns that the model's `@orm.type(..., exclude=[...])` hides are left out of every generated input. Naming one in `_meta.create`, `_meta.update` or `_meta.upsert.where` raises `ValueError`, and so does declaring the type after an input that already writes the column.
 - So are the relations it hides, and a link whose foreign key column it hides: `exclude=["author_id"]` leaves out `author`. Naming such a relation in `project=` raises `ValueError`, and so does declaring the type after an input that already writes it.
 - Relations with sensitive-looking names (`roles`, `groups`, `permissions`) are left out unless `project=` names them, as sensitive-looking columns are unless `_meta` lists them.
@@ -2249,6 +2252,19 @@ A call returns the GraphQL result:
 - **Queries read, mutations are marked.** Query tools carry MCP's `readOnlyHint` and mutation tools `destructiveHint`, which clients use to ask their user before a change. Nothing else can run: a client can only call the operations you listed.
 - **Your permissions apply.** Every operation runs through the schema with the context from `context_getter`, so `scope_rows`, `scope=`, permission classes and the optimizer behave as for any other request. Over stdio, `context_getter` receives `None`; by default the context is `{"request": request}`.
 - **Results are GraphQL results.** A tool returns `{"data": ..., "errors": [...]}`. Partial data comes back with its errors; a result with no data at all is a tool error. Arguments are coerced by GraphQL, so a wrong one comes back as GraphQL's own error message.
+- **Mask your resolvers' errors.** An error reaches the client with the message it was raised with, as it does over HTTP, but here it lands in a model's transcript, where it is easier to pass on. The library's own errors leave out SQL and values; for exceptions your resolvers raise, add Strawberry's `MaskErrors` to the schema. Masking only the errors a resolver raised keeps GraphQL's own messages, which a client needs to correct its query:
+
+  ```python
+  from strawberry.extensions import MaskErrors
+
+  def mask_raised(error):
+      return error.original_error is not None
+
+  schema = orm.schema(
+      query=Query,
+      extensions=[lambda: MaskErrors(should_mask_error=mask_raised)],
+  )
+  ```
 - **Authenticate it.** `mcp_server` adds no authentication of its own. Pass `token_verifier=` and `auth=`, or serve it behind your own, before anyone else can reach it. Other keyword arguments, such as `instructions=` and `tools=`, go to `MCPServer`, and the server it returns takes more tools with `@server.tool()`.
 - **Sync schemas need `sync=True`.** It runs `schema.execute_sync` in a worker thread and, with Django, closes stale connections around each call as Django's request handler would. Use it for Django's sync ORM, or whenever a resolver blocks. Without it the server awaits `schema.execute`; if Django refuses with `SynchronousOnlyOperation`, it warns and reruns the query with `execute_sync` from then on, but a mutation fails rather than run twice. `execute=` takes over entirely: an async `(query, variables, context, allowed) -> ExecutionResult`.
 

@@ -1039,8 +1039,15 @@ class TestAColumnIsNamedByItsAttribute:
         orm = _orm()
         written = orm.input(Person).__strawberry_definition__.fields
         filtered = orm.filter(Person)._field_type.__strawberry_definition__.fields
-        assert {field.python_name for field in written} == {"name", "_phone"}
-        assert {field.python_name for field in filtered} == {"key", "name", "_phone"}
+        assert {field.python_name for field in written} == {"name"}
+        assert {field.python_name for field in filtered} == {"key", "name"}
+
+    def test_a_private_attribute_is_left_out_unless_named(self):
+        orm = _orm()
+        named = orm.input(Person, include=["name", "_phone"])
+        assert {
+            field.python_name for field in named.__strawberry_definition__.fields
+        } == {"name", "_phone"}
 
     def test_a_hybrid_named_like_the_column_does_not_open_it(self):
         orm = _orm()

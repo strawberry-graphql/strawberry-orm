@@ -971,9 +971,14 @@ class BaseBackend:
         field_name: str,
         include: list[str] | tuple[str, ...] | set[str] | None,
     ) -> bool:
+        if include and field_name in include:
+            return False
+        # A leading underscore marks an attribute private to the model, such
+        # as the column behind a property that shows it masked.
+        if field_name.startswith("_"):
+            return True
         return (
             self._exclude_sensitive_fields
-            and not (include and field_name in include)
             and _SENSITIVE_PATTERNS.search(field_name) is not None
         )
 
@@ -2317,9 +2322,8 @@ class BaseBackend:
         if query_is_scoped(query):
             return query
         get_qs = self._type_querysets.get(model)
-        if get_qs is None:
-            return query
-        scoped = get_qs(query, info)
+        scoped = query if get_qs is None else get_qs(query, info)
+        scoped = self._scope_subclass_rows(scoped, model, info)
         # A scope that hands back what it was given (everything, for an admin)
         # leaves the caller's own object, which a module-level statement can
         # share with requests the scope would narrow. Scoping it again costs
@@ -2327,6 +2331,17 @@ class BaseBackend:
         if scoped is not query:
             mark_query_scoped(scoped)
         return scoped
+
+    def classes_scoped_apart(self, model: type) -> list[type]:
+        """Subclasses a read of *model* returns as themselves, scoped by their own type.
+
+        Only a backend that hands back a subclass's row as the subclass has any.
+        """
+        return []
+
+    def _scope_subclass_rows(self, query: Any, model: type, info: Any) -> Any:
+        """*query* over *model*, less the rows of a subclass its own scope hides."""
+        return query
 
     def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
         """Return the subset of *pks* ``scope_rows`` still allows.
@@ -2559,7 +2574,11 @@ class BaseBackend:
             return None
         get_qs = self._type_querysets.get(related)
         field_scope = self._field_scope(model, relation, info)
-        if get_qs is None and field_scope is None:
+        if (
+            get_qs is None
+            and field_scope is None
+            and not self.classes_scoped_apart(related)
+        ):
             return None
         if info is None:
             raise ValueError(
@@ -2576,6 +2595,7 @@ class BaseBackend:
             given = query
             if get_qs is not None:
                 query = get_qs(query, resolver_info)
+            query = self._scope_subclass_rows(query, related, resolver_info)
             if field_scope is not None:
                 query = call_scope(field_scope, query, resolver_info)
             # The query is scoped, so a later apply_type_scope must not apply

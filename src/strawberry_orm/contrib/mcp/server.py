@@ -91,6 +91,10 @@ def mcp_server(
     with a warning, while a mutation fails. ``execute(query, variables,
     context, allowed)`` replaces all of this with your own async executor.
 
+    A tool's result carries each error's message as raised, into the
+    client's transcript; add Strawberry's ``MaskErrors`` to ``schema`` to
+    mask the exceptions resolvers raise.
+
     ``server_options`` go to :class:`mcp.server.mcpserver.MCPServer`, for
     example ``token_verifier``, ``auth`` and ``instructions``.
     """

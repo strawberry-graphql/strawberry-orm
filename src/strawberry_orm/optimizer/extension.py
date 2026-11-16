@@ -562,9 +562,13 @@ class RowScopeExtension(SchemaExtension):
         result = _next(root, info, *args, **kwargs)
         if type(result) in _SCALAR_LEAF_TYPES:
             return result
-        if isawaitable(result):
+        if isawaitable(result) and not self._is_query(result):
             return self._resolve_async(result, info)
         return self._scope(result, info)
+
+    def _is_query(self, result: Any) -> bool:
+        backend = self._backend
+        return backend is not None and backend.is_query_object(result)
 
     async def _resolve_async(self, result: Any, info: Any) -> Any:
         result = await await_maybe(result)
@@ -578,7 +582,10 @@ class RowScopeExtension(SchemaExtension):
         if backend is None or type(result) in _SCALAR_LEAF_TYPES:
             return result
         if backend.is_query_object(result):
-            return backend.apply_type_scope(result, backend.query_model(result), info)
+            scoped = backend.apply_type_scope(result, backend.query_model(result), info)
+            # Left to GraphQL, the query would run where a database error
+            # reaches the client with its SQL.
+            return backend.materialize_query(scoped, info)
 
         if backend.is_model_instance(result):
             rows: list[Any] | None = [result]

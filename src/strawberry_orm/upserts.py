@@ -356,6 +356,13 @@ class UpsertWriter:
                 self._validate_unlink(model, parent)
 
     def _validate_unlink(self, model: type, parent: _Parent) -> None:
+        if parent.spec.deletes_orphans:
+            raise UpsertValidationError(
+                f"{model.__name__} cannot be unlinked from "
+                f"{parent.model.__name__}.{parent.spec.name}: "
+                f"{parent.model.__name__}.{parent.spec.name} deletes the rows it "
+                f"lets go of, so send delete instead"
+            )
         if parent.spec.relation_mode == "reverse_fk" and not parent.spec.nullable:
             raise UpsertValidationError(
                 f"{model.__name__} cannot be unlinked from "
@@ -537,7 +544,9 @@ class UpsertWriter:
                     yield from self._check_repo(
                         spec.related_model, "can_unlink", instance, name, previous
                     )
-                    if self._on_replace(link, fields[name]) == "DELETE":
+                    if spec.deletes_orphans:
+                        yield from self._check_orphaned(spec.related_model, previous)
+                    elif self._on_replace(link, fields[name]) == "DELETE":
                         replaced.append((spec.related_model, previous))
             setattr(instance, name, target)
 
@@ -712,6 +721,24 @@ class UpsertWriter:
         visible = yield self._ops.get(self._repo(model), model, pk)
         if visible is not None:
             yield from self._delete_instance(model, visible)
+
+    def _check_orphaned(self, model: type, previous: Any) -> Steps:
+        """Ask to delete a link's old target, which the ORM deletes once let go of.
+
+        The cascade deletes it as the row is saved, whatever ``onReplace``
+        says, so it cannot be left in place: re-pointing the link is refused
+        unless the caller could delete the target by its key.
+        """
+        pk = self._ops.pk_value(previous)
+        yield from self._check_authorize("delete", model, pk)
+        visible = yield self._ops.get(self._repo(model), model, pk)
+        if visible is None:
+            raise PermissionError(
+                f"{model.__name__} {pk!r} would be deleted by re-pointing the "
+                f"link, and cannot be deleted"
+            )
+        yield from self._check_repo(model, "can_delete", visible)
+        yield self._repo(model).on_before_delete(visible, self._info)
 
     def _update_by_id(self, payload: Any, cls: type) -> Steps:
         model = cls.__orm_model__  # type: ignore[attr-defined]

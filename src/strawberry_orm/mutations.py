@@ -113,6 +113,9 @@ class RelationSpec:
     fk_column: str | None = None
     remote_attr: str | None = None
     nullable: bool = True
+    #: The ORM deletes a row this relation lets go of (SQLAlchemy's
+    #: ``delete-orphan`` cascade), so letting go of one is deleting it.
+    deletes_orphans: bool = False
 
 
 @dataclass(frozen=True)
@@ -1368,6 +1371,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
         # Unlinking clears only the related row's keys; ``remote_side`` also
         # holds columns a primaryjoin filters on, such as ``Task.done``.
         keys_nullable = all(remote.nullable for _, remote in rel.local_remote_pairs)
+        deletes_orphans = bool(rel.cascade.delete_orphan)
         if rel.secondary is not None:
             specs[rel.key] = RelationSpec(
                 name=rel.key,
@@ -1384,6 +1388,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 relation_mode="reverse_fk",
                 remote_attr=rel.back_populates,
                 nullable=keys_nullable,
+                deletes_orphans=deletes_orphans,
             )
         elif rel.direction.name == "ONETOMANY":
             # A one-to-one held by the related row's foreign key.
@@ -1394,6 +1399,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 relation_mode="reverse_fk",
                 remote_attr=rel.back_populates,
                 nullable=keys_nullable,
+                deletes_orphans=deletes_orphans,
             )
         else:
             fk_column = next(iter(rel.local_columns)).key if rel.local_columns else None
@@ -1406,6 +1412,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 nullable=all(column.nullable for column in rel.local_columns)
                 if rel.local_columns
                 else True,
+                deletes_orphans=deletes_orphans,
             )
     return specs
 

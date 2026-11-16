@@ -378,6 +378,176 @@ def test_a_relation_page_drops_the_subclass_rows_their_type_hides(session):
     }
 
 
+def build_counted():
+    orm = StrawberryORM.for_sqlalchemy(
+        dialect="sqlite", warn_missing_scope=False, lazy_resolution="off"
+    )
+
+    @orm.type(Document, filters=orm.filter(Document), group=orm.group(Document))
+    class DocumentNode(relay.Node):
+        id: relay.NodeID[int]
+        title: auto
+        kind: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return mine(stmt, info)
+
+    @orm.type(Contract)
+    class ContractType:
+        id: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return a_party_to(stmt, info)
+
+    @orm.type(Folder, filters=orm.filter(Folder))
+    class FolderNode(relay.Node):
+        id: relay.NodeID[int]
+        documents: ORMListConnection[DocumentNode] = orm.connection.eager()
+
+    @strawberry.type
+    class Query:
+        documents: ORMListConnection[DocumentNode] = orm.connection.eager()
+        folders: list[FolderNode] = orm.field.eager()
+
+    return orm.schema(query=Query, types=[ContractType])
+
+
+def titled(*titles):
+    return [{"key": {"title": title}} for title in titles]
+
+
+#: Of my documents, contracts 3 and 6 are between others, so they count nowhere.
+COUNTED = {
+    "{ documents(first: 1) { totalCount pageInfo { hasNextPage } } }": {
+        "documents": {"totalCount": 4, "pageInfo": {"hasNextPage": True}}
+    },
+    "{ documents(first: 2) { edges { node { title } } } }": {
+        "documents": {
+            "edges": [
+                {"node": {"title": "handbook"}},
+                {"node": {"title": "my contract"}},
+            ]
+        }
+    },
+    "{ documents { aggregates { count } } }": {
+        "documents": {"aggregates": {"count": 4}}
+    },
+    "{ documents(groupBy: [{field: {title: true}}]) { groups { key { title } } } }": {
+        "documents": {"groups": titled("handbook", "lease", "minutes", "my contract")}
+    },
+    "{ documents(groupBy: [{field: {kind: true}}])"
+    " { groups { items { edges { node { title } } } } } }": {
+        "documents": {
+            "groups": [
+                {"items": {"edges": [{"node": {"title": t}} for t in titles]}}
+                for titles in (["my contract", "lease"], ["handbook", "minutes"])
+            ]
+        }
+    },
+    "{ folders { documents(first: 1) { totalCount } } }": {
+        "folders": [
+            {"documents": {"totalCount": 2}},
+            {"documents": {"totalCount": 2}},
+            {"documents": {"totalCount": 0}},
+        ]
+    },
+    '{ folders(filter: {object: {documents: {field: {title: {contains: "CEO"}}}}})'
+    " { id } }": {"folders": []},
+}
+
+
+@pytest.mark.parametrize("query", list(COUNTED))
+def test_counts_groups_and_pages_through_the_base_leave_out_hidden_subclass_rows(
+    session, query
+):
+    assert run(build_counted(), session, query) == COUNTED[query]
+
+
+class _Layered(DeclarativeBase):
+    pass
+
+
+class Note(_Layered):
+    __tablename__ = "note"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(20))
+    level: Mapped[int]
+    kind: Mapped[str] = mapped_column(String(20))
+
+    __mapper_args__ = {"polymorphic_on": "kind", "polymorphic_identity": "note"}
+
+
+class Memo(Note):
+    __mapper_args__ = {"polymorphic_identity": "memo"}
+
+
+class SealedMemo(Memo):
+    __mapper_args__ = {"polymorphic_identity": "sealed"}
+
+
+def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
+    orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
+
+    @orm.type(Note)
+    class NoteNode(relay.Node):
+        id: relay.NodeID[int]
+        label: auto
+
+    @orm.type(Memo)
+    class MemoType:
+        id: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return stmt.where(Note.level == 1)
+
+    @orm.type(SealedMemo)
+    class SealedType:
+        id: auto
+
+        @classmethod
+        def scope_rows(cls, stmt, info):
+            return stmt.where(Note.level == 2)
+
+    @strawberry.type
+    class Query:
+        notes: ORMListConnection[NoteNode] = orm.connection.eager()
+
+    engine = create_engine("sqlite://")
+    _Layered.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                Note(id=1, label="note", level=0),
+                Memo(id=2, label="memo", level=1),
+                Memo(id=3, label="raised memo", level=2),
+                SealedMemo(id=4, label="sealed", level=2),
+                SealedMemo(id=5, label="lowered sealed", level=1),
+            ]
+        )
+        session.commit()
+        session.expunge_all()
+        data = run(
+            orm.schema(query=Query, types=[MemoType, SealedType]),
+            session,
+            "{ notes(first: 1) { totalCount } all: notes { edges { node { label } } } }",
+        )
+
+    assert data == {
+        "notes": {"totalCount": 3},
+        "all": {
+            "edges": [
+                {"node": {"label": "note"}},
+                {"node": {"label": "memo"}},
+                {"node": {"label": "sealed"}},
+            ]
+        },
+    }
+
+
 class DocumentRepo(AbstractRepo[Document]):
     """Callers write only their own documents, and deleting one archives it."""
 

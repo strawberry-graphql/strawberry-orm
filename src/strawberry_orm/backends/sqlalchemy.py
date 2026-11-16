@@ -21,7 +21,6 @@ from strawberry.extensions import SchemaExtension
 from strawberry_orm._async import run_orm_work
 from strawberry_orm.backends._base import (
     _AGGREGATES,
-    _SENSITIVE_PATTERNS,
     WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
@@ -547,11 +546,7 @@ class SQLAlchemyBackend(BaseBackend):
                 continue
             if exclude and fname in exclude:
                 continue
-            if (
-                self._exclude_sensitive_fields
-                and not (include and fname in include)
-                and _SENSITIVE_PATTERNS.search(fname)
-            ):
+            if self._exclude_generated_sensitive_field(fname, include):
                 continue
             if is_relation:
                 continue
@@ -887,19 +882,7 @@ class SQLAlchemyBackend(BaseBackend):
                 items_by_key[key].append(found[0])
             return dict(items_by_key)
 
-        def steps() -> Steps:
-            items_by_key = yield self._execute_then(info, page, collect)
-            rows = [row for items in items_by_key.values() for row in items]
-            kept = yield from self._scope_apart(rows, model, {}, info)
-            if len(kept) < len(rows):
-                ids = {id(row) for row in kept}
-                items_by_key = {
-                    key: [row for row in items if id(row) in ids]
-                    for key, items in items_by_key.items()
-                }
-            return items_by_key
-
-        return _drive(steps())
+        return self._execute_then(info, page, collect)
 
     def group_memberships(
         self, query: Any, paths: list[Any], pks: list[Any], info: Any
@@ -1197,6 +1180,68 @@ class SQLAlchemyBackend(BaseBackend):
             return query.column_descriptions[0]["entity"]
         except (AttributeError, IndexError, KeyError, TypeError):
             return None
+
+    def classes_scoped_apart(self, model: type) -> list[type]:
+        from sqlalchemy import inspect as sa_inspect
+
+        mapper = sa_inspect(model, raiseerr=False)
+        if getattr(mapper, "polymorphic_on", None) is None:
+            return []
+        # Only a polymorphic load hands back a subclass's row as the subclass.
+        returned = set(mapper.polymorphic_map.values())
+        return [
+            sub.class_
+            for sub in mapper.self_and_descendants
+            if sub is not mapper
+            and sub in returned
+            and not sub.concrete
+            and self._type_querysets.exact(sub.class_) is not None
+        ]
+
+    def _scope_subclass_rows(self, query: Any, model: type, info: Any) -> Any:
+        """*query* over *model*, less the rows of a subclass its own scope hides.
+
+        Read through *model*, such a row comes back as the subclass and is
+        scoped by the subclass's type (see ``rows_scoped_apart``). Said in the
+        statement, it is left out of counts, aggregates, groups and pages as
+        well as the rows. A subclass of it with a scope of its own answers for
+        its own rows.
+        """
+        from sqlalchemy import or_, select
+
+        apart = self.classes_scoped_apart(model)
+        if not apart:
+            return query
+
+        def rows_of(cls: type) -> Any:
+            # Read off the subclass, the key selects only its rows; the
+            # attribute it inherits would select every row of the table.
+            return getattr(cls, _get_sa_pk_column(cls).key)
+
+        key = _get_sa_pk_column(model)
+        conditions = []
+        scopes = []
+        for cls in apart:
+            scoped = self._type_querysets.exact(cls)(select(cls), info)
+            scopes.append(scoped)
+            nearer = [
+                other for other in apart if other is not cls and issubclass(other, cls)
+            ]
+            conditions.append(
+                or_(
+                    key.not_in(select(rows_of(cls)).correlate(None)),
+                    key.in_(
+                        scoped.with_only_columns(rows_of(cls))
+                        .correlate(None)
+                        .scalar_subquery()
+                    ),
+                    *(
+                        key.in_(select(rows_of(other)).correlate(None))
+                        for other in nearer
+                    ),
+                )
+            )
+        return _carrying(query.where(*conditions), *scopes)
 
     def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
         from inspect import isawaitable

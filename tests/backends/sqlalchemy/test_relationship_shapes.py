@@ -21,7 +21,12 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
-from strawberry_orm import StrawberryORM, UpsertNotFoundError
+from strawberry_orm import (
+    AbstractRepo,
+    StrawberryORM,
+    UpsertNotFoundError,
+    UpsertValidationError,
+)
 from strawberry_orm.mutations import _sqlalchemy_relation_specs
 from strawberry_orm.types import auto
 from tests.abstract.write_path_authorization import (
@@ -80,6 +85,43 @@ class Task(Base):
     )
 
 
+class Album(Base):
+    __tablename__ = "shape_album"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    photos: Mapped[list["Photo"]] = relationship(
+        back_populates="album", cascade="all, delete-orphan"
+    )
+
+
+class Photo(Base):
+    __tablename__ = "shape_photo"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(50))
+    album_id: Mapped[int | None] = mapped_column(ForeignKey("shape_album.id"))
+    album: Mapped[Album | None] = relationship(back_populates="photos")
+
+
+class Badge(Base):
+    __tablename__ = "shape_badge"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+
+
+class Wearer(Base):
+    __tablename__ = "shape_wearer"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    badge_id: Mapped[int | None] = mapped_column(ForeignKey("shape_badge.id"))
+    badge: Mapped[Badge | None] = relationship(
+        cascade="all, delete-orphan", single_parent=True
+    )
+
+
 def new_orm(**kwargs: Any) -> Any:
     return StrawberryORM.for_sqlalchemy(
         dialect="sqlite",
@@ -125,6 +167,12 @@ async def db(session):
             Task(id=1, title="open", project_id=1),
             Task(id=2, title="done", done=True, project_id=1),
             Task(id=3, title="also open", project_id=1),
+            Album(id=1, name="Holiday"),
+            Photo(id=1, title="beach", album_id=1),
+            Photo(id=2, title="hills", album_id=1),
+            Badge(id=1, name="old"),
+            Badge(id=2, name="new"),
+            Wearer(id=1, name="Me", badge_id=1),
         ]
     )
     await resolve(session.commit())
@@ -291,6 +339,119 @@ class TestPrimaryjoinMembership:
             orm.apply_ref_list(await self.project(db), "tasks", refs, db.info)
         )
         assert await tasks(db) == [(1, 1), (3, 1)]
+
+
+# -- A relationship that deletes orphans deletes the rows it lets go of ---------------
+
+WEARER = {
+    "_meta": {"update": ["name"], "upsert": {"where": ["name"], "onMatch": "UPDATE"}},
+    "badge": {"_meta": {"onReplace": ["DISCONNECT", "DELETE"]}},
+}
+
+
+def badge_repo(
+    calls: list[Any], *, kept: tuple[str, ...] = (), hidden: tuple[str, ...] = ()
+) -> type:
+    class BadgeRepo(AbstractRepo):
+        def scope_query(self, query, info):
+            return query.where(Badge.name.not_in(hidden))
+
+        def can_delete(self, instance, info):
+            calls.append(("can_delete", instance.name))
+            return instance.name not in kept
+
+        def on_before_delete(self, instance, info):
+            calls.append(("on_before_delete", instance.name))
+
+    return BadgeRepo
+
+
+async def stored_rows(db: Any) -> dict[str, Any]:
+    photos = await resolve(db.session.execute(select(Photo.title, Photo.album_id)))
+    badges = await resolve(db.session.execute(select(Badge.name)))
+    worn = await resolve(db.session.execute(select(Wearer.badge_id)))
+    return {
+        "photos": sorted(photos.all()),
+        "badges": sorted(badges.scalars()),
+        "worn": worn.scalar_one(),
+    }
+
+
+KEPT = {"photos": [("beach", 1), ("hills", 1)], "badges": ["new", "old"], "worn": 1}
+
+
+class TestOrphansGoAsDeletes:
+    @staticmethod
+    def repoint(orm: Any, on_replace: str | None = None) -> Any:
+        upsert = orm.mutations.upsert_node_input(
+            model=Wearer, project=WEARER, name="WearerUpsertInput"
+        )
+        link_type = member(upsert, "update", "badge")
+        options = {} if on_replace is None else {"on_replace": on_replace}
+        link = link_type(update=member(link_type, "update")(id="2"), **options)
+        return upsert(
+            where=member(upsert, "where")(name="Me"),
+            update=member(upsert, "update")(badge=link),
+        )
+
+    async def test_the_specs_say_which_relations_delete_orphans(self):
+        assert _sqlalchemy_relation_specs(Album)["photos"].deletes_orphans
+        assert _sqlalchemy_relation_specs(Wearer)["badge"].deletes_orphans
+        assert not _sqlalchemy_relation_specs(Member)["profile"].deletes_orphans
+        assert not _sqlalchemy_relation_specs(Photo)["album"].deletes_orphans
+
+    async def test_unlinking_from_a_list_that_deletes_orphans_is_refused(self, db):
+        orm = new_orm()
+        ref = orm.ref(Photo, unlink=True, delete=True)
+        album = await resolve(db.session.get(Album, 1))
+        with pytest.raises(
+            UpsertValidationError, match=r"Album\.photos deletes .* send delete"
+        ):
+            await resolve(
+                orm.apply_ref_list(
+                    album, "photos", [item(ref, "unlink", id="1")], db.info
+                )
+            )
+        assert await stored_rows(db) == KEPT
+
+    @pytest.mark.parametrize("on_replace", [None, "DISCONNECT", "DELETE"])
+    async def test_replacing_a_link_asks_to_delete_what_it_held(self, db, on_replace):
+        calls: list[Any] = []
+        orm = new_orm(repos={Badge: badge_repo(calls, kept=("old",))})
+        with pytest.raises(PermissionError, match="can_delete denied"):
+            await resolve(orm.apply_upsert(self.repoint(orm, on_replace), db.info))
+        assert calls == [("can_delete", "old")]
+        assert await stored_rows(db) == KEPT
+
+    async def test_a_row_the_repo_hides_is_not_left_to_the_cascade(self, db):
+        calls: list[Any] = []
+        orm = new_orm(repos={Badge: badge_repo(calls, hidden=("old",))})
+        with pytest.raises(PermissionError, match="Badge 1 .* cannot be deleted"):
+            await resolve(orm.apply_upsert(self.repoint(orm), db.info))
+        assert calls == []
+        assert await stored_rows(db) == KEPT
+
+    async def test_authorize_decides_the_delete_too(self, db):
+        orm = new_orm(repos={Badge: badge_repo([])})
+
+        def authorize(action, model, pk, info):
+            return action != "delete"
+
+        payload = self.repoint(orm)
+        with pytest.raises(PermissionError, match="denied the delete operation"):
+            await resolve(orm.apply_upsert(payload, db.info, authorize=authorize))
+        assert await stored_rows(db) == KEPT
+
+    @pytest.mark.parametrize("on_replace", [None, "DELETE"])
+    async def test_an_allowed_replacement_deletes_the_old_row_once(
+        self, db, on_replace
+    ):
+        calls: list[Any] = []
+        orm = new_orm(repos={Badge: badge_repo(calls)})
+        await resolve(orm.apply_upsert(self.repoint(orm, on_replace), db.info))
+        await resolve(db.session.commit())
+        assert calls == [("can_delete", "old"), ("on_before_delete", "old")]
+        assert await stored_rows(db) == {**KEPT, "badges": ["new"], "worn": 2}
 
 
 # -- isNull on a reverse one-to-one -----------------------------------------------------

@@ -11,12 +11,13 @@ import pytest
 import strawberry
 from mcp import Client
 from mcp.server.mcpserver.tools import Tool
+from strawberry.extensions import MaskErrors
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
 from strawberry_orm.contrib.mcp.checks import check_operation
 
-from .fakes import OPERATIONS, RUNS, Query, schema
+from .fakes import OPERATIONS, RUNS, Mutation, Query, schema
 
 HELLO = {
     "title": "Hello",
@@ -164,6 +165,25 @@ async def test_no_data_at_all_is_a_tool_error():
 
     assert result.is_error is True
     assert result.structured_content["errors"][0]["message"] == "No such thing."
+
+
+async def test_mask_errors_hides_what_resolvers_raise_and_keeps_graphqls_own():
+    masked = strawberry.Schema(
+        query=Query,
+        mutation=Mutation,
+        extensions=[
+            lambda: MaskErrors(
+                should_mask_error=lambda error: error.original_error is not None
+            )
+        ],
+    )
+    async with Client(mcp_server(masked, operations=OPERATIONS)) as client:
+        raised = await client.call_tool("Secrets", {})
+        coerced = await client.call_tool("FindPost", {"key": {}, "withStatus": True})
+
+    assert raised.structured_content["errors"][0]["message"] == "Unexpected error."
+    assert "secrets" not in raised.content[0].text
+    assert "exactly one key" in coerced.structured_content["errors"][0]["message"]
 
 
 async def test_a_mutation_tool_runs_its_mutation_once():
