@@ -685,11 +685,13 @@ class MutationNamespace:
             field_name,
             _field_type,
             is_relation,
-            _related,
+            related,
         ) in self._backend._introspect_model(model):
             if is_relation:
                 continue
             if field_name in excluded_scalar_fields:
+                continue
+            if self._backend._is_forward_fk_attname_field(is_relation, related):
                 continue
             if field_name in pk_names:
                 continue
@@ -1058,11 +1060,15 @@ class MutationNamespace:
             field_name,
             field_type,
             is_relation,
-            _related_model,
+            related_model,
         ) in self._backend._introspect_model(model):
             if is_relation:
                 continue
             if field_name in excluded_scalar_fields or field_name in hidden:
+                continue
+            # A key into another model is written through its relation, where
+            # the related repo's scope_query and can_link apply.
+            if self._backend._is_forward_fk_attname_field(is_relation, related_model):
                 continue
             if self._backend._exclude_generated_sensitive_field(
                 field_name, op_fields.fields
@@ -1394,23 +1400,37 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
 
 
 def _tortoise_relation_specs(model: type) -> dict[str, RelationSpec]:
+    from strawberry_orm.backends.tortoise import (
+        _FORWARD_REL_TYPES,
+        _relation_kind,
+        _resolve_related_model,
+    )
+
     specs: dict[str, RelationSpec] = {}
     for field_name, field in model._meta.fields_map.items():  # type: ignore[attr-defined]
-        related_model = getattr(field, "related_model", None)
-        if related_model is None:
+        field_type = _relation_kind(field)
+        if field_type is None:
             continue
-
-        field_type = type(field).__name__
-        if field_type == "ForeignKeyFieldInstance":
+        # Before Tortoise.init a relation only names its model.
+        related_model = _resolve_related_model(model, field)
+        if field_type in _FORWARD_REL_TYPES:
+            if related_model is None:
+                raise ValueError(
+                    f"{model.__name__}.{field_name} names {field.model_name!r}, "
+                    f"which is not in {model.__module__} and is not known until "
+                    f"Tortoise.init() has run. Build the node inputs for "
+                    f"{model.__name__} after Tortoise.init(), or import that "
+                    f"model into {model.__module__}."
+                )
             specs[field_name] = RelationSpec(
                 name=field_name,
                 related_model=related_model,
                 kind="single",
                 relation_mode="forward_fk",
-                fk_column=getattr(field, "source_field", None),
+                fk_column=f"{field_name}_id",
                 nullable=getattr(field, "null", False),
             )
-        elif field_type == "ManyToManyFieldInstance":
+        elif field_type == "ManyToManyFieldInstance" and related_model is not None:
             specs[field_name] = RelationSpec(
                 name=field_name,
                 related_model=related_model,

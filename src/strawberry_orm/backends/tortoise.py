@@ -9,6 +9,7 @@ import re
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
+from functools import wraps
 from types import SimpleNamespace
 from typing import Any
 
@@ -47,6 +48,9 @@ _UNRANKABLE_FIELDS = frozenset({"JSONField", "BinaryField", "TSVectorField"})
 
 #: Where the grouped count puts each group's total.
 _COUNT_ALIAS = "_orm_count"
+
+#: What a client is told when a statement run by a read fails.
+_READ_REFUSED = "Invalid filter expression"
 
 _TORTOISE_FIELD_MAP: dict[str, type] = {
     "IntField": int,
@@ -95,6 +99,59 @@ _MAX_REMEMBERED_ORDERINGS = 1024
 
 def _primary_key(value: Any) -> Any:
     return getattr(value, "id", getattr(value, "pk", None))
+
+
+def _relation_kind(field: Any) -> str | None:
+    """Which of Tortoise's relation fields *field* is, or ``None`` for a column.
+
+    Read off the class's bases: ``OneToOneFieldInstance`` is itself a
+    ``ForeignKeyFieldInstance``, and a field class of an app's own derives
+    from one of these.
+    """
+    for cls in type(field).__mro__:
+        if cls.__name__ in _REL_FIELD_TYPES:
+            return cls.__name__
+    return None
+
+
+def _resolve_related_model(
+    model: type, field: Any, annotation: str | None = None
+) -> type | None:
+    """The model *field* of *model* points at, before ``Tortoise.init`` too.
+
+    Until init a relation only names its model, as ``"app.Model"`` or in an
+    annotation, so the name is looked up in *model*'s own module.
+    """
+    related_model = getattr(field, "related_model", None)
+    if related_model is not None:
+        return related_model
+    model_name = getattr(field, "model_name", None)
+    if isinstance(model_name, type):
+        return model_name
+    if isinstance(model_name, str):
+        target_name = model_name.split(".")[-1]
+    elif annotation and (
+        match := re.search(r"\[\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)", annotation)
+    ):
+        target_name = match.group(1)
+    else:
+        return None
+    found = getattr(importlib.import_module(model.__module__), target_name, None)
+    return found if isinstance(found, type) and issubclass(found, Model) else None
+
+
+def _foreign_key_type(field: Any, related_model: type | None) -> type:
+    """The Python type of the key a forward relation stores, as its column reads."""
+    target = getattr(field, "to_field_instance", None)
+    if target is None and related_model is not None:
+        meta = related_model._meta  # type: ignore[attr-defined]
+        target = meta.fields_map.get(field.to_field or meta.pk_attr)
+    fk_type = (
+        int if target is None else _TORTOISE_FIELD_MAP.get(type(target).__name__, str)
+    )
+    if getattr(field, "null", False):
+        return fk_type | None  # type: ignore[return-value]
+    return fk_type
 
 
 def _remember_query_ordering(
@@ -230,6 +287,17 @@ def _counting_call(original: Any, probe: Any) -> Any:
     return _counted
 
 
+def _reading(method: Any) -> Any:
+    """*method*, a read, raising only what :func:`_read_errors` lets a client see."""
+
+    @wraps(method)
+    async def _read(*args: Any, **kwargs: Any) -> Any:
+        with _read_errors():
+            return await method(*args, **kwargs)
+
+    return _read
+
+
 class TortoiseBackend(BaseBackend):
     """Backend adapter for Tortoise ORM (async)."""
 
@@ -258,53 +326,27 @@ class TortoiseBackend(BaseBackend):
         result: list[tuple[str, type, bool, type | None]] = []
         seen: set[str] = set()
 
-        module = importlib.import_module(model.__module__)
-
-        def _resolve_related_model(
-            field_obj: Any, annotation: str | None = None
-        ) -> type | None:
-            related_model = getattr(field_obj, "related_model", None)
-            if related_model is not None:
-                return related_model
-
-            model_name = getattr(field_obj, "model_name", None)
-            if isinstance(model_name, str):
-                target_name = model_name.split(".")[-1]
-                return getattr(module, target_name, None)
-
-            if annotation:
-                match = re.search(r"\[\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)", annotation)
-                if match:
-                    return getattr(module, match.group(1), None)
-
-            return None  # pragma: no cover
-
         for name, field_obj in meta.fields_map.items():
-            field_class_name = type(field_obj).__name__
+            if name in seen:
+                # The ``<name>_id`` column init adds, listed with its relation.
+                continue
+            kind = _relation_kind(field_obj)
 
-            if field_class_name in _MANY_REL_TYPES:
-                related_model = _resolve_related_model(field_obj)
+            if kind in _MANY_REL_TYPES:
+                related_model = _resolve_related_model(model, field_obj)
                 result.append((name, Any, True, related_model))
                 seen.add(name)
                 continue
 
-            if field_class_name == "ForeignKeyFieldInstance":
-                related_model = _resolve_related_model(field_obj)
+            if kind in _FORWARD_REL_TYPES:
+                related_model = _resolve_related_model(model, field_obj)
                 result.append((name, Any, True, related_model))
-                seen.add(name)
-                fk_type: type = int
-                if related_model is not None:
-                    pk_attr = related_model._meta.pk_attr  # type: ignore[attr-defined]
-                    pk_field = related_model._meta.fields_map.get(pk_attr)  # type: ignore[attr-defined]
-                    if pk_field is not None and type(pk_field).__name__ == "CharField":
-                        fk_type = str
-                if getattr(field_obj, "null", False):
-                    fk_type = fk_type | None  # type: ignore[assignment]
+                fk_type = _foreign_key_type(field_obj, related_model)
                 result.append((f"{name}_id", fk_type, False, related_model))
-                seen.add(f"{name}_id")
+                seen.update((name, f"{name}_id"))
                 continue
 
-            py_type = _TORTOISE_FIELD_MAP.get(field_class_name, str)
+            py_type = _TORTOISE_FIELD_MAP.get(type(field_obj).__name__, str)
             result.append((name, py_type, False, None))
             seen.add(name)
 
@@ -315,7 +357,7 @@ class TortoiseBackend(BaseBackend):
                 continue
             if "Relation[" not in annotation:
                 continue  # pragma: no cover
-            related_model = _resolve_related_model(None, annotation)
+            related_model = _resolve_related_model(model, None, annotation)
             result.append((name, Any, True, related_model))  # pragma: no cover
             seen.add(name)
 
@@ -445,10 +487,9 @@ class TortoiseBackend(BaseBackend):
                                 related_model,
                                 info,
                             )
-                            return _apply_python_ordering(
-                                list(await qs),
-                                _query_orderings(qs),
-                            )
+                            with _read_errors():
+                                rows = list(await qs)
+                            return _apply_python_ordering(rows, _query_orderings(qs))
 
                         resolver.__name__ = fname
                         resolver.__annotations__ = {
@@ -602,6 +643,7 @@ class TortoiseBackend(BaseBackend):
 
     # -- Grouping / aggregation -----------------------------------------------
 
+    @_reading
     async def apply_aggregation(
         self, query: Any, info: Any, aggregate_meta: AggregateMeta
     ) -> Any:
@@ -645,7 +687,7 @@ class TortoiseBackend(BaseBackend):
             relation=relation,
             model=model,
             target=field.related_model,
-            many=type(field).__name__ in _TO_MANY_REL_TYPES,
+            many=_relation_kind(field) in _TO_MANY_REL_TYPES,
         )
 
     def together_reader(self, model: type, column: str, interval: Any) -> Any:
@@ -658,6 +700,7 @@ class TortoiseBackend(BaseBackend):
         field = model._meta.fields_map[column]  # type: ignore[attr-defined]
         return lambda value: field.to_python_value(read(value))
 
+    @_reading
     async def apply_grouping(
         self,
         query: Any,
@@ -716,6 +759,7 @@ class TortoiseBackend(BaseBackend):
             )
         return groups
 
+    @_reading
     async def batch_group_items(
         self,
         query: Any,
@@ -775,6 +819,7 @@ class TortoiseBackend(BaseBackend):
             items_by_key[key_tuple(paths, values)].append(model._init_from_db(**found))
         return dict(items_by_key)
 
+    @_reading
     async def group_memberships(
         self, query: Any, paths: list[Any], pks: list[Any], info: Any
     ) -> dict[Any, set[tuple]]:
@@ -791,6 +836,7 @@ class TortoiseBackend(BaseBackend):
             found[read_pk(row["_orm_pk"])].add(key_tuple(paths, rows.read(row)))
         return dict(found)
 
+    @_reading
     async def group_counts(
         self, query: Any, key_field: str, info: Any
     ) -> dict[Any, int]:
@@ -832,7 +878,7 @@ class TortoiseBackend(BaseBackend):
             name
             for name, field in fields_map.items()
             if getattr(field, "related_model", None) is not None
-            or type(field).__name__ in _REL_FIELD_TYPES
+            or _relation_kind(field) is not None
         }
 
     @contextmanager
@@ -863,6 +909,7 @@ class TortoiseBackend(BaseBackend):
             for name, original in originals.items():
                 setattr(client, name, original)
 
+    @_reading
     async def count_query(self, query: Any, info: Any) -> int:
         if not query._distinct:
             return await query.count()
@@ -885,6 +932,7 @@ class TortoiseBackend(BaseBackend):
         page = _ordered_to_the_row(query)
         return page.offset(prior_offset + offset).limit(limit)
 
+    @_reading
     async def materialize_query(self, query: Any, info: Any) -> list[Any]:
         return _apply_python_ordering(
             list(await query),
@@ -904,6 +952,7 @@ class TortoiseBackend(BaseBackend):
     def query_model(self, query: Any) -> type | None:
         return getattr(query, "model", None)
 
+    @_reading
     async def filter_scoped_pks(
         self, model: type, pks: list[Any], info: Any
     ) -> set[Any]:
@@ -1036,10 +1085,8 @@ class TortoiseBackend(BaseBackend):
             type_name: str | None,
         ) -> _PlannedPrefetch | None:
             field_obj = current_model._meta.fields_map.get(rel_name)  # type: ignore[attr-defined]
-            field_cls = type(field_obj).__name__
-            if field_obj is None or (
-                field_cls not in _FORWARD_REL_TYPES and field_cls not in _MANY_REL_TYPES
-            ):
+            field_cls = _relation_kind(field_obj)
+            if field_cls is None:
                 return None
             load = level.get(rel_name)
             if load is None:
@@ -1108,6 +1155,7 @@ class TortoiseBackend(BaseBackend):
                 _plan_selection(plan, field_node.selection_set, model, root_type_name)
         return plan
 
+    @_reading
     async def apply_optimizer_hints(
         self,
         store: Any,
@@ -1137,6 +1185,7 @@ class TortoiseBackend(BaseBackend):
 
         return results
 
+    @_reading
     async def load_relations(
         self, store: Any, instances: list[Any], info: Any
     ) -> list[Any]:
@@ -1331,12 +1380,20 @@ def _make_tortoise_to_one_resolver(
             )
         ):
             related = getattr(self, fname, None)
-            return await related if inspect.isawaitable(related) else related
+            with _read_errors():
+                return await related if inspect.isawaitable(related) else related
 
-        related_id = getattr(self, f"{fname}_id", None)
-        if related_id is None:
+        field = type(self)._meta.fields_map[fname]
+        target = field.to_field_instance.model_field_name
+        if _relation_kind(field) in _FORWARD_REL_TYPES:
+            key, value = target, getattr(self, field.source_field, None)
+        else:
+            # A reverse one-to-one: the key is on the related row.
+            key, value = field.relation_field, getattr(self, target)
+        if value is None:
             return None
-        return await restrict(rel_model.filter(pk=related_id), info).first()
+        with _read_errors():
+            return await restrict(rel_model.filter(**{key: value}), info).first()
 
     resolver.__name__ = fname
     resolver.__annotations__ = {
@@ -1379,6 +1436,11 @@ def _make_tortoise_rel_resolver(
         )
         return backend._apply_nested_queryset(qs, type(self), fname, rel_model, info)
 
+    async def _read(qs: Any) -> list[Any]:
+        with _read_errors():
+            rows = list(await qs)
+        return _apply_python_ordering(rows, _query_orderings(qs))
+
     if filter_type and order_type:
 
         async def resolver(
@@ -1393,10 +1455,7 @@ def _make_tortoise_rel_resolver(
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model, info=info)
-            return _apply_python_ordering(
-                list(await qs),
-                _query_orderings(qs),
-            )
+            return await _read(qs)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1413,10 +1472,7 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if filter is not None:
                 qs = backend.apply_filters(qs, filter, rel_model, info=info)
-            return _apply_python_ordering(
-                list(await qs),
-                _query_orderings(qs),
-            )
+            return await _read(qs)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1432,10 +1488,7 @@ def _make_tortoise_rel_resolver(
             qs = _build_qs(self, info)
             if order is not None:
                 qs = backend.apply_ordering(qs, order, rel_model, info=info)
-            return _apply_python_ordering(
-                list(await qs),
-                _query_orderings(qs),
-            )
+            return await _read(qs)
 
         resolver.__annotations__ = {
             "info": info_type,
@@ -1466,9 +1519,9 @@ _LOOKUP_TO_TORTOISE: dict[str, str] = {
 
 
 def _tortoise_relation_scope_q(
-    backend: Any, model: type | None, relation: str, info: Any, prefix: str
+    backend: Any, model: type | None, relation: str, info: Any
 ) -> Any | None:
-    """``Q`` restricting *relation* to the rows its scoping allows.
+    """``Q`` on rows of *model* restricting *relation* to the rows its scoping allows.
 
     Covers both the related type's ``scope_rows`` and any ``scope=`` on this
     edge, so a filter cannot reach rows the read path hides.
@@ -1483,13 +1536,28 @@ def _tortoise_relation_scope_q(
     related = backend._relation_target_model(model, relation)
     pk_attr = related._meta.pk_attr
     scoped = get_qs(related.all(), info)
-    return Q(**{f"{prefix}{relation}__{pk_attr}__in": Subquery(scoped.values(pk_attr))})
+    return Q(**{f"{relation}__{pk_attr}__in": Subquery(scoped.values(pk_attr))})
+
+
+def _tortoise_matching_rows(model: Any, clause: Any, prefix: str) -> Any:
+    """``Q`` for the rows of *model* that *clause* matches, tested on their key.
+
+    A condition on related rows is answered in a subquery of its own, and
+    the row is kept by its key, which is never ``NULL``. Joined straight, a
+    row with no related row reads ``NULL``, which a negation leaves out,
+    while one whose related row is hidden reads as a miss, which it keeps.
+    """
+    from tortoise.expressions import Q, Subquery
+
+    pk_attr = model._meta.pk_attr
+    matching = model.filter(_tortoise_checked_q(model, clause)).values(pk_attr)
+    return Q(**{f"{prefix}{pk_attr}__in": Subquery(matching)})
 
 
 def _tortoise_has_related(
     backend: Any, model: type, relation: str, info: Any, prefix: str
 ) -> Any:
-    """``Q`` for rows of *model* with a related row through a to-many *relation*.
+    """``Q`` for rows of *model* with a related row through *relation*.
 
     Tested on the row's key, so the join a to-many relation needs does not
     repeat rows, and a related row the related type hides does not count.
@@ -1584,29 +1652,31 @@ def _build_tortoise_filter(
                 nested_filter = getattr(val, rel_name)
                 if nested_filter is strawberry.UNSET or nested_filter is None:
                     continue
+                kind = (
+                    _relation_kind(model._meta.fields_map.get(rel_name))  # type: ignore[attr-defined]
+                    if model is not None
+                    else None
+                )
+                # Traversal joins straight to the related table, so the related
+                # type's row scoping has to be re-applied or it is bypassed.
+                scope_q = _tortoise_relation_scope_q(backend, model, rel_name, info)
+                # Matched on the parent's key: across a to-many relation the join
+                # repeats rows, and into a scoped type a parent with no related
+                # row has to answer as one whose related row is hidden does.
+                by_key = kind in _TO_MANY_REL_TYPES or scope_q is not None
                 is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
                 if (
                     is_null_val is not strawberry.UNSET
                     and is_null_val is not None
                     and backend is not None
-                    and model is not None
-                    and type(model._meta.fields_map.get(rel_name)).__name__  # type: ignore[attr-defined]
-                    in _TO_MANY_REL_TYPES
+                    and (by_key or kind == "BackwardOneToOneRelation")
                 ):
+                    # "Has no related row" has to mean "none the caller can see".
                     present = _tortoise_has_related(
                         backend, model, rel_name, info, _prefix
                     )
                     return (~present if is_null_val else present), query
-                # Traversal joins straight to the related table, so the related
-                # type's row scoping has to be re-applied or it is bypassed.
-                scope_q = _tortoise_relation_scope_q(
-                    backend, model, rel_name, info, _prefix
-                )
-                if scope_q is not None:
-                    is_null_val = getattr(nested_filter, "is_null", strawberry.UNSET)
-                    if is_null_val is not strawberry.UNSET and is_null_val is not None:
-                        # "Has no related row" has to mean "none the caller can see".
-                        return (~scope_q if is_null_val else scope_q), query
+                hop_prefix = "" if by_key else _prefix
                 reference = _tortoise_reference_key(model, rel_name)
                 if reference is not None:
                     fk_col, key_name = reference
@@ -1618,18 +1688,16 @@ def _build_tortoise_filter(
                         max_branches=max_branches,
                         max_depth=max_depth,
                         depth=_depth + 1,
-                        fk_prefix=f"{_prefix}{fk_col}",
+                        fk_prefix=f"{hop_prefix}{fk_col}",
                         enable_regex=enable_regex,
                         max_in_list_size=max_in_list_size,
                     )
                     if fk_clause is not None:
-                        if scope_q is not None:
-                            fk_clause = fk_clause & scope_q
-                        return fk_clause, query
-                to_many = model is not None and (
-                    type(model._meta.fields_map.get(rel_name)).__name__  # type: ignore[attr-defined]
-                    in _TO_MANY_REL_TYPES
-                )
+                        if scope_q is None:
+                            return fk_clause, query
+                        return _tortoise_matching_rows(
+                            model, fk_clause & scope_q, _prefix
+                        ), query
                 with past_a_hop():
                     nested_clause, query = _build_tortoise_filter(
                         nested_filter,
@@ -1646,31 +1714,14 @@ def _build_tortoise_filter(
                         enable_regex=enable_regex,
                         max_in_list_size=max_in_list_size,
                         _depth=_depth + 1,
-                        _prefix=f"{rel_name}__"
-                        if to_many
-                        else f"{_prefix}{rel_name}__",
+                        _prefix=f"{hop_prefix}{rel_name}__",
                         _on_query=False,
                     )
-                if nested_clause is None or not to_many:
-                    if nested_clause is not None and scope_q is not None:
-                        nested_clause = nested_clause & scope_q
+                if nested_clause is None or not by_key:
                     return nested_clause, query
-                # The parents a readable related row matches, found in one
-                # subquery, so a negation keeps the parents with none.
-                from tortoise.expressions import Q, Subquery
-
-                own_scope_q = (
-                    _tortoise_relation_scope_q(backend, model, rel_name, info, "")
-                    if _prefix
-                    else scope_q
-                )
-                if own_scope_q is not None:
-                    nested_clause = nested_clause & own_scope_q
-                pk_attr = model._meta.pk_attr  # type: ignore[union-attr]
-                matching = model.filter(  # type: ignore[union-attr]
-                    _tortoise_checked_q(model, nested_clause)
-                ).values(pk_attr)
-                return Q(**{f"{_prefix}{pk_attr}__in": Subquery(matching)}), query
+                if scope_q is not None:
+                    nested_clause = nested_clause & scope_q
+                return _tortoise_matching_rows(model, nested_clause, _prefix), query
         elif key == "all":
             if len(val) > max_branches:
                 raise ValueError(
@@ -1758,7 +1809,10 @@ def _tortoise_reference_key(
     if model is None:
         return None
     field = model._meta.fields_map.get(rel_name)  # type: ignore[attr-defined]
-    if type(field).__name__ not in _FORWARD_REL_TYPES or not field.to_field_instance.pk:
+    if (
+        _relation_kind(field) not in _FORWARD_REL_TYPES
+        or not field.to_field_instance.pk
+    ):
         return None
     return field.source_field, field.to_field_instance.model_field_name
 
@@ -1801,7 +1855,7 @@ def _tortoise_checked_q(model: Any, q: Any) -> Any:
             )
         )
     except FieldError:
-        raise ValueError("Invalid filter expression") from None
+        raise ValueError(_READ_REFUSED) from None
     return q
 
 
@@ -2289,7 +2343,7 @@ class _GroupedRows:
                         model, relation, type(entry)
                     )
                     field = meta.fields_map[relation]
-                    if type(field).__name__ not in _FORWARD_REL_TYPES:
+                    if _relation_kind(field) not in _FORWARD_REL_TYPES:
                         continue
                     target = field.related_model
                     hop = (*chain, relation)
@@ -2342,7 +2396,7 @@ class _GroupedRows:
             rows = restrict(rows, self.info)
         field = hop.model._meta.fields_map[hop.relation]
         parent, target = hop.model._meta, hop.target._meta
-        kind = type(field).__name__
+        kind = _relation_kind(field)
         if kind == "ManyToManyFieldInstance":
             # The through table goes inside the scoped rows: joined outside, a
             # link to a hidden row would still add a row of its own.
@@ -2450,7 +2504,7 @@ def _together(
         if interval is not None:
             term = _truncate(term, target.fields_map[column], interval, dialect)
         columns.append(term.as_(name))
-    if type(field).__name__ == "ManyToManyFieldInstance":
+    if _relation_kind(field) == "ManyToManyFieldInstance":
         through = Table(field.through).as_(f"{alias}_link")
         linked = (
             db.query_class.from_(visible)
@@ -2579,6 +2633,24 @@ def _ordered_to_the_row(query: Any) -> Any:
     ordered = query._clone()
     ordered._orderings = [*orderings, (meta.pk_attr, Order.asc)]
     return ordered
+
+
+@contextmanager
+def _read_errors() -> Any:
+    """Raise what a client may see in place of an error running a read.
+
+    The database's message names tables and columns, and Tortoise's own for a
+    field it cannot resolve lists every column of the model, so the original
+    is kept only as the cause, for the server log.
+    """
+    from tortoise.exceptions import DBConnectionError, FieldError, OperationalError
+
+    try:
+        yield
+    except DBConnectionError as exc:
+        raise ConnectionError("Database connection failed") from exc
+    except (OperationalError, FieldError) as exc:
+        raise ValueError(_READ_REFUSED) from exc
 
 
 @contextmanager

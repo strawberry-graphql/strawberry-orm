@@ -643,7 +643,15 @@ class TestRelationScopeCondition:
     def test_without_a_backend_there_is_nothing_to_scope(self):
         from strawberry_orm.backends.tortoise import _tortoise_relation_scope_q
 
-        assert _tortoise_relation_scope_q(None, None, "author", None, "") is None
+        assert _tortoise_relation_scope_q(None, None, "author", None) is None
+
+
+class TestRelatedModelBeforeInit:
+    def test_a_relation_naming_no_model_resolves_to_none(self, Post):
+        from strawberry_orm.backends.tortoise import _resolve_related_model
+
+        unnamed = SimpleNamespace(related_model=None, model_name=None)
+        assert _resolve_related_model(Post, unnamed, "fields.ReverseRelation") is None
 
 
 class TestGroupedRows:

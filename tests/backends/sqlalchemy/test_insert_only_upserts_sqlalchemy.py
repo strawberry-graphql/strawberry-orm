@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Integer
 
-from strawberry_orm import UpsertValidationError
+from strawberry_orm.upserts import _declared_fields
 from tests.abstract.insert_only_upserts import ADA, _collect, address_linked_to
 from tests.backends.sqlalchemy.insert_only_harness import ORM
 from tests.backends.sqlalchemy.insert_only_models import Note, Person
@@ -23,15 +23,23 @@ NOTED_PERSON = {
         "create": ["ssn", "dob"],
         "upsert": {"where": ["ssn", "dob"]},
     },
-    "notes": {
-        "_meta": {"name": "Note", "immutable": True, "create": ["body", "person_id"]}
-    },
+    "notes": {"_meta": {"name": "Note", "immutable": True, "create": ["body"]}},
 }
 N = _collect(
     ORM.mutations.upsert_node_input(
         model=Person, project=NOTED_PERSON, name="NotedPersonInput"
     )
 )
+NOTED_PERSON_WITH_KEY = {
+    **NOTED_PERSON,
+    "notes": {
+        "_meta": {
+            "name": "KeyedNote",
+            "immutable": True,
+            "create": ["body", "person_id"],
+        }
+    },
+}
 
 
 def _noted_person(**note: Any) -> Any:
@@ -48,10 +56,21 @@ class TestColumnOnlyRelations:
         [person] = await db.rows(Person)
         assert note.person_id == person.id
 
-    async def test_a_nested_item_cannot_set_its_parent_key(self, db):
-        with pytest.raises(UpsertValidationError, match="NoteCreate.person_id cannot"):
-            await db.apply(_noted_person(body="hi", person_id=2))
-        assert db.statements == []
+    def test_a_key_column_without_a_relationship_is_not_offered(self):
+        assert list(_declared_fields(N["NoteCreate"])) == ["body"]
+        with pytest.raises(
+            ValueError,
+            match=r"Unknown field\(s\) in _meta.create for Note: person_id",
+        ):
+            ORM.mutations.upsert_node_input(
+                model=Person, project=NOTED_PERSON_WITH_KEY, name="KeyedPersonInput"
+            )
+
+    def test_a_hand_written_input_keeps_the_key_column(self):
+        assert list(_declared_fields(ORM.input(Note, name="NoteFields"))) == [
+            "body",
+            "person_id",
+        ]
 
 
 class TestColumnTypes:
