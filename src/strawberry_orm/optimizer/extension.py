@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Iterator
 from contextlib import suppress
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
@@ -87,25 +87,49 @@ def _without_rejected(
     """Remove *candidates* that ``scope_rows`` did not keep.
 
     A list is filtered in a copy of its own type, so a ``PreslicedRows``
-    subclass, and the total it carries, survive. Not in place: the list is the
-    app's, which may hand the same one to the next request, whose scope can
-    allow more. A single rejected instance becomes ``None``, and so does a
-    rejected row of a list whose positions answer the IDs asked for.
+    subclass, and the total it carries, survive, and so is each list nested in
+    it. Not in place: the list is the app's, which may hand the same one to the
+    next request, whose scope can allow more. A single rejected instance
+    becomes ``None``, and so does a rejected row of a list whose positions
+    answer the IDs asked for.
     """
     kept_ids = {id(row) for row in kept}
     dropped = {id(row) for row in candidates if id(row) not in kept_ids}
     if isinstance(result, list):
         if dropped:
-            filtered = copy.copy(result)
-            if info is not None and _answers_by_position(info):
-                filtered[:] = [None if id(row) in dropped else row for row in result]
-            else:
-                filtered[:] = [row for row in result if id(row) not in dropped]
-            result = filtered
-        return result, [row for row in result if id(row) in kept_ids]
+            by_position = info is not None and _answers_by_position(info)
+            result = _without(result, dropped, by_position)
+        return result, [row for row in rows_in(result) if id(row) in kept_ids]
     if dropped:
         return None, []
     return result, list(kept)
+
+
+def _without(rows: list[Any], dropped: set[int], by_position: bool) -> list[Any]:
+    """A copy of *rows*, and of the lists nested in it, less the *dropped* rows.
+
+    *by_position* leaves ``None`` where a dropped row was.
+    """
+    filtered = copy.copy(rows)
+    filtered[:] = [
+        _without(row, dropped, by_position)
+        if isinstance(row, list)
+        else None
+        if id(row) in dropped
+        else row
+        for row in rows
+        if by_position or id(row) not in dropped
+    ]
+    return filtered
+
+
+def rows_in(rows: list[Any]) -> Iterator[Any]:
+    """What *rows* holds, the rows of the lists nested in it included."""
+    for row in rows:
+        if isinstance(row, list):
+            yield from rows_in(row)
+        else:
+            yield row
 
 
 def _answers_by_position(info: Any) -> bool:
@@ -125,11 +149,14 @@ def _answers_by_position(info: Any) -> bool:
     )
 
 
-def _returns_a_list(info: Any) -> bool:
+def _list_depth(info: Any) -> int:
+    """How many lists the field's type nests: one for ``[Post]``, two for ``[[Post]]``."""
+    depth = 0
     return_type = getattr(info, "return_type", None)
-    while isinstance(return_type, GraphQLNonNull):
+    while isinstance(return_type, (GraphQLList, GraphQLNonNull)):
+        depth += isinstance(return_type, GraphQLList)
         return_type = return_type.of_type
-    return isinstance(return_type, GraphQLList)
+    return depth
 
 
 def read_rows(result: Any) -> Any:
@@ -150,15 +177,57 @@ def read_rows(result: Any) -> Any:
 
 
 def listed_rows(result: Any, info: Any) -> Any:
-    """*result* read into a list, when a list field was given another iterable.
+    """*result* read into lists, when a list field was given other iterables.
 
-    graphql-core reads any iterable for a list field, an async one included, so
-    a tuple, a generator or a ``ScalarResult`` reaches the client just as a list
-    does. Read into one, its rows are checked as a list's are.
+    graphql-core reads any iterable for a list field, an async one included,
+    and so for each list of a list of lists, so a tuple, a generator or a
+    ``ScalarResult`` reaches the client just as a list does. Read into lists,
+    their rows are checked as a list's are. ``None`` when *result* holds
+    nothing to read.
     """
-    if isinstance(result, list) or not _returns_a_list(info):
+    return _read_lists(result, _list_depth(info))
+
+
+def _read_lists(result: Any, depth: int) -> Any:
+    """*result* read into lists *depth* levels down, or ``None`` if it is already.
+
+    May be awaitable. What is not iterable is left in its place for
+    graphql-core to refuse.
+    """
+    if depth == 0 or (depth == 1 and isinstance(result, list)):
         return None
-    return read_rows(result)
+    if not isinstance(result, list):
+        rows = read_rows(result)
+        if isawaitable(rows):
+
+            async def _await_rows() -> Any:
+                read = await rows
+                inner = await await_maybe(_read_lists(read, depth))
+                return read if inner is None else inner
+
+            return _await_rows()
+        if rows is None:
+            return None
+        inner = _read_lists(rows, depth)
+        return rows if inner is None else inner
+    read = [_read_lists(item, depth - 1) for item in result]
+    if all(item is None for item in read):
+        return None
+
+    def rebuilt(read: list[Any]) -> list[Any]:
+        lists = copy.copy(result)
+        lists[:] = [
+            item if new is None else new for item, new in zip(result, read, strict=True)
+        ]
+        return lists
+
+    if any(isawaitable(item) for item in read):
+
+        async def _await_read() -> Any:
+            return rebuilt([await item if isawaitable(item) else item for item in read])
+
+        return _await_read()
+    return rebuilt(read)
 
 
 def load_kept(
@@ -466,26 +535,26 @@ class OptimizerExtension(SchemaExtension):
             rows: list[Any] = [] if prepared else [result]
             if not rows:
                 return result
-        elif isinstance(result, list) and result:
-            rows = [
-                row
-                for row in result
-                if backend.is_model_instance(row)
-                and not _is_prepared(row, scope_owner(type(row)))
-            ]
-            if not rows:
-                return result
         else:
             listed = listed_rows(result, info)
-            if listed is None:
-                return result
             if isawaitable(listed):
 
                 async def _await_listed() -> Any:
                     return await await_maybe(self._load_rows(await listed, root, info))
 
                 return _await_listed()
-            return self._load_rows(listed, root, info)
+            if listed is not None:
+                return self._load_rows(listed, root, info)
+            if not isinstance(result, list):
+                return result
+            rows = [
+                row
+                for row in rows_in(result)
+                if backend.is_model_instance(row)
+                and not _is_prepared(row, scope_owner(type(row)))
+            ]
+            if not rows:
+                return result
 
         # Relation fields of the parent returned above: those caches were
         # scoped with the parent, and checking every row again would query
@@ -589,19 +658,19 @@ class RowScopeExtension(SchemaExtension):
 
         if backend.is_model_instance(result):
             rows: list[Any] | None = [result]
-        elif isinstance(result, list):
-            rows = [row for row in result if backend.is_model_instance(row)]
         else:
             listed = listed_rows(result, info)
-            if listed is None:
-                return result
             if isawaitable(listed):
 
                 async def _await_listed() -> Any:
                     return await await_maybe(self._scope(await listed, info))
 
                 return _await_listed()
-            return self._scope(listed, info)
+            if listed is not None:
+                return self._scope(listed, info)
+            if not isinstance(result, list):
+                return result
+            rows = [row for row in rows_in(result) if backend.is_model_instance(row)]
         if not rows:
             return result
 

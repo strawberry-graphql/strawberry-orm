@@ -17,6 +17,7 @@ from typing import Any
 import strawberry
 from pypika_tortoise.terms import AggregateFunction
 from strawberry.extensions import SchemaExtension
+from tortoise.expressions import Function as ExpressionFunction
 from tortoise.models import Model
 from tortoise.queryset import QuerySet
 
@@ -40,6 +41,7 @@ from ._base import (
     extract_element_type,
     hint_hops,
     invoke_custom_callback,
+    key_in_range,
     model_is_type_of,
     past_a_hop,
     requested_aggregates,
@@ -593,7 +595,11 @@ class TortoiseBackend(BaseBackend):
             ) in entry_orderings:
                 python_orderings.append((col_name, descending, nulls_first, nulls_last))
                 if nulls_first or nulls_last:
-                    continue
+                    # Ordered in the database too: a page is cut there.
+                    rank = f"_orm_nulls{len(clauses)}"
+                    nulls = "first" if nulls_first else "last"
+                    query = query.annotate(**{rank: _NullsRank(col_name, nulls)})
+                    clauses.append(rank)
                 clauses.append(f"-{col_name}" if descending else col_name)
         if clauses:
             query = query.order_by(*clauses)
@@ -619,7 +625,7 @@ class TortoiseBackend(BaseBackend):
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
         with _write_errors():
-            async with in_transaction(type(instance)._meta.default_connection):
+            async with in_transaction(_write_connection(type(instance))):
                 await run_async(writer.apply_refs(instance, spec, refs))
 
     # -- Upserts -------------------------------------------------------------
@@ -635,7 +641,7 @@ class TortoiseBackend(BaseBackend):
         writer.validate_root(payload)
         model = type(payload).__orm_model__
         with _write_errors():
-            async with in_transaction(model._meta.default_connection):
+            async with in_transaction(_write_connection(model)):
                 return await run_async(writer.apply_root(payload))
 
     def _upsert_ops(self, info: Any) -> Any:
@@ -1061,7 +1067,7 @@ class TortoiseBackend(BaseBackend):
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
             fragments_from_info,
-            iter_field_nodes,
+            merged_field_nodes,
         )
 
         fragments = fragments_from_info(info)
@@ -1146,12 +1152,12 @@ class TortoiseBackend(BaseBackend):
 
         def _plan_selection(
             level: dict[str, _PlannedPrefetch],
-            selection_set: Any,
+            selection_sets: list[Any],
             current_model: type,
             type_name: str | None,
         ) -> None:
-            for node in iter_field_nodes(selection_set, fragments):
-                field_name = _to_snake(node.name.value)
+            for name, nodes in merged_field_nodes(selection_sets, fragments).items():
+                field_name = _to_snake(name)
 
                 # A field that answers for itself will ignore whatever the
                 # prefetch loads, so do not pay for it.
@@ -1160,19 +1166,21 @@ class TortoiseBackend(BaseBackend):
                 _plan_hints(level, current_model, type_name, field_name)
 
                 load = _planned(level, current_model, field_name, type_name)
-                if load is None or not node.selection_set:
+                below = [node.selection_set for node in nodes if node.selection_set]
+                if load is None or not below:
                     continue
                 child_type = self._child_type_name(
-                    type_name, node.name.value, load.related_model, info
+                    type_name, name, load.related_model, info
                 )
-                _plan_selection(
-                    load.children, node.selection_set, load.related_model, child_type
-                )
+                _plan_selection(load.children, below, load.related_model, child_type)
 
         root_type_name = self._selection_type_name(model, info)
-        for field_node in field_nodes_from_info(info):
-            if field_node.selection_set is not None:
-                _plan_selection(plan, field_node.selection_set, model, root_type_name)
+        _plan_selection(
+            plan,
+            [node.selection_set for node in field_nodes_from_info(info)],
+            model,
+            root_type_name,
+        )
         return plan
 
     @_reading
@@ -1296,6 +1304,10 @@ class _TortoiseUpsertOps:
     def delete(self, repo: Any, instance: Any) -> Any:
         return repo._delete_async(instance, self._info)
 
+    def check_constraints(self) -> None:
+        """Nothing to do: Tortoise's foreign keys are checked as each statement runs."""
+        return None
+
     # -- Relations -----------------------------------------------------------
 
     def load_attr(self, instance: Any, name: str) -> Any:
@@ -1360,11 +1372,9 @@ class _TortoiseUpsertOps:
         if not isinstance(value, str):
             return value
         try:
-            return model._meta.pk.to_python_value(value)  # type: ignore[attr-defined]
+            return key_in_range(model._meta.pk.to_python_value(value))  # type: ignore[attr-defined]
         except (TypeError, ValueError):
-            raise UpsertValidationError(
-                f"{value!r} is not a valid {model.__name__} id"
-            ) from None
+            raise UpsertValidationError(f"{value!r} is not a valid id") from None
 
     # -- Internals -----------------------------------------------------------
 
@@ -2606,6 +2616,17 @@ def _nulls_rank(term: Any, nulls: str) -> Any:
     return Case().when(term.isnull(), 0 if first else 1).else_(1 if first else 0)
 
 
+class _NullsRank(ExpressionFunction):  # type: ignore[misc]
+    """``_nulls_rank`` of a field, by name, to annotate a queryset with."""
+
+    def __init__(self, field: str, nulls: str) -> None:
+        super().__init__(field)
+        self.nulls = nulls
+
+    def _get_function_field(self, field: Any, *default_values: Any) -> Any:
+        return _nulls_rank(field, self.nulls)
+
+
 def _order_by(stmt: Any, term: Any, descending: bool, nulls: str | None) -> Any:
     from pypika_tortoise import Order
 
@@ -2677,13 +2698,24 @@ def _ordered_to_the_row(query: Any) -> Any:
     return ordered
 
 
+def _write_connection(model: type) -> str:
+    """The name of the connection Tortoise writes *model*'s rows on.
+
+    A router's ``db_for_write`` can send them past the model's own connection.
+    """
+    from tortoise.router import router
+
+    return (router.db_for_write(model) or model._meta.db).connection_name  # type: ignore[attr-defined]
+
+
 @contextmanager
 def _read_errors() -> Any:
     """Raise what a client may see in place of an error running a read.
 
     The database's message names tables and columns, and Tortoise's own for a
     field it cannot resolve lists every column of the model, so the original
-    is kept only as the cause, for the server log.
+    is kept only as the cause, for the server log. The driver raises
+    ``OverflowError`` for an integer its column type cannot hold.
     """
     from tortoise.exceptions import DBConnectionError, FieldError, OperationalError
 
@@ -2691,7 +2723,7 @@ def _read_errors() -> Any:
         yield
     except DBConnectionError as exc:
         raise ConnectionError("Database connection failed") from exc
-    except (OperationalError, FieldError) as exc:
+    except (OperationalError, FieldError, OverflowError) as exc:
         raise ValueError(_READ_REFUSED) from exc
 
 
@@ -2700,13 +2732,20 @@ def _write_errors() -> Any:
     """Raise what a client may see in place of the database refusing a write.
 
     The driver's error names the table and column, and on PostgreSQL the
-    row's values, so it is kept only as the cause, for the server log.
+    row's values, and Tortoise's ``ValidationError`` names the field and the
+    value it refused, so each is kept only as the cause, for the server log.
+    The driver raises ``OverflowError`` for an integer its column type cannot
+    hold.
     """
-    from tortoise.exceptions import DBConnectionError, OperationalError
+    from tortoise.exceptions import (
+        DBConnectionError,
+        OperationalError,
+        ValidationError,
+    )
 
     try:
         yield
     except DBConnectionError as exc:
         raise ConnectionError("Database connection failed") from exc
-    except OperationalError as exc:
+    except (OperationalError, ValidationError, OverflowError) as exc:
         raise ValueError(WRITE_REFUSED) from exc

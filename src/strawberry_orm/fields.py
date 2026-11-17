@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 
@@ -21,6 +21,17 @@ def _positional_names(fn: Callable[..., Any]) -> list[str]:
 def call_scope(scope: Callable[..., Any], query: Any, info: Any) -> Any:
     """Invoke a ``scope=`` callable."""
     return scope(query, info)
+
+
+def every_scope(scopes: Sequence[Callable[..., Any]]) -> Callable[..., Any]:
+    """One ``scope=`` narrowing a query by each of *scopes* in turn."""
+
+    def scoped(query: Any, info: Any) -> Any:
+        for scope in scopes:
+            query = call_scope(scope, query, info)
+        return query
+
+    return scoped
 
 
 def check_scope_signature(fn: Callable[..., Any]) -> None:

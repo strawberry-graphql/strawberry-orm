@@ -218,3 +218,7 @@ __marimo__/
 
 # Benchmark output
 benchmarks/results_*.json
+
+# Local editor and agent configuration
+.cursor/
+.mcp.json

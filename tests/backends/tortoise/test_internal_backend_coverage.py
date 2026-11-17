@@ -337,7 +337,7 @@ class TestInternalBackendCoverage:
                 create=strawberry.UNSET,
                 update=strawberry.UNSET,
                 unlink=strawberry.UNSET,
-                delete=UnlinkInput(id=strawberry.ID("2")),
+                delete=UnlinkInput(id=strawberry.ID("1")),
             ),
         ]
         await backend.apply_ref_list(

@@ -146,7 +146,7 @@ async def test_a_one_to_one_is_linked_through_the_related_repo(models, run):
     )
     hidden = await run(schema, link % 2)
     visible = await run(schema, link % 3)
-    assert [error.message for error in hidden.errors] == ["No Member 2"]
+    assert [error.message for error in hidden.errors] == ["No row 2"]
     assert visible.data == {"saveProfile": True}
     assert links == [("member", "Cy")]
     assert (await Profile.get(id=1)).member_id == 3

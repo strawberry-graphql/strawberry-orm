@@ -36,7 +36,12 @@ if not settings.configured:
     )
     django.setup()
 
-from strawberry_orm import AbstractRepo, MutationPolicy, StrawberryORM
+from strawberry_orm import (
+    AbstractRepo,
+    MutationPolicy,
+    StrawberryORM,
+    UpsertNotFoundError,
+)
 from strawberry_orm._async import (
     async_safe_resolver,
     await_maybe_blocking,
@@ -1407,13 +1412,17 @@ class TestFinalCoveragePush:
                 ),
             ]
             info = SimpleNamespace(context={"session": async_session})
-            await backend.apply_ref_list(
-                post,
-                "tags",
-                refs,
-                info,
-                authorize=lambda action, model, obj_id, _info: False,
-            )
+
+            def deny(action, model, obj_id, _info):
+                return False
+
+            await backend.apply_ref_list(post, "tags", refs[:1], info, authorize=deny)
+            for ref in refs[1:]:
+                # A row is looked up before authorize is asked about it.
+                with pytest.raises(UpsertNotFoundError, match="No row 999 in tags"):
+                    await backend.apply_ref_list(
+                        post, "tags", [ref], info, authorize=deny
+                    )
         await engine.dispose()
 
     def test_async_helpers_remaining_branches(self):
@@ -1450,6 +1459,7 @@ class TestFinalCoveragePush:
         session = SimpleNamespace(
             is_async=True,
             delete=AsyncMock(),
+            flush=AsyncMock(),
         )
         backend = type(
             "SQLAlchemyBackend",
@@ -1462,6 +1472,7 @@ class TestFinalCoveragePush:
         )()
         sa_repo = SARepo(backend)
         await sa_repo._delete_async(object(), SimpleNamespace(context={}))
+        session.flush.assert_awaited_once()
 
         sync_session = MagicMock()
         sync_backend = type(

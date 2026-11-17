@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import functools
 import sys
+import traceback
 import uuid
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from strawberry_orm.backends._base import (
     extract_element_type,
     hint_hops,
     invoke_custom_callback,
+    key_in_range,
     model_is_type_of,
     past_a_hop,
     requested_aggregates,
@@ -66,7 +68,9 @@ class _PlannedLoad:
     parents' keys. A to-many relation whose scope orders (``ordered``) is
     always read that way, and so is one whose scope says more than a loader's
     criteria can (``whole``). ``token`` is the edge's own ``scope=``, which
-    its relation cache is marked with.
+    its relation cache is marked with. A scope carrying loader options other
+    than ``with_loader_criteria`` may fill relations of the rows it reads
+    (``eager``).
     """
 
     __slots__ = (
@@ -78,6 +82,7 @@ class _PlannedLoad:
         "token",
         "ordered",
         "whole",
+        "eager",
         "keys",
         "link",
         "children",
@@ -92,6 +97,7 @@ class _PlannedLoad:
         self.token: Any = None
         self.ordered = False
         self.whole = False
+        self.eager = False
         self.keys: tuple[str, Any, str] | None = None
         self.link: tuple[Any, Any] | None = None
         self.children: dict[str, _PlannedLoad] = {}
@@ -138,6 +144,10 @@ _KEYS_PER_STATEMENT = 500
 #: Stands for the scope a planned relation is loaded with when its load does
 #: not apply that scope, so a cache it fills is never marked as scoped.
 _UNMARKED = object()
+
+#: ``relationship(lazy=...)`` values under which the mapper fills a relation
+#: only when it is read, if at all, never while loading the rows holding it.
+_LOADS_WHEN_READ = frozenset({True, "select", "raise", "raise_on_sql", None, "noload"})
 
 
 def _equates(join: Any, left: Any, right: Any) -> bool:
@@ -202,6 +212,10 @@ def _reads_alone_below(level: dict[str, _PlannedLoad]) -> bool:
         load.reads_alone() or _reads_alone_below(load.children)
         for load in level.values()
     )
+
+
+def _eager_below(level: dict[str, _PlannedLoad]) -> bool:
+    return any(load.eager or _eager_below(load.children) for load in level.values())
 
 
 def _related_rows(rows: list[Any], name: str) -> list[Any]:
@@ -462,7 +476,15 @@ class SQLAlchemyBackend(BaseBackend):
         from sqlalchemy import inspect as sa_inspect
 
         mapper = sa_inspect(model)
-        return {
+        # A joined-inheritance child's key is a foreign key to its own row.
+        own_row = {
+            prop.key
+            for prop in mapper.column_attrs
+            for column in prop.columns
+            for fk in column.foreign_keys
+            if any(fk.column is other for other in prop.columns)
+        }
+        return (super()._link_key_columns(model) - own_row) | {
             mapper.get_property_by_column(column).key
             for rel in mapper.relationships
             if rel.direction.name == "MANYTOONE"
@@ -665,25 +687,26 @@ class SQLAlchemyBackend(BaseBackend):
         """*stmt* over *model*, less the rows of a subclass its own repo hides.
 
         Such a row is written through its own model's repo (see
-        ``UpsertWriter._owner``), so counting a match on one that repo hides
-        would answer for a row the caller cannot reach. A subclass of it with
-        a repo of its own answers for its own rows.
+        ``UpsertWriter._owner``), whether a read of *model* hands it back as
+        the subclass or as a *model* row, so counting a match on one that repo
+        hides would answer for a row the caller cannot reach. A subclass of it
+        with a repo of its own answers for its own rows.
         """
         from sqlalchemy import or_, select
 
         mapper = sa_inspect(model)
-        if mapper.polymorphic_on is None:
+        returned = _returned_as_themselves(mapper)
+        apart = self.classes_written_apart(
+            repo,
+            [
+                sub.class_
+                for sub in mapper.self_and_descendants
+                if sub is not mapper and sub in returned and not sub.concrete
+            ]
+            + self.subclasses_read_as_base(model),
+        )
+        if not apart:
             return stmt
-        returned = set(mapper.polymorphic_map.values())
-        apart: dict[type, Any] = {}
-        for sub in mapper.self_and_descendants:
-            if sub is mapper or sub not in returned or sub.concrete:
-                continue
-            own = self.get_repo(sub.class_)
-            if own is not None and not (
-                type(own) is type(repo) and own.model is repo.model
-            ):
-                apart[sub.class_] = own
 
         def rows_of(cls: type) -> Any:
             return getattr(cls, _get_sa_pk_column(cls).key)
@@ -1289,6 +1312,20 @@ class SQLAlchemyBackend(BaseBackend):
         mark_query_scoped(narrowed)
         return narrowed
 
+    def subclasses_read_as_base(self, model: type) -> list[type]:
+        mapper = sa_inspect(model)
+        returned = _returned_as_themselves(mapper)
+        # A single-table subclass without an identity of its own has no table
+        # to be told apart by.
+        return [
+            sub.class_
+            for sub in mapper.self_and_descendants
+            if sub is not mapper
+            and sub not in returned
+            and not sub.concrete
+            and not sub.single
+        ]
+
     def classes_scoped_apart(self, model: type) -> list[type]:
         from sqlalchemy import inspect as sa_inspect
 
@@ -1438,11 +1475,14 @@ class SQLAlchemyBackend(BaseBackend):
             params = compiled.params
         except Exception:  # pragma: no cover - defensive
             return None
+        options = _options_signature(query)
+        if options is None:
+            return None
         typed = tuple(
             (key, type(params[key]).__name__, repr(params[key]))
             for key in sorted(params)
         )
-        return repr((str(compiled), typed))
+        return repr((str(compiled), typed, options))
 
     def apply_key_filter(
         self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
@@ -1648,7 +1688,7 @@ class SQLAlchemyBackend(BaseBackend):
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
             fragments_from_info,
-            iter_field_nodes,
+            merged_field_nodes,
         )
 
         fragments = fragments_from_info(info)
@@ -1692,6 +1732,7 @@ class SQLAlchemyBackend(BaseBackend):
             scoped = scope(sa_select(related_entity))
             load.scope = scope
             load.token = field_scope
+            load.eager = not _only_criteria(scoped)
             if load.keys is not None:
                 load.ordered = load.uselist and bool(scoped._order_by_clauses)
             if _says_only_where(scoped, related_entity):
@@ -1782,12 +1823,12 @@ class SQLAlchemyBackend(BaseBackend):
 
         def _plan_selection(
             level: dict[str, _PlannedLoad],
-            selection_set: Any,
+            selection_sets: list[Any],
             current_mapper: Any,
             type_name: str | None,
         ) -> None:
-            for node in iter_field_nodes(selection_set, fragments):
-                field_name = _get_field_name(node)
+            for name, nodes in merged_field_nodes(selection_sets, fragments).items():
+                field_name = _get_field_name(nodes[0])
 
                 # A field that answers for itself will ignore whatever this
                 # loads, so do not pay for it.
@@ -1797,18 +1838,20 @@ class SQLAlchemyBackend(BaseBackend):
                 if field_name not in current_mapper.relationships:
                     continue
                 load = _planned(level, current_mapper, field_name, type_name)
-                if node.selection_set:
+                below = [node.selection_set for node in nodes if node.selection_set]
+                if below:
                     child_type = self._child_type_name(
-                        type_name, node.name.value, load.mapper.class_, info
+                        type_name, name, load.mapper.class_, info
                     )
-                    _plan_selection(
-                        load.children, node.selection_set, load.mapper, child_type
-                    )
+                    _plan_selection(load.children, below, load.mapper, child_type)
 
         root_type_name = self._selection_type_name(entity, info)
-        for field_node in field_nodes_from_info(info):
-            if field_node.selection_set is not None:
-                _plan_selection(plan, field_node.selection_set, mapper, root_type_name)
+        _plan_selection(
+            plan,
+            [node.selection_set for node in field_nodes_from_info(info)],
+            mapper,
+            root_type_name,
+        )
         return plan, scoped_edges
 
     def _keyed_loads(
@@ -1929,7 +1972,12 @@ class SQLAlchemyBackend(BaseBackend):
             rows = yield self._execute_in(session, loaded)
             yield from self._keyed_loads(session, rows, plan)
             marks = (
-                self._scoped_marks([(rows, plan)], trusted, before=window.unloaded)
+                self._scoped_marks(
+                    [(rows, plan)],
+                    trusted,
+                    before=window.unloaded,
+                    eager=not _only_criteria(query),
+                )
                 if window is not None
                 else []
             )
@@ -2129,6 +2177,7 @@ class SQLAlchemyBackend(BaseBackend):
         edges: list[tuple[type, str, Any]],
         *,
         before: dict[int, set[str]],
+        eager: bool = False,
     ) -> list[tuple[Any, str, Any]]:
         """The relations a scoped loader populated during this query, and its scope.
 
@@ -2141,7 +2190,12 @@ class SQLAlchemyBackend(BaseBackend):
         path that reaches the object. Reached where the plan leaves the
         relation out, the object may have had it filled there by SQLAlchemy's
         own loader (a ``lazy="joined"`` mapping), unscoped, and a planned
-        loader leaves alone an object that already holds the relation.
+        loader leaves alone an object that already holds the relation. A
+        relation the mapper loads only when it is read is the exception: if
+        it is planned on some path to the object, and no statement carried
+        loader options but the plan's (*eager* says the one reading the rows
+        did), only the plan can have filled it, so a selection that loops
+        back to rows it already read keeps its marks.
 
         Each edge comes with the scope it was loaded with. One relation planned
         in two places under different scopes cannot tell which load filled an
@@ -2162,6 +2216,7 @@ class SQLAlchemyBackend(BaseBackend):
         seen: set[tuple[int, int]] = set()
         reached: dict[int, tuple[Any, Any]] = {}
         unplanned: set[tuple[int, str]] = set()
+        planned: set[tuple[int, str]] = set()
         while pending:
             obj, level = pending.pop()
             if (
@@ -2183,8 +2238,18 @@ class SQLAlchemyBackend(BaseBackend):
                 load = level.get(name) if level is not None else None
                 if load is None:
                     unplanned.add((id(obj), name))
+                else:
+                    planned.add((id(obj), name))
                 below = load.children if load is not None else None
                 pending.extend((child, below) for child in _members(state.dict, name))
+        if not eager and not any(_eager_below(plan) for _rows, plan in walks):
+            unplanned = {
+                (key, name)
+                for key, name in unplanned
+                if (key, name) not in planned
+                or sa_inspect(reached[key][0]).mapper.relationships[name].lazy
+                not in _LOADS_WHEN_READ
+            }
         marks: list[tuple[Any, str, Any]] = []
         for key, (obj, unloaded) in reached.items():
             was = before.get(key)
@@ -2335,6 +2400,35 @@ class _SQLAlchemyUpsertOps:
             return repo._get_async(model, pk, self._info)
         return repo._get(model, pk, self._info)
 
+    def holders(self, row: Any, models: list[type]) -> Any:
+        """Those of *models*, joined-table subclasses of *row*'s class, holding *row*."""
+        from sqlalchemy import select
+
+        identity = sa_inspect(row).identity
+        probes = []
+        for model in models:
+            keys = _get_sa_pk_columns(model)
+            matched = (key == value for key, value in zip(keys, identity, strict=True))
+            # The key attributes can be the base's own, which read its table
+            # alone; selected from the subclass, they read the subclass's too.
+            probes.append(
+                (model, select(*keys).select_from(model).where(*matched).limit(1))
+            )
+        if self._async:
+            return self._holders_async(probes)
+        return [
+            model
+            for model, probe in probes
+            if self._session.execute(probe).first() is not None
+        ]
+
+    async def _holders_async(self, probes: list[tuple[type, Any]]) -> list[type]:
+        return [
+            model
+            for model, probe in probes
+            if (await self._session.execute(probe)).first() is not None
+        ]
+
     def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
         if self._async:
             return repo._create_async(model, data, self._info)
@@ -2349,6 +2443,13 @@ class _SQLAlchemyUpsertOps:
         if self._async:
             return repo._delete_async(instance, self._info)
         return repo._delete(instance, self._info)
+
+    def check_constraints(self) -> Any:
+        """Flush, so the database refuses now what it would as the savepoint ends.
+
+        A link is only set on the rows; it is written with the next flush.
+        """
+        return self._session.flush()
 
     # -- Relations -----------------------------------------------------------
 
@@ -2517,11 +2618,9 @@ class _SQLAlchemyUpsertOps:
         if python_type is str:
             return value
         try:
-            return python_type(value)
+            return key_in_range(python_type(value))
         except (TypeError, ValueError):
-            raise UpsertValidationError(
-                f"{value!r} is not a valid {model.__name__} id"
-            ) from None
+            raise UpsertValidationError(f"{value!r} is not a valid id") from None
 
     # -- Internals -----------------------------------------------------------
 
@@ -2578,6 +2677,8 @@ def _scoped_sa_relation(
     A cache is returned only when this library filled it after applying
     ``scope_rows``. A ``joinedload`` in the resolver is re-queried.
     """
+    from inspect import isawaitable
+
     from sqlalchemy import select
     from sqlalchemy.orm import with_parent
 
@@ -2604,6 +2705,13 @@ def _scoped_sa_relation(
     rows = backend._execute_stmt(restrict(stmt, info), info)
     if uselist:
         return rows
+    if isawaitable(rows):
+
+        async def _await_first() -> Any:
+            found = await rows
+            return found[0] if found else None
+
+        return _await_first()
     return rows[0] if rows else None
 
 
@@ -2616,31 +2724,59 @@ def _make_sa_on_resolver(
     second view of the same relation. The statement is therefore built per
     parent and left for the batcher to collapse, which is why one of these
     cannot be declared with batching turned off.
+
+    The statement is the relation's join rebuilt from its keys, so only a
+    to-many relation joining on the parent's primary key alone is served: any
+    other would list rows the relation does not, or cost a query per parent.
     """
     from sqlalchemy import inspect as sa_inspect
 
-    rel = sa_inspect(parent_model).relationships[relation]
-    pairs = list(rel.local_remote_pairs or ())
-    if rel.secondary is not None or len(pairs) != 1:
+    mapper = sa_inspect(parent_model)
+    rel = mapper.relationships[relation]
+    view = f"{parent_model.__name__}.{field_name}: on={relation!r}"
+    if rel.secondary is not None:
         raise ValueError(
-            f"{parent_model.__name__}.{field_name}: on={relation!r} goes through "
-            f"an association table, so the rows carry no column tying them to one "
-            f"parent and the batcher cannot collapse the per-parent queries. The "
-            f"field would cost a query per parent row; write it as "
-            f"orm.field.lazy instead."
+            f"{view} goes through an association table, so the rows carry no "
+            f"column tying them to one parent and the batcher cannot collapse "
+            f"the per-parent queries. The field would cost a query per parent "
+            f"row; write it as orm.field.lazy instead."
+        )
+    keys = _join_keys(rel)
+    if keys is None:
+        raise ValueError(
+            f"{view} joins on more than one column, or its primaryjoin says more "
+            f"than the key comparison, so a query built from its key would list "
+            f"rows the relation does not. Write it as orm.field.lazy instead."
+        )
+    if not rel.uselist:
+        raise ValueError(
+            f"{view} is a to-one relation, and the batcher collapses only lists "
+            f"keyed on the parent, so the field would cost a query per parent "
+            f"row; write it as orm.field.lazy instead."
+        )
+    parent_column, related_column, _link = keys
+    parent_key = mapper.get_property_by_column(parent_column).key
+    if (
+        len(mapper.primary_key) != 1
+        or mapper.get_property_by_column(mapper.primary_key[0]).key != parent_key
+    ):
+        raise ValueError(
+            f"{view} joins on {parent_model.__name__}.{parent_key} rather than "
+            f"on {parent_model.__name__}'s primary key alone, and the batcher "
+            f"collapses the per-parent queries by primary key. The field would "
+            f"cost a query per parent row; write it as orm.field.lazy instead."
         )
 
     # The batcher collapses these by rewriting ``fk = <pk>`` into
     # ``fk IN (...)``, and only recognises that predicate with the column on
     # the left. with_parent() emits it the other way round, which reads
     # identically in SQL but silently costs a query per parent.
-    fk_column = pairs[0][1]
     rel_model = backend._relation_target_model(parent_model, relation)
 
     def resolver(self: Any, info: Any) -> Any:
         from sqlalchemy import select
 
-        stmt = select(rel_model).where(fk_column == backend.instance_pk(self))
+        stmt = select(rel_model).where(related_column == getattr(self, parent_key))
         restrict = backend.relation_scope(parent_model, field_name, info, on=relation)
         return stmt if restrict is None else restrict(stmt, info)
 
@@ -2818,6 +2954,13 @@ def _read_entity(entity: Any) -> tuple[Any, Any]:
     return found.mapper.class_, entity
 
 
+def _returned_as_themselves(mapper: Any) -> set[Any]:
+    """The mappers whose rows a read of *mapper* hands back as their own class."""
+    if mapper.polymorphic_on is None:
+        return set()
+    return set(mapper.polymorphic_map.values())
+
+
 def _get_sa_pk_column(model: type) -> Any:
     """Return the primary-key column attribute for scoped queries."""
     from sqlalchemy import inspect as sa_inspect
@@ -2848,6 +2991,45 @@ def _whole_key_in(keys: list[Any], rows: Any) -> Any:
     if len(keys) == 1:
         return keys[0].in_(rows)
     return tuple_(*keys).in_(rows)
+
+
+def _options_signature(query: Any) -> tuple[Any, ...] | None:
+    """What *query*'s loader and execution options say, to compare it by.
+
+    Neither is in the compiled SQL: a loader option shapes the loads that
+    follow, and a ``do_orm_execute`` hook can read either to change what the
+    statement reads. A loader option is compared by its cache key and the
+    values it binds; ``None`` for one without a cache key, such as a
+    ``UserDefinedOption``, which leaves nothing to compare it by.
+    """
+    loaders = []
+    for option in query._with_options:
+        generate = getattr(option, "_generate_cache_key", None)
+        key = generate() if generate is not None else None
+        if key is None:
+            return None
+        bound = tuple(_signed(bind.effective_value) for bind in key.bindparams)
+        loaders.append((key.key, bound))
+    execution = tuple(
+        (name, _signed(value))
+        for name, value in sorted(query.get_execution_options().items())
+    )
+    return tuple(loaders), execution
+
+
+def _signed(value: Any) -> Any:
+    """*value* as a signature compares it: plain data by type and value.
+
+    Anything else is compared by identity, which the statement holding it
+    keeps from being reused while siblings are compared.
+    """
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return type(value).__name__, repr(value)
+    if isinstance(value, dict):
+        return "dict", tuple(
+            sorted(((_signed(k), _signed(v)) for k, v in value.items()), key=repr)
+        )
+    return "object", id(value)
 
 
 def _missing_pk(order_clauses: Any, entity: Any) -> list[Any]:
@@ -2908,21 +3090,32 @@ def _database_errors(refused: str = _READ_REFUSED) -> Generator[None]:
     ``StatementError`` covers the driver's errors and SQLAlchemy's own, such
     as a value the column's type cannot bind; each carries the statement.
     A statement SQLAlchemy cannot compile raises before it has one, with a
-    message that describes the statement all the same.
+    message that describes the statement all the same, and so does a flush
+    that cannot write the rows as they were left (``StaleDataError``, or an
+    ``AssertionError`` blanking out a key column). The driver raises
+    ``OverflowError`` for an integer its column type cannot hold.
     """
-    from sqlalchemy.exc import (
-        ArgumentError,
-        CompileError,
-        InvalidRequestError,
-        StatementError,
-    )
+    from sqlalchemy.exc import SQLAlchemyError, StatementError
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
     try:
         yield
     except StatementError as exc:
         raise _sanitized(exc, refused) from exc
-    except (ArgumentError, CompileError, InvalidRequestError) as exc:
+    except PoolTimeoutError as exc:
+        raise ConnectionError("Database connection failed") from exc
+    except (SQLAlchemyError, OverflowError) as exc:
         raise ValueError(refused) from exc
+    except AssertionError as exc:
+        if not _raised_by_sqlalchemy(exc):
+            raise
+        raise ValueError(refused) from exc
+
+
+def _raised_by_sqlalchemy(exc: BaseException) -> bool:
+    """True for an error SQLAlchemy raised itself, not code it called."""
+    *_, (frame, _line) = traceback.walk_tb(exc.__traceback__)
+    return str(frame.f_globals.get("__name__")).startswith("sqlalchemy.")
 
 
 def _sanitizing(work: Callable[..., Any], *args: Any) -> Any:
@@ -2936,8 +3129,14 @@ def _first_appearances_page(query: Any, offset: int, limit: int) -> Any | None:
     Rows are read with ``.unique()``, which keeps each entity where its first
     row is. Each entity is numbered by that row, so the page counts entities,
     not the rows the join makes of them. ``None`` for a statement whose
-    entities cannot be numbered this way: one with a second FROM, more than
-    one entity, or loader options that may lean on the join.
+    entities cannot be numbered this way: one with a second FROM or more than
+    one entity.
+
+    The criteria of a ``with_loader_criteria`` go on the page's statement,
+    where SQLAlchemy applies them to the numbered rows too. Other loader
+    options may lean on the join (``contains_eager``), so with one the page is
+    *query* itself, narrowed to the entities numbered onto the page, each read
+    with the rows the join makes of it.
     """
     from sqlalchemy import and_, func, select
 
@@ -2949,7 +3148,6 @@ def _first_appearances_page(query: Any, offset: int, limit: int) -> Any | None:
         mapper is None
         or len(query.column_descriptions) != 1
         or len(query.get_final_froms()) != 1
-        or query._with_options
     ):
         return None
     keys = [
@@ -2974,21 +3172,33 @@ def _first_appearances_page(query: Any, offset: int, limit: int) -> Any | None:
         .group_by(*(numbered.c[label] for label in labels))
         .subquery()
     )
-    page = (
-        select(entity)
-        .join(
-            firsts,
-            and_(
-                *(
-                    key == firsts.c[label]
-                    for key, label in zip(keys, labels, strict=True)
-                )
-            ),
+    if not _only_criteria(query):
+        on_page = (
+            select(*(firsts.c[label] for label in labels))
+            .order_by(firsts.c._orm_first)
+            .offset(offset)
+            .limit(limit)
         )
-        .order_by(firsts.c._orm_first)
-        .offset(offset)
-        .limit(limit)
-    )
+        page = query.where(_whole_key_in(keys, on_page)).order_by(
+            *_missing_pk(query._order_by_clauses, entity)
+        )
+    else:
+        page = _carrying(
+            select(entity)
+            .join(
+                firsts,
+                and_(
+                    *(
+                        key == firsts.c[label]
+                        for key, label in zip(keys, labels, strict=True)
+                    )
+                ),
+            )
+            .order_by(firsts.c._orm_first)
+            .offset(offset)
+            .limit(limit),
+            query,
+        )
     if query_is_scoped(query):
         mark_query_scoped(page)
     return page
@@ -3133,6 +3343,16 @@ def _carrying(outer: Any, *embedded: Any) -> Any:
                 held.add(id(option))
                 carried.append(option)
     return outer.options(*carried) if carried else outer
+
+
+def _only_criteria(stmt: Any) -> bool:
+    """Whether *stmt*'s options are only ``with_loader_criteria``, which load nothing."""
+    from sqlalchemy.orm.util import LoaderCriteriaOption
+
+    return all(
+        isinstance(option, LoaderCriteriaOption)
+        for option in getattr(stmt, "_with_options", ())
+    )
 
 
 def _liftable_criteria(scoped: Any, related: type, model: type) -> Any | None:

@@ -254,7 +254,7 @@ def test_a_child_models_row_is_found_for_a_write_through_its_parents_repo(articl
     hidden = schema.execute_sync(edit % "Pinned draft")
     assert hidden.data is None
     assert [error.message for error in hidden.errors or ()] == [
-        "No PinnedArticle matches {'title': 'Pinned draft'} and no create was sent"
+        "No PinnedType matches {'title': 'Pinned draft'} and no create was sent"
     ]
     assert dict(PinnedArticle.objects.values_list("title", "note")) == {
         "Pinned draft": "",

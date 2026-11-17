@@ -279,21 +279,19 @@ class AbstractTestRefListMembership(Blog):
 
     async def test_delete_refuses_a_tag_outside_the_relation(self, writes, blog, orm):
         ref = orm.ref(writes.m.Tag, unlink=True, delete=True)
-        with pytest.raises(UpsertNotFoundError, match=r"No Tag 2 in Post\.tags"):
+        with pytest.raises(UpsertNotFoundError, match=r"^No row 2 in tags$"):
             await writes.refs(orm, blog.hello, "tags", [item(ref, "delete", id="2")])
         assert await names(writes, blog.other, "tags") == ["rust"]
 
     async def test_unlink_refuses_a_tag_outside_the_relation(self, writes, blog, orm):
         ref = orm.ref(writes.m.Tag, unlink=True, delete=True)
-        with pytest.raises(UpsertNotFoundError, match=r"No Tag 2 in Post\.tags"):
+        with pytest.raises(UpsertNotFoundError, match=r"^No row 2 in tags$"):
             await writes.refs(orm, blog.hello, "tags", [item(ref, "unlink", id="2")])
         assert await names(writes, blog.other, "tags") == ["rust"]
 
     async def test_delete_refuses_a_comment_on_another_post(self, writes, blog, orm):
         ref = orm.ref(writes.m.Comment, delete=True)
-        with pytest.raises(
-            UpsertNotFoundError, match=r"No Comment 2 in Post\.comments"
-        ):
+        with pytest.raises(UpsertNotFoundError, match=r"^No row 2 in comments$"):
             await writes.refs(
                 orm, blog.hello, "comments", [item(ref, "delete", id="2")]
             )
@@ -304,9 +302,7 @@ class AbstractTestRefListMembership(Blog):
     ):
         ref = orm.ref(writes.m.Comment, unlink=True, delete=True)
         for operation in ("delete", "unlink"):
-            with pytest.raises(
-                UpsertNotFoundError, match=r"No Comment 4 in Comment\.replies"
-            ):
+            with pytest.raises(UpsertNotFoundError, match=r"^No row 4 in replies$"):
                 await writes.refs(
                     orm, blog.mine, "replies", [item(ref, operation, id="4")]
                 )
@@ -315,7 +311,7 @@ class AbstractTestRefListMembership(Blog):
     async def test_a_missing_row_is_refused_like_a_non_member(self, writes, blog, orm):
         ref = orm.ref(writes.m.Tag, unlink=True, delete=True)
         for operation in ("delete", "unlink"):
-            with pytest.raises(UpsertNotFoundError, match=r"No Tag 99 in Post\.tags"):
+            with pytest.raises(UpsertNotFoundError, match=r"^No row 99 in tags$"):
                 await writes.refs(
                     orm, blog.hello, "tags", [item(ref, operation, id="99")]
                 )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import warnings
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
@@ -19,7 +20,9 @@ from pydantic import ConfigDict
 from strawberry.types.graphql import OperationType
 
 from .checks import (
+    check_coercion,
     check_operation,
+    check_variables,
     exposed_schema,
     exposed_sdl,
     refuses_introspection,
@@ -32,6 +35,12 @@ ContextGetter = Callable[[Any], Any]
 _RUN_TOOL = "graphql"
 _SCHEMA_TOOL = "graphql_schema"
 
+_UNAUTHENTICATED_WARNING = (
+    "This MCP server's tools can change data, and it has no authentication: "
+    "anyone who can reach it over HTTP can call them. Pass token_verifier= and "
+    "auth= to mcp_server, or serve it behind authentication of your own."
+)
+
 
 @dataclass(frozen=True)
 class GraphQLTool:
@@ -40,17 +49,24 @@ class GraphQLTool:
 
     Only queries run unless ``allow_mutations``. ``root_fields`` limits the
     root fields it may use, and the schema shows only those and the types
-    they reach. An operation must be a single operation of at most
-    ``max_tokens`` tokens and ``max_depth`` levels that passes validation,
-    may not select one field more than 20 times in one place of its result,
-    fragments included, and may not ask for ``__schema`` or ``__type``:
+    they reach, through any field that returns a root type too. An operation
+    must be a single operation of at most ``max_tokens`` tokens and
+    ``max_depth`` levels that passes validation, may not select one field
+    more than 20 times in one place of its result, nor more than
+    ``max_fields`` fields with each fragment counted wherever it is spread
+    and each alias counted, and may not ask for ``__schema`` or ``__type``:
     ``graphql_schema`` describes what it may use. ``descriptions=False``
-    leaves the schema's descriptions out of ``graphql_schema``.
+    leaves the schema's descriptions and deprecation reasons out of
+    ``graphql_schema``.
 
     ``schema_tool=False`` leaves ``graphql_schema`` out. A schema that refuses
     introspection (Strawberry's ``DisableIntrospection``) keeps its SDL from
     clients, so ``mcp_server`` will not hand it out unless ``schema_tool`` says
-    which: ``True`` gives every MCP client the SDL all the same.
+    which: ``True`` gives every MCP client the SDL all the same. Without
+    ``graphql_schema``, on a schema that refuses introspection, or with
+    ``StrawberryConfig(disable_field_suggestions=True)``, a refused
+    operation's errors suggest no names, and neither do those of variables
+    that do not fit the types it declares.
 
     The token limit is checked as the operation is parsed, before anything
     else reads it; the schema's own extensions, such as Strawberry's
@@ -66,6 +82,7 @@ class GraphQLTool:
     descriptions: bool = True
     max_tokens: int = 2_000
     schema_tool: bool | None = None
+    max_fields: int = 1_000
 
 
 def mcp_server(
@@ -77,6 +94,7 @@ def mcp_server(
     sync: bool | None = None,
     execute: Execute | None = None,
     name: str = "graphql",
+    max_variable_values: int = 10_000,
     **server_options: Any,
 ) -> MCPServer:
     """An MCP server whose tools are the operations in ``operations``.
@@ -106,12 +124,18 @@ def mcp_server(
     with a warning, while a mutation fails. ``execute(query, variables,
     context, allowed)`` replaces all of this with your own async executor.
 
+    A call's variables may hold at most ``max_variable_values`` values,
+    counting each object, list and scalar, nested at most 100 levels deep;
+    they are measured in a worker thread before GraphQL coerces them.
+
     A tool's result carries each error's message as raised, into the
     client's transcript; add Strawberry's ``MaskErrors`` to ``schema`` to
     mask the exceptions resolvers raise.
 
     ``server_options`` go to :class:`mcp.server.mcpserver.MCPServer`, for
-    example ``token_verifier``, ``auth`` and ``instructions``.
+    example ``token_verifier``, ``auth`` and ``instructions``. A server with
+    a mutation tool, or a ``graphql`` tool that may run mutations, warns
+    when it is built without ``auth``.
     """
     if operations is None and not graphql_tool:
         raise ValueError("Pass operations=, graphql_tool=, or both.")
@@ -133,21 +157,39 @@ def mcp_server(
             raise ValueError(
                 f"The operation names {taken} are taken by graphql_tool's tools."
             )
-    tools = [_operation_tool(op, executor, build_context) for op in stored]
+    tools = [
+        _operation_tool(op, executor, build_context, max_variable_values)
+        for op in stored
+    ]
     server = MCPServer(
         name, tools=[*server_options.pop("tools", ()), *tools], **server_options
     )
+    writes = any(op.kind is OperationType.MUTATION for op in stored)
     if graphql_tool:
         options = (
             graphql_tool if isinstance(graphql_tool, GraphQLTool) else GraphQLTool()
         )
-        if options.schema_tool is None and refuses_introspection(schema):
+        refuses = refuses_introspection(schema)
+        if options.schema_tool is None and refuses:
             raise ValueError(
                 "The schema refuses introspection, and graphql_schema would give "
                 "every MCP client its SDL. Pass GraphQLTool(schema_tool=True) to "
                 "give it all the same, or schema_tool=False to leave it out."
             )
-        _add_graphql_tools(server, schema._schema, options, executor, build_context)
+        exposed = _add_graphql_tools(
+            server,
+            schema._schema,
+            options,
+            executor,
+            build_context,
+            hide_suggestions=refuses
+            or options.schema_tool is False
+            or schema.config.disable_field_suggestions,
+            max_variable_values=max_variable_values,
+        )
+        writes = writes or exposed.mutation_type is not None
+    if writes and server_options.get("auth") is None:
+        warnings.warn(_UNAUTHENTICATED_WARNING, UserWarning, stacklevel=2)
     return server
 
 
@@ -164,6 +206,7 @@ def _operation_tool(
     operation: Operation,
     executor: Executor,
     build_context: Callable[[Context], Any],
+    max_variable_values: int,
 ) -> Tool:
     properties = operation.input_schema["properties"]
 
@@ -174,6 +217,11 @@ def _operation_tool(
         variables = {
             key: _parsed(value, properties[key]) for key, value in arguments.items()
         }
+        errors = await asyncio.to_thread(
+            check_variables, variables, max_values=max_variable_values
+        )
+        if errors:
+            raise ToolError("\n".join(errors))
         result = await executor.run(
             operation.document, variables, await build_context(ctx), {operation.kind}
         )
@@ -204,7 +252,12 @@ def _add_graphql_tools(
     options: GraphQLTool,
     executor: Executor,
     build_context: Callable[[Context], Any],
-) -> None:
+    *,
+    hide_suggestions: bool,
+    max_variable_values: int,
+) -> GraphQLSchema:
+    """Adds ``graphql`` and ``graphql_schema`` to *server*, and returns the
+    schema they show."""
     allowlist = None if options.root_fields is None else set(options.root_fields)
     if allowlist is not None:
         _check_root_fields(schema, allowlist, allow_mutations=options.allow_mutations)
@@ -216,24 +269,35 @@ def _add_graphql_tools(
     if options.allow_mutations:
         allowed.add(OperationType.MUTATION)
 
-    async def graphql(
-        query: str, ctx: Context, variables: dict[str, Any] | None = None
-    ) -> CallToolResult:
-        errors, kind = await asyncio.to_thread(
-            check_operation,
+    def check(
+        query: str, variables: dict[str, Any]
+    ) -> tuple[list[str], OperationType | None]:
+        errors, kind = check_operation(
             exposed,
             query,
             allowed=allowed,
             max_depth=options.max_depth,
             max_tokens=options.max_tokens,
+            max_fields=options.max_fields,
             schema_tool=schema_tool,
+            hide_suggestions=hide_suggestions,
         )
+        errors = errors or check_variables(variables, max_values=max_variable_values)
+        if not errors and hide_suggestions:
+            errors = check_coercion(exposed, query, variables)
+        return errors, kind
+
+    async def graphql(
+        query: str, ctx: Context, variables: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        variables = variables or {}
+        errors, kind = await asyncio.to_thread(check, query, variables)
         if errors:
             raise ToolError("\n".join(errors))
         assert kind is not None
         result = await executor.run(
             query,
-            variables or {},
+            variables,
             await build_context(ctx),
             {kind},
             prepare_off_loop=True,
@@ -263,7 +327,7 @@ def _add_graphql_tools(
         structured_output=False,
     )
     if not schema_tool:
-        return
+        return exposed
     sdl = exposed_sdl(exposed, descriptions=options.descriptions)
 
     def graphql_schema() -> str:
@@ -281,6 +345,7 @@ def _add_graphql_tools(
         ),
         structured_output=False,
     )
+    return exposed
 
 
 def _check_root_fields(

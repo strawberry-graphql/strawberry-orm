@@ -10,7 +10,16 @@ import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from graphql import GraphQLError, parse
+from graphql import (
+    FieldNode,
+    FragmentDefinitionNode,
+    FragmentSpreadNode,
+    GraphQLError,
+    InlineFragmentNode,
+    OperationDefinitionNode,
+    parse,
+    value_from_ast_untyped,
+)
 from mcp.server.mcpserver.exceptions import ToolError
 from strawberry import Schema
 from strawberry.extensions import SchemaExtension
@@ -34,6 +43,12 @@ _SYNC_MUTATION_ERROR = (
     "Pass sync=True to mcp_server."
 )
 
+_SYNC_MUTATION_STOPPED = (
+    "This mutation needs sync execution: SynchronousOnlyOperation stopped "
+    "{stopped}{after}, and a mutation is not run a second time. Pass sync=True "
+    "to mcp_server."
+)
+
 
 class Executor:
     """Runs operations with ``await schema.execute``, ``execute_sync`` in a
@@ -42,7 +57,8 @@ class Executor:
     With ``sync=None``, a query that Django refuses on the event loop is
     rerun with ``execute_sync``, which is then kept for every later call. A
     mutation is not rerun, since whatever it did before its first ORM call
-    would happen twice.
+    would happen twice; its result comes back with an error naming the root
+    field Django stopped and those that ran before it.
 
     ``prepare_off_loop=True`` has ``schema.execute`` parse and validate the
     operation in a worker thread, for one a client wrote; its resolvers
@@ -87,6 +103,8 @@ class Executor:
                 raise
             return await self._switch(query, variables, context, allowed)
         if self._sync is None and _result_has_sync_only_operation(result):
+            if allowed != {OperationType.QUERY}:
+                return _stopped(result, query, variables)
             return await self._switch(query, variables, context, allowed)
         return result
 
@@ -183,11 +201,85 @@ def _is_sync_only_operation(exc: BaseException) -> bool:
 
 def _result_has_sync_only_operation(result: Any) -> bool:
     """True when Strawberry wrapped a ``SynchronousOnlyOperation`` in *result*."""
+    return _sync_only_error(result) is not None
+
+
+def _sync_only_error(result: Any) -> GraphQLError | None:
+    """The first error in *result* that wraps a ``SynchronousOnlyOperation``."""
     for error in getattr(result, "errors", None) or ():
         original = getattr(error, "original_error", None)
         if original is not None and _is_sync_only_operation(original):
-            return True
-    return False
+            return error
+    return None
+
+
+def _stopped(result: Any, query: str, variables: dict[str, Any]) -> Any:
+    """*result* of a mutation ``SynchronousOnlyOperation`` stopped, with an
+    error naming the root field it stopped and those that ran before it.
+
+    A mutation's root fields run one after another, so those before it ran
+    whether or not the data shows them: a non-null field's error leaves
+    ``data`` empty.
+    """
+    error = _sync_only_error(result)
+    assert error is not None
+    stopped = error.path[0] if error.path else None
+    keys = _root_fields(query, variables)
+    ran = keys[: keys.index(stopped)] if stopped in keys else []
+    after = f", after {', '.join(ran)} had run" if ran else ""
+    hint = _SYNC_MUTATION_STOPPED.format(stopped=stopped or "it", after=after)
+    result.errors = [*result.errors, GraphQLError(hint)]
+    return result
+
+
+def _root_fields(query: str, variables: dict[str, Any]) -> list[str]:
+    """The response keys of the root fields of *query*'s operation, in the
+    order they run, less those ``@skip`` or ``@include`` leaves out."""
+    document = parse(query)
+    [operation] = [
+        d for d in document.definitions if isinstance(d, OperationDefinitionNode)
+    ]
+    fragments = {
+        d.name.value: d
+        for d in document.definitions
+        if isinstance(d, FragmentDefinitionNode)
+    }
+    values = {
+        d.variable.name.value: value_from_ast_untyped(d.default_value)
+        for d in operation.variable_definitions or ()
+        if d.default_value is not None
+    }
+    values.update(variables)
+    keys: list[str] = []
+    spread: set[str] = set()
+    pending = list(reversed(operation.selection_set.selections))
+    while pending:
+        selection = pending.pop()
+        if not _included(selection, values):
+            continue
+        if isinstance(selection, FieldNode):
+            key = (selection.alias or selection.name).value
+            if key not in keys:
+                keys.append(key)
+        elif isinstance(selection, InlineFragmentNode):
+            pending.extend(reversed(selection.selection_set.selections))
+        elif selection.name.value not in spread:
+            spread.add(selection.name.value)
+            fragment = fragments[selection.name.value]
+            pending.extend(reversed(fragment.selection_set.selections))
+    return keys
+
+
+def _included(
+    node: FieldNode | InlineFragmentNode | FragmentSpreadNode, values: dict[str, Any]
+) -> bool:
+    for directive in node.directives or ():
+        name = directive.name.value
+        if name in ("skip", "include") and value_from_ast_untyped(
+            directive.arguments[0].value, values
+        ) is (name == "skip"):
+            return False
+    return True
 
 
 def _django_close_old_connections() -> Callable[[], None]:

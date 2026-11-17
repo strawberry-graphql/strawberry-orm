@@ -553,7 +553,7 @@ class AbstractTestForwardLinks(Fixtures):
             'mutation { address(input: { where: { line1: "1 Main" } create: {'
             ' person: { upsert: { where: { id: "abc" } } } } }) }'
         )
-        assert "'abc' is not a valid Person id" in str(error)
+        assert "'abc' is not a valid id" in str(error)
 
     async def test_a_link_on_a_matched_row_is_rejected(self, db, ada):
         await db.create(db.m.Address, id=1, line1="1 Main", person=ada)
@@ -626,7 +626,7 @@ class AbstractTestValidation(Fixtures):
             }) }"""
         )
         assert isinstance(error, UpsertValidationError)
-        assert "Person appears 3 times" in str(error)
+        assert "PersonNode appears 3 times" in str(error)
         assert db.statements == []
 
     async def test_the_depth_limit_allows_its_own_depth(self, db):

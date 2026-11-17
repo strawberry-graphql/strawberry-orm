@@ -1056,11 +1056,12 @@ class MutationNamespace:
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         relation_specs = self._relation_specs(model)
+        generic_keys = self._backend._generic_key_columns(model)
         excluded_scalar_fields = {
             spec.fk_column
             for spec in relation_specs.values()
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
-        } | self._backend._generic_key_columns(model)
+        } | generic_keys
         pk_names = self._backend._get_pk_names(model)
         allowed_scalars = None if op_fields.fields is None else set(op_fields.fields)
         hidden = self._hidden_fields(model)
@@ -1109,8 +1110,21 @@ class MutationNamespace:
                         f"reads leaves it writable unless the input leaves the "
                         f"relation out too; remove '{field_name}' from the project."
                     )
-                if leaked or self._backend._exclude_generated_sensitive_field(
-                    field_name, named
+                generic = self._written_by(spec) & generic_keys
+                if generic and named is not None:
+                    raise ValueError(
+                        f"The project for {model.__name__} names the relation "
+                        f"'{field_name}', which sets {sorted(generic)}, the "
+                        f"content type of a generic foreign key. Re-pointed, it "
+                        f"would read the key as a row of another model, which no "
+                        f"repo is asked about; remove '{field_name}' from the project."
+                    )
+                if (
+                    leaked
+                    or generic
+                    or self._backend._exclude_generated_sensitive_field(
+                        field_name, named
+                    )
                 ):
                     continue
                 relations[field_name] = spec

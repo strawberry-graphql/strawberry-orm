@@ -876,7 +876,7 @@ class _AutoField:
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
         field = strawberry.field(
-            resolver=resolver,
+            resolver=converting_resolver(self._backend, resolver),
             description=self._description,
             deprecation_reason=self._deprecation_reason,
             metadata=self.metadata,
@@ -1607,6 +1607,7 @@ class StrawberryORM:
         """
         from strawberry_orm.optimizer.extension import (
             _mark_prepared,
+            rows_in,
             scope_then_load,
         )
         from strawberry_orm.optimizer.selections import narrow_info
@@ -1637,7 +1638,9 @@ class StrawberryORM:
         if self._backend.is_model_instance(data):
             instances = [data]
         elif isinstance(data, list):
-            instances = [item for item in data if self._backend.is_model_instance(item)]
+            instances = [
+                item for item in rows_in(data) if self._backend.is_model_instance(item)
+            ]
             if not instances:
                 return data
         else:

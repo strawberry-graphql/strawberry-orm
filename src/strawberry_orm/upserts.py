@@ -17,7 +17,7 @@ import inspect
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from functools import cache
-from typing import Any
+from typing import Any, NoReturn
 
 import strawberry
 from strawberry.relay import GlobalID
@@ -27,6 +27,8 @@ from strawberry_orm.repo import AbstractRepo, _allows, _require
 
 _OPERATIONS = ("create", "update", "upsert", "unlink", "delete")
 _PLAIN_OPERATIONS = ("create", "update", "unlink", "delete")
+#: The ``on_after_*`` hooks a repo inherits, which do nothing.
+_NO_AFTER_HOOK = (AbstractRepo.on_after_create, AbstractRepo.on_after_update)
 
 Steps = Generator[Any, Any, Any]
 
@@ -248,10 +250,15 @@ class UpsertWriter:
         A check later in the same write can still refuse it and roll it back,
         and the side effects the hooks are for cannot be rolled back with it.
         """
-        self._after.append((hook, instance))
+        if getattr(hook, "__func__", None) not in _NO_AFTER_HOOK:
+            self._after.append((hook, instance))
 
     def _run_after_hooks(self) -> Steps:
         after, self._after = self._after, []
+        if after:
+            # The database checks some of the write only as it is flushed or
+            # committed, which would be after the hooks.
+            yield self._ops.check_constraints()
         for hook, instance in after:
             yield hook(instance, self._info)
 
@@ -263,8 +270,8 @@ class UpsertWriter:
         visits = path.count(model) + 1
         if max_visits is not None and visits > max_visits:
             raise UpsertValidationError(
-                f"{model.__name__} appears {visits} times on one nesting path; "
-                f"its projection allows at most {max_visits} (maxVisits)"
+                f"{self._called(model, 'One type')} appears {visits} times on one "
+                f"nesting path; its projection allows at most {max_visits} (maxVisits)"
             )
         return (*path, model)
 
@@ -285,8 +292,8 @@ class UpsertWriter:
         if _is_set(update):
             if policy["on_match"] != "UPDATE":
                 raise UpsertValidationError(
-                    f"{_type_name(cls)} takes no update: matched "
-                    f"{model.__name__} rows are not modified"
+                    f"{_type_name(cls)} takes no update: a matched "
+                    f"{self._called(model, 'row')} is not modified"
                 )
             _expect(update, fields["update"])
             self._validate_model_input(update, fields["update"], path, parent)
@@ -303,8 +310,8 @@ class UpsertWriter:
                 if name not in creatable:
                     raise UpsertValidationError(
                         f"{_type_name(cls)}: where.{name} cannot be sent with "
-                        f"create, because a new {model.__name__} would be "
-                        f"written with it and create does not allow {name}"
+                        f"create, because a new {self._called(model, 'row')} would "
+                        f"be written with it and create does not allow {name}"
                     )
                 sent = getattr(create, name, strawberry.UNSET)
                 if sent is not strawberry.UNSET and sent != value:
@@ -327,7 +334,7 @@ class UpsertWriter:
                 ):
                     raise UpsertValidationError(
                         f"{_type_name(cls)}.{attr} cannot be set: the row is nested "
-                        f"under {parent.model.__name__}.{parent.spec.name}"
+                        f"under {self._relation(parent)}"
                     )
 
         fields = _declared_fields(cls)
@@ -383,17 +390,15 @@ class UpsertWriter:
                 self._validate_unlink(model, parent)
 
     def _validate_unlink(self, model: type, parent: _Parent) -> None:
+        unlinked, relation = self._called(model, "A row"), self._relation(parent)
         if parent.spec.deletes_orphans:
             raise UpsertValidationError(
-                f"{model.__name__} cannot be unlinked from "
-                f"{parent.model.__name__}.{parent.spec.name}: "
-                f"{parent.model.__name__}.{parent.spec.name} deletes the rows it "
-                f"lets go of, so send delete instead"
+                f"{unlinked} cannot be unlinked from {relation}: {relation} "
+                f"deletes the rows it lets go of, so send delete instead"
             )
         if parent.spec.relation_mode == "reverse_fk" and not parent.spec.nullable:
             raise UpsertValidationError(
-                f"{model.__name__} cannot be unlinked from "
-                f"{parent.model.__name__}.{parent.spec.name}: its foreign key "
+                f"{unlinked} cannot be unlinked from {relation}: its foreign key "
                 f"is not nullable"
             )
 
@@ -419,7 +424,10 @@ class UpsertWriter:
     def _pk(self, raw: Any, model: type) -> Any:
         """Accept a raw primary key or a Relay global ID for *model*."""
         if raw is None:
-            raise UpsertValidationError(f"A {model.__name__} id cannot be null")
+            named = self._backend.type_name_of(model)
+            raise UpsertValidationError(
+                f"A {named} id cannot be null" if named else "An id cannot be null"
+            )
         if isinstance(raw, str):
             try:
                 global_id = GlobalID.from_id(raw)
@@ -433,9 +441,18 @@ class UpsertWriter:
                 elif owner is not None:
                     raise UpsertValidationError(
                         f"{raw!r} is a global ID for {global_id.type_name}, "
-                        f"not {model.__name__}"
+                        f"not {self._called(model, 'the type this id is for')}"
                     )
         return self._ops.coerce_pk(model, raw)
+
+    def _called(self, model: type, otherwise: str) -> str:
+        """What a client calls *model*'s rows, or *otherwise* if no type says."""
+        return self._backend.type_name_of(model) or otherwise
+
+    def _relation(self, parent: _Parent) -> str:
+        """*parent*'s relation, named after the type a client knows its rows by."""
+        named = self._backend.type_name_of(parent.model)
+        return f"{named}.{parent.spec.name}" if named else parent.spec.name
 
     # -- Writes ----------------------------------------------------------------
 
@@ -449,20 +466,47 @@ class UpsertWriter:
         return self._repos[model]
 
     def _owner(self, model: type, row: Any) -> type:
-        """The model whose repo governs *row*, a row read as a *model* row.
+        """The model whose repo governs *row*, a row read as a *model* row."""
+        return self._owner_of(model, type(row))
+
+    def _owner_of(self, model: type, row_model: type) -> type:
+        """The model whose repo governs a *row_model* row, read as a *model* row.
 
         A row of a subclass is its own model's, unless that model's repo is
         *model*'s exactly: the same class, for the same model. One repo class
         registered for both, or the one ``policy=`` makes, can answer for
         each model differently, so its ``self.model`` must be the row's.
         """
-        row_model = type(row)
         if row_model is model:
             return model
         mine, base = self._repo(row_model), self._repo(model)
         if type(mine) is type(base) and mine.model is base.model:
             return model
         return row_model
+
+    def _row_model(self, model: type, row: Any) -> Generator[Any, Any, type | None]:
+        """The model *row*, read as a *model* row, is a row of.
+
+        A Django multi-table child, or a SQLAlchemy joined-table subclass
+        without a discriminator, reads as a row of its base, and only its own
+        table holds it apart. Where such a subclass has a repo of its own, a
+        row its table holds is its own: the deepest such subclass's. ``None``
+        when two of them, neither inheriting the other, hold it, so no one
+        repo can answer for it.
+        """
+        loaded = type(row)
+        apart = self._backend.classes_written_apart(
+            self._repo(model), self._backend.subclasses_read_as_base(loaded)
+        )
+        if not apart:
+            return loaded
+        holders = yield self._ops.holders(row, list(apart))
+        if not holders:
+            return loaded
+        deepest = max(holders, key=lambda holder: len(holder.__mro__))
+        if all(issubclass(deepest, holder) for holder in holders):
+            return deepest
+        return None
 
     def _owned(self, model: type, row: Any) -> Generator[Any, Any, tuple[type, Any]]:
         """*row*, read through *model*'s repo, and the model whose repo owns it.
@@ -472,31 +516,37 @@ class UpsertWriter:
         """
         if row is None:
             return model, None
-        owner = self._owner(model, row)
+        row_model = yield from self._row_model(model, row)
+        if row_model is None:
+            return model, None
+        owner = self._owner_of(model, row_model)
         if owner is model:
             return model, row
         pk = self._ops.pk_value(row)
         return owner, (yield self._ops.get(self._repo(owner), owner, pk))
 
-    def _get(
-        self, model: type, pk: Any, action: str | None = None
-    ) -> Generator[Any, Any, tuple[type, Any]]:
-        """The *model* row *pk* names, if the repos let the caller see it, and its owner.
+    def _as_own(self, model: type, row: Any) -> Generator[Any, Any, tuple[type, Any]]:
+        """*row*, read off a link to *model*, as a row of its own model, and that model.
 
-        ``authorize`` was asked about *action* on a *model* row before the row
-        was read. A row of a subclass is asked about again as its own model's,
-        and reads as absent if that is denied.
+        Read off the link, no repo narrowed it, and none narrows it here.
         """
+        row_model = yield from self._row_model(model, row)
+        if row_model is None:
+            raise PermissionError(
+                f"The {self._called(model, 'row')} the link held is a row of more "
+                f"than one subclass with a repo of its own, so none can let it go"
+            )
+        if row_model is not type(row):
+            unscoped = AbstractRepo(self._backend)
+            unscoped.model = row_model
+            pk = self._ops.pk_value(row)
+            row = yield self._ops.get(unscoped, row_model, pk)
+        return self._owner_of(model, row_model), row
+
+    def _get(self, model: type, pk: Any) -> Generator[Any, Any, tuple[type, Any]]:
+        """The *model* row *pk* names, if the repos let the caller see it, and its owner."""
         row = yield self._ops.get(self._repo(model), model, pk)
-        owner, row = yield from self._owned(model, row)
-        if (
-            row is not None
-            and action is not None
-            and type(row) is not model
-            and not (yield from self._authorized(action, type(row), pk))
-        ):
-            return owner, None
-        return owner, row
+        return (yield from self._owned(model, row))
 
     def _check_repo(self, model: type, method: str, *args: Any) -> Steps:
         allowed = yield getattr(self._repo(model), method)(*args, self._info)
@@ -510,9 +560,33 @@ class UpsertWriter:
 
     def _check_authorize(self, action: str, model: type, pk: Any) -> Steps:
         if not (yield from self._authorized(action, model, pk)):
-            raise PermissionError(
-                f"authorize denied the {action} operation on {model.__name__}"
-            )
+            self._authorize_denied(action, model)
+
+    def _authorize_denied(self, action: str, model: type) -> NoReturn:
+        named = self._backend.type_name_of(model)
+        on = f" on {named}" if named else ""
+        raise PermissionError(f"authorize denied the {action} operation{on}")
+
+    def _denied(
+        self, action: str, model: type, row: Any
+    ) -> Generator[Any, Any, type | None]:
+        """The model ``authorize`` denies *action* on *row* as, a row read as *model*'s.
+
+        Asked once the row is read, so it is told the key as the row stores
+        it, not the caller's spelling of it, which the database may match
+        regardless of case or padding; and never about a row the repos hide.
+        A row of a subclass is asked about again as its own model's.
+        """
+        pk = self._ops.pk_value(row)
+        for asked in dict.fromkeys((model, type(row))):
+            if not (yield from self._authorized(action, asked, pk)):
+                return asked
+        return None
+
+    def _check_allowed(self, action: str, model: type, row: Any) -> Steps:
+        denied = yield from self._denied(action, model, row)
+        if denied is not None:
+            self._authorize_denied(action, denied)
 
     def _upsert(
         self, payload: Any, cls: type, parent: _Parent | None
@@ -537,7 +611,8 @@ class UpsertWriter:
             create = getattr(payload, "create", strawberry.UNSET)
             if not _is_set(create):
                 raise UpsertNotFoundError(
-                    f"No {model.__name__} matches {where} and no create was sent"
+                    f"No {self._called(model, 'row')} matches {where} and no "
+                    f"create was sent"
                 )
             seed = {name: value for name, value in where.items() if name != "id"}
             created = yield from self._create(create, fields["create"], parent, seed)
@@ -636,12 +711,11 @@ class UpsertWriter:
                     if holder is not None and not self._same_row(holder, instance):
                         yield from self._check_taken(model, spec, holder, target)
                 if previous is not None:
+                    held_by, previous = yield from self._as_own(
+                        spec.related_model, previous
+                    )
                     yield from self._check_repo(
-                        self._owner(spec.related_model, previous),
-                        "can_unlink",
-                        instance,
-                        name,
-                        previous,
+                        held_by, "can_unlink", instance, name, previous
                     )
                     if spec.deletes_orphans:
                         yield from self._check_orphaned(spec.related_model, previous)
@@ -669,8 +743,8 @@ class UpsertWriter:
                 continue
             raise UpsertValidationError(
                 f"{_type_name(cls)}.{name} cannot be applied to a matched "
-                f"{type(instance).__name__}: forward links are only written when "
-                f"the row is created"
+                f"{self._called(type(instance), 'row')}: forward links are only "
+                f"written when the row is created"
             )
         yield from self._apply_to_many(instance, payload, cls, created=False)
 
@@ -707,8 +781,9 @@ class UpsertWriter:
             yield from self._check_link(parent, child)
         else:
             pk = self._pk(value.id, model)
-            yield from self._check_authorize(operation, model, pk)
-            yield from self._remove_member(parent, operation, pk, model)
+            owner, child = yield from self._member(parent, pk, model)
+            yield from self._check_allowed(operation, model, child)
+            yield from self._remove_member(parent, operation, owner, child)
             return
         yield self._ops.link(parent.instance, parent.spec, child)
 
@@ -730,10 +805,10 @@ class UpsertWriter:
         elif operation == "update":
             data = input_to_dict(value)
             pk = self._pk(data.pop("id"), model)
-            if not (yield from self._authorized("update", model, pk)):
-                return
-            owner, child = yield from self._get(model, pk, "update")
+            owner, child = yield from self._get(model, pk)
             if child is None:
+                return
+            if (yield from self._denied("update", model, child)) is not None:
                 return
             repo = self._repo(owner)
             data = yield repo.on_before_update(child, data, self._info)
@@ -746,9 +821,10 @@ class UpsertWriter:
                 self._after_write(repo.on_after_update, child)
         else:
             pk = self._pk(value.id, model)
-            if not (yield from self._authorized(operation, model, pk)):
+            owner, child = yield from self._member(parent, pk, model)
+            if (yield from self._denied(operation, model, child)) is not None:
                 return
-            yield from self._remove_member(parent, operation, pk, model)
+            yield from self._remove_member(parent, operation, owner, child)
             return
         yield self._ops.link(parent.instance, parent.spec, child)
 
@@ -807,8 +883,9 @@ class UpsertWriter:
         owner, visible = yield from self._get(model, self._ops.pk_value(holder))
         if visible is None:
             raise PermissionError(
-                f"{spec.related_model.__name__} {self._ops.pk_value(target)!r} "
-                f"cannot be taken from the {model.__name__} it is linked from"
+                f"{self._called(spec.related_model, 'Row')} "
+                f"{self._ops.pk_value(target)!r} cannot be taken from the "
+                f"{self._called(model, 'row')} it is linked from"
             )
         yield from self._check_repo(
             owner, "can_unlink", target, spec.taken_from, visible
@@ -816,19 +893,24 @@ class UpsertWriter:
         if spec.orphans_holder:
             yield from self._check_orphaned(owner, visible)
 
-    def _remove_member(
-        self, parent: _Parent, operation: str, pk: Any, model: type
-    ) -> Steps:
-        owner, child = yield from self._get(model, pk, operation)
+    def _member(
+        self, parent: _Parent, pk: Any, model: type
+    ) -> Generator[Any, Any, tuple[type, Any]]:
+        """The *model* row *pk* names in *parent*'s list, if the caller sees it, and its owner."""
+        owner, child = yield from self._get(model, pk)
         if child is not None:
             is_member = yield self._ops.is_member(parent.instance, parent.spec, child)
             if not is_member:
                 child = None
         if child is None:
             raise UpsertNotFoundError(
-                f"No {model.__name__} {pk!r} in "
-                f"{parent.model.__name__}.{parent.spec.name}"
+                f"No {self._called(model, 'row')} {pk!r} in {self._relation(parent)}"
             )
+        return owner, child
+
+    def _remove_member(
+        self, parent: _Parent, operation: str, owner: type, child: Any
+    ) -> Steps:
         if operation == "unlink":
             yield from self._check_repo(
                 owner, "can_unlink", parent.instance, parent.spec.name, child
@@ -867,11 +949,10 @@ class UpsertWriter:
         ``authorize`` that denies its deletion, leaves it unlinked but in place,
         and the caller is told nothing either way.
         """
-        pk = self._ops.pk_value(previous)
-        if not (yield from self._authorized("delete", model, pk)):
+        owner, visible = yield from self._get(model, self._ops.pk_value(previous))
+        if visible is None:
             return
-        owner, visible = yield from self._get(model, pk, "delete")
-        if visible is not None:
+        if (yield from self._denied("delete", model, visible)) is None:
             yield from self._delete_instance(owner, visible)
 
     def _check_orphaned(self, model: type, previous: Any) -> Steps:
@@ -881,25 +962,24 @@ class UpsertWriter:
         says, so it cannot be left in place: re-pointing the link is refused
         unless the caller could delete the target by its key.
         """
-        pk = self._ops.pk_value(previous)
-        yield from self._check_authorize("delete", model, pk)
-        owner, visible = yield from self._get(model, pk, "delete")
+        owner, visible = yield from self._get(model, self._ops.pk_value(previous))
         if visible is None:
             # The key is the row's, which the caller may not be able to read.
             raise PermissionError(
-                f"The {model.__name__} the link held would be deleted by "
-                f"re-pointing it, and cannot be deleted"
+                f"The {self._called(model, 'row')} the link held would be deleted "
+                f"by re-pointing it, and cannot be deleted"
             )
+        yield from self._check_allowed("delete", model, visible)
         yield from self._check_repo(owner, "can_delete", visible)
         yield self._repo(owner).on_before_delete(visible, self._info)
 
     def _update_by_id(self, payload: Any, cls: type) -> Steps:
         model = cls.__orm_model__  # type: ignore[attr-defined]
         pk = self._pk(payload.id, model)
-        yield from self._check_authorize("update", model, pk)
-        _owner, instance = yield from self._get(model, pk, "update")
+        _owner, instance = yield from self._get(model, pk)
         if instance is None:
-            raise UpsertNotFoundError(f"No {model.__name__} {pk!r}")
+            raise UpsertNotFoundError(f"No {self._called(model, 'row')} {pk!r}")
+        yield from self._check_allowed("update", model, instance)
         return (yield from self._update(instance, payload, cls))
 
     def _link_target(

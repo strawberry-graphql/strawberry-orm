@@ -392,6 +392,7 @@ def test_a_fragment_spread_many_times_is_measured_once():
         allowed={OperationType.QUERY},
         max_depth=2,
         max_tokens=2_000,
+        max_fields=1_000,
     )
     assert time.perf_counter() - started < 1
     assert (errors, kind) == ([], OperationType.QUERY)

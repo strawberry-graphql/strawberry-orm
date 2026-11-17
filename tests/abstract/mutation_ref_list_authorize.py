@@ -15,7 +15,7 @@ class AbstractTestRefListAuthorizeSync:
             """
             mutation {
                 setPostTags(
-                    postId: 3
+                    postId: 1
                     tags: [
                         { update: { id: "1" } }
                         { create: { name: "blocked-create" } }
@@ -30,7 +30,7 @@ class AbstractTestRefListAuthorizeSync:
             """,
         )
         assert result.errors is None
-        assert result.data == {"setPostTags": []}
+        assert result.data == {"setPostTags": [{"name": "python"}]}
 
         query_result = schema_execute(schema, "{ tags { name } }")
         assert query_result.errors is None
@@ -106,7 +106,7 @@ class AbstractTestRefListAuthorizeAsync:
             """
             mutation {
                 setPostTags(
-                    postId: 3
+                    postId: 1
                     tags: [
                         { update: { id: "1" } }
                         { create: { name: "blocked-create" } }
@@ -121,7 +121,7 @@ class AbstractTestRefListAuthorizeAsync:
             """,
         )
         assert result.errors is None
-        assert result.data == {"setPostTags": []}
+        assert result.data == {"setPostTags": [{"name": "python"}]}
 
         query_result = await schema_execute_async(schema, "{ tags { name } }")
         assert query_result.errors is None

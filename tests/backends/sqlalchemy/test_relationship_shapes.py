@@ -493,7 +493,7 @@ class TestForwardOneToOneLinks:
         who = "new profile" if create else "spare profile"
         payload = point(orm, Profile, PROFILE, who, "member", "2", create=create)
         with pytest.raises(
-            PermissionError, match="Member 2 cannot be taken from the Profile"
+            PermissionError, match="Row 2 cannot be taken from the row it is linked"
         ):
             await resolve(orm.apply_upsert(payload, db.info))
         assert ("can_unlink", "Victim", "profile", "their profile") not in calls
@@ -575,9 +575,7 @@ class TestPrimaryjoinMembership:
         ref = orm.ref(Task, unlink=True, delete=True)
         project = await self.project(db)
         for operation in ("delete", "unlink"):
-            with pytest.raises(
-                UpsertNotFoundError, match=r"No Task 2 in Project\.open_tasks"
-            ):
+            with pytest.raises(UpsertNotFoundError, match=r"^No row 2 in open_tasks$"):
                 await resolve(
                     orm.apply_ref_list(
                         project, "open_tasks", [item(ref, operation, id="2")], db.info
@@ -763,7 +761,7 @@ class TestOrphansGoAsDeletes:
         ref = orm.ref(Photo, unlink=True, delete=True)
         album = await resolve(db.session.get(Album, 1))
         with pytest.raises(
-            UpsertValidationError, match=r"Album\.photos deletes .* send delete"
+            UpsertValidationError, match=r"from photos: photos deletes .* send delete"
         ):
             await resolve(
                 orm.apply_ref_list(
@@ -789,7 +787,7 @@ class TestOrphansGoAsDeletes:
         with pytest.raises(PermissionError) as refused:
             await resolve(orm.apply_upsert(self.repoint(orm), db.info))
         assert str(refused.value) == (
-            "The Badge the link held would be deleted by re-pointing it, and "
+            "The row the link held would be deleted by re-pointing it, and "
             "cannot be deleted"
         )
         assert calls == []
@@ -849,7 +847,7 @@ class TestManyToManyOrphans:
 
     async def test_unlinking_from_it_is_refused(self, db):
         with pytest.raises(
-            UpsertValidationError, match=r"Shelf\.books deletes .* send delete"
+            UpsertValidationError, match=r"from books: books deletes .* send delete"
         ):
             await self.edit(db, new_orm(), "unlink")
         assert await shelved(db) == SHELVED

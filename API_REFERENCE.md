@@ -384,7 +384,7 @@ Contradictory keys raise `ValueError` when the input is built, as does naming a 
 orm.apply_upsert(input, info, *, authorize=None) -> instance
 ```
 
-Executes an input built by `upsert_node_input()` as one unit of work and returns the matched or created row. The unit is a savepoint of the SQLAlchemy session, `transaction.atomic()` on Django, or `in_transaction()` on Tortoise. Awaitable on an async SQLAlchemy session, in an async Django context, and always on Tortoise. Raises `UpsertValidationError` (a `ValueError`) before writing when the payload breaks its projection, `UpsertNotFoundError` (a `LookupError`) when an upsert without `create` or an `id` names no row, and `PermissionError` on any denial. See [Applying an upsert](README.md#applying-an-upsert).
+Executes an input built by `upsert_node_input()` as one unit of work and returns the matched or created row. The unit is a savepoint of the SQLAlchemy session, `transaction.atomic()` on the database Django's router writes to, or `in_transaction()` on the connection Tortoise's router writes to. Awaitable on an async SQLAlchemy session, in an async Django context, and always on Tortoise. Raises `UpsertValidationError` (a `ValueError`) before writing when the payload breaks its projection, `UpsertNotFoundError` (a `LookupError`) when an upsert without `create` or an `id` names no row, and `PermissionError` on any denial. See [Applying an upsert](README.md#applying-an-upsert).
 
 ### `AbstractRepo`
 
@@ -423,7 +423,7 @@ The writes create, load, save and delete rows through `_create`, `_get`, `_save`
 orm.optimize(data, info, *, at: str | Sequence[str] | None = None) -> Any
 ```
 
-Eager-load what the current selection needs from rows already in memory. Rarely needed: a resolver's return value is optimized automatically, including rows under a payload's `data`. Accepts a query object, a model instance, or a list, and returns anything else untouched. Instances are checked against `scope_rows` first: the result leaves out rows the scope rejects, and is `None` for a single rejected instance. `at` re-roots the selection when the rows sit below the resolved field. Awaitable on async backends. See [Rows a resolver already fetched](README.md#rows-a-resolver-already-fetched).
+Eager-load what the current selection needs from rows already in memory. Rarely needed: a resolver's return value is optimized automatically, including rows under a payload's `data`. Accepts a query object, a model instance, or a list (lists nested in it included), and returns anything else untouched. Instances are checked against `scope_rows` first: the result leaves out rows the scope rejects, and is `None` for a single rejected instance. `at` re-roots the selection when the rows sit below the resolved field. Awaitable on async backends. See [Rows a resolver already fetched](README.md#rows-a-resolver-already-fetched).
 
 ```python
 orm.get_default_queryset(model) -> query

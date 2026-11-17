@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import statistics
 import sys
@@ -20,11 +21,11 @@ from strawberry.relay.fields import ConnectionExtension
 from strawberry.relay.types import Node
 from strawberry.relay.utils import (
     SliceMetadata,
-    should_resolve_list_connection_edges,
     to_base64,
 )
 from strawberry.types import Info
 from strawberry.types.base import StrawberryContainer, get_object_definition
+from strawberry.types.nodes import SelectedField
 
 from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.backends._base import (
@@ -34,12 +35,41 @@ from strawberry_orm.optimizer.extension import (
     get_configured_optimizer,
     optimize_query_nodes,
 )
+from strawberry_orm.optimizer.selections import selected_fields, selects_anywhere
 
 NodeType = TypeVar("NodeType", bound=relay.Node)
 
 #: Databases number rows with signed 64-bit integers, and a cursor can carry
 #: any number at all; nothing past this is sent as an offset or a limit.
 _LAST_POSITION = 2**63 - 1
+
+#: What Strawberry's ``ListConnection`` looks for below a connection before
+#: it builds edges.
+_EDGE_FIELDS = frozenset({"edges", "pageInfo"})
+
+
+def _edges_answered(info: Any) -> Any:
+    """A copy of *info* answering what ``ListConnection`` asks before building edges.
+
+    Strawberry asks by walking ``info.selected_fields`` for an ``edges`` or a
+    ``pageInfo``, which converts everything the connection selects, each
+    fragment spread anew: exponential in the depth of a query that repeats
+    its spreads. The copy's ``selected_fields`` holds only the answer, read
+    off the query.
+    """
+    if not isinstance(info, Info):
+        return info
+    edges = SelectedField(name="edges", directives={}, arguments={}, selections=[])
+    answered = copy.copy(info)
+    answered.selected_fields = [
+        SelectedField(
+            name=info.field_name,
+            directives={},
+            arguments={},
+            selections=[edges] if selects_anywhere(info, _EDGE_FIELDS) else [],
+        )
+    ]
+    return answered
 
 
 def _then[T](value: AwaitableOrValue[T], step: Callable[[T], Any]) -> Any:
@@ -690,7 +720,7 @@ class ORMListConnection(ORMConnection[NodeType]):
         def count() -> AwaitableOrValue[int | None]:
             return backend.count_query(query, info) if want_total else None
 
-        if not should_resolve_list_connection_edges(info):
+        if not selects_anywhere(info, _EDGE_FIELDS):
             # Strawberry builds no edges without edges or pageInfo selected.
             connection = cls._slice(_PageRows([], window.start), info=info, **args)
             return cls._finish_connection(connection, count(), info=info, **args)
@@ -776,8 +806,8 @@ class ORMListConnection(ORMConnection[NodeType]):
         return _then(optimize_query_nodes(page, info), finish)
 
     @classmethod
-    def _slice(cls, nodes: Any, **kwargs: Any) -> AwaitableOrValue[Any]:
-        return super().resolve_connection(nodes, **kwargs)
+    def _slice(cls, nodes: Any, *, info: Any, **kwargs: Any) -> AwaitableOrValue[Any]:
+        return super().resolve_connection(nodes, info=_edges_answered(info), **kwargs)
 
     @classmethod
     def _edge_type(cls) -> Any:
@@ -826,7 +856,9 @@ class ORMListConnection(ORMConnection[NodeType]):
         if getattr(nodes, "orm_offset", 0):
             nodes = _PageRows(nodes, nodes.orm_offset)
 
-        connection = super().resolve_connection(nodes, info=info, **kwargs)
+        connection = super().resolve_connection(
+            nodes, info=_edges_answered(info), **kwargs
+        )
 
         if inspect.isawaitable(connection):
 
@@ -1001,7 +1033,7 @@ def _items_arguments(info: Any) -> list[dict[str, Any]]:
 
     return [
         items.arguments
-        for connection in info.selected_fields
+        for connection in selected_fields(info)
         for groups in _selected_fields(connection)
         if groups.name == "groups"
         for items in _selected_fields(groups)

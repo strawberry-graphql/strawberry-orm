@@ -21,7 +21,6 @@ import re
 import threading
 from asyncio import ensure_future
 from inspect import isawaitable
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from graphql import GraphQLList, GraphQLNonNull, get_named_type, is_abstract_type
@@ -634,15 +633,10 @@ def _asks_of_the_whole_relation(info: Any) -> bool:
     Aggregates and groups are taken over each parent's whole relation, from
     the query the field's resolver builds; a windowed page hands it rows.
     """
-    from strawberry.types.nodes import convert_selections
-
     from strawberry_orm.backends._base import _selection_requests
 
-    selected = SimpleNamespace(
-        selected_fields=convert_selections(info, info.field_nodes)
-    )
     return any(
-        _selection_requests(selected, *path)
+        _selection_requests(info, *path)
         for path in (("aggregates",), ("groups",), ("pageInfo", "aggregates"))
     )
 

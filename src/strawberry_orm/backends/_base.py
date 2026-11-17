@@ -9,7 +9,7 @@ import inspect
 import re
 import typing
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -61,6 +61,20 @@ _NOT_FILTERING: Any = object()
 #: What a client is told when the database refuses a statement a write runs.
 #: Its own error names tables and columns, and can carry the row's values.
 WRITE_REFUSED = "The database refused the write"
+
+#: The integers a 64-bit key column holds, the widest any backend's driver binds.
+_KEY_RANGE = range(-(2**63), 2**63)
+
+
+def key_in_range(key: Any) -> Any:
+    """Return *key*, raising ``ValueError`` for an integer no key column holds.
+
+    The driver would fail to bind it, naming the column type it does not fit.
+    """
+    if isinstance(key, int) and key not in _KEY_RANGE:
+        raise ValueError(key)
+    return key
+
 
 #: While a filter is built, the name of the type its rows are read as; ``None``
 #: past an ``object:`` hop, where the type of the rows reached is not known.
@@ -604,15 +618,17 @@ class AggregateMeta:
 
 
 def _find_selection(info: Any, field_path: str) -> Any:
-    """Walk ``info.selected_fields`` to find a nested selection by dot-path.
+    """Walk what *info*'s field selects to find a nested selection by dot-path.
 
     Strawberry wraps the current field in ``info.selected_fields``, so
     the first entry is the field being resolved.  We unwrap that
     automatically when the first path component does not match the
     top-level field name.
     """
+    from strawberry_orm.optimizer.selections import selected_fields
+
     parts = field_path.split(".")
-    selections = info.selected_fields
+    selections = selected_fields(info)
 
     if (
         selections
@@ -901,6 +917,45 @@ class BaseBackend:
             repo.model = model
         return repo
 
+    def type_name_of(self, model: type) -> str | None:
+        """The name clients know *model*'s rows by, that of its one GraphQL type.
+
+        A model's class name is the app's own, not part of its schema. With no
+        type over the model, or more than one, no one name is the client's.
+        """
+        types = self._types_by_model.get(model, ())
+        if len(types) != 1:
+            return None
+        return types[0].__strawberry_definition__.name
+
+    def subclasses_read_as_base(self, model: type) -> list[type]:
+        """Subclasses of *model* whose rows a read of *model* hands back as its own.
+
+        Nothing in such a row says which subclass it belongs to but the
+        subclass's own table holding it, so a write reaching the row through
+        *model* looks there before it chooses the repo that owns it (see
+        ``UpsertWriter._row_model``).
+        """
+        return []
+
+    def classes_written_apart(
+        self, repo: Any, models: Iterable[type]
+    ) -> dict[type, Any]:
+        """Each of *models* whose rows a repo of its own writes, not *repo*.
+
+        One repo class registered for both, or the one ``policy=`` makes, still
+        writes apart when its ``self.model`` differs, since it can answer for
+        each model differently (see ``UpsertWriter._owner``).
+        """
+        apart: dict[type, Any] = {}
+        for model in models:
+            own = self.get_repo(model)
+            if own is not None and not (
+                type(own) is type(repo) and own.model is repo.model
+            ):
+                apart[model] = own
+        return apart
+
     # -- Upserts -------------------------------------------------------------
 
     def apply_upsert(
@@ -960,8 +1015,9 @@ class BaseBackend:
 
         if len(rows) > 1:
             raise UpsertValidationError(
-                f"The upsert where matches more than one {model.__name__}; "
-                f"match on fields that identify a single row"
+                f"The upsert where matches more than one "
+                f"{self.type_name_of(model) or 'row'}; match on fields that "
+                f"identify a single row"
             )
         return rows[0] if rows else None
 
@@ -1009,7 +1065,7 @@ class BaseBackend:
         pk_names = self._get_pk_names(model) if exclude_pk else set()
 
         fields_meta = self._introspect_model(model)
-        link_keys = self._link_key_columns(model)
+        link_keys = self._link_key_columns(model) | self._generic_key_columns(model)
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         for fname, ftype, is_relation, _rel_model in fields_meta:
@@ -1058,9 +1114,11 @@ class BaseBackend:
         }
 
     def _generic_key_columns(self, model: type) -> set[str]:
-        """Columns keying a row of whichever model another column names.
+        """Columns keying a row of whichever model another column names, and that column.
 
-        No relation reaches that row to ask its repo, so no input writes them.
+        No relation reaches that row to ask its repo, so no input writes them:
+        nor the link that sets the column naming the model, which would point
+        the key at another model's rows.
         """
         return set()
 
@@ -2349,7 +2407,9 @@ class BaseBackend:
 
         A query is scoped at most once. The optimizer and a resolver can both
         call this; the second call is a no-op so a scope that joins is not
-        applied twice.
+        applied twice. A query reading a subclass of *model* whose own type
+        scopes its rows is held to that scope as well, as the rows are read
+        as the subclass's.
         """
         if model is None:
             return query
@@ -2360,6 +2420,9 @@ class BaseBackend:
         get_qs = self._type_querysets.get(model)
         scoped = query if get_qs is None else get_qs(query, info)
         scoped = self._scope_subclass_rows(scoped, model, info)
+        apart = self._subclass_read_apart(query, model)
+        if apart is not None:
+            scoped = self._type_querysets.exact(apart)(scoped, info)
         # A scope that hands back what it was given (everything, for an admin)
         # leaves the caller's own object, which a module-level statement can
         # share with requests the scope would narrow. Scoping it again costs
@@ -2378,6 +2441,22 @@ class BaseBackend:
     def _scope_subclass_rows(self, query: Any, model: type, info: Any) -> Any:
         """*query* over *model*, less the rows of a subclass its own scope hides."""
         return query
+
+    def _subclass_read_apart(self, query: Any, model: type) -> type | None:
+        """The class scoping the rows *query* reads, where *model*'s does not.
+
+        A field over *model*'s type may return a query over a subclass, whose
+        rows are scoped by the subclass's own type when it has one. ``None``
+        when *model*'s scope covers them, or ``_scope_subclass_rows`` already
+        held them to theirs.
+        """
+        read = self.query_model(query)
+        if not isinstance(read, type) or read is model or not issubclass(read, model):
+            return None
+        owner = self._type_querysets.owner(read)
+        if owner in (None, self._type_querysets.owner(model)):
+            return None
+        return None if owner in self.classes_scoped_apart(model) else owner
 
     def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
         """Return the subset of *pks* ``scope_rows`` still allows.
@@ -2517,14 +2596,9 @@ class BaseBackend:
         if len(scopes) < 2:
             return scopes[0] if scopes else None
 
-        from strawberry_orm.fields import call_scope
+        from strawberry_orm.fields import every_scope
 
-        def every_scope(query: Any, info: Any) -> Any:
-            for scope in scopes:
-                query = call_scope(scope, query, info)
-            return query
-
-        return every_scope
+        return every_scope(scopes)
 
     def _reading_type_names(self, model: type, info: Any) -> list[str]:
         """The type *model*'s rows are read as outside a filter.
@@ -3310,7 +3384,37 @@ class BaseBackend:
         schema = getattr(graphql_resolve_info(info), "schema", None)
         field_type = child_field_type(schema, parent_type_name, field_name)
         name = registered_type_name(field_type, model, self._type_registry)
-        return name if name is not None else self._type_name_for_model(model)
+        return name if name is not None else self._every_type_name(model)
+
+    def _every_type_name(self, model: type) -> str | None:
+        """A name for the hints of whichever type over *model* reads its rows.
+
+        Which one cannot be told, so under it each relation carries the
+        ``scope=`` of every one of them and loads only the rows all of them
+        allow. Its other hints are the first type's.
+        """
+        from strawberry_orm.fields import every_scope
+
+        names = self._type_names_of(model)
+        if len(names) < 2:
+            return next(iter(names), None)
+        hints = dict(self._store.hints.get(names[0], {}))
+        scopes: dict[str, list[Any]] = {}
+        for type_name in names:
+            for field_name, field_hints in self._store.hints.get(type_name, {}).items():
+                found = scopes.setdefault(field_name, [])
+                if field_hints.scope is not None and field_hints.scope not in found:
+                    found.append(field_hints.scope)
+        for field_name, found in scopes.items():
+            if found:
+                hints[field_name] = dataclasses.replace(
+                    hints.get(field_name) or FieldHints(),
+                    scope=found[0] if len(found) == 1 else every_scope(found),
+                )
+        # Not a GraphQL name, so it never stands for a type in the schema.
+        every = "|".join(names)
+        self._store.hints[every] = hints
+        return every
 
     def _resolved_type_name(self, model: type, info: Any) -> str | None:
         """Name of *model*'s type that the current field is being resolved on."""

@@ -66,11 +66,10 @@ class TestColumnOnlyRelations:
                 model=Person, project=NOTED_PERSON_WITH_KEY, name="KeyedPersonInput"
             )
 
-    def test_a_hand_written_input_keeps_the_key_column(self):
-        assert list(_declared_fields(ORM.input(Note, name="NoteFields"))) == [
-            "body",
-            "person_id",
-        ]
+    def test_a_hand_written_input_offers_the_key_column_only_when_named(self):
+        assert list(_declared_fields(ORM.input(Note, name="NoteFields"))) == ["body"]
+        named = ORM.input(Note, include=["body", "person_id"], name="NoteKeyFields")
+        assert list(_declared_fields(named)) == ["body", "person_id"]
 
 
 class TestColumnTypes:

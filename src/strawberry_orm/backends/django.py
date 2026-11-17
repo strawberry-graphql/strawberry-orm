@@ -36,6 +36,7 @@ from ._base import (
     extract_element_type,
     hint_hops,
     invoke_custom_callback,
+    key_in_range,
     model_is_type_of,
     past_a_hop,
     requested_aggregates,
@@ -215,11 +216,13 @@ class DjangoBackend(BaseBackend):
     def _generic_key_columns(self, model: type) -> set[str]:
         # contenttypes is not imported: an app without it installed has no
         # GenericForeignKey, and importing it would refuse to load.
-        return {
-            field.fk_field
-            for field in model._meta.private_fields  # type: ignore[attr-defined]
-            if hasattr(field, "ct_field") and hasattr(field, "fk_field")
-        }
+        meta = model._meta  # type: ignore[attr-defined]
+        columns: set[str] = set()
+        for field in meta.private_fields:
+            if hasattr(field, "ct_field") and hasattr(field, "fk_field"):
+                # The content type picks the model the key is read in.
+                columns |= {field.fk_field, meta.get_field(field.ct_field).attname}
+        return columns
 
     # -- Type generation -----------------------------------------------------
 
@@ -377,14 +380,16 @@ class DjangoBackend(BaseBackend):
         *,
         authorize: Any | None = None,
     ) -> Any:
-        from django.db import transaction
+        from django.db import router, transaction
 
         from strawberry_orm.upserts import run_sync as run_steps
 
         def apply() -> None:
             writer = self._ref_list_writer(instance, field, refs, info, authorize)
             spec = self._upsert_relation_spec(type(instance), field)
-            with _write_errors(), transaction.atomic(using=instance._state.db):
+            # The parent may have been read from a replica; the writes are not.
+            using = router.db_for_write(type(instance), instance=instance)
+            with _write_errors(), transaction.atomic(using=using):
                 run_steps(writer.apply_refs(instance, spec, refs))
 
         return run_sync(apply, thread_sensitive=True)
@@ -415,12 +420,52 @@ class DjangoBackend(BaseBackend):
 
         return _django_relation_specs(model)[field]
 
+    def subclasses_read_as_base(self, model: type) -> list[type]:
+        # A proxy shares its base's table, so nothing tells its rows apart.
+        found: list[type] = []
+        pending = list(model._meta.concrete_model.__subclasses__())  # type: ignore[attr-defined]
+        while pending:
+            sub = pending.pop(0)
+            pending.extend(sub.__subclasses__())
+            if not sub._meta.proxy and sub not in found:
+                found.append(sub)
+        return found
+
+    def _scope_subclass_writes(
+        self, rows: Any, repo: Any, model: type, info: Any
+    ) -> Any:
+        """*rows* of *model*, less the rows of a multi-table child its own repo hides.
+
+        Read through *model*, such a row comes back as a *model* row, yet it
+        is written through its own model's repo (see ``UpsertWriter._owner``),
+        so counting a match on one that repo hides would answer for a row the
+        caller cannot reach. A child of it with a repo of its own answers for
+        its own rows.
+        """
+        from django.db.models import Q
+
+        apart = self.classes_written_apart(repo, self.subclasses_read_as_base(model))
+        parent = model._meta.concrete_model  # type: ignore[attr-defined]
+        for cls, own in apart.items():
+            link = _parent_link(cls, parent)
+            shown = ~Q(pk__in=cls._base_manager.values(link)) | Q(
+                pk__in=own.scope_query(cls._default_manager.all(), info).values(link)
+            )
+            for other in apart:
+                if other is not cls and issubclass(other, cls):
+                    shown |= Q(
+                        pk__in=other._base_manager.values(_parent_link(other, parent))
+                    )
+            rows = rows.filter(shown)
+        return rows
+
     def _find_for_upsert(
         self, repo: Any, model: type, query: dict[str, Any], info: Any
     ) -> Any:
         rows = repo.scope_query(model._default_manager.all(), info).filter(
             **self._upsert_lookup_kwargs(query)
         )
+        rows = self._scope_subclass_writes(rows, repo, model, info)
         return self._single_upsert_match(model, list(rows[:2]))
 
     async def _find_for_upsert_async(
@@ -1116,7 +1161,7 @@ class DjangoBackend(BaseBackend):
         from strawberry_orm.optimizer.selections import (
             field_nodes_from_info,
             fragments_from_info,
-            iter_field_nodes,
+            merged_field_nodes,
         )
 
         def compute() -> tuple[list[str], list[Any]]:
@@ -1211,13 +1256,15 @@ class DjangoBackend(BaseBackend):
 
             def _plan_selection(
                 level: dict[str, _PlannedLookup],
-                selection_set: Any,
+                selection_sets: list[Any],
                 current_model: type,
                 type_name: str | None,
             ) -> None:
                 meta = current_model._meta  # type: ignore[attr-defined]
-                for node in iter_field_nodes(selection_set, fragments):
-                    field_name = _to_snake(node.name.value)
+                for name, nodes in merged_field_nodes(
+                    selection_sets, fragments
+                ).items():
+                    field_name = _to_snake(name)
 
                     # A on= field is served by a relation under another name,
                     # so ask the model about the relation, not the field.
@@ -1249,6 +1296,7 @@ class DjangoBackend(BaseBackend):
                     ):
                         continue
                     related_model = field_obj.related_model
+                    below = [node.selection_set for node in nodes if node.selection_set]
 
                     if kind == "many" and on is not None:
                         # to_attr keeps the two views apart: without it the
@@ -1271,13 +1319,13 @@ class DjangoBackend(BaseBackend):
                                 token=_edge_scope(type_name, field_name),
                             ),
                         )
-                        if node.selection_set:
+                        if below:
                             _plan_selection(
                                 view.children,
-                                node.selection_set,
+                                below,
                                 related_model,
                                 self._child_type_name(
-                                    type_name, node.name.value, related_model, info
+                                    type_name, name, related_model, info
                                 ),
                             )
                         continue
@@ -1285,13 +1333,13 @@ class DjangoBackend(BaseBackend):
                     lookup = _planned(
                         level, field_name, kind == "one", type_name, related_model
                     )
-                    if node.selection_set:
+                    if below:
                         child_type = self._child_type_name(
-                            type_name, node.name.value, related_model, info
+                            type_name, name, related_model, info
                         )
                         _plan_selection(
                             lookup.children,
-                            node.selection_set,
+                            below,
                             related_model,
                             child_type,
                         )
@@ -1340,11 +1388,12 @@ class DjangoBackend(BaseBackend):
                         _emit(lookup.children, path, True)
 
             root_type_name = self._selection_type_name(model, info)
-            for field_node in field_nodes_from_info(info):
-                if field_node.selection_set is not None:
-                    _plan_selection(
-                        plan, field_node.selection_set, model, root_type_name
-                    )
+            _plan_selection(
+                plan,
+                [node.selection_set for node in field_nodes_from_info(info)],
+                model,
+                root_type_name,
+            )
             _emit(plan, "", False)
 
             return select_related, prefetch_related
@@ -2123,6 +2172,9 @@ class _DjangoUpsertOps:
 
     def __init__(self, info: Any) -> None:
         self._info = info
+        #: The tables written on each database; ``None`` once a row was
+        #: deleted, which can leave its key behind in any table.
+        self._written: dict[str, set[str] | None] = {}
 
     # -- Repo-backed reads and writes ----------------------------------------
 
@@ -2132,14 +2184,50 @@ class _DjangoUpsertOps:
     def get(self, repo: Any, model: type, pk: Any) -> Any:
         return repo._get(model, pk, self._info)
 
+    def holders(self, row: Any, models: list[type]) -> list[type]:
+        """Those of *models*, multi-table children of *row*'s model, holding *row*."""
+        parent = type(row)._meta.concrete_model
+        return [
+            model
+            for model in models
+            if model._base_manager.using(row._state.db)
+            .filter(**{_parent_link(model, parent): row.pk})
+            .exists()
+        ]
+
     def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
-        return repo._create(model, data, self._info)
+        instance = repo._create(model, data, self._info)
+        self._wrote(instance)
+        return instance
 
     def save(self, repo: Any, instance: Any) -> None:
         repo._save(instance, self._info)
+        self._wrote(instance)
 
     def delete(self, repo: Any, instance: Any) -> None:
+        self._written[_written_db(instance)] = None
         repo._delete(instance, self._info)
+
+    def check_constraints(self) -> None:
+        """Check the foreign keys the database would check as it commits.
+
+        Django creates them deferred on SQLite and PostgreSQL, where a key
+        naming no row is refused only by the outermost commit.
+        """
+        from django.db import connections
+
+        for using, tables in self._written.items():
+            connection = connections[using]
+            if connection.features.can_defer_constraint_checks:
+                connection.check_constraints(None if tables is None else sorted(tables))
+
+    def _wrote(self, instance: Any) -> None:
+        tables = self._written.setdefault(_written_db(instance), set())
+        if tables is not None:
+            meta = instance._meta
+            tables.update(
+                model._meta.db_table for model in (meta.model, *meta.get_parent_list())
+            )
 
     # -- Relations -----------------------------------------------------------
 
@@ -2198,11 +2286,9 @@ class _DjangoUpsertOps:
         if not isinstance(value, str):
             return value
         try:
-            return model._meta.pk.to_python(value)  # type: ignore[attr-defined]
-        except ValidationError:
-            raise UpsertValidationError(
-                f"{value!r} is not a valid {model.__name__} id"
-            ) from None
+            return key_in_range(model._meta.pk.to_python(value))  # type: ignore[attr-defined]
+        except (ValidationError, ValueError):
+            raise UpsertValidationError(f"{value!r} is not a valid id") from None
 
     # -- Internals -----------------------------------------------------------
 
@@ -2257,6 +2343,14 @@ def _django_reference_key(model: type, rel_name: str) -> tuple[str, str] | None:
     ):
         return field.attname, field.target_field.name
     return None
+
+
+def _parent_link(model: type, parent: type) -> str:
+    """The lookup from a multi-table *model* to the key of *parent*, an ancestor."""
+    return "__".join(
+        path.join_field.name
+        for path in model._meta.get_path_to_parent(parent)  # type: ignore[attr-defined]
+    )
 
 
 def _django_to_many_link(model: type | None, rel_name: str) -> str | None:
@@ -3118,7 +3212,7 @@ def _read_errors(using: str | None = None) -> Any:
     )
 
     try:
-        with _refused_values(TypeError, AttributeError):
+        with _refused_values(TypeError, AttributeError, OverflowError):
             yield
     except Error as exc:
         raw = connections[using or DEFAULT_DB_ALIAS].connection
@@ -3151,6 +3245,12 @@ def _instance_db(instance: Any) -> str | None:
     return getattr(getattr(instance, "_state", None), "db", None)
 
 
+def _written_db(instance: Any) -> str:
+    from django.db import router
+
+    return instance._state.db or router.db_for_write(type(instance), instance=instance)
+
+
 def _listed(query: Any) -> list[Any]:
     with _read_errors(query.db):
         return list(query)
@@ -3166,11 +3266,12 @@ def _write_errors() -> Any:
     """Raise what a client may see in place of the database refusing a write.
 
     Django's error names the table and column, and on PostgreSQL the row's
-    values, so it is kept only as the cause, for the server log.
+    values, so it is kept only as the cause, for the server log. The driver
+    raises ``OverflowError`` for an integer its column type cannot hold.
     """
     from django.db import Error
 
     try:
         yield
-    except Error as exc:
+    except (Error, OverflowError) as exc:
         raise ValueError(WRITE_REFUSED) from exc

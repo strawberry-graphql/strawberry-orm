@@ -342,6 +342,7 @@ class AbstractRepo(Generic[M]):
             session = backend._get_session(info)
             if backend._is_async_session(session):
                 await session.delete(instance)
+                await session.flush()
                 return
 
         self._delete(instance, info)

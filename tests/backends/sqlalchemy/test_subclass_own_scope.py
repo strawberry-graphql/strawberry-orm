@@ -733,7 +733,7 @@ def test_a_subclass_row_its_own_repo_hides_cannot_be_deleted_through_the_base(
     deleted = 'mutation { editDocuments(documents: [{delete: {id: "3"}}]) }'
     result = schema.execute_sync(deleted, context_value={"session": session, "me": ME})
     assert [error.message for error in result.errors or ()] == [
-        "No Document 3 in Folder.documents"
+        "No row 3 in FolderType.documents"
     ]
     assert stored(session, 3) == [(3, "CEO contract", False, 1)]
     assert party_calls == []
@@ -769,7 +769,7 @@ def test_an_upsert_through_the_base_is_held_to_the_rows_own_repo(session, party_
     )
     info = SimpleNamespace(context={"session": session, "me": ME})
 
-    with pytest.raises(UpsertNotFoundError, match="No Document matches"):
+    with pytest.raises(UpsertNotFoundError, match="No row matches"):
         orm.apply_upsert(upsert(where=where(id="3"), update=update(title="x")), info)
     orm.apply_upsert(upsert(where=where(id="2"), update=update(title="ours")), info)
     session.commit()
@@ -806,7 +806,7 @@ def test_one_repo_class_for_both_models_answers_for_the_rows_own(session):
 
     hidden = delete(3, "delete_document", "delete_contract")
     assert [error.message for error in hidden.errors] == [
-        "No Document 3 in Folder.documents"
+        "No row 3 in FolderType.documents"
     ]
     refused = delete(2, "delete_document")
     assert [error.message for error in refused.errors] == [
@@ -854,16 +854,13 @@ def test_authorize_is_asked_about_a_subclass_row_as_its_own_model(session):
     ref = orm.ref(Document, delete=True)
     delete = _declared_fields(ref)["delete"]
     info = SimpleNamespace(context={"session": session, "me": ME})
-    with pytest.raises(
-        UpsertNotFoundError, match=r"No Document 2 in Folder\.documents"
-    ):
-        orm.apply_ref_list(
-            session.get(Folder, 1),
-            "documents",
-            [ref(delete=delete(id="2"))],
-            info,
-            authorize=authorize,
-        )
+    orm.apply_ref_list(
+        session.get(Folder, 1),
+        "documents",
+        [ref(delete=delete(id="2"))],
+        info,
+        authorize=authorize,
+    )
     assert seen == [("delete", "Document", 2), ("delete", "Contract", 2)]
     assert stored(session, 2) == [(2, "my contract", False, 1)]
 
@@ -903,7 +900,7 @@ def test_an_override_of_find_for_upsert_is_held_to_scope_query(session):
     upsert = document_upsert(orm)
     where = _declared_fields(upsert)["where"]
     info = SimpleNamespace(context={"session": session, "me": ME})
-    with pytest.raises(UpsertNotFoundError, match="No Document matches"):
+    with pytest.raises(UpsertNotFoundError, match="No row matches"):
         orm.apply_upsert(upsert(where=where(title="their notes")), info)
     assert orm.apply_upsert(upsert(where=where(title="handbook")), info).id == 1
 
