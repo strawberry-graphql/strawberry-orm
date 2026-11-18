@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
@@ -122,6 +122,9 @@ class RelationSpec:
     taken_from: str | None = None
     #: The ``taken_from`` relation deletes the row it lets go of.
     orphans_holder: bool = False
+    #: A reverse link whose foreign key is also the related row's primary key:
+    #: moving a row to another parent gives it that parent's row's key.
+    link_is_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,24 +162,34 @@ class RelationPolicy:
     def effective_on_match(self) -> OnMatch:
         if self.on_match is not None:
             return self.on_match
-        return "APPEND" if self.immutable else "UPDATE"
+        if self.immutable:
+            return "APPEND"
+        return "UPDATE" if self.offers("update") else "IGNORE"
 
     @property
     def effective_on_match_links(self) -> OnMatchLinks:
         return self.on_match_links or "ERROR"
 
-    @property
-    def update_enabled(self) -> bool:
-        """Whether anything may generate update fields for this projection.
+    def offers(self, operation: str) -> bool:
+        """Whether any input this projection shapes may offer *operation*.
 
-        An upsert with the default ``onMatch`` keeps its historical ``update``
-        branch, so ``upsert`` alone still enables update fields.
+        A projection naming none of the operations offers ``create`` and
+        ``update`` (``create`` alone when immutable). One naming any offers
+        only those it names, whichever arm would reach the others: an
+        ``upsert`` creates only where ``create`` is named, and updates only
+        where ``update`` is.
         """
-        if self.immutable:
-            return False
-        if not self.explicit_ops or self.update is not None:
-            return True
-        return self.upsert_where is not None and self.effective_on_match == "UPDATE"
+        if not self.explicit_ops:
+            return operation == "create" or (
+                operation == "update" and not self.immutable
+            )
+        return {
+            "create": self.create is not None,
+            "update": self.update is not None,
+            "upsert": self.upsert_where is not None,
+            "unlink": self.unlink,
+            "delete": self.delete,
+        }[operation]
 
     @property
     def match_rules_configured(self) -> bool:
@@ -288,8 +301,9 @@ class MutationNamespace:
         """Build a ``{where, create, update}`` input that upserts one *model* row.
 
         ``project`` is a model projection whose ``_meta.upsert.where`` names the
-        match fields. A projection that sets ``_meta.name`` names its types after
-        it (``<name>Create``, ``<name>Where``, ...) and may be reused, including
+        match fields; ``create`` and ``update`` are there where it names them.
+        A projection that sets ``_meta.name`` names its types after it
+        (``<name>Create``, ``<name>Where``, ...) and may be reused, including
         recursively, wherever that model appears.
         """
         normalized = self._normalize_model_project(model, project)
@@ -668,7 +682,7 @@ class MutationNamespace:
             *(self._written_by(spec) for spec in relations.values())
         )
         self._backend._input_registry.setdefault(model, []).append(
-            (cls.__name__, written - {"id"})
+            (cls.__name__, written - {"id"}, "write")
         )
 
     @staticmethod
@@ -688,7 +702,7 @@ class MutationNamespace:
             for spec in relation_specs.values()
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
         } | self._backend._generic_key_columns(model)
-        pk_names = self._backend._get_pk_names(model)
+        row_keys = self._backend._row_keys(model)
         names: set[str] = set()
         for (
             field_name,
@@ -702,7 +716,7 @@ class MutationNamespace:
                 continue
             if self._backend._is_forward_fk_attname_field(is_relation, related):
                 continue
-            if field_name in pk_names:
+            if field_name in row_keys:
                 continue
             if self._backend._exclude_generated_sensitive_field(field_name, include):
                 continue
@@ -717,42 +731,23 @@ class MutationNamespace:
     def _op_fields_for(
         self, project: Any, operation: str, model: type | None = None
     ) -> OpFields:
+        if operation not in ("create", "update"):
+            raise ValueError(f"Unsupported operation for field allowlist: {operation}")
         policy = self._policy_from_project(project)
-        if operation == "create":
-            if policy.create is not None:
-                return policy.create
-            return OpFields(fields=None)
-        if operation == "update":
-            if not policy.update_enabled:
-                model_name = model.__name__ if model is not None else "this model"
-                raise ValueError(
-                    f"Update fields were requested for {model_name}, whose "
-                    f"projection has no update operation"
-                )
-            if policy.update is not None:
-                return policy.update
-            return OpFields(fields=None)
-        raise ValueError(f"Unsupported operation for field allowlist: {operation}")
+        if not policy.offers(operation):
+            model_name = model.__name__ if model is not None else "this model"
+            raise ValueError(
+                f"{operation.capitalize()} fields were requested for {model_name}, "
+                f"whose projection has no {operation} operation"
+            )
+        fields = policy.create if operation == "create" else policy.update
+        return OpFields(fields=None) if fields is None else fields
 
     def _enabled_ops(
         self, policy: RelationPolicy, *, kind: Literal["single", "many"]
     ) -> set[str]:
-        if not policy.explicit_ops:
-            return {"create"} if policy.immutable else {"create", "update"}
-
-        enabled: set[str] = set()
-        if policy.create is not None:
-            enabled.add("create")
-        if policy.update is not None:
-            enabled.add("update")
-        if policy.upsert_where is not None:
-            enabled.add("upsert")
-        if kind == "many":
-            if policy.unlink:
-                enabled.add("unlink")
-            if policy.delete:
-                enabled.add("delete")
-        elif policy.unlink or policy.delete:
+        enabled = {operation for operation in _OP_META_KEYS if policy.offers(operation)}
+        if kind == "single" and enabled & {"unlink", "delete"}:
             raise ValueError(
                 "unlink/delete are only valid on list (to-many) relation _meta"
             )
@@ -857,13 +852,10 @@ class MutationNamespace:
         defaults: dict[str, Any] = {}
         for model in models:
             key = _model_key(model)
-            if (
-                operation == "update"
-                and not self._policy_from_project(root_projects[key]).update_enabled
-            ):
+            if not self._policy_from_project(root_projects[key]).offers(operation):
                 raise ValueError(
-                    f"update_node_input() cannot include {model.__name__}: its "
-                    f"projection has no update operation"
+                    f"{operation}_node_input() cannot include {model.__name__}: its "
+                    f"projection has no {operation} operation"
                 )
             annotations[key] = (
                 self._create_input(model, root_projects[key])
@@ -894,6 +886,7 @@ class MutationNamespace:
         if cache_key in self._create_inputs:
             return self._create_inputs[cache_key]
 
+        op_fields = self._op_fields_for(project, "create", model)
         cls = type(
             self._type_name(model, project, "Create", "Create"),
             (),
@@ -905,7 +898,7 @@ class MutationNamespace:
             model,
             operation="create",
             project=project,
-            op_fields=self._op_fields_for(project, "create"),
+            op_fields=op_fields,
             include_id=False,
         )
         result = strawberry.input(cls)
@@ -982,6 +975,9 @@ class MutationNamespace:
         result = strawberry.input(cls)
         result.__orm_model__ = model  # type: ignore[attr-defined]
         self._where_inputs[cache_key] = result
+        self._backend._input_registry.setdefault(model, []).append(
+            (cls.__name__, set(annotations) - {"id"}, "match")
+        )
         return result
 
     def _upsert_input(
@@ -1000,23 +996,24 @@ class MutationNamespace:
             {},
         )
         self._upsert_inputs[cache_key] = cls
-        cls.__annotations__ = {
-            "where": self._where_input(model, project),
-            "create": self._create_input(model, project) | None,
-        }
+        cls.__annotations__ = {"where": self._where_input(model, project)}
+        behaviour = _MATCH_BEHAVIOUR[on_match]
         if policy.match_rules_configured:
-            behaviour = _MATCH_BEHAVIOUR[on_match]
             cls.where = strawberry.field(
                 description=f"Fields that find an existing {model.__name__}. "
                 f"{behaviour}"
             )
-            cls.create = strawberry.field(
-                default=strawberry.UNSET,
-                description=f"Creates the {model.__name__} when nothing matches "
-                f"`where`. {behaviour}",
+        if policy.offers("create"):
+            cls.__annotations__["create"] = self._create_input(model, project) | None
+            cls.create = (
+                strawberry.field(
+                    default=strawberry.UNSET,
+                    description=f"Creates the {model.__name__} when nothing "
+                    f"matches `where`. {behaviour}",
+                )
+                if policy.match_rules_configured
+                else strawberry.UNSET
             )
-        else:
-            cls.create = strawberry.UNSET
         if on_match == "UPDATE":
             cls.__annotations__["update"] = (
                 self._update_input(model, project, include_id=False) | None
@@ -1062,7 +1059,7 @@ class MutationNamespace:
             for spec in relation_specs.values()
             if spec.fk_column is not None and spec.relation_mode == "forward_fk"
         } | generic_keys
-        pk_names = self._backend._get_pk_names(model)
+        row_keys = self._backend._row_keys(model)
         allowed_scalars = None if op_fields.fields is None else set(op_fields.fields)
         hidden = self._hidden_fields(model)
 
@@ -1084,7 +1081,7 @@ class MutationNamespace:
                 field_name, op_fields.fields
             ):
                 continue
-            if field_name in pk_names:
+            if field_name in row_keys:
                 continue
             if allowed_scalars is not None and field_name not in allowed_scalars:
                 continue
@@ -1335,19 +1332,30 @@ class MutationNamespace:
 
         backend_name = self._backend.__class__.__name__
         if backend_name == "DjangoBackend":
-            specs = _django_relation_specs(model)
+            build = _django_relation_specs
         elif backend_name == "SQLAlchemyBackend":
-            specs = _sqlalchemy_relation_specs(model)
+            build = _sqlalchemy_relation_specs
         elif backend_name == "TortoiseBackend":
-            specs = _tortoise_relation_specs(model)
+            build = _tortoise_relation_specs
         else:
             raise ValueError(f"Unsupported backend for node mutations: {backend_name}")
+        specs = build(model, self._backend._row_keys)
 
+        # Linked or created through one of these, a row's key would be written:
+        # this row's, or that of the one row a reverse link holds.
+        row_keys = self._backend._row_keys(model)
+        specs = {
+            name: spec
+            for name, spec in specs.items()
+            if name not in row_keys and not (spec.kind == "single" and spec.link_is_key)
+        }
         self._relation_cache[model] = specs
         return specs
 
 
-def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
+def _django_relation_specs(
+    model: type, row_keys_of: Callable[[type], set[str]]
+) -> dict[str, RelationSpec]:
     from django.db import models
 
     specs: dict[str, RelationSpec] = {}
@@ -1369,6 +1377,7 @@ def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
                 relation_mode="reverse_fk",
                 remote_attr=remote_field,
                 nullable=getattr(field.field, "null", False),
+                link_is_key=remote_field in row_keys_of(field.related_model),
             )
         elif isinstance(field, models.ForeignKey):
             specs[field.name] = RelationSpec(
@@ -1382,7 +1391,9 @@ def _django_relation_specs(model: type) -> dict[str, RelationSpec]:
     return specs
 
 
-def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
+def _sqlalchemy_relation_specs(
+    model: type, row_keys_of: Callable[[type], set[str]]
+) -> dict[str, RelationSpec]:
     from sqlalchemy import inspect as sa_inspect
 
     mapper = sa_inspect(model)
@@ -1391,6 +1402,14 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
         # Unlinking clears only the related row's keys; ``remote_side`` also
         # holds columns a primaryjoin filters on, such as ``Task.done``.
         keys_nullable = all(remote.nullable for _, remote in rel.local_remote_pairs)
+        related_keys = row_keys_of(rel.mapper.class_)
+        link_is_key = any(
+            prop.key in related_keys
+            for prop in rel.mapper.column_attrs
+            if set(prop.columns).intersection(
+                remote for _, remote in rel.local_remote_pairs
+            )
+        )
         deletes_orphans = bool(rel.cascade.delete_orphan)
         if rel.secondary is not None:
             specs[rel.key] = RelationSpec(
@@ -1410,6 +1429,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 remote_attr=rel.back_populates,
                 nullable=keys_nullable,
                 deletes_orphans=deletes_orphans,
+                link_is_key=link_is_key,
             )
         elif rel.direction.name == "ONETOMANY":
             # A one-to-one held by the related row's foreign key.
@@ -1421,6 +1441,7 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
                 remote_attr=rel.back_populates,
                 nullable=keys_nullable,
                 deletes_orphans=deletes_orphans,
+                link_is_key=link_is_key,
             )
         else:
             # The attribute, which ``exclude=`` names, not the database column.
@@ -1448,7 +1469,9 @@ def _sqlalchemy_relation_specs(model: type) -> dict[str, RelationSpec]:
     return specs
 
 
-def _tortoise_relation_specs(model: type) -> dict[str, RelationSpec]:
+def _tortoise_relation_specs(
+    model: type, row_keys_of: Callable[[type], set[str]]
+) -> dict[str, RelationSpec]:
     from strawberry_orm.backends.tortoise import (
         _FORWARD_REL_TYPES,
         _relation_kind,
@@ -1489,18 +1512,19 @@ def _tortoise_relation_specs(model: type) -> dict[str, RelationSpec]:
             )
         elif field_type == "BackwardFKRelation":
             relation_field = getattr(field, "relation_field", "")
+            remote_attr = (
+                relation_field[:-3]
+                if relation_field.endswith("_id")
+                else relation_field
+            )
+            remote_fields = related_model._meta.fields_map  # type: ignore[attr-defined]
             specs[field_name] = RelationSpec(
                 name=field_name,
                 related_model=related_model,
                 kind="many",
                 relation_mode="reverse_fk",
-                remote_attr=relation_field[:-3]
-                if relation_field.endswith("_id")
-                else relation_field,
-                nullable=getattr(
-                    related_model._meta.fields_map.get(relation_field),  # type: ignore[attr-defined]
-                    "null",
-                    False,
-                ),
+                remote_attr=remote_attr,
+                nullable=getattr(remote_fields.get(relation_field), "null", False),
+                link_is_key=remote_attr in row_keys_of(related_model),
             )
     return specs

@@ -28,10 +28,11 @@ class TestDiagnosticsMessages(AbstractTestDiagnosticsMessages):
                     return list(session.scalars(stmt))  # type: ignore[return-value]
                 return stmt  # type: ignore[return-value]
 
-        extensions = [orm.lazy_resolution_extension(mode=mode)]
-        if optimize:
-            extensions.insert(0, orm.optimizer_extension())
-        return strawberry.Schema(query=Query, extensions=extensions)
+        return orm.schema(
+            query=Query,
+            optimizer=optimize,
+            extensions=[orm.lazy_resolution_extension(mode=mode)],
+        )
 
     def execute(self, schema, query):
         return schema.execute_sync(query, context_value={"session": self._sa_session})
@@ -61,8 +62,10 @@ class TestAsyncDiagnostics:
             def posts(self) -> list[PT]:
                 return list(sa_session.scalars(select(SAPost)))  # type: ignore[return-value]
 
-        schema = strawberry.Schema(
-            query=Query, extensions=[orm.lazy_resolution_extension(mode="warn")]
+        schema = orm.schema(
+            query=Query,
+            optimizer=False,
+            extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = await schema.execute(
             "{ posts { byline } }", context_value={"session": sa_session}

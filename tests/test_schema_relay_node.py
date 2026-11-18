@@ -106,7 +106,11 @@ def test_a_later_schema_from_the_same_types_still_answers_node(
     Query = _query(orm, cut)
     first = orm.schema(query=Query, **({"tags": tags} if tags else {}))
     assert _node_field(Query).base_resolver is None
-    later = strawberry.Schema(query=Query) if plain else orm.schema(query=Query)
+    later = (
+        strawberry.Schema(query=Query, extensions=[orm.optimizer_extension()])
+        if plain
+        else orm.schema(query=Query)
+    )
     assert _answer(later, session) == ANSWER
     assert _answer(first, session) == ANSWER
 

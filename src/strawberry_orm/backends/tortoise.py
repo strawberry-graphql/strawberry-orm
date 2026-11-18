@@ -7,7 +7,7 @@ import importlib
 import inspect
 import re
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from decimal import Decimal
 from functools import wraps
@@ -21,30 +21,36 @@ from tortoise.expressions import Function as ExpressionFunction
 from tortoise.models import Model
 from tortoise.queryset import QuerySet
 
+from strawberry_orm._quoting import quoted
 from strawberry_orm.backends.filter_budget import check_filter_budget
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
-from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import (
-    check_regex,
     is_fk_shortcut_lookup,
     is_reference_lookup,
 )
 from strawberry_orm.lazy_resolution import reads_relation
 from strawberry_orm.optimizer import OptimizerExtension
+from strawberry_orm.optimizer.planning import Planner, Relation, cast_type_name
+from strawberry_orm.upserts import is_writing, writing
 
 from ._base import (
+    SCOPE_LIMIT_REFUSED,
     WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
+    driver_errors,
     extract_element_type,
-    hint_hops,
     invoke_custom_callback,
     key_in_range,
     model_is_type_of,
     past_a_hop,
+    raised_by_orm,
+    read_record,
+    renew_record,
     requested_aggregates,
+    write_record,
 )
 
 #: Where the window puts each row's number within its group. Dropped again
@@ -58,6 +64,12 @@ _COUNT_ALIAS = "_orm_count"
 
 #: What a client is told when a statement run by a read fails.
 _READ_REFUSED = "Invalid filter expression"
+#: Tortoise has no ``regex`` lookup, and its ``posix_regex`` cannot keep a
+#: value longer than ``max_regex_text_length`` from the regex.
+_NO_REGEX = (
+    "Tortoise has no regex lookup this library can bound, so "
+    "enable_regex_filters=True is not supported."
+)
 
 _TORTOISE_FIELD_MAP: dict[str, type] = {
     "IntField": int,
@@ -184,7 +196,7 @@ class _PlannedPrefetch:
     """One relation in a query's load plan, with the relations under it.
 
     ``token`` is the edge's own ``scope=``, which the cache it fills is marked
-    with.
+    with. ``tag`` is left on every row its scoped queryset reads.
     """
 
     __slots__ = (
@@ -193,6 +205,7 @@ class _PlannedPrefetch:
         "many_to_many",
         "scope",
         "token",
+        "tag",
         "children",
     )
 
@@ -204,7 +217,76 @@ class _PlannedPrefetch:
         self.many_to_many = field_cls == "ManyToManyFieldInstance"
         self.scope = scope
         self.token = token
+        self.tag = object()
         self.children: dict[str, _PlannedPrefetch] = {}
+
+
+#: On a row a scoped prefetch read: that prefetch's tag.
+_LOADED_BY = "_strawberry_orm_loaded_by"
+
+
+def _tagging(queryset: Any, tag: object) -> Any:
+    """*queryset*, and every one cloned from it, leaving *tag* on each row it reads."""
+
+    class Tagging(type(queryset)):  # type: ignore[misc]
+        __slots__ = ()
+
+        async def _execute(self) -> Any:
+            rows = await super()._execute()
+            for row in rows if isinstance(rows, list) else [rows]:
+                if isinstance(row, Model):
+                    row.__dict__[_LOADED_BY] = tag
+            return rows
+
+    tagged = queryset._clone()
+    tagged.__class__ = Tagging
+    return tagged
+
+
+def _read_by(row: Any, name: str, tag: object) -> bool:
+    """Whether every row *name* holds on *row* was read by the load *tag* names."""
+    held = _held(row, name)
+    rows = held if isinstance(held, list) else [] if held is None else [held]
+    return all(item.__dict__.get(_LOADED_BY) is tag for item in rows)
+
+
+class _PrefetchPlanner(Planner):
+    """Plans ``prefetch_related`` lookups, each scope a callable on its queryset."""
+
+    def relation(self, model: type, name: str) -> Relation | None:
+        field_obj = model._meta.fields_map.get(name)  # type: ignore[attr-defined]
+        field_cls = _relation_kind(field_obj)
+        if field_cls is None:
+            return None
+        return Relation(name, field_obj.related_model, field_cls)
+
+    def build(
+        self, model: type, key: str, load: Any, scope: Any, owner: str
+    ) -> _PlannedPrefetch:
+        related = load.relation.related
+        return _PlannedPrefetch(
+            related_model=related,
+            field_cls=load.relation.detail,
+            scope=self._scope(related, scope),
+            token=scope,
+        )
+
+    def _scope(self, related: type, load_fn: Any) -> Any:
+        """The related type's ``scope_rows``, then *load_fn*, or ``None`` for neither."""
+        nested_get_qs = self.backend._type_querysets.get(related)
+        if nested_get_qs is None and load_fn is None:
+            return None
+        info = self.info
+        call_row_scope = self.backend.call_row_scope
+
+        def combined(qs: Any) -> Any:
+            if nested_get_qs is not None:
+                qs = call_row_scope(nested_get_qs, qs, info)
+            if load_fn is not None:
+                qs = call_row_scope(load_fn, qs, info)
+            return qs
+
+        return combined
 
 
 def _prefetch_lookups(plan: dict[str, _PlannedPrefetch]) -> list[Any]:
@@ -230,18 +312,22 @@ def _prefetch_lookups(plan: dict[str, _PlannedPrefetch]) -> list[Any]:
             queryset = load.scope(queryset)
         if children:
             queryset = queryset.prefetch_related(*children)
-        lookups.append(Prefetch(name, queryset))
+        lookups.append(
+            Prefetch(name, _tagging(queryset, load.tag) if scoped else queryset)
+        )
     return lookups
 
 
-async def _prefetch_onto(model: type, rows: list[Any], lookups: list[Any]) -> None:
+async def _prefetch_onto(
+    model: type, rows: list[Any], lookups: list[Any], db: Any = None
+) -> None:
     """Prefetch *lookups* onto rows already in memory.
 
     ``fetch_for_list`` only takes strings, so this runs the queryset's own
     prefetch step, which takes ``Prefetch`` objects too.
     """
     queryset = model.all().prefetch_related(*lookups)  # type: ignore[attr-defined]
-    db = model._choose_db()  # type: ignore[attr-defined]
+    db = db or model._choose_db()  # type: ignore[attr-defined]
     executor = db.executor_class(
         model=model,
         db=db,
@@ -278,32 +364,78 @@ def _held(row: Any, name: str) -> Any:
     )
 
 
-async def _hide_scoped_out(rows: list[Any], name: str, load: _PlannedPrefetch) -> None:
-    """Drop cached forward rows *load*'s scope rejects, leaving the FK alone."""
+def _keyed_rows(query: Any) -> Any:
+    """*query*, to be read for the keys of its rows, still allowing just those.
+
+    Tortoise leaves a limit of none out of a ``values()`` query, which would
+    then allow every row (and keeps an offset, which SQLite refuses without a
+    limit), and ``first()`` replaces it, so a query allowing no rows says so
+    with a condition instead. Ordering means nothing to a set of keys, unless
+    it picks the rows a limit keeps.
+    """
+    if query._limit == 0:
+        return query.filter(pk__in=[]).offset(0)
+    if query._limit is None and not query._offset:
+        return query.order_by()
+    return query
+
+
+def _query_bounds(query: Any) -> tuple[Any, Any]:
+    return getattr(query, "_limit", None), getattr(query, "_offset", None) or None
+
+
+async def _hide_scoped_out(
+    rows: list[Any], name: str, load: _PlannedPrefetch
+) -> list[Any]:
+    """Drop cached forward rows *load*'s scope rejects, leaving the FK alone.
+
+    Returns the rows whose cache now holds only what the scope allows: not one
+    whose cache something replaced while the scope was being checked.
+    """
     cache_attr = f"_{name}"
     pk_attr = load.related_model._meta.pk_attr  # type: ignore[attr-defined]
     cached = [row.__dict__.get(cache_attr) for row in rows]
     pks = {getattr(obj, pk_attr) for obj in cached if obj is not None}
-    if not pks:
-        return
-    visible = set(
-        await load.scope(
+    visible: set[Any] = set()
+    if pks:
+        scoped = load.scope(
             load.related_model.filter(**{f"{pk_attr}__in": list(pks)})  # type: ignore[attr-defined]
-        ).values_list(pk_attr, flat=True)
-    )
+        )
+        visible = set(await _keyed_rows(scoped).values_list(pk_attr, flat=True))
+    vouched: list[Any] = []
     for row, obj in zip(rows, cached, strict=True):
+        if cache_attr not in row.__dict__ or row.__dict__[cache_attr] is not obj:
+            continue
         if obj is not None and getattr(obj, pk_attr) not in visible:
             row.__dict__[cache_attr] = None
+        vouched.append(row)
+    return vouched
 
 
-def _counting_call(original: Any, probe: Any) -> Any:
-    """Wrap an async client method so each call bumps *probe*."""
+def _counting_call(original: Any, counter: list[int]) -> Any:
+    """Wrap an async client method so each call bumps *counter*."""
 
     async def _counted(*args: Any, **kwargs: Any) -> Any:
-        probe.count += 1
+        counter[0] += 1
         return await original(*args, **kwargs)
 
     return _counted
+
+
+def _statement_counter(client: Any) -> list[int]:
+    """How many statements *client* has run, counted from the first call.
+
+    The client is shared by every request, and probes overlap, so the hook is
+    put on once and never taken off: a probe that swapped the client's methods
+    in and out put back whatever it had found, another probe's included.
+    """
+    counter = getattr(client, "_strawberry_orm_statements", None)
+    if counter is None:
+        counter = [0]
+        for name in ("execute_query", "execute_query_dict"):
+            setattr(client, name, _counting_call(getattr(client, name), counter))
+        client._strawberry_orm_statements = counter
+    return counter
 
 
 def _reading(method: Any) -> Any:
@@ -329,11 +461,13 @@ class TortoiseBackend(BaseBackend):
         max_in_list_size: int = 500,
         **kwargs: Any,
     ) -> None:
+        if enable_regex_filters:
+            raise ValueError(_NO_REGEX)
         super().__init__(**kwargs)
         self._type_cache: dict[tuple[int, str], type] = {}
         self._max_filter_depth = max_filter_depth
         self._max_filter_branches = max_filter_branches
-        self._enable_regex_filters = enable_regex_filters
+        self._enable_regex_filters = False
         self._max_in_list_size = max_in_list_size
 
     def _introspect_model(
@@ -386,6 +520,18 @@ class TortoiseBackend(BaseBackend):
         meta = model._meta  # type: ignore[attr-defined]
         return {meta.pk_attr}
 
+    def _row_keys(self, model: type) -> set[str]:
+        meta = model._meta  # type: ignore[attr-defined]
+        names = set()
+        for name, field in meta.fields_map.items():
+            if field.pk:
+                names.add(name)
+                # A relation's column is marked as the key for a one-to-one
+                # field only, not for a foreign key.
+                if hasattr(field, "related_model"):
+                    names.add(field.source_field)
+        return names
+
     # -- Type generation -----------------------------------------------------
 
     def type(self, model: type, **kwargs: Any) -> Any:
@@ -398,8 +544,7 @@ class TortoiseBackend(BaseBackend):
         aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
-            if "is_type_of" not in cls.__dict__:
-                cls.is_type_of = model_is_type_of(model)  # type: ignore[method-assign]
+            cls.is_type_of = model_is_type_of(model, cls.__dict__.get("is_type_of"))  # type: ignore[method-assign]
 
             fields_meta = self._introspect_model(model)
             col_types: dict[str, type] = {}
@@ -449,8 +594,7 @@ class TortoiseBackend(BaseBackend):
                     )
                     continue
 
-                f_type = getattr(el_type, "__orm_filter__", None)
-                o_type = getattr(el_type, "__orm_order__", None)
+                f_type, o_type = self._relation_inputs(cls, field_name, el_type)
 
                 if f_type or o_type:
                     setattr(
@@ -541,6 +685,10 @@ class TortoiseBackend(BaseBackend):
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             max_values=self._max_in_list_size,
+            max_regex_filters=self._max_regex_filters,
+            max_text_length=self._max_filter_text_length,
+            max_value_length=self._max_filter_value_length,
+            info=info,
         )
         with self.filtering(model, info):
             q_obj, query = _build_tortoise_filter(
@@ -624,7 +772,7 @@ class TortoiseBackend(BaseBackend):
 
         writer = self._ref_list_writer(instance, field, refs, info, authorize)
         spec = self._upsert_relation_spec(type(instance), field)
-        with _write_errors():
+        with _reads_where_writes_go(), _write_errors():
             async with in_transaction(_write_connection(type(instance))):
                 await run_async(writer.apply_refs(instance, spec, refs))
 
@@ -640,7 +788,7 @@ class TortoiseBackend(BaseBackend):
         writer = self._upsert_writer(info, authorize)
         writer.validate_root(payload)
         model = type(payload).__orm_model__
-        with _write_errors():
+        with _reads_where_writes_go(), _write_errors():
             async with in_transaction(_write_connection(model)):
                 return await run_async(writer.apply_root(payload))
 
@@ -650,7 +798,7 @@ class TortoiseBackend(BaseBackend):
     def _upsert_relation_spec(self, model: type, field: str) -> Any:
         from strawberry_orm.mutations import _tortoise_relation_specs
 
-        return _tortoise_relation_specs(model)[field]
+        return _tortoise_relation_specs(model, self._row_keys)[field]
 
     def _find_for_upsert(
         self, repo: Any, model: type, query: dict[str, Any], info: Any
@@ -660,7 +808,7 @@ class TortoiseBackend(BaseBackend):
     async def _find_for_upsert_async(
         self, repo: Any, model: type, query: dict[str, Any], info: Any
     ) -> Any:
-        rows = repo.scope_query(model.all(), info).filter(
+        rows = self.call_repo_scope(repo, model.all(), info).filter(
             **self._upsert_lookup_kwargs(query)
         )
         return self._single_upsert_match(model, list(await rows.limit(2)))
@@ -865,13 +1013,18 @@ class TortoiseBackend(BaseBackend):
         self, query: Any, key_field: str, info: Any
     ) -> dict[Any, int]:
         """Each group's real total, which the windowed page cannot report."""
+        from tortoise.expressions import Subquery
         from tortoise.functions import Count
 
+        # Counted by key, so a scope that joins or groups counts each row once.
         # Inherited ordering would drag non-grouped columns into the statement.
+        pk_attr = query.model._meta.pk_attr
+        own = query.model.filter(
+            **{f"{pk_attr}__in": Subquery(_keyed_rows(query).values(pk_attr))}
+        )
         counted = (
-            query.order_by()
-            .group_by(key_field)
-            .annotate(**{_COUNT_ALIAS: Count(query.model._meta.pk_attr)})
+            own.group_by(key_field)
+            .annotate(**{_COUNT_ALIAS: Count(pk_attr)})
             .values(key_field, _COUNT_ALIAS)
         )
         return {row[key_field]: row[_COUNT_ALIAS] for row in await counted}
@@ -907,7 +1060,7 @@ class TortoiseBackend(BaseBackend):
 
     @contextmanager
     def query_probe(self, info: Any) -> Any:
-        """Count statements by wrapping the client's execute methods."""
+        """Count the statements the default client runs while open."""
         from strawberry_orm.lazy_resolution import QueryProbe
 
         probe = QueryProbe()
@@ -920,18 +1073,12 @@ class TortoiseBackend(BaseBackend):
             yield probe
             return
 
-        originals = {}
-        for name in ("execute_query", "execute_query_dict"):
-            original = getattr(client, name, None)
-            if original is None:
-                continue  # pragma: no cover
-            originals[name] = original
-            setattr(client, name, _counting_call(original, probe))
+        counter = _statement_counter(client)
+        start = counter[0]
         try:
             yield probe
         finally:
-            for name, original in originals.items():
-                setattr(client, name, original)
+            probe.count = counter[0] - start
 
     @_reading
     async def count_query(self, query: Any, info: Any) -> int:
@@ -978,10 +1125,23 @@ class TortoiseBackend(BaseBackend):
 
     @_reading
     async def filter_scoped_pks(
-        self, model: type, pks: list[Any], info: Any
+        self, model: type, pks: list[Any], info: Any, *, read_as: Any = None
     ) -> set[Any]:
-        queryset = self.apply_type_scope(model.filter(pk__in=pks), model, info)
+        queryset = self.apply_type_scope(
+            model.filter(pk__in=pks), model, info, read_as=read_as
+        )
         return {self.instance_pk(row) for row in await queryset}
+
+    def read_errors(self) -> Any:
+        return _read_errors()
+
+    def rows_scope_allows(self, given: Any, scoped: Any) -> Any:
+        bounds = _query_bounds(scoped)
+        if bounds[0] == 0:
+            return _keyed_rows(scoped)
+        if bounds not in ((None, None), _query_bounds(given)):
+            raise ValueError(SCOPE_LIMIT_REFUSED)
+        return scoped
 
     def _relation_connection_spec(
         self, model: type, field_name: str, relation: str
@@ -1046,142 +1206,26 @@ class TortoiseBackend(BaseBackend):
         """Re-apply child scoping for nested relation resolvers."""
         get_qs = self._type_querysets.get(related_model)
         if get_qs is not None:
-            qs = get_qs(qs, info)
+            qs = self.call_row_scope(get_qs, qs, info)
 
         type_name = self._resolved_type_name(parent_model, info)
         if type_name:
             hints = self._store.get(type_name, field_name)
             if hints and hints.scope is not None:
-                qs = call_scope(hints.scope, qs, info)
+                qs = self.call_row_scope(hints.scope, qs, info)
 
         return qs
 
     def _relation_prefetches(
-        self, store: Any, model: type, info: Any
+        self, store: Any, model: type, info: Any, cast: str | None = None
     ) -> dict[str, _PlannedPrefetch]:
         """Plan the relations the selection and its ``using=`` paths need.
 
         Shared by query optimization and by loading relations onto instances
-        the caller already holds, so both apply the same row scoping.
+        the caller already holds, so both apply the same row scoping. *cast*
+        is the type the rows are cast to.
         """
-        from strawberry_orm.optimizer.selections import (
-            field_nodes_from_info,
-            fragments_from_info,
-            merged_field_nodes,
-        )
-
-        fragments = fragments_from_info(info)
-
-        # A relation reached both by the selection and by a ``using=`` path is
-        # loaded once, with one scope, so neither can leave the other's rows in
-        # the cache.
-        plan: dict[str, _PlannedPrefetch] = {}
-
-        def _to_snake(name: str) -> str:
-            return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
-
-        def _edge_scope(type_name: str | None, field_name: str) -> Any:
-            hints = store.get(type_name, field_name) if type_name and store else None
-            return hints.scope if hints else None
-
-        def _get_custom_qs(
-            type_name: str | None,
-            field_name: str,
-            related_model: type,
-        ) -> Any:
-            """Return a load callable or None."""
-            nested_get_qs = self._type_querysets.get(related_model)
-            load_fn = _edge_scope(type_name, field_name)
-            if nested_get_qs is None and load_fn is None:
-                return None
-
-            def combined(qs: Any) -> Any:
-                if nested_get_qs is not None:
-                    qs = nested_get_qs(qs, info)
-                if load_fn is not None:
-                    qs = call_scope(load_fn, qs, info)
-                return qs
-
-            return combined
-
-        def _planned(
-            level: dict[str, _PlannedPrefetch],
-            current_model: type,
-            rel_name: str,
-            type_name: str | None,
-        ) -> _PlannedPrefetch | None:
-            field_obj = current_model._meta.fields_map.get(rel_name)  # type: ignore[attr-defined]
-            field_cls = _relation_kind(field_obj)
-            if field_cls is None:
-                return None
-            load = level.get(rel_name)
-            if load is None:
-                related_model = field_obj.related_model
-                load = level[rel_name] = _PlannedPrefetch(
-                    related_model=related_model,
-                    field_cls=field_cls,
-                    scope=_get_custom_qs(type_name, rel_name, related_model),
-                    token=_edge_scope(type_name, rel_name),
-                )
-            return load
-
-        def _plan_hints(
-            level: dict[str, _PlannedPrefetch],
-            current_model: type,
-            type_name: str | None,
-            field_name: str,
-        ) -> None:
-            """Plan the relation paths declared on ``using=`` for *field_name*.
-
-            Declared against the field name, so they also apply to computed
-            fields that are not ORM fields themselves.
-            """
-            hints = store.get(type_name, field_name) if type_name and store else None
-            if not hints or hints.disable_optimization or not hints.using:
-                return
-            for path in hints.using:
-                hop_level, hop_model, hop_type = level, current_model, type_name
-                for hop in hint_hops(path):
-                    load = _planned(hop_level, hop_model, hop, hop_type)
-                    if load is None:
-                        break
-                    hop_type = self._child_type_name(
-                        hop_type, hop, load.related_model, info
-                    )
-                    hop_level, hop_model = load.children, load.related_model
-
-        def _plan_selection(
-            level: dict[str, _PlannedPrefetch],
-            selection_sets: list[Any],
-            current_model: type,
-            type_name: str | None,
-        ) -> None:
-            for name, nodes in merged_field_nodes(selection_sets, fragments).items():
-                field_name = _to_snake(name)
-
-                # A field that answers for itself will ignore whatever the
-                # prefetch loads, so do not pay for it.
-                if self.resolves_itself(type_name, field_name):
-                    continue
-                _plan_hints(level, current_model, type_name, field_name)
-
-                load = _planned(level, current_model, field_name, type_name)
-                below = [node.selection_set for node in nodes if node.selection_set]
-                if load is None or not below:
-                    continue
-                child_type = self._child_type_name(
-                    type_name, name, load.related_model, info
-                )
-                _plan_selection(load.children, below, load.related_model, child_type)
-
-        root_type_name = self._selection_type_name(model, info)
-        _plan_selection(
-            plan,
-            [node.selection_set for node in field_nodes_from_info(info)],
-            model,
-            root_type_name,
-        )
-        return plan
+        return _PrefetchPlanner(self, store, info).plan(model, cast)
 
     @_reading
     async def apply_optimizer_hints(
@@ -1197,19 +1241,23 @@ class TortoiseBackend(BaseBackend):
         except AttributeError:
             return _apply_python_ordering(list(await query), orderings)
 
+        from strawberry_orm.lazy_resolution import load_alone
+
         query = self.apply_type_scope(query, model, info)
-
-        plan = self._relation_prefetches(store, model, info)
-
-        if plan:
-            query = query.prefetch_related(*_prefetch_lookups(plan))
         if orderings:
             _remember_query_ordering(query, orderings)
 
+        # Tortoise runs a query's prefetches side by side, each replacing what
+        # a relation holds, so the app's own on the query go first.
         results = list(await query)
 
+        plan = self._relation_prefetches(store, model, info)
         if plan:
-            await self._finish_prefetches(results, plan)
+            with load_alone(results, plan) as alone:
+                await _prefetch_onto(
+                    model, results, _prefetch_lookups(plan), db=query._db
+                )
+                await self._finish_prefetches(results, plan, alone)
 
         return results
 
@@ -1226,18 +1274,20 @@ class TortoiseBackend(BaseBackend):
         Returns the rows it actually loaded onto, which is empty when the
         selection named no relations.
         """
-        by_model: dict[type, list[Any]] = {}
+        # Rows cast to different types are planned apart, each as its own.
+        by_model: dict[tuple[type, str | None], list[Any]] = {}
         for instance in instances:
-            by_model.setdefault(type(instance), []).append(instance)
+            key = (type(instance), cast_type_name(instance))
+            by_model.setdefault(key, []).append(instance)
 
         from strawberry_orm.lazy_resolution import load_alone
 
         loaded: list[Any] = []
-        for model, rows in by_model.items():
-            plan = self._relation_prefetches(store, model, info)
+        for (model, cast), rows in by_model.items():
+            plan = self._relation_prefetches(store, model, info, cast)
             if not plan:
                 continue
-            with load_alone(rows) as alone:
+            with load_alone(rows, plan) as alone:
                 await _prefetch_onto(model, rows, _prefetch_lookups(plan))
                 await self._finish_prefetches(rows, plan, alone)
             loaded.extend(rows)
@@ -1257,17 +1307,22 @@ class TortoiseBackend(BaseBackend):
         save would write back. The rows the scope rejects are dropped from the
         cache here instead, leaving the column alone.
 
-        *alone* says whether the rows' caches still hold this load's rows; once
-        another load crossed it, nothing more is marked.
+        Any other scoped cache is marked only where every row it holds was read
+        by this load's own queryset. *alone* says whether the rows' caches
+        still hold this load's rows; once another load crossed it, nothing
+        more is marked.
         """
         from strawberry_orm.lazy_resolution import mark_relations_scoped
 
         for name, load in plan.items():
             if load.scope is not None:
-                if load.forward:
+                vouched = (
                     await _hide_scoped_out(rows, name, load)
+                    if load.forward
+                    else [row for row in rows if _read_by(row, name, load.tag)]
+                )
                 if alone():
-                    mark_relations_scoped(rows, [name], scope=load.token, held=_held)
+                    mark_relations_scoped(vouched, [name], scope=load.token, held=_held)
             if not load.children:
                 continue
             related = _cached_related(rows, name)
@@ -1276,6 +1331,168 @@ class TortoiseBackend(BaseBackend):
                     load.related_model, related, _prefetch_lookups(load.children)
                 )
             await self._finish_prefetches(related, load.children, alone)
+
+    def relation_loaded(self, row: Any, name: str) -> bool:
+        from strawberry_orm.lazy_resolution import _tortoise_relation_prefetched
+
+        return bool(_tortoise_relation_prefetched(row, name))
+
+    def relation_holds_scoped(self, row: Any, name: str, token: Any) -> bool:
+        from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+
+        return self.relation_loaded(row, name) and relation_cache_is_scoped(
+            row, name, scope=token, held=_held
+        )
+
+    def held_related(self, rows: list[Any], name: str) -> list[Any]:
+        return _cached_related(rows, name)
+
+    @_reading
+    async def read_relation_scoped(
+        self,
+        rows: list[Any],
+        model: type,
+        name: str,
+        restrict: Any,
+        token: Any,
+        info: Any,
+    ) -> None:
+        """Prefetch *name* onto *rows* again under *restrict*, and mark it."""
+        from strawberry_orm.lazy_resolution import load_alone
+
+        field = model._meta.fields_map[name]  # type: ignore[attr-defined]
+        plan = {
+            name: _PlannedPrefetch(
+                related_model=field.related_model,
+                field_cls=_relation_kind(field) or "",
+                scope=None if restrict is None else (lambda qs: restrict(qs, info)),
+                token=token,
+            )
+        }
+        with load_alone(rows, plan) as alone:
+            await _prefetch_onto(model, rows, _prefetch_lookups(plan))
+            await self._finish_prefetches(rows, plan, alone)
+
+
+def _aware(field: Any, value: Any) -> Any:
+    """*value*, for *field*, as Tortoise reads it: in the default time zone,
+    when time zones are on and it names none.
+
+    Tortoise does the same after a warning quoting the value, a new entry in
+    its ``__warningregistry__`` for every datetime or time a client sends.
+    """
+    from tortoise import fields, timezone
+
+    kind = datetime.time if isinstance(field, fields.TimeField) else datetime.datetime
+    if not (
+        isinstance(value, kind) and timezone.is_naive(value) and timezone.get_use_tz()
+    ):
+        return value
+    if kind is datetime.time:
+        return value.replace(tzinfo=timezone.get_default_timezone())
+    return timezone.make_aware(value)
+
+
+def _zoned_fields(model: type) -> dict[str, Any]:
+    """*model*'s fields Tortoise reads in a time zone, by name."""
+    from tortoise import fields
+
+    return {
+        name: field
+        for name, field in model._meta.fields_map.items()  # type: ignore[attr-defined]
+        if isinstance(field, fields.DatetimeField | fields.TimeField)
+    }
+
+
+def _aware_values(model: type, values: dict[str, Any]) -> dict[str, Any]:
+    """*values* for *model*'s fields, each datetime and time read as Tortoise reads it."""
+    fields = _zoned_fields(model)
+    return {
+        name: _aware(fields[name], value) if name in fields else value
+        for name, value in values.items()
+    }
+
+
+def _aware_row(instance: Any) -> None:
+    """Read each datetime and time *instance* is about to save as Tortoise reads it."""
+    for name, field in _zoned_fields(type(instance)).items():
+        value = getattr(instance, name)
+        aware = _aware(field, value)
+        if aware is not value:
+            setattr(instance, name, aware)
+
+
+def _written_fields(model: type) -> list[str]:
+    """The fields a save of a *model* row writes, by name: not its key, nor generated."""
+    meta = model._meta  # type: ignore[attr-defined]
+    return [
+        name
+        for name in meta.fields_db_projection
+        if name != meta.pk_attr and not meta.fields_map[name].generated
+    ]
+
+
+def _stamped(model: type) -> list[str]:
+    """*model*'s fields Tortoise stamps with the time of each save that names them."""
+    fields_map = model._meta.fields_map  # type: ignore[attr-defined]
+    return [
+        name
+        for name in _written_fields(model)
+        if getattr(fields_map[name], "auto_now", False)
+    ]
+
+
+def _columns(row: Any) -> dict[str, Any]:
+    """*row*'s loaded columns a save writes, by field name."""
+    held = row.__dict__
+    return {name: held[name] for name in _written_fields(type(row)) if name in held}
+
+
+def _read_for_write(row: Any) -> Any:
+    """*row*, read for a write, with what it holds kept to save only what changes."""
+    if isinstance(row, Model):
+        write_record(row, _columns)
+    return row
+
+
+async def save_changes(instance: Any) -> None:
+    """Save *instance* as ``AbstractRepo._save`` describes.
+
+    A relation's name, such as ``owner``, saves its key field, ``owner_id``.
+    """
+    record = read_record(instance)
+    if record is None:
+        await instance.save()
+        return
+    meta = instance._meta
+    relations = meta.fk_fields | meta.o2o_fields
+    names = {
+        meta.fields_map[name].source_field if name in relations else name
+        for name in record.names
+    }
+    fields = record.changed(_columns(instance))
+    fields.update(name for name in _written_fields(type(instance)) if name in names)
+    fields.update(_stamped(type(instance)))
+    if fields:
+        await _update_row(instance, fields)
+    renew_record(instance, _columns)
+
+
+async def _update_row(row: Any, fields: set[str]) -> None:
+    """Write *fields* of *row* with an ``UPDATE``, refused once no row has its key.
+
+    Tortoise never inserts a row it has saved, nor says when an update matched
+    no row; its ``force_update`` goes by the count the database reports, which
+    on MySQL leaves out a row the update matched but did not change.
+    """
+    from tortoise import connections
+    from tortoise.exceptions import IntegrityError
+
+    model = type(row)
+    db = connections.get(_write_connection(model))
+    await row.save(using_db=db, update_fields=sorted(fields))
+    if not await model.filter(pk=row.pk).using_db(db).exists():
+        raise IntegrityError(f"No {model.__name__} row has the key it was read with")
 
 
 class _TortoiseUpsertOps:
@@ -1289,20 +1506,60 @@ class _TortoiseUpsertOps:
 
     # -- Repo-backed reads and writes ----------------------------------------
 
-    def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
-        return repo.find_for_upsert_async(model, query, self._info)
+    async def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
+        return _read_for_write(
+            await repo.find_for_upsert_async(
+                model, _aware_values(model, query), self._info
+            )
+        )
 
-    def get(self, repo: Any, model: type, pk: Any) -> Any:
-        return repo._get_async(model, pk, self._info)
+    async def get(self, repo: Any, model: type, pk: Any) -> Any:
+        return _read_for_write(await repo._get_async(model, pk, self._info))
 
     def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
-        return repo._create_async(model, data, self._info)
+        return repo._create_async(model, _aware_values(model, data), self._info)
 
-    def save(self, repo: Any, instance: Any) -> Any:
+    def save(self, repo: Any, instance: Any, names: Iterable[str]) -> Any:
+        """Save *instance*, on which the write set the attributes *names*."""
+        write_record(instance, _columns).names.update(names)
+        _aware_row(instance)
         return repo._save_async(instance, self._info)
 
     def delete(self, repo: Any, instance: Any) -> Any:
         return repo._delete_async(instance, self._info)
+
+    async def cascaded(self, row: Any) -> list[Any]:
+        """The rows deleting *row* deletes with it.
+
+        Tortoise leaves a foreign key's ``on_delete`` to the database, which
+        deletes the rows whose ``CASCADE`` key points at a deleted row.
+        """
+        from tortoise.fields import CASCADE
+
+        seen = {(type(row), row.pk)}
+        found: list[Any] = []
+        pending = [row]
+        while pending:
+            current = pending.pop()
+            meta = current._meta
+            for name in sorted(meta.backward_fk_fields | meta.backward_o2o_fields):
+                relation = meta.fields_map[name]
+                key = relation.related_model._meta.fields_map[relation.relation_field]
+                if (
+                    key.reference.on_delete != CASCADE
+                    or not key.reference.db_constraint
+                ):
+                    continue
+                target = getattr(current, relation.to_field_instance.model_field_name)
+                query = relation.related_model.filter(
+                    **{relation.relation_field: target}
+                )
+                for other in await query:
+                    if (type(other), other.pk) not in seen:
+                        seen.add((type(other), other.pk))
+                        found.append(other)
+                        pending.append(other)
+        return found
 
     def check_constraints(self) -> None:
         """Nothing to do: Tortoise's foreign keys are checked as each statement runs."""
@@ -1321,14 +1578,49 @@ class _TortoiseUpsertOps:
             if self._is_child(parent, spec, child):
                 return None
             setattr(child, spec.remote_attr, parent)
-            return child.save()
+            return self._save_key(spec, child)
         return getattr(parent, spec.name).add(child)
 
     def unlink(self, parent: Any, spec: Any, child: Any) -> Any:
         if spec.relation_mode == "reverse_fk":
             setattr(child, spec.remote_attr, None)
-            return child.save()
+            return self._save_key(spec, child)
         return getattr(parent, spec.name).remove(child)
+
+    def link_model(self, parent: Any, spec: Any) -> type | None:
+        """The model mapping many-to-many relation *spec*'s ``through`` table, if any."""
+        from tortoise import Tortoise
+
+        through = type(parent)._meta.fields_map[spec.name].through
+        for models in Tortoise.apps.values():
+            for model in models.values():
+                if model._meta.db_table == through:
+                    return model
+        return None
+
+    def link_values(self, parent: Any, spec: Any, child: Any) -> dict[str, Any]:
+        """The values of the ``through`` row linking *child* to *parent*, by field."""
+        field = type(parent)._meta.fields_map[spec.name]
+        columns = {
+            column: name
+            for name, column in self.link_model(
+                parent, spec
+            )._meta.fields_db_projection.items()
+        }
+        return {
+            columns[field.backward_key]: parent.pk,
+            columns[field.forward_key]: child.pk,
+        }
+
+    def link_rows(self, parent: Any, spec: Any, child: Any) -> Any:
+        """The ``through`` rows linking *child* to *parent*."""
+        link = self.link_model(parent, spec)
+        return link.filter(**self.link_values(parent, spec, child))
+
+    def _save_key(self, spec: Any, child: Any) -> Any:
+        """Save the key *child* points back along *spec* with, and its stamped fields."""
+        key = self._foreign_key(spec).source_field
+        return _update_row(child, {key, *_stamped(type(child))})
 
     def is_member(self, parent: Any, spec: Any, child: Any) -> Any:
         if spec.relation_mode == "reverse_fk":
@@ -1374,7 +1666,7 @@ class _TortoiseUpsertOps:
         try:
             return key_in_range(model._meta.pk.to_python_value(value))  # type: ignore[attr-defined]
         except (TypeError, ValueError):
-            raise UpsertValidationError(f"{value!r} is not a valid id") from None
+            raise UpsertValidationError(f"{quoted(value)} is not a valid id") from None
 
     # -- Internals -----------------------------------------------------------
 
@@ -1582,7 +1874,7 @@ def _tortoise_relation_scope_q(
 
     related = backend._relation_target_model(model, relation)
     pk_attr = related._meta.pk_attr
-    scoped = get_qs(related.all(), info)
+    scoped = _keyed_rows(get_qs(related.all(), info))
     return Q(**{f"{relation}__{pk_attr}__in": Subquery(scoped.values(pk_attr))})
 
 
@@ -1618,7 +1910,7 @@ def _tortoise_has_related(
     if get_qs is None:
         having = {f"{relation}__{related_pk}__isnull": False}
     else:
-        visible = get_qs(related.all(), info).values(related_pk)
+        visible = _keyed_rows(get_qs(related.all(), info)).values(related_pk)
         having = {f"{relation}__{related_pk}__in": Subquery(visible)}
     owners = model.filter(**having).values(pk_attr)  # type: ignore[attr-defined]
     return Q(**{f"{prefix}{pk_attr}__in": Subquery(owners)})
@@ -1879,7 +2171,8 @@ def _tortoise_custom_filter_q(
         handler, filter_input, query=model.all(), value=value, info=info
     )
     pk_attr = model._meta.pk_attr
-    return Q(**{f"{prefix}{pk_attr}__in": Subquery(narrowed.values(pk_attr))})
+    keys = _keyed_rows(narrowed).values(pk_attr)
+    return Q(**{f"{prefix}{pk_attr}__in": Subquery(keys)})
 
 
 def _tortoise_checked_q(model: Any, q: Any) -> Any:
@@ -1889,9 +2182,10 @@ def _tortoise_checked_q(model: Any, q: Any) -> Any:
     message listing every column of the model. Checked here, the client gets
     the short message the other backends give. A value its column cannot
     convert, such as a string for a duration, fails here too, with a Python
-    error of the conversion's own.
+    error of the conversion's own, and one a field's validator refuses with a
+    message naming the validator.
     """
-    from tortoise.exceptions import FieldError
+    from tortoise.exceptions import BaseORMException, FieldError
     from tortoise.expressions import ResolveContext
 
     try:
@@ -1905,7 +2199,7 @@ def _tortoise_checked_q(model: Any, q: Any) -> Any:
         )
     except FieldError:
         raise ValueError(_READ_REFUSED) from None
-    except (TypeError, AttributeError, ValueError) as exc:
+    except (BaseORMException, TypeError, AttributeError, ValueError) as exc:
         raise ValueError(_READ_REFUSED) from exc
     return q
 
@@ -2057,14 +2351,7 @@ def _build_tortoise_lookup(
         elif op_name == "neq":
             q = q & ~Q(**{f"{col_name}": val})
         elif op_name in ("regex", "i_regex"):
-            if not enable_regex:
-                raise ValueError(
-                    "Regex filters are disabled. Pass enable_regex_filters=True "
-                    "to enable."
-                )
-            check_regex(val)
-            suffix = {"regex": "__regex", "i_regex": "__iregex"}.get(op_name, "")
-            q = q & Q(**{f"{col_name}{suffix}": val})
+            raise ValueError(f"Regex filters are disabled: {_NO_REGEX}")
         elif op_name in _LOOKUP_TO_TORTOISE:
             suffix = _LOOKUP_TO_TORTOISE[op_name]
             q = q & Q(**{f"{col_name}{suffix}": val})
@@ -2232,10 +2519,7 @@ class _GroupedRows:
         meta = model._meta  # type: ignore[attr-defined]
         self.base = Table(meta.db_table)
         self.pk = self.base.field(meta.db_pk_column)
-        # Ordering means nothing to a set of keys, unless it picks the rows a
-        # limit keeps.
-        if query._limit is None and not query._offset:
-            query = query.order_by()
+        query = _keyed_rows(query)
         self.query = query
         own = _pypika(query.values_list(meta.pk_attr, flat=True))
         self.stmt = self.query_class.from_(self.base).where(self.pk.isin(own))
@@ -2708,23 +2992,48 @@ def _write_connection(model: type) -> str:
     return (router.db_for_write(model) or model._meta.db).connection_name  # type: ignore[attr-defined]
 
 
+class _ReadsWhereWritesGo:
+    """A router sending each read a write makes where the write goes.
+
+    First among Tortoise's routers: one of the app's may send reads to a
+    replica, which a write must not decide on.
+    """
+
+    def db_for_read(self, model: type) -> str | None:
+        return _write_connection(model) if is_writing() else None
+
+
+_READS_WHERE_WRITES_GO = _ReadsWhereWritesGo()
+
+
+@contextmanager
+def _reads_where_writes_go() -> Any:
+    """Run a write, its reads sent where it writes.
+
+    ``Tortoise.init()`` sets the app's routers afresh, so the router sending
+    them is put first on every write.
+    """
+    from tortoise.router import router
+
+    routers = router._routers
+    if routers and routers[0] is not _READS_WHERE_WRITES_GO:
+        routers.insert(0, _READS_WHERE_WRITES_GO)
+    with writing():
+        yield
+
+
 @contextmanager
 def _read_errors() -> Any:
     """Raise what a client may see in place of an error running a read.
 
-    The database's message names tables and columns, and Tortoise's own for a
-    field it cannot resolve lists every column of the model, so the original
-    is kept only as the cause, for the server log. The driver raises
-    ``OverflowError`` for an integer its column type cannot hold.
+    The database's message names tables and columns, Tortoise's own for a
+    field it cannot resolve lists every column of the model, one for a value a
+    validator refused names the validator, and one for a missing row names the
+    model's class, so the original is kept only as the cause, for the server
+    log.
     """
-    from tortoise.exceptions import DBConnectionError, FieldError, OperationalError
-
-    try:
+    with _orm_errors(_READ_REFUSED):
         yield
-    except DBConnectionError as exc:
-        raise ConnectionError("Database connection failed") from exc
-    except (OperationalError, FieldError, OverflowError) as exc:
-        raise ValueError(_READ_REFUSED) from exc
 
 
 @contextmanager
@@ -2734,18 +3043,33 @@ def _write_errors() -> Any:
     The driver's error names the table and column, and on PostgreSQL the
     row's values, and Tortoise's ``ValidationError`` names the field and the
     value it refused, so each is kept only as the cause, for the server log.
-    The driver raises ``OverflowError`` for an integer its column type cannot
-    hold.
     """
-    from tortoise.exceptions import (
-        DBConnectionError,
-        OperationalError,
-        ValidationError,
-    )
+    with _orm_errors(WRITE_REFUSED):
+        yield
+
+
+#: Where Tortoise builds and runs a statement.
+_STATEMENT_MODULES = ("tortoise.backends.", "tortoise.queryset")
+
+
+@contextmanager
+def _orm_errors(refused: str) -> Any:
+    """Raise *refused* in place of any error Tortoise or its driver raises.
+
+    Tortoise's database client passes most of its driver's errors on as they
+    are, and the driver raises ``OverflowError`` for an integer its column
+    type cannot hold, ``UnicodeEncodeError`` for a lone surrogate, and a
+    field preparing a value whatever it likes.
+    """
+    from tortoise.exceptions import BaseORMException, DBConnectionError
 
     try:
         yield
     except DBConnectionError as exc:
         raise ConnectionError("Database connection failed") from exc
-    except (OperationalError, ValidationError, OverflowError) as exc:
-        raise ValueError(WRITE_REFUSED) from exc
+    except (BaseORMException, OverflowError, *driver_errors()) as exc:
+        raise ValueError(refused) from exc
+    except Exception as exc:
+        if not raised_by_orm(exc, ("tortoise.",), _STATEMENT_MODULES):
+            raise
+        raise ValueError(refused) from exc

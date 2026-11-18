@@ -21,10 +21,18 @@ import strawberry
 
 #: The longest pattern a ``regex`` or ``iRegex`` filter takes.
 MAX_REGEX_LENGTH = 100
+#: The longest value a ``regex`` or ``iRegex`` filter is run on, by default.
+MAX_REGEX_TEXT_LENGTH = 256
+#: The most steps a regex filter takes at one place in a value without reading
+#: on, about what ten lookaheads of ``a{94}`` spelled out in a pattern take.
+_MAX_STEPS_IN_PLACE = 1000
 
 
-def check_regex(pattern: str) -> None:
+def check_regex(pattern: str, *, ignore_case: bool = False) -> str:
     """Refuse a pattern whose matching can take more than quadratic time.
+
+    Return the pattern to run, which is the one analysed: with
+    ``ignore_case``, as ``iRegex`` runs it on SQLite, after ``(?i)``.
 
     SQLite matches a regex with Python's ``re``, in the server's process and
     holding the GIL, so one such pattern stalls every request the process
@@ -37,23 +45,35 @@ def check_regex(pattern: str) -> None:
     time the one before gives a character back. A counted repeat reads its
     whole count each time, so those after a repeat that can match the same
     characters may read no more than ``MAX_REGEX_LENGTH`` characters in all,
-    the most a pattern spelling them out could. What is left costs at most time
-    quadratic in the value's length per row. A pattern Python cannot parse is
-    left to the database, which refuses it or reads it in a dialect of its
-    own.
+    the most a pattern spelling them out could, and so may the lookarounds a
+    repeat of variable count runs on every pass. Lookarounds, and the passes
+    of a repeat over what matches nothing (``(?:a{0}){99}``), read no further
+    into the value, so no value's length bounds them: a pattern may take at
+    most 1,000 such steps at one place. What is left costs at most time
+    quadratic in the value's length per row, which the backends bound by
+    running it only on values of at most ``max_regex_text_length``.
+
+    A pattern Python cannot parse, or warns it may read another way, is
+    refused: a database reads it in a dialect of its own (``(?c)``, ``\\m``,
+    ``\\p{L}``, or ``[[:alpha:]]``, which Python reads as a set holding
+    ``[``), where it can backtrack as nothing analysed here would.
     """
     from re import _constants as sre
     from re import _parser
 
     if len(pattern) > MAX_REGEX_LENGTH:
         raise ValueError(f"A regex filter takes at most {MAX_REGEX_LENGTH} characters.")
+    executed = "(?i)" + pattern if ignore_case else pattern
     try:
         with warnings.catch_warnings():
-            # PostgreSQL's ``[[:alpha:]]`` reads to Python as a nested set.
-            warnings.simplefilter("ignore")
-            parsed = _parser.parse(pattern)
-    except (re.error, RecursionError, OverflowError):
-        return
+            warnings.simplefilter("error")
+            parsed = _parser.parse(executed)
+    except (re.error, RecursionError, OverflowError, Warning) as exc:
+        raise ValueError(
+            "This regex filter cannot be analysed: write it as Python's re "
+            "reads it, with flags only at the start and no POSIX classes "
+            "such as '[[:alpha:]]'."
+        ) from exc
     if _backtracks(parsed, sre, repeated=False):
         raise ValueError(
             "A regex filter may not repeat a group that repeats or offers a "
@@ -72,8 +92,18 @@ def check_regex(pattern: str) -> None:
         raise ValueError(
             "A regex filter's counted repeats may read at most "
             f"{MAX_REGEX_LENGTH} characters in all that a repeat before them "
-            "can match too, which '.*x{101}' exceeds."
+            "can match too, which '.*x{101}' exceeds, and that budget covers "
+            "the lookarounds a repeat runs on every pass, as in "
+            "'(?:(?=a{101})a)*'."
         )
+    if trades.in_place(parsed) > _MAX_STEPS_IN_PLACE:
+        raise ValueError(
+            f"A regex filter may take at most {_MAX_STEPS_IN_PLACE} steps at "
+            "one place in a value without reading on, which '(?:(?=a{99})){11}' "
+            "exceeds: a lookaround, or a repeat of what matches nothing, runs "
+            "again on every pass of the repeat holding it."
+        )
+    return executed
 
 
 #: Code points, as sorted ``(first, last)`` ranges that neither overlap nor
@@ -93,7 +123,8 @@ class _Trades:
     variable-length repeat overlapping one still open is refused, a
     possessive one included. Possessive repeats and atomic groups give
     nothing back, so they open nothing. ``counted`` adds up what the counted
-    repeats overlapping an open repeat read. Sets are compared as ranges of
+    repeats overlapping an open repeat read, and what the lookarounds of a
+    repeat of variable count read on each pass. Sets are compared as ranges of
     code points, ``\\d``, ``\\s`` and ``\\w`` as ``re.ASCII`` reads them where
     it is on, and letters with every case ``re`` matches them to, since
     ``iRegex`` ignores case.
@@ -158,6 +189,8 @@ class _Trades:
         width = low * self._width(body)
         if overlapping and high > 1:
             self.counted += high * self._reads(body)
+        if low != high and high > 1:
+            self.counted += self.in_place(body)
         if low != high and not possessive:
             return [chars] if width else [*open_sets, chars]
         return overlapping if width else open_sets
@@ -177,13 +210,14 @@ class _Trades:
     def _reads(self, pattern: Any) -> int:
         """How many characters matching *pattern* reads, lookarounds included.
 
-        Only for what a counted repeat holds, which ``_backtracks`` leaves no
-        choice and no repeat of variable count.
+        Exact for what a counted repeat holds, which ``_backtracks`` leaves no
+        choice and no repeat of variable count; elsewhere, the fewest, since
+        a repeat of variable count reads no more than the value holds.
         """
         sre, total = self.sre, 0
         for op, av in pattern:
             if op in (sre.MAX_REPEAT, sre.MIN_REPEAT, sre.POSSESSIVE_REPEAT):
-                total += av[1] * self._reads(av[2])
+                total += av[0] * self._reads(av[2])
             elif op is sre.SUBPATTERN:
                 total += self._reads(av[-1])
             elif op is sre.ATOMIC_GROUP:
@@ -193,6 +227,38 @@ class _Trades:
             elif op is not sre.AT:
                 total += 1
         return total
+
+    def in_place(self, pattern: Any) -> int:
+        """Steps matching *pattern* once takes without reading on in the value.
+
+        What its lookarounds read, and every pass of a repeat over what
+        matches nothing, which ``re`` makes as often as a count says and, past
+        it, once. A repeat over what does read on makes at least its lowest
+        count of passes; those past it are bounded by the value's length.
+        """
+        sre, total = self.sre, 0
+        for op, av in pattern:
+            if op in (sre.ASSERT, sre.ASSERT_NOT):
+                total += self._reads(av[1]) + self.in_place(av[1])
+            elif op in (sre.MAX_REPEAT, sre.MIN_REPEAT, sre.POSSESSIVE_REPEAT):
+                low, high, body = av
+                inner = self.in_place(body)
+                if self._widest(body) == 0:
+                    total += (high if low == high else low + 1) * max(inner, 1)
+                else:
+                    total += low * inner
+            elif op is sre.SUBPATTERN:
+                total += self.in_place(av[-1])
+            elif op is sre.ATOMIC_GROUP:
+                total += self.in_place(av)
+            elif op is sre.BRANCH:
+                total += sum(self.in_place(branch) for branch in av[1])
+        return total
+
+    def _widest(self, items: list) -> int:
+        from re import _parser
+
+        return _parser.SubPattern(self.state, items).getwidth()[1]
 
     def _chars(self, pattern: Any, ascii_only: bool) -> _Ranges:
         """Every code point something in *pattern* can consume."""

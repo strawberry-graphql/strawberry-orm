@@ -511,13 +511,16 @@ class TestRegexPatternGuard:
             "(?>a+)b",
             "a+?",
             "a++",
-            "[[:alpha:]]+",
-            "(unclosed",
             "a" * MAX_REGEX_LENGTH,
         ],
     )
     def test_a_pattern_that_cannot_backtrack_for_long_is_allowed(self, pattern):
         check_regex(pattern)
+
+    @pytest.mark.parametrize("pattern", ["[[:alpha:]]+", "(unclosed"])
+    def test_a_pattern_python_reads_otherwise_or_not_at_all_is_refused(self, pattern):
+        with pytest.raises(ValueError, match="cannot be analysed"):
+            check_regex(pattern)
 
     @pytest.mark.parametrize(
         "pattern",

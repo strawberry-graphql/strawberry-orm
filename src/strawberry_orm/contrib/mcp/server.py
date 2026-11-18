@@ -10,7 +10,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
-from graphql import GraphQLSchema
+from graphql import GraphQLSchema, assert_valid_schema, get_variable_values
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.tools import Tool
@@ -19,15 +19,20 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import ConfigDict
 from strawberry.types.graphql import OperationType
 
+from strawberry_orm._quoting import quoted_list
+
 from .checks import (
-    check_coercion,
-    check_operation,
+    Costs,
+    Parsed,
     check_variables,
+    escaping_types,
     exposed_schema,
     exposed_sdl,
+    reaching,
+    read_operation,
     refuses_introspection,
 )
-from .execution import Execute, Executor
+from .execution import Call, Execute, Executor, Target
 from .operations import Operation, read_operations
 
 ContextGetter = Callable[[Any], Any]
@@ -47,11 +52,18 @@ class GraphQLTool:
     """A ``graphql`` tool that runs an operation the client writes, and a
     ``graphql_schema`` tool that returns the schema it is written against.
 
-    Only queries run unless ``allow_mutations``. ``root_fields`` limits the
-    root fields it may use, and the schema shows only those and the types
-    they reach, through any field that returns a root type too. An operation
-    must be a single operation of at most ``max_tokens`` tokens and
-    ``max_depth`` levels that passes validation, may not select one field
+    Only queries run unless ``allow_mutations``. ``root_fields`` names the
+    root fields it may use, bare or qualified by their root type, as
+    ``Query.posts`` or ``Mutation.publish``; with ``allow_mutations``, a name
+    both root types have must be qualified. The schema shows only those
+    fields and the types they reach, through any field that returns a root
+    type too, and operations run on the schema as it shows it, so no field,
+    interface or union produces a value of a type it leaves out (with
+    ``mcp_server(execute=...)``, a field that returns an interface or union
+    that might is refused). An
+    operation must be a single operation of at most ``max_length``
+    characters, ``max_tokens`` tokens and ``max_depth`` levels that passes
+    validation, may not define a fragment it does not use, select one field
     more than 20 times in one place of its result, nor more than
     ``max_fields`` fields with each fragment counted wherever it is spread
     and each alias counted, and may not ask for ``__schema`` or ``__type``:
@@ -68,12 +80,14 @@ class GraphQLTool:
     operation's errors suggest no names, and neither do those of variables
     that do not fit the types it declares.
 
-    The token limit is checked as the operation is parsed, before anything
-    else reads it; the schema's own extensions, such as Strawberry's
-    ``MaxTokensLimiter``, only run once it executes. Checking the operation,
-    and the parsing and validation ``schema.execute`` does before its
-    resolvers run, happen in a worker thread, unless an extension of the
-    schema's own, such as ``ParserCache`` or ``ValidationCache``, does them.
+    The length limit is checked before anything reads the operation, and
+    the token limit as it is parsed. It is parsed, checked and validated
+    once, in a worker thread, and ``schema.execute`` runs that document,
+    validating it, in a worker thread too, only with the rules the schema's
+    own extensions add. Those extensions run once it executes: an extension
+    such as ``ParserCache`` or ``ValidationCache`` still parses or validates
+    it again on the event loop, as Strawberry does for a ``MaxTokensLimiter``
+    the operation is past, to report it.
     """
 
     allow_mutations: bool = False
@@ -83,6 +97,7 @@ class GraphQLTool:
     max_tokens: int = 2_000
     schema_tool: bool | None = None
     max_fields: int = 1_000
+    max_length: int = 100_000
 
 
 def mcp_server(
@@ -123,10 +138,19 @@ def mcp_server(
     query Django refuses on the event loop is rerun with ``execute_sync``,
     with a warning, while a mutation fails. ``execute(query, variables,
     context, allowed)`` replaces all of this with your own async executor.
+    It runs the ``graphql`` tool's operations on your schema rather than the
+    one the tool shows, so the tool refuses a field that returns an
+    interface or union your schema may resolve to a type the tool leaves
+    out.
 
     A call's variables may hold at most ``max_variable_values`` values,
     counting each object, list and scalar, nested at most 100 levels deep;
-    they are measured in a worker thread before GraphQL coerces them.
+    they are measured in a worker thread before GraphQL coerces them. Its
+    fields' arguments may hold no more between them, counted as GraphQL
+    coerces them, with variables substituted and defaults filled in, for
+    each field an alias or fragment repeats, also in that worker thread;
+    and as it runs, again each time a list repeats a field: a field that
+    would pass the limit fails before its arguments are coerced.
 
     A tool's result carries each error's message as raised, into the
     client's transcript; add Strawberry's ``MaskErrors`` to ``schema`` to
@@ -139,7 +163,7 @@ def mcp_server(
     """
     if operations is None and not graphql_tool:
         raise ValueError("Pass operations=, graphql_tool=, or both.")
-    executor = Executor(schema, sync=sync, execute=execute)
+    executor = Executor(sync=sync, execute=execute)
 
     async def build_context(ctx: Context) -> Any:
         request = ctx.request_context.request
@@ -157,8 +181,9 @@ def mcp_server(
             raise ValueError(
                 f"The operation names {taken} are taken by graphql_tool's tools."
             )
+    target = Target(schema)
     tools = [
-        _operation_tool(op, executor, build_context, max_variable_values)
+        _operation_tool(op, executor, target, build_context, max_variable_values)
         for op in stored
     ]
     server = MCPServer(
@@ -178,7 +203,7 @@ def mcp_server(
             )
         exposed = _add_graphql_tools(
             server,
-            schema._schema,
+            schema,
             options,
             executor,
             build_context,
@@ -186,6 +211,7 @@ def mcp_server(
             or options.schema_tool is False
             or schema.config.disable_field_suggestions,
             max_variable_values=max_variable_values,
+            runs_whole_schema=execute is not None,
         )
         writes = writes or exposed.mutation_type is not None
     if writes and server_options.get("auth") is None:
@@ -205,26 +231,33 @@ class _Arguments(ArgModelBase):
 def _operation_tool(
     operation: Operation,
     executor: Executor,
+    target: Target,
     build_context: Callable[[Context], Any],
     max_variable_values: int,
 ) -> Tool:
     properties = operation.input_schema["properties"]
 
-    async def run(arguments: dict[str, Any], ctx: Context) -> CallToolResult:
+    def prepare(arguments: dict[str, Any]) -> Call:
         unknown = sorted(set(arguments) - set(properties))
         if unknown:
-            raise ToolError(f"{operation.name} has no arguments named {unknown}.")
+            raise ToolError(
+                f"{operation.name} has no arguments named {quoted_list(unknown)}."
+            )
         variables = {
             key: _parsed(value, properties[key]) for key, value in arguments.items()
         }
-        errors = await asyncio.to_thread(
-            check_variables, variables, max_values=max_variable_values
+        return _prepared(
+            target,
+            operation.document,
+            operation.parsed,
+            variables,
+            max_values=max_variable_values,
+            hide_suggestions=False,
         )
-        if errors:
-            raise ToolError("\n".join(errors))
-        result = await executor.run(
-            operation.document, variables, await build_context(ctx), {operation.kind}
-        )
+
+    async def run(arguments: dict[str, Any], ctx: Context) -> CallToolResult:
+        call = await asyncio.to_thread(prepare, arguments)
+        result = await executor.run(call, await build_context(ctx))
         return _result(result)
 
     is_query = operation.kind is OperationType.QUERY
@@ -248,60 +281,67 @@ def _operation_tool(
 
 def _add_graphql_tools(
     server: MCPServer,
-    schema: GraphQLSchema,
+    schema: Any,
     options: GraphQLTool,
     executor: Executor,
     build_context: Callable[[Context], Any],
     *,
     hide_suggestions: bool,
     max_variable_values: int,
+    runs_whole_schema: bool,
 ) -> GraphQLSchema:
     """Adds ``graphql`` and ``graphql_schema`` to *server*, and returns the
-    schema they show."""
-    allowlist = None if options.root_fields is None else set(options.root_fields)
-    if allowlist is not None:
-        _check_root_fields(schema, allowlist, allow_mutations=options.allow_mutations)
+    schema they show and run operations on.
+
+    With *runs_whole_schema*, operations run on *schema* itself, where an
+    interface or union may resolve to a type the tool leaves out, so a field
+    that returns one of those is refused.
+    """
     exposed = exposed_schema(
-        schema, allow_mutations=options.allow_mutations, root_fields=allowlist
+        schema._schema,
+        allow_mutations=options.allow_mutations,
+        root_fields=options.root_fields,
     )
+    assert_valid_schema(exposed)
+    target = Target(schema, exposed, hide_suggestions=hide_suggestions)
+    escaping = escaping_types(schema._schema, exposed) if runs_whole_schema else ()
     schema_tool = options.schema_tool is not False
     allowed = {OperationType.QUERY}
     if options.allow_mutations:
         allowed.add(OperationType.MUTATION)
 
-    def check(
-        query: str, variables: dict[str, Any]
-    ) -> tuple[list[str], OperationType | None]:
-        errors, kind = check_operation(
+    def prepare(query: str, variables: dict[str, Any]) -> Call:
+        errors, parsed = read_operation(
             exposed,
             query,
             allowed=allowed,
+            max_length=options.max_length,
             max_depth=options.max_depth,
             max_tokens=options.max_tokens,
             max_fields=options.max_fields,
             schema_tool=schema_tool,
             hide_suggestions=hide_suggestions,
         )
-        errors = errors or check_variables(variables, max_values=max_variable_values)
-        if not errors and hide_suggestions:
-            errors = check_coercion(exposed, query, variables)
-        return errors, kind
+        if errors:
+            raise ToolError("\n".join(errors))
+        assert parsed is not None
+        field = reaching(exposed, parsed.document, escaping) if escaping else None
+        if field is not None:
+            raise ToolError(f"{field} may return a type this tool leaves out.")
+        return _prepared(
+            target,
+            query,
+            parsed,
+            variables,
+            max_values=max_variable_values,
+            hide_suggestions=hide_suggestions,
+        )
 
     async def graphql(
         query: str, ctx: Context, variables: dict[str, Any] | None = None
     ) -> CallToolResult:
-        variables = variables or {}
-        errors, kind = await asyncio.to_thread(check, query, variables)
-        if errors:
-            raise ToolError("\n".join(errors))
-        assert kind is not None
-        result = await executor.run(
-            query,
-            variables,
-            await build_context(ctx),
-            {kind},
-            prepare_off_loop=True,
-        )
+        call = await asyncio.to_thread(prepare, query, variables or {})
+        result = await executor.run(call, await build_context(ctx))
         return _result(result)
 
     kinds = "query or mutation" if options.allow_mutations else "query"
@@ -348,19 +388,41 @@ def _add_graphql_tools(
     return exposed
 
 
-def _check_root_fields(
-    schema: GraphQLSchema, allowlist: set[str], *, allow_mutations: bool
-) -> None:
-    assert schema.query_type is not None
-    queries = set(schema.query_type.fields)
-    mutation = schema.mutation_type
-    mutations = set(mutation.fields) if allow_mutations and mutation else set()
-    unknown = sorted(allowlist - queries - mutations)
-    if unknown:
-        hint = "" if allow_mutations else " (mutations need allow_mutations)"
-        raise ValueError(f"root_fields names no such root field: {unknown}{hint}.")
-    if not allowlist & queries:
-        raise ValueError("root_fields must include at least one query field.")
+def _prepared(
+    target: Target,
+    query: str,
+    parsed: Parsed,
+    variables: dict[str, Any],
+    *,
+    max_values: int,
+    hide_suggestions: bool,
+) -> Call:
+    """A call of *parsed* with *variables*, which may hold at most
+    *max_values* values, as may its fields' arguments between them.
+
+    Variables that do not fit the types the operation declares are refused
+    here with ``hide_suggestions``, and otherwise reach execution, which
+    reports them before any field runs.
+    """
+    errors = check_variables(variables, max_values=max_values)
+    if errors:
+        raise ToolError("\n".join(errors))
+    assert target.graphql_schema is not None
+    coerced = get_variable_values(
+        target.graphql_schema,
+        parsed.operation.variable_definitions or (),
+        variables,
+        hide_suggestions=hide_suggestions,
+    )
+    if isinstance(coerced, list):
+        if hide_suggestions:
+            raise ToolError("\n".join(error.message for error in coerced))
+        return Call(query, parsed.document, parsed.kind, variables, target)
+    costs = Costs(target.graphql_schema, coerced, max_values)
+    errors = costs.check(parsed)
+    if errors:
+        raise ToolError("\n".join(errors))
+    return Call(query, parsed.document, parsed.kind, variables, target, costs)
 
 
 def _parsed(value: Any, schema: dict[str, Any]) -> Any:

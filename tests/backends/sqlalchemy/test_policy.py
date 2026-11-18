@@ -10,7 +10,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from strawberry_orm import MutationPolicy, StrawberryORM
-from strawberry_orm.policy import _check_policy
 from tests.backends.sqlalchemy.models import (
     Base as SABase,
 )
@@ -68,7 +67,7 @@ class ScopingPolicy(MutationPolicy):
     """Only allows access to objects where the PK matches the context's allowed_ids."""
 
     def scope_query(self, model, query, info):
-        from strawberry_orm.backends.sqlalchemy import _get_sa_pk_column
+        from strawberry_orm.repo import _get_sa_pk_column
 
         pk_col = _get_sa_pk_column(model)
         allowed = info.context.get("allowed_ids", [])
@@ -118,23 +117,6 @@ def _seed(session):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for _check_policy helper
-# ---------------------------------------------------------------------------
-
-
-class TestCheckPolicy:
-    def test_none_policy_is_noop(self):
-        _check_policy(None, "can_create", SAUser, {}, None)
-
-    def test_allow_policy_passes(self):
-        _check_policy(MutationPolicy(), "can_create", SAUser, {}, None)
-
-    def test_deny_policy_raises(self):
-        with pytest.raises(PermissionError, match="can_create denied"):
-            _check_policy(DenyAllPolicy(), "can_create", SAUser, {}, None)
-
-
-# ---------------------------------------------------------------------------
 # apply_ref_list policy tests
 # ---------------------------------------------------------------------------
 
@@ -156,6 +138,28 @@ class TestRefListPolicy:
 
         with pytest.raises(PermissionError, match="can_create denied"):
             orm.apply_ref_list(data["post"], "tags", [ref], info)
+
+    def test_create_allowed_by_a_policy_that_keeps_the_default(self):
+        session = _make_session()
+        data = _seed(session)
+
+        orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", policy=DenyUpdatePolicy())
+        info = _make_info(session)
+
+        @strawberry.input
+        class CreateTag:
+            name: str
+
+        ref_type = orm.ref(SATag, create=CreateTag)
+        orm.apply_ref_list(
+            data["post"], "tags", [ref_type(create=CreateTag(name="go"))], info
+        )
+        session.commit()
+        assert sorted(tag.name for tag in data["post"].tags) == [
+            "go",
+            "graphql",
+            "python",
+        ]
 
     def test_update_denied_by_policy(self):
         session = _make_session()

@@ -137,7 +137,7 @@ class AbstractTestConnectionOrderScoping:
             schema, comment_page("{ object: { author: { field: { name: ASC } } } }")
         )
         assert result.errors is not None
-        assert "Cannot order by Comment.author" in str(result.errors[0].message)
+        assert "Cannot order by author:" in str(result.errors[0].message)
 
     async def test_a_relation_connection_still_orders_by_its_own_columns(
         self, orm, models, narrow, run

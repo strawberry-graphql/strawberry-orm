@@ -527,9 +527,14 @@ class TestInternalBackendCoverage:
             def scope_rows(cls, stmt, info):
                 return stmt.where(SAComment.body != "")
 
+        class UserQueryType:
+            @classmethod
+            def scope_rows(cls, stmt, info):
+                return stmt.where(User.name != "")
+
         backend._type_querysets[Post] = PostQueryType.scope_rows
         backend._type_querysets[SAComment] = CommentQueryType.scope_rows
-        backend._type_querysets[User] = PostQueryType.scope_rows
+        backend._type_querysets[User] = UserQueryType.scope_rows
         backend._store.hints = {
             "UserType": {
                 "name": SimpleNamespace(

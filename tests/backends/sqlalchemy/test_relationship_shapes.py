@@ -198,6 +198,31 @@ class Book(Base):
     withdrawn: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class Team(Base):
+    __tablename__ = "shape_team"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    players: Mapped[list["Player"]] = relationship(secondary="shape_roster")
+
+
+class Player(Base):
+    __tablename__ = "shape_player"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+
+
+class Roster(Base):
+    """The link rows of ``Team.players``, keyed by both their ends."""
+
+    __tablename__ = "shape_roster"
+
+    team_id: Mapped[int] = mapped_column(ForeignKey("shape_team.id"), primary_key=True)
+    player_id: Mapped[int] = mapped_column(
+        ForeignKey("shape_player.id"), primary_key=True
+    )
+
+
 def new_orm(**kwargs: Any) -> Any:
     return StrawberryORM.for_sqlalchemy(
         dialect="sqlite",
@@ -206,6 +231,10 @@ def new_orm(**kwargs: Any) -> Any:
         warn_sensitive=False,
         **kwargs,
     )
+
+
+def relation_specs(model: type) -> dict[str, Any]:
+    return _sqlalchemy_relation_specs(model, new_orm().backend._row_keys)
 
 
 @pytest_asyncio.fixture(params=["sync", "async"])
@@ -255,6 +284,10 @@ async def db(session):
             Chair(id=2, name="their chair", desk_id=2),
             Chair(id=3, name="spare chair"),
             Shelf(id=1, books=[Book(id=1, title="atlas"), Book(id=2, title="diary")]),
+            Team(id=1),
+            Player(id=1, name="ann"),
+            Player(id=2, name="bo"),
+            Roster(team_id=1, player_id=2),
         ]
     )
     await resolve(session.commit())
@@ -311,7 +344,7 @@ class TestReverseOneToOneLinks:
         )
 
     async def test_the_link_is_labelled_as_the_reverse_side(self):
-        spec = _sqlalchemy_relation_specs(Member)["profile"]
+        spec = relation_specs(Member)["profile"]
         assert (spec.kind, spec.relation_mode, spec.fk_column, spec.remote_attr) == (
             "single",
             "reverse_fk",
@@ -359,6 +392,41 @@ class TestReverseOneToOneLinks:
             "their profile": 1,
             "spare profile": None,
         }
+
+    async def test_an_owner_the_repo_hides_reads_as_missing(self, db, calls):
+        class HidingVictim(link_recorder(calls, locked=set())):
+            def scope_query(self, query, info):
+                return query.where(Member.name != "Victim")
+
+        orm = new_orm(repos={Member: HidingVictim})
+        with pytest.raises(PermissionError) as refused:
+            await resolve(orm.apply_upsert(self.take(orm, "Me", "2"), db.info))
+        assert str(refused.value) == (
+            "The row cannot be taken from the row that holds it"
+        )
+        assert calls == []
+        assert await held_by(db) == UNTOUCHED
+
+    async def test_taking_a_profile_asks_the_owners_own_repo(self, db, calls):
+        orm = new_orm(repos={Member: link_recorder(calls, locked={"Victim"})})
+        with pytest.raises(PermissionError, match="can_unlink denied"):
+            await resolve(orm.apply_upsert(self.take(orm, "Me", "2"), db.info))
+        assert calls == [("can_unlink", "Victim", "profile", "their profile")]
+        assert await held_by(db) == UNTOUCHED
+
+    async def test_authorize_is_asked_to_unlink_the_owner(self, db):
+        seen: list[Any] = []
+
+        def authorize(action, model, pk, info):
+            seen.append((action, model.__name__, pk))
+            return (action, model) != ("unlink", Member)
+
+        orm = new_orm()
+        payload = self.take(orm, "Me", "2")
+        with pytest.raises(PermissionError, match="authorize denied the unlink"):
+            await resolve(orm.apply_upsert(payload, db.info, authorize=authorize))
+        assert ("unlink", "Member", 2) in seen
+        assert await held_by(db) == UNTOUCHED
 
     async def test_a_profile_nobody_holds_is_only_linked(self, db, calls):
         orm = self.orm(calls, locked=set())
@@ -467,9 +535,9 @@ class TestForwardOneToOneLinks:
         )
 
     async def test_the_specs_name_the_relation_a_target_is_taken_from(self):
-        profile = _sqlalchemy_relation_specs(Profile)["member"]
-        chair = _sqlalchemy_relation_specs(Chair)["desk"]
-        badge = _sqlalchemy_relation_specs(Wearer)["badge"]
+        profile = relation_specs(Profile)["member"]
+        chair = relation_specs(Chair)["desk"]
+        badge = relation_specs(Wearer)["badge"]
         assert (profile.taken_from, profile.orphans_holder) == ("profile", False)
         assert (chair.taken_from, chair.orphans_holder) == ("chair", True)
         assert (badge.taken_from, badge.orphans_holder) == (None, False)
@@ -497,6 +565,20 @@ class TestForwardOneToOneLinks:
         ):
             await resolve(orm.apply_upsert(payload, db.info))
         assert ("can_unlink", "Victim", "profile", "their profile") not in calls
+        assert await held_by(db) == UNTOUCHED
+
+    async def test_authorize_is_asked_to_unlink_the_holder(self, db):
+        seen: list[Any] = []
+
+        def authorize(action, model, pk, info):
+            seen.append((action, model.__name__, pk))
+            return (action, model) != ("unlink", Profile)
+
+        orm = new_orm()
+        payload = point(orm, Profile, PROFILE, "spare profile", "member", "2")
+        with pytest.raises(PermissionError, match="authorize denied the unlink"):
+            await resolve(orm.apply_upsert(payload, db.info, authorize=authorize))
+        assert ("unlink", "Profile", 2) in seen
         assert await held_by(db) == UNTOUCHED
 
     async def test_an_allowed_take_clears_the_holders_key(self, db, calls):
@@ -750,11 +832,11 @@ class TestOrphansGoAsDeletes:
         )
 
     async def test_the_specs_say_which_relations_delete_orphans(self):
-        assert _sqlalchemy_relation_specs(Album)["photos"].deletes_orphans
-        assert _sqlalchemy_relation_specs(Wearer)["badge"].deletes_orphans
-        assert _sqlalchemy_relation_specs(Shelf)["books"].deletes_orphans
-        assert not _sqlalchemy_relation_specs(Member)["profile"].deletes_orphans
-        assert not _sqlalchemy_relation_specs(Photo)["album"].deletes_orphans
+        assert relation_specs(Album)["photos"].deletes_orphans
+        assert relation_specs(Wearer)["badge"].deletes_orphans
+        assert relation_specs(Shelf)["books"].deletes_orphans
+        assert not relation_specs(Member)["profile"].deletes_orphans
+        assert not relation_specs(Photo)["album"].deletes_orphans
 
     async def test_unlinking_from_a_list_that_deletes_orphans_is_refused(self, db):
         orm = new_orm()
@@ -786,10 +868,7 @@ class TestOrphansGoAsDeletes:
         orm = new_orm(repos={Badge: badge_repo(calls, hidden=("old",))})
         with pytest.raises(PermissionError) as refused:
             await resolve(orm.apply_upsert(self.repoint(orm), db.info))
-        assert str(refused.value) == (
-            "The row the link held would be deleted by re-pointing it, and "
-            "cannot be deleted"
-        )
+        assert str(refused.value) == "The row the link held cannot be let go of"
         assert calls == []
         assert await stored_rows(db) == KEPT
 
@@ -862,6 +941,62 @@ class TestManyToManyOrphans:
     async def test_a_deleted_row_takes_its_link_rows_with_it(self, db):
         await self.edit(db, new_orm(), "delete")
         assert await shelved(db) == {"books": [("diary", False)], "shelved": [2]}
+
+
+# -- A link row keyed by both its ends is read by its whole key ----------------------
+
+
+def roster_repo(calls: list[Any], *, hidden: tuple[int, ...] = ()) -> type:
+    class RosterRepo(AbstractRepo):
+        def scope_query(self, query, info):
+            return query.where(Roster.player_id.not_in(hidden))
+
+        def can_create(self, data, info):
+            calls.append(("can_create", data))
+            return False
+
+        def can_delete(self, instance, info):
+            calls.append(("can_delete", instance.team_id, instance.player_id))
+            return False
+
+    return RosterRepo
+
+
+async def rostered(db: Any) -> list[tuple[int, int]]:
+    statement = select(Roster.team_id, Roster.player_id).order_by(Roster.player_id)
+    return [tuple(row) for row in (await resolve(db.session.execute(statement))).all()]
+
+
+class TestACompositeKeyedLinkRow:
+    async def edit(self, db: Any, orm: Any, operation: str, player: str) -> None:
+        ref = orm.ref(Player, unlink=True)
+        team = await resolve(db.session.get(Team, 1))
+        refs = [item(ref, operation, id=player)]
+        await resolve(orm.apply_ref_list(team, "players", refs, db.info))
+
+    async def test_a_link_asks_to_create_its_row(self, db):
+        calls: list[Any] = []
+        orm = new_orm(repos={Roster: roster_repo(calls)})
+        with pytest.raises(PermissionError, match=r"^AbstractRepo.can_create denied"):
+            await self.edit(db, orm, "update", "1")
+        assert calls == [("can_create", {"team_id": 1, "player_id": 1})]
+        assert await rostered(db) == [(1, 2)]
+
+    async def test_a_link_row_the_repo_hides_reads_as_no_member(self, db):
+        calls: list[Any] = []
+        orm = new_orm(repos={Roster: roster_repo(calls, hidden=(2,))})
+        with pytest.raises(UpsertNotFoundError, match=r"^No row 2 in players$"):
+            await self.edit(db, orm, "unlink", "2")
+        assert calls == []
+        assert await rostered(db) == [(1, 2)]
+
+    async def test_unlinking_asks_to_delete_its_row(self, db):
+        calls: list[Any] = []
+        orm = new_orm(repos={Roster: roster_repo(calls)})
+        with pytest.raises(PermissionError, match=r"^AbstractRepo.can_delete denied"):
+            await self.edit(db, orm, "unlink", "2")
+        assert calls == [("can_delete", 1, 2)]
+        assert await rostered(db) == [(1, 2)]
 
 
 # -- isNull on a reverse one-to-one -----------------------------------------------------

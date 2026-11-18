@@ -69,20 +69,6 @@ class MutationPolicy:
         return query
 
 
-def _check_policy(
-    policy: MutationPolicy | None,
-    method_name: str,
-    *args: Any,
-) -> None:
-    """Call a policy method and raise ``PermissionError`` unless it allows."""
-    from strawberry_orm.repo import _require, _sync_result
-
-    if policy is None:
-        return
-    check = f"MutationPolicy.{method_name}"
-    _require(_sync_result(getattr(policy, method_name)(*args), check), check)
-
-
 class _PolicyRepoDict(dict):
     """A dict subclass that returns the same repo class for *any* model key.
 

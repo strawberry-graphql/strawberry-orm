@@ -61,7 +61,7 @@ class TestBailDiagnostic:
     async def test_a_resolver_running_its_own_query_is_reported(self):
         message = await self._warnings(self._schema(materialize=True))
         assert "one query per parent" in message
-        assert "users.written" in message
+        assert "UserType.written" in message
 
     async def test_a_rewritable_resolver_is_not_reported(self):
         """Async resolution cannot be rewritten either, so this one is reported too."""

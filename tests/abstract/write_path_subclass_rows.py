@@ -10,8 +10,10 @@ it do from the row itself.
 Each backend supplies a ``writes`` fixture: a :class:`WriteDb` over models of
 one shape - a ``WaFolder`` of ``WaDoc`` rows, ``WaSealedDoc`` and
 ``WaPublicDoc`` subclassing ``WaDoc``, ``WaRestrictedDoc`` subclassing
-``WaSealedDoc``, and a ``WaPin`` linking one doc - whose ``also_a(model, pk)``
-makes an existing row a row of another subclass as well.
+``WaSealedDoc``, a ``WaPin`` linking one doc, and a ``WaBinder`` listing and a
+``WaMark`` linking docs of each of ``WaDoc``, ``WaSealedDoc`` and
+``WaRestrictedDoc`` - whose ``also_a(model, pk)`` makes an existing row a row
+of another subclass as well.
 """
 
 from types import SimpleNamespace
@@ -145,6 +147,7 @@ class AbstractTestSubclassRowsReadAsTheBase:
     async def test_an_upsert_through_the_base_is_checked_by_the_rows_own_repo(
         self, writes, docs, orm, calls, doc_upsert
     ):
+        """And by the base's: a sealed doc is a doc too."""
         seen = []
 
         def authorize(action, model, pk, info):
@@ -154,8 +157,8 @@ class AbstractTestSubclassRowsReadAsTheBase:
         payload = self.edit(doc_upsert, "edited", id="3")
         row = await writes.upsert(orm, payload, authorize=authorize)
         assert type(row) is writes.m.SealedDoc
-        assert calls == [("sealed", "can_update", 3)]
-        assert seen == [("upsert", "WaSealedDoc", 3)]
+        assert calls == [("doc", "can_update", 3), ("sealed", "can_update", 3)]
+        assert seen == [("upsert", "WaDoc", 3), ("upsert", "WaSealedDoc", 3)]
         assert (await self.titles(writes))[3] == "edited"
 
     async def test_an_upsert_match_leaves_out_a_row_its_own_repo_hides(
@@ -203,6 +206,58 @@ class AbstractTestSubclassRowsReadAsTheBase:
         assert (await self.titles(writes))[5] == "both"
         assert calls == []
 
+    @pytest.mark.parametrize("field", ["id", "title"])
+    @pytest.mark.parametrize(
+        ("model", "pk", "title", "hider"),
+        [
+            ("SealedDoc", 2, "sealed", "doc"),
+            ("RestrictedDoc", 6, "restricted", "doc"),
+            ("RestrictedDoc", 6, "restricted", "sealed"),
+            ("SealedDoc", 2, "sealed", None),
+            ("RestrictedDoc", 6, "restricted", None),
+        ],
+    )
+    async def test_a_write_through_a_subclass_cannot_reach_a_row_a_bases_repo_hides(
+        self, writes, docs, calls, field, model, pk, title, hider
+    ):
+        """A sealed doc is a doc: the docs' repo hiding one hides it from a
+        write reaching it as a sealed doc, as it does through the docs."""
+        m = writes.m
+        repos = {"doc": m.Doc, "sealed": m.SealedDoc, "restricted": m.RestrictedDoc}
+        orm = writes.new_orm(
+            repos={
+                written: recorder(
+                    writes,
+                    calls,
+                    name,
+                    [other for other in range(1, 7) if other != pk]
+                    if name == hider
+                    else None,
+                )
+                for name, written in repos.items()
+            }
+        )
+        target = getattr(m, model)
+        upsert = orm.mutations.upsert_node_input(
+            model=target,
+            project={
+                "_meta": {
+                    "update": ["title"],
+                    "upsert": {"where": [field], "onMatch": "UPDATE"},
+                }
+            },
+            name=f"Wa{model}By{field.title()}",
+        )
+        where = {"id": str(pk)} if field == "id" else {"title": title}
+        if hider is None:
+            await writes.upsert(orm, self.edit(upsert, "edited", **where))
+            assert (await self.titles(writes))[pk] == "edited"
+            return
+        with pytest.raises(UpsertNotFoundError):
+            await writes.upsert(orm, self.edit(upsert, "pwned", **where))
+        assert (await self.titles(writes))[pk] == title
+        assert calls == []
+
     @pytest.fixture
     def pin_upsert(self, orm, writes):
         return orm.mutations.upsert_node_input(
@@ -233,14 +288,17 @@ class AbstractTestSubclassRowsReadAsTheBase:
     ):
         with pytest.raises(PermissionError, match="can_unlink denied"):
             await writes.upsert(orm, self.re_point(pin_upsert, "open pin", "1"))
-        assert calls == [("sealed", "can_unlink", "WaSealedDoc 3")]
+        assert calls == [
+            ("doc", "can_unlink", "WaSealedDoc 3"),
+            ("sealed", "can_unlink", "WaSealedDoc 3"),
+        ]
         pins = await writes.rows(writes.m.Pin)
         assert [pin.doc_id for pin in pins] == [3, 5]
 
     async def test_re_pointing_a_link_off_a_row_two_subclasses_hold_is_refused(
         self, writes, docs, orm, calls, pin_upsert
     ):
-        with pytest.raises(PermissionError, match="more than one subclass"):
+        with pytest.raises(PermissionError, match="the link held cannot be let go"):
             await writes.upsert(orm, self.re_point(pin_upsert, "both pin", "1"))
         assert calls == []
         pins = await writes.rows(writes.m.Pin)

@@ -224,7 +224,7 @@ class AbstractTestScopedOrderTraversal:
         schema = self.build_with_edge_scope(checked=False)
         result = self.execute(schema, ORDER_TRAVERSAL)
         assert result.data is None
-        assert "Cannot order by Post.author" in result.errors[0].message
+        assert "Cannot order by author:" in result.errors[0].message
 
 
 class AbstractTestScopedOrderTraversalAsync:
@@ -273,7 +273,7 @@ class AbstractTestScopedOrderTraversalAsync:
         schema = self.build_with_edge_scope(checked=False)
         result = await self.execute(schema, ORDER_TRAVERSAL)
         assert result.data is None
-        assert "Cannot order by Post.author" in result.errors[0].message
+        assert "Cannot order by author:" in result.errors[0].message
 
 
 class AbstractTestJoinScopedTraversalAsync:

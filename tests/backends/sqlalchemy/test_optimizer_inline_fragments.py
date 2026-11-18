@@ -68,11 +68,9 @@ def apply_optimizer_hints_inline_fragment(sa_session, Post):
 
 
 class TestOptimizerInlineFragments(AbstractTestOptimizerInlineFragmentsSync):
-    @pytest.mark.skip(
-        reason="GraphQL union list runtime mapping is only exercised on Django"
-    )
-    def test_graphql_union_list_inline_fragments(self) -> None:
-        pass
+    @staticmethod
+    def published_only(query, Post):
+        return query.where(Post.is_published.is_(True))
 
 
 class TestOptimizerInlineFragmentsUnit(AbstractTestOptimizerInlineFragmentsUnitSync):

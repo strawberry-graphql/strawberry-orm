@@ -53,6 +53,7 @@ from strawberry_orm.backends._base import (
     AggregateMeta,
     BaseBackend,
     invoke_custom_callback,
+    model_is_type_of,
 )
 from strawberry_orm.backends.django import DjangoBackend
 from strawberry_orm.backends.filter_pk_shortcut import (
@@ -102,6 +103,7 @@ from strawberry_orm.relay.connection import (
     _use_orm_connection_extension,
     connection_state,
     connection_type_for_node,
+    refuse_page_held_by_nothing,
     stash_state,
 )
 from strawberry_orm.types import auto
@@ -474,12 +476,23 @@ class TestLazyResolutionCoverage:
 
 def _connection_info(selected_fields):
     """An ``info`` with what ``resolve_connection`` reads to hold the page to
-    ``max_results``: the schema's config and a context."""
+    ``max_results``: the schema's config, and a context naming the backend
+    that holds its rows to scope."""
     return SimpleNamespace(
         selected_fields=selected_fields,
         schema=SimpleNamespace(config=SimpleNamespace(relay_max_results=100)),
-        context={},
+        context={"_orm_backend": StrawberryORM.for_sqlalchemy()._backend},
+        field_name="usersConnection",
     )
+
+
+def test_a_type_decorated_again_keeps_the_is_type_of_it_was_given():
+    """Only an ``is_type_of`` of the app's own is wrapped, and only once."""
+    made = model_is_type_of(SABase)
+    decided = model_is_type_of(SABase, classmethod(lambda cls, obj, info: True))
+    assert model_is_type_of(SABase, made) is made
+    assert model_is_type_of(SABase, decided) is decided
+    assert decided is not made
 
 
 class TestConnectionCoverage:
@@ -518,6 +531,12 @@ class TestConnectionCoverage:
         assert agg.avg.amount == 15
         assert agg.min.amount == 10
         assert agg.max.amount == 20
+
+    def test_a_page_of_a_field_it_cannot_read_is_refused(self):
+        """With no field to read the node type off, its rows may be rows of a
+        model, and with no backend nothing would hold them to scope."""
+        with pytest.raises(TypeError, match="Cannot page usersConnection"):
+            refuse_page_held_by_nothing(SimpleNamespace(field_name="usersConnection"))
 
     @pytest.mark.asyncio
     async def test_resolve_connection_returns_awaitable(self):
@@ -742,7 +761,9 @@ class TestConnectionCoverage:
                 return _fail().__await__()
 
         backend = SimpleNamespace(
-            is_query_object=lambda value: isinstance(value, AwaitableQuery)
+            is_query_object=lambda value: isinstance(value, AwaitableQuery),
+            query_model=lambda _query: None,
+            apply_type_scope=lambda query, _model, _info: query,
         )
         info = SimpleNamespace(context={"_orm_backend": backend})
         ext = ORMConnectionExtension()
@@ -2295,7 +2316,9 @@ class TestLastCoverageLines:
             field_name="title",
             python_name="title",
         )
-        assert _query_selection_path(info) == "{ users.posts.title }"
+        assert (
+            _query_selection_path(info) == "query Named { users { posts { title } } }"
+        )
 
         info_op_only = SimpleNamespace(
             operation=SimpleNamespace(
@@ -2619,6 +2642,30 @@ class TestRepoAndInputInternals:
 
         with pytest.raises(ValueError, match="2 primary key columns"):
             _get_sa_pk_column(Pair)
+
+    def test_a_composite_primary_key_is_looked_up_whole(self):
+        from sqlalchemy import Column, Integer
+        from sqlalchemy.orm import DeclarativeBase, Session
+
+        class CompositeBase(DeclarativeBase):
+            pass
+
+        class Pair(CompositeBase):
+            __tablename__ = "pair"
+            left = Column(Integer, primary_key=True)
+            right = Column(Integer, primary_key=True)
+
+        engine = create_engine("sqlite:///:memory:")
+        CompositeBase.metadata.create_all(engine)
+        session = Session(engine)
+        session.add_all([Pair(left=1, right=1), Pair(left=1, right=2)])
+        session.flush()
+        info = SimpleNamespace(context={"session": session})
+        repo = AbstractRepo(SQLAlchemyBackend(dialect="sqlite"))
+
+        assert repo._get(Pair, (1, 2), info).right == 2
+        with pytest.raises(ValueError, match="a tuple of 2 values"):
+            repo._get(Pair, 1, info)
 
     def test_the_generated_node_input_is_cached_per_name(self):
         orm = StrawberryORM.for_sqlalchemy(dialect="sqlite")

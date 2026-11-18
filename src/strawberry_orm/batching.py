@@ -30,7 +30,11 @@ from strawberry.types.cast import get_strawberry_type_cast
 
 from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.grouping import GroupPath
-from strawberry_orm.lazy_resolution import _path_field_names, execution_mark
+from strawberry_orm.lazy_resolution import (
+    _path_field_names,
+    execution_mark,
+    field_label,
+)
 
 if TYPE_CHECKING:
     from strawberry_orm.backends.protocol import Backend
@@ -311,22 +315,24 @@ def _already_loaded(root: Any, info: Any) -> bool:
     return False
 
 
-def record_bail(execution_context: Any, path: str, reason: str) -> None:
-    """Note that *path* fell back to one query per parent, and why.
+def record_bail(execution_context: Any, info: Any, reason: str) -> None:
+    """Note that the field *info* resolves fell back to one query per parent,
+    and why.
 
     The batcher knows exactly when its rewrite does not hold, and that is the
     one thing a field's declaration can never tell you: whether the collapse
     actually happened. The lazy-resolution diagnostic reports these alongside
-    the loads it finds itself.
+    the loads it finds itself. *reason* is the batcher's own text, never the
+    request's.
     """
     store = _operation_store(execution_context, _BAILS_KEY)
     if store is None:  # pragma: no cover - only without an execution context
         return
-    store.setdefault(path, reason)
+    store.setdefault(path_key(info), (field_label(info), reason))
 
 
-def recorded_bails(execution_context: Any) -> dict[str, str]:
-    """Paths that fell back during this operation, keyed by path."""
+def recorded_bails(execution_context: Any) -> dict[str, tuple[str, str]]:
+    """The field and reason of each path that fell back during this operation."""
     return _operation_store(execution_context, _BAILS_KEY) or {}
 
 
@@ -410,7 +416,7 @@ class BatchingExtension(SchemaExtension):
             if not _already_loaded(root, info):
                 record_bail(
                     execution_context,
-                    key,
+                    info,
                     "the resolver answers asynchronously, so there is no query "
                     "to rewrite before it runs"
                     if isawaitable(first)
@@ -424,7 +430,7 @@ class BatchingExtension(SchemaExtension):
             results[cache_key] = _UNBATCHABLE
             record_bail(
                 execution_context,
-                key,
+                info,
                 "the query could not be rewritten to cover every parent at once",
             )
             return first
@@ -621,7 +627,7 @@ def _page_window(
             **cursors,
         )
     except (TypeError, ValueError) as exc:
-        raise _Bail(str(exc)) from exc
+        raise _Bail("the field refuses the page it is asked for") from exc
     if window.start < 0 or window.end < 0:
         raise _Bail("a cursor before the first row")
     return window
@@ -726,7 +732,7 @@ class RelationConnectionExtension(SchemaExtension):
                 cached = self._fetch_pages(backend, spec, parents, info, kwargs=kwargs)
             except _Bail as exc:
                 pages[cache_key] = _UNBATCHABLE
-                record_bail(execution_context, key, str(exc) or "not windowable")
+                record_bail(execution_context, info, str(exc) or "not windowable")
                 return _next(root, info, *args, **kwargs)
             if isawaitable(cached):
                 # Siblings reach this concurrently, before any result exists to

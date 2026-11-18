@@ -34,8 +34,9 @@ class TestLazyQueryLogging:
             def posts(self) -> list[PostType]:
                 return list(DjPost.objects.all())
 
-        schema = strawberry.Schema(
+        schema = orm.schema(
             query=Query,
+            optimizer=False,
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = schema.execute_sync("{ posts { author { name } } }")
@@ -139,8 +140,9 @@ class TestLazyQueryLogging:
             def users(self) -> list[UserType]:
                 return list(DjUser.objects.all())
 
-        schema = strawberry.Schema(
+        schema = orm.schema(
             query=Query,
+            optimizer=False,
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = schema.execute_sync("{ users { posts { title } } }")

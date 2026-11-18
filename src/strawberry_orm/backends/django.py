@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import datetime
+import threading
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from inspect import iscoroutinefunction
 from typing import Any
@@ -12,34 +14,45 @@ from typing import Any
 import strawberry
 from django.db import models
 from django.db.models import Aggregate, FloatField, Model, QuerySet
+from django.db.models.deletion import Collector
 from strawberry.extensions import SchemaExtension
 
 from strawberry_orm._async import async_safe_resolver, materialize_result, run_sync
+from strawberry_orm._quoting import quoted
 from strawberry_orm.backends.filter_budget import check_filter_budget
 from strawberry_orm.backends.filter_pk_shortcut import (
     build_reference_object_filter_clause,
 )
-from strawberry_orm.fields import call_scope
 from strawberry_orm.filters import (
+    MAX_REGEX_TEXT_LENGTH,
+    DateTimeComparisonLookup,
     check_regex,
     is_fk_shortcut_lookup,
     is_reference_lookup,
 )
-from strawberry_orm.lazy_resolution import reads_relation
+from strawberry_orm.lazy_resolution import _QUERY_SCOPED, reads_relation
 from strawberry_orm.leaf_fields import is_default_relay_id
 from strawberry_orm.optimizer import OptimizerExtension
+from strawberry_orm.optimizer.planning import Planner, Relation, cast_type_name
+from strawberry_orm.upserts import is_writing, writing
 
 from ._base import (
+    SCOPE_LIMIT_REFUSED,
     WRITE_REFUSED,
     AggregateMeta,
     BaseBackend,
+    driver_errors,
     extract_element_type,
-    hint_hops,
     invoke_custom_callback,
     key_in_range,
     model_is_type_of,
     past_a_hop,
+    raised_by_orm,
+    read_record,
+    renew_record,
     requested_aggregates,
+    signed_value,
+    write_record,
 )
 
 #: Relation-name sets by model class; see :meth:`DjangoBackend.relation_names`.
@@ -116,6 +129,93 @@ class _PlannedLookup:
         self.scoped = scoped
         self.token = token
         self.children: dict[str, _PlannedLookup] = {}
+
+
+class _LookupPlanner(Planner):
+    """Plans ``select_related`` and ``Prefetch`` lookups.
+
+    A ``on=`` field is served by a relation under another name, so the model
+    is asked about that relation, not the field; a to-many one loads into an
+    attribute of its own, as a view no other field shares.
+    """
+
+    def __init__(self, backend: Any, store: Any, info: Any) -> None:
+        super().__init__(backend, store, info)
+        self._querysets: dict[tuple[type, int], Any] = {}
+
+    def _on(self, type_name: str | None, field_name: str) -> str | None:
+        hints = self.hints(type_name, field_name)
+        return getattr(hints, "on", None) if hints else None
+
+    def skips(self, type_name: str | None, field_name: str) -> bool:
+        return self._on(type_name, field_name) is None and super().skips(
+            type_name, field_name
+        )
+
+    def relation(self, model: type, name: str) -> Relation | None:
+        try:
+            field = model._meta.get_field(name)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        if _relation_kind(field) is None:
+            return None
+        return Relation(name, field.related_model, field)
+
+    def selected(
+        self, model: type, type_name: str | None, field_name: str
+    ) -> tuple[str, Relation, str | None] | None:
+        on = self._on(type_name, field_name)
+        relation = self.relation(model, on or field_name)
+        if relation is None:
+            return None
+        field = relation.detail
+        attname = getattr(field, "attname", None)
+        if attname and field_name == attname and field_name != field.name:
+            return None
+        if on is not None and _relation_kind(field) == "many":
+            # to_attr keeps the two views apart: without it the second
+            # Prefetch of the same relation collides.
+            return f"@{field_name}", relation, field_name
+        return field_name, relation, None
+
+    def build(
+        self, model: type, key: str, load: Any, scope: Any, owner: str
+    ) -> _PlannedLookup:
+        relation = load.relation
+        queryset = self._queryset(relation.related, scope)
+        if load.view is None:
+            return _PlannedLookup(
+                to_one=_relation_kind(relation.detail) == "one",
+                queryset=queryset,
+                token=scope,
+            )
+        return _PlannedLookup(
+            to_one=False,
+            queryset=(
+                queryset
+                if queryset is not None
+                else relation.related._default_manager.all()
+            ),
+            relation=relation.name,
+            to_attr=load.view,
+            scoped=queryset is not None,
+            token=scope,
+        )
+
+    def _queryset(self, related: type, scope: Any) -> Any:
+        """The related type's ``scope_rows``, then *scope*, or ``None`` for neither."""
+        get_qs = self.backend._type_querysets.get(related)
+        if get_qs is None and scope is None:
+            return None
+        found = self._querysets.get((related, id(scope)))
+        if found is None:
+            found = related.objects.all()  # type: ignore[attr-defined]
+            if get_qs is not None:
+                found = self.backend.call_row_scope(get_qs, found, self.info)
+            if scope is not None:
+                found = self.backend.call_row_scope(scope, found, self.info)
+            self._querysets[(related, id(scope))] = found
+        return found.all()
 
 
 _DJANGO_FIELD_MAP: dict[str, type] = {
@@ -211,7 +311,24 @@ class DjangoBackend(BaseBackend):
         meta = model._meta  # type: ignore[attr-defined]
         if meta.pk is None:
             return set()
-        return {meta.pk.name}
+        return {field.name for field in _key_fields(meta)}
+
+    def _row_keys(self, model: type) -> set[str]:
+        meta = model._meta  # type: ignore[attr-defined]
+        # A multi-table child's parents are saved with an UPDATE when their key,
+        # or the child's link to them, is set. A composite key's ``pk`` is
+        # virtual: the save matches the row on the columns it is made of.
+        keys = [
+            field
+            for owner in (model, *meta.get_parent_list())
+            for field in (
+                owner._meta.pk,
+                *_key_fields(owner._meta),
+                *owner._meta.parents.values(),
+            )
+            if field is not None
+        ]
+        return {name for field in keys for name in (field.name, field.attname)}
 
     def _generic_key_columns(self, model: type) -> set[str]:
         # contenttypes is not imported: an app without it installed has no
@@ -236,8 +353,7 @@ class DjangoBackend(BaseBackend):
         aggregate = kwargs.get("aggregate")
 
         def decorator(cls: type) -> Any:
-            if "is_type_of" not in cls.__dict__:
-                cls.is_type_of = model_is_type_of(model)  # type: ignore[method-assign]
+            cls.is_type_of = model_is_type_of(model, cls.__dict__.get("is_type_of"))  # type: ignore[method-assign]
 
             meta = model._meta  # type: ignore[attr-defined]
 
@@ -288,12 +404,7 @@ class DjangoBackend(BaseBackend):
                 ann = annotations[field_name]
                 if kind == "many":
                     el_type = extract_element_type(ann)
-                    f_type = (
-                        getattr(el_type, "__orm_filter__", None) if el_type else None
-                    )
-                    o_type = (
-                        getattr(el_type, "__orm_order__", None) if el_type else None
-                    )
+                    f_type, o_type = self._relation_inputs(cls, field_name, el_type)
                     rel_model = rel_info["model"]
 
                     if f_type or o_type:
@@ -389,7 +500,11 @@ class DjangoBackend(BaseBackend):
             spec = self._upsert_relation_spec(type(instance), field)
             # The parent may have been read from a replica; the writes are not.
             using = router.db_for_write(type(instance), instance=instance)
-            with _write_errors(), transaction.atomic(using=using):
+            with (
+                _reads_where_writes_go(),
+                _write_errors(),
+                transaction.atomic(using=using),
+            ):
                 run_steps(writer.apply_refs(instance, spec, refs))
 
         return run_sync(apply, thread_sensitive=True)
@@ -407,7 +522,11 @@ class DjangoBackend(BaseBackend):
             writer = self._upsert_writer(info, authorize)
             writer.validate_root(payload)
             model = type(payload).__orm_model__
-            with _write_errors(), transaction.atomic(using=router.db_for_write(model)):
+            with (
+                _reads_where_writes_go(),
+                _write_errors(),
+                transaction.atomic(using=router.db_for_write(model)),
+            ):
                 return run_steps(writer.apply_root(payload))
 
         return run_sync(apply, thread_sensitive=True)
@@ -418,7 +537,7 @@ class DjangoBackend(BaseBackend):
     def _upsert_relation_spec(self, model: type, field: str) -> Any:
         from strawberry_orm.mutations import _django_relation_specs
 
-        return _django_relation_specs(model)[field]
+        return _django_relation_specs(model, self._row_keys)[field]
 
     def subclasses_read_as_base(self, model: type) -> list[type]:
         # A proxy shares its base's table, so nothing tells its rows apart.
@@ -431,41 +550,49 @@ class DjangoBackend(BaseBackend):
                 found.append(sub)
         return found
 
-    def _scope_subclass_writes(
-        self, rows: Any, repo: Any, model: type, info: Any
-    ) -> Any:
-        """*rows* of *model*, less the rows of a multi-table child its own repo hides.
+    def models_inherited(self, model: type) -> list[type]:
+        # A proxy's concrete model is among its parents.
+        return [*reversed(model._meta.get_parent_list()), model]  # type: ignore[attr-defined]
 
-        Read through *model*, such a row comes back as a *model* row, yet it
-        is written through its own model's repo (see ``UpsertWriter._owner``),
-        so counting a match on one that repo hides would answer for a row the
-        caller cannot reach. A child of it with a repo of its own answers for
-        its own rows.
+    def _scope_writes(self, rows: Any, repo: Any, model: type, info: Any) -> Any:
+        """*rows* of *model*, less those another repo governing them hides.
+
+        A *model* row is a row of each model it inherits, and one a
+        multi-table child holds, below *model* or beside it, is that child's
+        too (see ``classes_holding``); the writer reads it as absent unless
+        each of their repos shows it (see ``UpsertWriter._owned``). Counted,
+        a row one of them hides would make a match ambiguous, and so tell
+        the caller it exists.
         """
         from django.db.models import Q
 
-        apart = self.classes_written_apart(repo, self.subclasses_read_as_base(model))
-        parent = model._meta.concrete_model  # type: ignore[attr-defined]
-        for cls, own in apart.items():
-            link = _parent_link(cls, parent)
-            shown = ~Q(pk__in=cls._base_manager.values(link)) | Q(
-                pk__in=own.scope_query(cls._default_manager.all(), info).values(link)
+        bases = self.models_inherited(model)[:-1]
+        for base, own in self.classes_written_apart(repo, bases).items():
+            shown = self.call_repo_scope(own, base._default_manager.all(), info)
+            # A proxy has no link to its concrete model: it shares its key.
+            link = _parent_link(model, base) or "pk"
+            rows = rows.filter(**{f"{link}__in": shown.values("pk")})
+        # A sibling has no link to *model*, only to the root they share.
+        root = _root_model(model)
+        key = f"{_parent_link(model, root) or 'pk'}__in"
+        for cls, own in self.classes_written_apart(
+            repo, self.classes_holding(model)
+        ).items():
+            link = _parent_link(cls, root)
+            shown = self.call_repo_scope(own, cls._default_manager.all(), info)
+            rows = rows.filter(
+                ~Q(**{key: cls._base_manager.values(link)})
+                | Q(**{key: shown.values(link)})
             )
-            for other in apart:
-                if other is not cls and issubclass(other, cls):
-                    shown |= Q(
-                        pk__in=other._base_manager.values(_parent_link(other, parent))
-                    )
-            rows = rows.filter(shown)
         return rows
 
     def _find_for_upsert(
         self, repo: Any, model: type, query: dict[str, Any], info: Any
     ) -> Any:
-        rows = repo.scope_query(model._default_manager.all(), info).filter(
+        rows = self.call_repo_scope(repo, model._default_manager.all(), info).filter(
             **self._upsert_lookup_kwargs(query)
         )
-        rows = self._scope_subclass_writes(rows, repo, model, info)
+        rows = self._scope_writes(rows, repo, model, info)
         return self._single_upsert_match(model, list(rows[:2]))
 
     async def _find_for_upsert_async(
@@ -485,6 +612,10 @@ class DjangoBackend(BaseBackend):
             max_depth=self._max_filter_depth,
             max_branches=self._max_filter_branches,
             max_values=self._max_in_list_size,
+            max_regex_filters=self._max_regex_filters,
+            max_text_length=self._max_filter_text_length,
+            max_value_length=self._max_filter_value_length,
+            info=info,
         )
         with self.filtering(model, info), _refused_values():
             q_obj, query = _build_django_filter(
@@ -898,14 +1029,35 @@ class DjangoBackend(BaseBackend):
     def query_model(self, query: Any) -> type | None:
         return getattr(query, "model", None)
 
-    def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> set[Any]:
+    def filter_scoped_pks(
+        self, model: type, pks: list[Any], info: Any, *, read_as: Any = None
+    ) -> set[Any]:
         def _run() -> set[Any]:
             queryset = self.apply_type_scope(
-                model._default_manager.filter(pk__in=pks), model, info
+                model._default_manager.filter(pk__in=pks), model, info, read_as=read_as
             )
             return set(_listed(queryset.values_list("pk", flat=True)))
 
         return run_sync(_run, thread_sensitive=True)
+
+    def read_errors(self) -> Any:
+        return _read_errors()
+
+    def rows_scope_allows(self, given: Any, scoped: Any) -> Any:
+        query = scoped.query
+        if query.is_empty():
+            # ``[:0]`` allows no rows too, but then refuses another filter.
+            scoped = scoped._chain()
+            scoped.query.clear_limits()
+            return scoped
+        bounds = (query.low_mark, query.high_mark)
+        given_query = getattr(given, "query", None)
+        if bounds != (0, None) and (
+            given_query is None
+            or bounds != (given_query.low_mark, given_query.high_mark)
+        ):
+            raise ValueError(SCOPE_LIMIT_REFUSED)
+        return scoped
 
     def split_parent_predicate(
         self, query: Any, parent_pk: Any
@@ -916,6 +1068,10 @@ class DjangoBackend(BaseBackend):
         if inner.combinator or inner.distinct_fields or inner.extra:
             return None
         if inner.low_mark or inner.high_mark is not None:
+            return None
+        # A clone keeps only what ``QuerySet`` copies; rows already read, or
+        # anything else set on the queryset, would be lost from the batch.
+        if not _holds_queryset_state_only(query) or query._result_cache is not None:
             return None
 
         remainder = query._chain()
@@ -945,21 +1101,28 @@ class DjangoBackend(BaseBackend):
         hit = hits[0]
         attname = hit.lhs.target.attname
         where.children = [child for child in where.children if child is not hit]
+        remainder._known_related_objects = _without_own_parent(query, hit.lhs.target)
         return attname, attname, remainder
 
     def query_signature(self, query: Any) -> str | None:
+        inner = query.query
+        state = _queryset_state(query, self.query_signature)
+        if state is None:
+            return None
         # ``str(query.query)`` inlines parameters without quoting or type
         # information, so ``title=1`` and ``title="1"`` render identically even
         # though a strictly typed database treats them differently. Sign the
         # parameterised SQL plus typed parameters instead.
         try:
-            sql, params = query.query.get_compiler(using=query.db).as_sql()
+            sql, params = inner.get_compiler(using=query.db).as_sql()
         except Exception:  # pragma: no cover - defensive
             return None
-        typed = tuple((type(param).__name__, repr(param)) for param in params)
+        typed = signed_value(tuple(params))
+        if typed is None:
+            return None
         # The same SQL read from two databases (a tenant's, a replica) reads
         # different rows, so the alias is part of what the query is.
-        return repr((query.db, sql, typed))
+        return repr((query.db, sql, typed, state))
 
     def apply_key_filter(
         self, query: Any, attr_name: str, key_handle: Any, keys: list[Any]
@@ -979,14 +1142,20 @@ class DjangoBackend(BaseBackend):
             probe.count += 1
             return execute(sql, params, many, ctx)
 
-        with connection.execute_wrapper(_wrapper):
+        # Probes overlap on one connection, and ``execute_wrapper`` takes out
+        # whichever wrapper went on last rather than its own.
+        wrappers = connection.execute_wrappers
+        wrappers.append(_wrapper)
+        try:
             yield probe
+        finally:
+            wrappers.remove(_wrapper)
 
     def count_query(self, query: Any, info: Any) -> Any:
         return run_sync(_counted, query, thread_sensitive=True)
 
     def apply_page(self, query: Any, offset: int, limit: int) -> Any | None:
-        from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+        from strawberry_orm.lazy_resolution import narrowed_from
 
         # Rows already in memory cost nothing to slice; a cut would re-read them.
         if query._result_cache is not None:
@@ -994,10 +1163,7 @@ class DjangoBackend(BaseBackend):
         # Slicing composes with an existing slice. The clone forgets that
         # scope_rows was applied, and a sliced queryset can no longer be
         # filtered, so the optimizer must not try to apply it again.
-        page = _ordered_to_the_row(query)[offset : offset + limit]
-        if query_is_scoped(query):
-            mark_query_scoped(page)
-        return page
+        return narrowed_from(query, _ordered_to_the_row(query)[offset : offset + limit])
 
     def materialize_query(self, query: Any, info: Any) -> Any:
         from strawberry_orm._async import in_async_context
@@ -1105,7 +1271,8 @@ class DjangoBackend(BaseBackend):
         from django.db.models import Count
 
         def _run() -> dict[Any, int]:
-            rows = query.values(key_field).annotate(_n=Count("pk"))
+            # Counted by key, so a scope that joins or groups counts each row once.
+            rows = _own_rows(query).values(key_field).annotate(_n=Count("pk"))
             return {row[key_field]: row["_n"] for row in _listed(rows)}
 
         return run_sync(_run, thread_sensitive=True)
@@ -1147,258 +1314,63 @@ class DjangoBackend(BaseBackend):
         return OptimizerExtension.configure(backend=self, store=self._store)
 
     def _relation_lookups(
-        self, store: Any, model: type, info: Any
+        self, store: Any, model: type, info: Any, cast: str | None = None
     ) -> tuple[list[str], list[Any]]:
         """Return the lookups the current selection needs for *model*.
 
         Shared by query optimization and by loading relations onto instances
-        the caller already holds, so both apply the same row scoping.
+        the caller already holds, so both apply the same row scoping. *cast*
+        is the type the rows are cast to.
         """
-        import re
-
         from django.db.models import Prefetch
 
-        from strawberry_orm.optimizer.selections import (
-            field_nodes_from_info,
-            fragments_from_info,
-            merged_field_nodes,
-        )
+        plan = _LookupPlanner(self, store, info).plan(model, cast)
+        select_related: list[str] = []
+        prefetch_related: list[Any] = []
 
-        def compute() -> tuple[list[str], list[Any]]:
-            select_related: list[str] = []
-            prefetch_related: list[Any] = []
-            fragments = fragments_from_info(info)
-
-            def _to_snake(name: str) -> str:
-                return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
-
-            def _edge_scope(type_name: str | None, field_name: str) -> Any:
-                hints = (
-                    store.get(type_name, field_name) if type_name and store else None
-                )
-                return hints.scope if hints else None
-
-            def _get_nested_queryset(
-                type_name: str | None,
-                field_name: str,
-                related_model: type,
-            ) -> Any:
-                """Build a custom queryset if the field has a scope callable or
-                the related model's type defines scope_rows."""
-                get_qs = self._type_querysets.get(related_model)
-                load_fn = _edge_scope(type_name, field_name)
-
-                if get_qs is None and load_fn is None:
-                    return None
-
-                qs = related_model.objects.all()
-                if get_qs is not None:
-                    qs = get_qs(qs, info)
-                if load_fn is not None:
-                    qs = call_scope(load_fn, qs, info)
-                return qs
-
-            # A relation reached both by the selection and by a ``using=`` path
-            # must be loaded once, with one queryset. A plain lookup next to a
-            # scoped one fills the cache with whichever rows Django loads first.
-            plan: dict[str, _PlannedLookup] = {}
-
-            def _planned(
-                level: dict[str, _PlannedLookup],
-                key: str,
-                to_one: bool,
-                type_name: str | None,
-                related_model: type,
-            ) -> _PlannedLookup:
-                lookup = level.get(key)
-                if lookup is None:
-                    lookup = level[key] = _PlannedLookup(
-                        to_one=to_one,
-                        queryset=_get_nested_queryset(type_name, key, related_model),
-                        token=_edge_scope(type_name, key),
+        def _emit(
+            level: dict[str, _PlannedLookup], prefix: str, in_prefetch: bool
+        ) -> None:
+            """Parents go first: Django resolves ``a__b`` through ``a``."""
+            for key, lookup in level.items():
+                if lookup.to_attr is not None:
+                    relation = lookup.relation
+                    path = f"{prefix}__{relation}" if prefix else relation
+                    queryset = _without_select_related(
+                        lookup.queryset, _scoped_paths(lookup.children)
                     )
-                return lookup
-
-            def _plan_hints(
-                level: dict[str, _PlannedLookup],
-                current_model: type,
-                type_name: str | None,
-                field_name: str,
-            ) -> None:
-                """Plan the relation paths declared on ``using=`` for *field_name*.
-
-                Declared against the field name, so they apply to computed
-                fields that are not ORM fields themselves.
-                """
-                hints = (
-                    store.get(type_name, field_name) if type_name and store else None
-                )
-                if not hints or hints.disable_optimization or not hints.using:
-                    return
-                for path in hints.using:
-                    hop_level, hop_model, hop_type = level, current_model, type_name
-                    for hop in hint_hops(path):
-                        try:
-                            rel_field = hop_model._meta.get_field(hop)  # type: ignore[attr-defined]
-                        except Exception:
-                            break
-                        kind = _relation_kind(rel_field)
-                        if kind is None:
-                            break
-                        related_model = rel_field.related_model
-                        lookup = _planned(
-                            hop_level, hop, kind == "one", hop_type, related_model
+                    prefetch = (
+                        _scoped_prefetch(
+                            path, queryset, lookup.token, to_attr=lookup.to_attr
                         )
-                        hop_type = self._child_type_name(
-                            hop_type, hop, related_model, info
-                        )
-                        hop_level, hop_model = lookup.children, related_model
-
-            def _plan_selection(
-                level: dict[str, _PlannedLookup],
-                selection_sets: list[Any],
-                current_model: type,
-                type_name: str | None,
-            ) -> None:
-                meta = current_model._meta  # type: ignore[attr-defined]
-                for name, nodes in merged_field_nodes(
-                    selection_sets, fragments
-                ).items():
-                    field_name = _to_snake(name)
-
-                    # A on= field is served by a relation under another name,
-                    # so ask the model about the relation, not the field.
-                    on = None
-                    if type_name and store:
-                        on_hints = store.get(type_name, field_name)
-                        on = getattr(on_hints, "on", None) if on_hints else None
-                    relation_name = on or field_name
-
-                    # A field that answers for itself will ignore whatever the
-                    # prefetch loads, so do not pay for it.
-                    if on is None and self.resolves_itself(type_name, field_name):
-                        continue
-                    _plan_hints(level, current_model, type_name, field_name)
-
-                    try:
-                        field_obj = meta.get_field(relation_name)
-                    except Exception:
-                        continue
-
-                    kind = _relation_kind(field_obj)
-                    if kind is None:
-                        continue
-                    attname = getattr(field_obj, "attname", None)
-                    if (
-                        attname
-                        and field_name == attname
-                        and field_name != field_obj.name
-                    ):
-                        continue
-                    related_model = field_obj.related_model
-                    below = [node.selection_set for node in nodes if node.selection_set]
-
-                    if kind == "many" and on is not None:
-                        # to_attr keeps the two views apart: without it the
-                        # second Prefetch of the same relation collides.
-                        custom_qs = _get_nested_queryset(
-                            type_name, field_name, related_model
-                        )
-                        view = level.setdefault(
-                            f"@{field_name}",
-                            _PlannedLookup(
-                                to_one=False,
-                                queryset=(
-                                    custom_qs
-                                    if custom_qs is not None
-                                    else related_model._default_manager.all()
-                                ),
-                                relation=relation_name,
-                                to_attr=field_name,
-                                scoped=custom_qs is not None,
-                                token=_edge_scope(type_name, field_name),
-                            ),
-                        )
-                        if below:
-                            _plan_selection(
-                                view.children,
-                                below,
-                                related_model,
-                                self._child_type_name(
-                                    type_name, name, related_model, info
-                                ),
-                            )
-                        continue
-
-                    lookup = _planned(
-                        level, field_name, kind == "one", type_name, related_model
+                        if lookup.scoped
+                        else Prefetch(path, queryset=queryset, to_attr=lookup.to_attr)
                     )
-                    if below:
-                        child_type = self._child_type_name(
-                            type_name, name, related_model, info
-                        )
-                        _plan_selection(
-                            lookup.children,
-                            below,
-                            related_model,
-                            child_type,
-                        )
+                    prefetch_related.append(prefetch)
+                    # Django prefetches through the list a to_attr holds.
+                    view_path = (
+                        f"{prefix}__{lookup.to_attr}" if prefix else lookup.to_attr
+                    )
+                    _emit(lookup.children, view_path, True)
+                    continue
+                path = f"{prefix}__{key}" if prefix else key
+                if lookup.queryset is not None:
+                    queryset = _without_select_related(
+                        lookup.queryset, _scoped_paths(lookup.children)
+                    )
+                    prefetch_related.append(
+                        _scoped_prefetch(path, queryset, lookup.token)
+                    )
+                    _emit(lookup.children, path, True)
+                elif lookup.to_one and not in_prefetch:
+                    select_related.append(path)
+                    _emit(lookup.children, path, False)
+                else:
+                    prefetch_related.append(path)
+                    _emit(lookup.children, path, True)
 
-            def _emit(
-                level: dict[str, _PlannedLookup], prefix: str, in_prefetch: bool
-            ) -> None:
-                """Parents go first: Django resolves ``a__b`` through ``a``."""
-                for key, lookup in level.items():
-                    if lookup.to_attr is not None:
-                        relation = lookup.relation
-                        path = f"{prefix}__{relation}" if prefix else relation
-                        queryset = _without_select_related(
-                            lookup.queryset, _scoped_paths(lookup.children)
-                        )
-                        prefetch = (
-                            _scoped_prefetch(
-                                path, queryset, lookup.token, to_attr=lookup.to_attr
-                            )
-                            if lookup.scoped
-                            else Prefetch(
-                                path, queryset=queryset, to_attr=lookup.to_attr
-                            )
-                        )
-                        prefetch_related.append(prefetch)
-                        # Django prefetches through the list a to_attr holds.
-                        view_path = (
-                            f"{prefix}__{lookup.to_attr}" if prefix else lookup.to_attr
-                        )
-                        _emit(lookup.children, view_path, True)
-                        continue
-                    path = f"{prefix}__{key}" if prefix else key
-                    if lookup.queryset is not None:
-                        queryset = _without_select_related(
-                            lookup.queryset, _scoped_paths(lookup.children)
-                        )
-                        prefetch_related.append(
-                            _scoped_prefetch(path, queryset, lookup.token)
-                        )
-                        _emit(lookup.children, path, True)
-                    elif lookup.to_one and not in_prefetch:
-                        select_related.append(path)
-                        _emit(lookup.children, path, False)
-                    else:
-                        prefetch_related.append(path)
-                        _emit(lookup.children, path, True)
-
-            root_type_name = self._selection_type_name(model, info)
-            _plan_selection(
-                plan,
-                [node.selection_set for node in field_nodes_from_info(info)],
-                model,
-                root_type_name,
-            )
-            _emit(plan, "", False)
-
-            return select_related, prefetch_related
-
-        return compute()
+        _emit(plan, "", False)
+        return select_related, prefetch_related
 
     def apply_optimizer_hints(self, store: Any, query: Any, info: Any) -> Any:
         def optimize() -> Any:
@@ -1448,14 +1420,16 @@ class DjangoBackend(BaseBackend):
         def load() -> list[Any]:
             from django.db.models import prefetch_related_objects
 
-            by_model: dict[type, list[Any]] = {}
+            # Rows cast to different types are planned apart, each as its own.
+            by_model: dict[tuple[type, str | None], list[Any]] = {}
             for instance in instances:
-                by_model.setdefault(type(instance), []).append(instance)
+                key = (type(instance), cast_type_name(instance))
+                by_model.setdefault(key, []).append(instance)
 
             loaded: list[Any] = []
-            for model, rows in by_model.items():
+            for (model, cast), rows in by_model.items():
                 select_related, prefetch_related = self._relation_lookups(
-                    store, model, info
+                    store, model, info, cast
                 )
                 lookups = _dedupe_lookups([*select_related, *prefetch_related])
                 if lookups:
@@ -1471,10 +1445,68 @@ class DjangoBackend(BaseBackend):
 
         return run_sync(load, thread_sensitive=True)
 
+    def _exclusively(self, work: Callable[[], Any]) -> Any:
+        """Run *work* as a job on the one worker thread every load here runs on."""
+        return run_sync(work, thread_sensitive=True)
+
+    def relation_loaded(self, row: Any, name: str) -> bool:
+        from strawberry_orm.lazy_resolution import _django_relation_prefetched
+
+        return bool(_django_relation_prefetched(row, name))
+
+    def relation_holds_scoped(self, row: Any, name: str, token: Any) -> bool:
+        from strawberry_orm.lazy_resolution import relation_cache_is_scoped
+
+        return self.relation_loaded(row, name) and relation_cache_is_scoped(
+            row, name, scope=token, held=_held
+        )
+
+    def held_related(self, rows: list[Any], name: str) -> list[Any]:
+        return list(
+            {id(row): row for row in _django_related_children(rows, name)}.values()
+        )
+
+    def read_relation_scoped(
+        self,
+        rows: list[Any],
+        model: type,
+        name: str,
+        restrict: Any,
+        token: Any,
+        info: Any,
+    ) -> Any:
+        """Prefetch *name* onto *rows* again, through a tagged scoped ``Prefetch``."""
+
+        def read() -> None:
+            from django.db.models import prefetch_related_objects
+
+            for row in rows:
+                _clear_django_relation_cache(row, name)
+            lookup: Any = name
+            if restrict is not None:
+                related = self._relation_target_model(model, name)
+                lookup = _scoped_prefetch(
+                    name, restrict(related._default_manager.all(), info), token
+                )
+            with _read_errors(_instance_db(rows[0])):
+                prefetch_related_objects(rows, lookup)
+            _mark_scoped_prefetches(rows, [lookup])
+
+        return run_sync(read, thread_sensitive=True)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _key_fields(meta: Any) -> list[Any]:
+    """The fields of *meta*'s primary key: each of its columns', if composite.
+
+    A ``CompositePrimaryKey`` is a field of its own, named ``pk``, over the
+    fields that hold its values.
+    """
+    return list(getattr(meta, "pk_fields", [meta.pk]))
 
 
 def _pk_tiebreak(ordering: Any, model: type) -> str | None:
@@ -1536,7 +1568,7 @@ def _make_on_resolver(
                 self,
                 field_name,
                 scope=backend._field_scope(type(self), field_name, info),
-                held=_held,
+                held=lambda _row, _name: prefetched,
             )
         ):
             return prefetched
@@ -1683,8 +1715,21 @@ def _clear_django_relation_cache(instance: Any, field_name: str) -> None:
         instance.__dict__.pop(field_name, None)
 
 
+def _view_attr(lookup: Any) -> str | None:
+    """Attribute a top-level ``on=`` view writes, scoped or not, or ``None``."""
+    to_attr = getattr(lookup, "to_attr", None)
+    through = getattr(lookup, "prefetch_through", "") or ""
+    return to_attr if to_attr and "__" not in through else None
+
+
 def _clear_scoped_relation_caches(instances: list[Any], lookups: list[Any]) -> None:
-    names = [name for lookup in lookups if (name := _scoped_prefetch_attr(lookup))]
+    # Django keeps a view's rows rather than read them again, and those can
+    # be another type's, read under its scope.
+    names = [
+        name
+        for lookup in lookups
+        if (name := _scoped_prefetch_attr(lookup) or _view_attr(lookup))
+    ]
     if not names:
         return
     for instance in instances:
@@ -1816,16 +1861,18 @@ def _scoped_related_queryset(
     manager = getattr(instance, field_name)
     restrict = backend.relation_scope(type(instance), field_name, info)
     prefetched = _django_relation_prefetched(instance, field_name)
-    if prefetched and (
-        restrict is None
-        or relation_cache_is_scoped(
-            instance,
-            field_name,
-            scope=backend._field_scope(type(instance), field_name, info),
-            held=_held,
-        )
-    ):
+    if prefetched and restrict is None:
         return manager.all()
+    # Checked and returned as one value: a load on the worker thread can
+    # replace it while this runs on the event loop.
+    held = _held(instance, field_name)
+    if prefetched and relation_cache_is_scoped(
+        instance,
+        field_name,
+        scope=backend._field_scope(type(instance), field_name, info),
+        held=lambda _row, _name: held,
+    ):
+        return held
     if prefetched and restrict is not None:
         cache = getattr(instance, "_prefetched_objects_cache", None)
         if isinstance(cache, dict):
@@ -1857,13 +1904,14 @@ def _scoped_related_instance(
     # raises rather than returning None for a non-nullable column. A cache
     # this library did not fill is not that load: re-check the primary key.
     if _django_relation_prefetched(instance, field_name):
+        held = _held(instance, field_name)
         if relation_cache_is_scoped(
             instance,
             field_name,
             scope=backend._field_scope(type(instance), field_name, info),
-            held=_held,
+            held=lambda _row, _name: held,
         ):
-            return getattr(instance, field_name, None)
+            return held
         related = getattr(instance, field_name, None)
         if related is None:
             return None
@@ -1934,6 +1982,116 @@ def _is_parent_predicate(
     rhs = child.rhs
     value = getattr(rhs, "pk", rhs)
     return bool(value == parent_pk)
+
+
+#: What ``QuerySet.__init__`` sets, across the Django versions supported, and
+#: the library's mark that a type's scope is applied.
+_QUERYSET_STATE = frozenset(
+    {
+        "model",
+        "_db",
+        "_hints",
+        "_query",
+        "_result_cache",
+        "_sticky_filter",
+        "_for_write",
+        "_prefetch_related_lookups",
+        "_prefetch_done",
+        "_known_related_objects",
+        "_iterable_class",
+        "_fetch_mode",
+        "_fields",
+        "_defer_next_filter",
+        "_deferred_filter",
+        "_cloning_enabled",
+        _QUERY_SCOPED,
+    }
+)
+
+#: What ``Prefetch.__init__`` sets.
+_PREFETCH_STATE = frozenset({"prefetch_through", "prefetch_to", "queryset", "to_attr"})
+
+
+class _Bare:
+    pass
+
+
+#: What a class statement puts in any class's namespace.
+_CLASS_BOOKKEEPING = frozenset(vars(_Bare))
+
+
+def _holds_queryset_state_only(query: Any) -> bool:
+    return vars(query).keys() <= _QUERYSET_STATE
+
+
+def _adds_methods_only(cls: type) -> bool:
+    """True for ``QuerySet``, or a subclass overriding none of its members."""
+    stock = vars(QuerySet)
+    return not any(
+        name in stock and name not in _CLASS_BOOKKEEPING
+        for klass in cls.__mro__[: cls.__mro__.index(QuerySet)]
+        for name in vars(klass)
+    )
+
+
+def _without_own_parent(query: Any, field: Any) -> dict[Any, Any]:
+    """*query*'s known related objects, less the parent its related manager set.
+
+    Read for every parent at once, the rows load their parent instead.
+    """
+    known = dict(query._known_related_objects)
+    parent = query._hints.get("instance")
+    own = known.get(field)
+    if parent is not None and own and all(row is parent for row in own.values()):
+        del known[field]
+    return known
+
+
+def _queryset_state(query: Any, sign: Any) -> tuple[Any, ...] | None:
+    """What *query* holds besides its SQL, to compare it by, or ``None``.
+
+    Only the state ``QuerySet`` keeps is understood: on ``QuerySet`` or a
+    subclass adding methods, building rows of its own model the way
+    ``ModelIterable`` does, before anything is read. Anything else can shape
+    the rows its SQL reads. *sign* signs a ``Prefetch``'s queryset.
+    """
+    from django.db.models import Prefetch
+    from django.db.models.query import ModelIterable
+    from django.db.models.sql import Query
+
+    from strawberry_orm.lazy_resolution import query_is_scoped
+
+    if not _holds_queryset_state_only(query) or not _adds_methods_only(type(query)):
+        return None
+    if type(query.query) is not Query or query._iterable_class is not ModelIterable:
+        return None
+    if query._result_cache is not None or query._prefetch_done:
+        return None
+    if query._known_related_objects:
+        return None
+    lookups: list[Any] = []
+    for lookup in query._prefetch_related_lookups:
+        if type(lookup) is str:
+            lookups.append(lookup)
+            continue
+        if type(lookup) is not Prefetch or not vars(lookup).keys() <= _PREFETCH_STATE:
+            return None
+        nested = None if lookup.queryset is None else sign(lookup.queryset)
+        if lookup.queryset is not None and nested is None:
+            return None
+        lookups.append(
+            (lookup.prefetch_through, lookup.prefetch_to, lookup.to_attr, nested)
+        )
+    return (
+        id(query.model),
+        id(query.query.model),
+        query._fields,
+        query._sticky_filter,
+        query._defer_next_filter,
+        id(getattr(query, "_fetch_mode", None)),
+        tuple(lookups),
+        query_is_scoped(query),
+    )
 
 
 def _references_parent(node: Any, parent_pk: Any) -> bool:
@@ -2179,34 +2337,58 @@ class _DjangoUpsertOps:
     # -- Repo-backed reads and writes ----------------------------------------
 
     def find(self, repo: Any, model: type, query: dict[str, Any]) -> Any:
-        return repo.find_for_upsert(model, query, self._info)
+        return _read_for_write(
+            repo.find_for_upsert(model, _aware_values(model, query), self._info)
+        )
 
     def get(self, repo: Any, model: type, pk: Any) -> Any:
-        return repo._get(model, pk, self._info)
+        return _read_for_write(repo._get(model, pk, self._info))
 
     def holders(self, row: Any, models: list[type]) -> list[type]:
-        """Those of *models*, multi-table children of *row*'s model, holding *row*."""
-        parent = type(row)._meta.concrete_model
+        """Those of *models*, multi-table children of *row*'s root model, holding *row*."""
+        root = _root_model(type(row))
+        pk = getattr(row, root._meta.pk.attname)
         return [
             model
             for model in models
-            if model._base_manager.using(row._state.db)
-            .filter(**{_parent_link(model, parent): row.pk})
+            if model._base_manager.using(_written_db(row))
+            .filter(**{_parent_link(model, root): pk})
             .exists()
         ]
 
     def create(self, repo: Any, model: type, data: dict[str, Any]) -> Any:
-        instance = repo._create(model, data, self._info)
+        instance = repo._create(model, _aware_values(model, data), self._info)
         self._wrote(instance)
         return instance
 
-    def save(self, repo: Any, instance: Any) -> None:
+    def save(self, repo: Any, instance: Any, names: Iterable[str]) -> None:
+        """Save *instance*, on which the write set the attributes *names*."""
+        write_record(instance, _columns).names.update(names)
+        _aware_row(instance)
         repo._save(instance, self._info)
         self._wrote(instance)
 
     def delete(self, repo: Any, instance: Any) -> None:
         self._written[_written_db(instance)] = None
         repo._delete(instance, self._info)
+
+    def cascaded(self, row: Any) -> list[Any]:
+        """The rows deleting *row* deletes with it, each read as its root model.
+
+        A multi-table row's parent and child rows are one row, which the root
+        model's reads hold, and *row*'s are *row*; an auto-created
+        many-to-many table's rows are links, of no model.
+        """
+        collector = _EveryRowCollector(_written_db(row), origin=row)
+        collector.collect([row])
+        root = _root_model(type(row))
+        return [
+            found
+            for collected, rows in collector.data.items()
+            if not collected._meta.auto_created and not collected._meta.parents
+            for found in rows
+            if not (collected is root and found.pk == row.pk)
+        ]
 
     def check_constraints(self) -> None:
         """Check the foreign keys the database would check as it commits.
@@ -2244,6 +2426,22 @@ class _DjangoUpsertOps:
 
     def unlink(self, parent: Any, spec: Any, child: Any) -> None:
         getattr(parent, spec.name).remove(child)
+
+    def link_model(self, parent: Any, spec: Any) -> type | None:
+        """The ``through`` model of many-to-many relation *spec*, unless auto-created."""
+        through = getattr(parent, spec.name).through
+        return None if through._meta.auto_created else through
+
+    def link_values(self, parent: Any, spec: Any, child: Any) -> dict[str, Any]:
+        """The values of the ``through`` row linking *child* to *parent*."""
+        manager = getattr(parent, spec.name)
+        return {manager.source_field_name: parent, manager.target_field_name: child}
+
+    def link_rows(self, parent: Any, spec: Any, child: Any) -> list[Any]:
+        """The ``through`` rows linking *child* to *parent*, as ``remove()`` finds them."""
+        manager = getattr(parent, spec.name)
+        rows = manager.through._default_manager.using(_written_db(parent))
+        return list(rows.filter(**self.link_values(parent, spec, child)))
 
     def is_member(self, parent: Any, spec: Any, child: Any) -> bool:
         if spec.relation_mode == "reverse_fk":
@@ -2286,9 +2484,13 @@ class _DjangoUpsertOps:
         if not isinstance(value, str):
             return value
         try:
-            return key_in_range(model._meta.pk.to_python(value))  # type: ignore[attr-defined]
-        except (ValidationError, ValueError):
-            raise UpsertValidationError(f"{value!r} is not a valid id") from None
+            key = model._meta.pk.to_python(value)  # type: ignore[attr-defined]
+            # A composite key reads a JSON list, compared as the tuple a row has.
+            if isinstance(key, list):
+                return tuple(key_in_range(part) for part in key)
+            return key_in_range(key)
+        except (ValidationError, ValueError, TypeError):
+            raise UpsertValidationError(f"{quoted(value)} is not a valid id") from None
 
     # -- Internals -----------------------------------------------------------
 
@@ -2351,6 +2553,25 @@ def _parent_link(model: type, parent: type) -> str:
         path.join_field.name
         for path in model._meta.get_path_to_parent(parent)  # type: ignore[attr-defined]
     )
+
+
+class _EveryRowCollector(Collector):
+    """Collects every row a delete takes, those it would delete unread too."""
+
+    def __init__(self, using: str, origin: Any) -> None:
+        super().__init__(using, origin=origin)
+        # Read from Django 6.1, to collect the rows a ``DB_CASCADE`` key deletes.
+        self.force_collection = True
+
+    def can_fast_delete(self, objs: Any, from_field: Any = None) -> bool:
+        return False
+
+
+def _root_model(model: type) -> type:
+    """The concrete model *model*'s rows are rows of, inheriting no other."""
+    meta = model._meta  # type: ignore[attr-defined]
+    roots = [parent for parent in meta.get_parent_list() if not parent._meta.parents]
+    return roots[0] if roots else meta.concrete_model
 
 
 def _django_to_many_link(model: type | None, rel_name: str) -> str | None:
@@ -2497,6 +2718,9 @@ def _build_django_filter(
                 prefix=_prefix,
                 enable_regex=enable_regex,
                 max_in_list_size=max_in_list_size,
+                max_regex_text_length=getattr(
+                    backend, "_max_regex_text_length", MAX_REGEX_TEXT_LENGTH
+                ),
             )
             return clause, query
         elif key == "object":
@@ -2570,7 +2794,7 @@ def _build_django_filter(
 
                 conditions = [nested_clause]
                 if scoped is not None:
-                    conditions.insert(0, Q(pk__in=scoped))
+                    conditions.insert(0, Q(pk__in=scoped.values("pk")))
                 related = rel_model._base_manager.filter(  # type: ignore[union-attr]
                     *conditions, **{f"{link}__pk": OuterRef(f"{_prefix}pk")}
                 )
@@ -2724,6 +2948,7 @@ def _build_django_field_clause(
     prefix: str = "",
     enable_regex: bool = False,
     max_in_list_size: int = 500,
+    max_regex_text_length: int = MAX_REGEX_TEXT_LENGTH,
 ) -> Any:
     from django.db.models import Q
 
@@ -2740,10 +2965,138 @@ def _build_django_field_clause(
             lookup,
             enable_regex=enable_regex,
             max_in_list_size=max_in_list_size,
+            max_regex_text_length=max_regex_text_length,
         )
         q &= col_q
 
     return q
+
+
+def _aware(value: Any) -> Any:
+    """*value*, for a ``DateTimeField``, as Django reads it: in the default
+    time zone, when time zones are on and it names none.
+
+    Django does the same after a warning quoting the value, a new entry in its
+    ``__warningregistry__`` for every datetime a client sends.
+    """
+    from django.conf import settings
+    from django.utils import timezone
+
+    if (
+        settings.USE_TZ
+        and isinstance(value, datetime.datetime)
+        and timezone.is_naive(value)
+    ):
+        return timezone.make_aware(value, timezone.get_default_timezone())
+    return value
+
+
+def _datetime_fields(model: type) -> dict[str, str]:
+    """Each ``DateTimeField`` of *model* by name and column attribute, to its attribute."""
+    return {
+        key: field.attname
+        for field in model._meta.concrete_fields  # type: ignore[attr-defined]
+        if isinstance(field, models.DateTimeField)
+        for key in (field.name, field.attname)
+    }
+
+
+def _aware_values(model: type, values: dict[str, Any]) -> dict[str, Any]:
+    """*values* for *model*'s fields, each datetime read as Django reads it."""
+    fields = _datetime_fields(model)
+    return {
+        name: _aware(value) if name in fields else value
+        for name, value in values.items()
+    }
+
+
+def _written_fields(model: type) -> list[Any]:
+    """The concrete fields a save of a *model* row writes: not its keys, nor generated."""
+    return [
+        field
+        for field in model._meta.concrete_fields  # type: ignore[attr-defined]
+        if not field.primary_key and not getattr(field, "generated", False)
+    ]
+
+
+def _columns(row: Any) -> dict[str, Any]:
+    """*row*'s loaded columns a save writes, by attribute name."""
+    held = row.__dict__
+    return {
+        field.attname: held[field.attname]
+        for field in _written_fields(type(row))
+        if field.attname in held
+    }
+
+
+def _read_for_write(row: Any) -> Any:
+    """*row*, read for a write, with what it holds kept to save only what changes.
+
+    Anything else a repo returns, an awaitable a sync write refuses among
+    them, is returned as it is.
+    """
+    if isinstance(row, Model):
+        write_record(row, _columns)
+    return row
+
+
+def save_changes(instance: Any) -> None:
+    """Save *instance* as ``AbstractRepo._save`` describes.
+
+    Django inserts a row that an ``UPDATE`` matches no row of, unless the save
+    names its ``update_fields``; and it stamps an ``auto_now`` column only
+    when the save names it.
+    """
+    record = read_record(instance)
+    if record is None:
+        instance.save()
+        return
+    names = record.names
+    fields = record.changed(_columns(instance))
+    fields.update(
+        field.attname
+        for field in _written_fields(type(instance))
+        if field.name in names
+        or field.attname in names
+        or getattr(field, "auto_now", False)
+    )
+    instance.save(update_fields=fields)
+    renew_record(instance, _columns)
+
+
+def _aware_row(instance: Any) -> None:
+    """Read each datetime *instance* is about to save as Django reads it."""
+    for attname in set(_datetime_fields(type(instance)).values()):
+        value = getattr(instance, attname)
+        aware = _aware(value)
+        if aware is not value:
+            setattr(instance, attname, aware)
+
+
+def _aware_lookup(lookup: DateTimeComparisonLookup) -> DateTimeComparisonLookup:
+    """*lookup* with its datetimes read as Django reads them for a ``DateTimeField``."""
+    from django.conf import settings
+
+    if not settings.USE_TZ:
+        return lookup
+
+    def aware(value: Any) -> Any:
+        return _aware(models.DateTimeField().to_python(value))
+
+    changes: dict[str, Any] = {}
+    for name in lookup.__class__.__dataclass_fields__:
+        value = getattr(lookup, name)
+        if value is strawberry.UNSET or value is None or name == "is_null":
+            continue
+        if name == "range":
+            changes[name] = replace(
+                value, start=aware(value.start), end=aware(value.end)
+            )
+        elif isinstance(value, list):
+            changes[name] = [aware(item) for item in value]
+        else:
+            changes[name] = aware(value)
+    return replace(lookup, **changes)
 
 
 def _build_django_lookup(
@@ -2752,6 +3105,7 @@ def _build_django_lookup(
     *,
     enable_regex: bool = False,
     max_in_list_size: int = 500,
+    max_regex_text_length: int = MAX_REGEX_TEXT_LENGTH,
 ) -> Any:
     if is_reference_lookup(lookup):
         return _build_django_reference_lookup(
@@ -2762,6 +3116,8 @@ def _build_django_lookup(
 
     from django.db.models import Q
 
+    if isinstance(lookup, DateTimeComparisonLookup):
+        lookup = _aware_lookup(lookup)
     q = Q()
     fields = lookup.__class__.__dataclass_fields__
 
@@ -2792,14 +3148,49 @@ def _build_django_lookup(
                     "Regex filters are disabled. Pass enable_regex_filters=True "
                     "to enable."
                 )
-            check_regex(val)
-            django_lookup = _LOOKUP_TO_DJANGO[op_name]
-            q &= Q(**{f"{col_name}__{django_lookup}": val})
+            ignore_case = op_name == "i_regex"
+            # ``iregex`` puts ``(?i)`` before the pattern on SQLite, as analysed.
+            check_regex(val, ignore_case=ignore_case)
+            bounded = _BoundedPattern(val, ignore_case, max_regex_text_length)
+            q &= Q(**{f"{col_name}__{_BoundedRegex.lookup_name}": bounded})
         elif op_name in _LOOKUP_TO_DJANGO:
             django_lookup = _LOOKUP_TO_DJANGO[op_name]
             q &= Q(**{f"{col_name}__{django_lookup}": val})
 
     return q
+
+
+@dataclass(frozen=True)
+class _BoundedPattern:
+    pattern: str
+    ignore_case: bool
+    max_length: int
+
+
+@models.Field.register_lookup
+class _BoundedRegex(models.Lookup):
+    """``regex`` or ``iregex``, matched only by values at most a bound long.
+
+    The regex is given NULL past the bound, so in whatever order the
+    database runs the two, it never reads a longer value.
+    """
+
+    lookup_name = "strawberry_orm_bounded_regex"
+    prepare_rhs = False
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple]:
+        from django.db.models import Case, When
+        from django.db.models.functions import Length
+        from django.db.models.lookups import IRegex, LessThanOrEqual, Regex
+
+        bound = self.rhs
+        short = LessThanOrEqual(Length(self.lhs), bound.max_length)
+        matches = (IRegex if bound.ignore_case else Regex)(
+            Case(When(short, then=self.lhs)), bound.pattern
+        )
+        short_sql, short_params = compiler.compile(short)
+        match_sql, match_params = compiler.compile(matches)
+        return f"({short_sql} AND {match_sql})", (*short_params, *match_params)
 
 
 # ---------------------------------------------------------------------------
@@ -3201,7 +3592,9 @@ def _read_errors(using: str | None = None) -> Any:
     Django's error names tables and columns, or the database host, so it is
     kept only as the cause, for the server log. Only an error from running the
     statement is the request's doing: one that leaves *using* with no open
-    connection - refused, or dropped - is the connection failing.
+    connection - refused, or dropped - is the connection failing. The ORM's
+    own name the model's class (``Post matching query does not exist``) or
+    list its fields.
     """
     from django.db import (
         DEFAULT_DB_ALIAS,
@@ -3222,6 +3615,46 @@ def _read_errors(using: str | None = None) -> Any:
         ):
             raise ConnectionError("Database connection failed") from exc
         raise ValueError(_READ_REFUSED) from exc
+    except _django_errors() as exc:
+        raise ValueError(_READ_REFUSED) from exc
+
+
+def _django_errors() -> tuple[type[BaseException], ...]:
+    """Django's errors outside ``django.db.Error``, and each driver's own.
+
+    Each names the model's class, lists its fields, quotes the value a field
+    refused, or quotes the statement.
+    """
+    from django.core.exceptions import (
+        EmptyResultSet,
+        FieldDoesNotExist,
+        FieldError,
+        FullResultSet,
+        MultipleObjectsReturned,
+        ObjectDoesNotExist,
+        ObjectNotUpdated,
+        ValidationError,
+    )
+
+    return (
+        EmptyResultSet,
+        FieldDoesNotExist,
+        FieldError,
+        FullResultSet,
+        MultipleObjectsReturned,
+        ObjectDoesNotExist,
+        ObjectNotUpdated,
+        ValidationError,
+        *driver_errors(),
+    )
+
+
+#: Where Django builds and runs a statement.
+_STATEMENT_MODULES = ("django.db.models.sql.", "django.db.backends.")
+
+
+def _raised_by_django(exc: BaseException) -> bool:
+    return raised_by_orm(exc, ("django.db.",), _STATEMENT_MODULES)
 
 
 @contextmanager
@@ -3230,14 +3663,22 @@ def _refused_values(*errors: type[BaseException]) -> Any:
 
     Django checks a value against its column as a filter is added, saying what
     the column holds with its template unfilled (``“%(value)s” is not a valid
-    UUID``); and some only as the statement compiles, failing with a Python
-    error of its own, in *errors*.
+    UUID``), or with an error of any type from a field preparing the value;
+    and some only as the statement compiles, failing with a Python error of
+    its own, in *errors*.
     """
     from django.core.exceptions import ValidationError
+    from django.db import Error
 
     try:
         yield
     except (ValidationError, *errors) as exc:
+        raise ValueError(_READ_REFUSED) from exc
+    except Error:
+        raise
+    except Exception as exc:
+        if not _raised_by_django(exc):
+            raise
         raise ValueError(_READ_REFUSED) from exc
 
 
@@ -3246,9 +3687,50 @@ def _instance_db(instance: Any) -> str | None:
 
 
 def _written_db(instance: Any) -> str:
+    """The database a write of *instance* goes to, as ``save()`` picks it.
+
+    Not the one *instance* was read from: a router may have read it from a
+    replica.
+    """
     from django.db import router
 
-    return instance._state.db or router.db_for_write(type(instance), instance=instance)
+    return router.db_for_write(type(instance), instance=instance)
+
+
+class _ReadsWhereWritesGo:
+    """A router sending each read a write makes where the write goes.
+
+    First among Django's routers: one of the app's may send reads to a
+    replica, which a write must not decide on.
+    """
+
+    def db_for_read(self, model: type, **hints: Any) -> str | None:
+        from django.db import router
+
+        if not is_writing():
+            return None
+        return router.db_for_write(model, **hints)
+
+
+_READS_WHERE_WRITES_GO = _ReadsWhereWritesGo()
+_ROUTERS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _reads_where_writes_go() -> Any:
+    """Run a write, its reads sent where it writes.
+
+    The app's routers are read again as its settings change, so the router
+    sending them is put first on every write.
+    """
+    from django.db import router
+
+    with _ROUTERS_LOCK:
+        routers = router.routers
+        if routers and routers[0] is not _READS_WHERE_WRITES_GO:
+            routers.insert(0, _READS_WHERE_WRITES_GO)
+    with writing():
+        yield
 
 
 def _listed(query: Any) -> list[Any]:
@@ -3266,12 +3748,18 @@ def _write_errors() -> Any:
     """Raise what a client may see in place of the database refusing a write.
 
     Django's error names the table and column, and on PostgreSQL the row's
-    values, so it is kept only as the cause, for the server log. The driver
-    raises ``OverflowError`` for an integer its column type cannot hold.
+    values, so it is kept only as the cause, for the server log, and so is
+    each of its others and the driver's. The driver raises ``OverflowError``
+    for an integer its column type cannot hold, ``UnicodeEncodeError`` for a
+    lone surrogate, and a field preparing a value whatever it likes.
     """
     from django.db import Error
 
     try:
         yield
-    except (Error, OverflowError) as exc:
+    except (Error, OverflowError, *_django_errors()) as exc:
+        raise ValueError(WRITE_REFUSED) from exc
+    except Exception as exc:
+        if not _raised_by_django(exc):
+            raise
         raise ValueError(WRITE_REFUSED) from exc

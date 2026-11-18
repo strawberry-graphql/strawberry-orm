@@ -278,13 +278,14 @@ class AbstractTestBatchingSiblingTypes(_SiblingTypes):
 
     @staticmethod
     def _people_schema(orm, wide, narrow, people):
+        """*people* returns the rows, as a cast holds in its own execution."""
         Person = Annotated[wide | narrow, strawberry.union("Person")]
 
         @strawberry.type
         class Query:
             @strawberry.field
             def people(self) -> list[Person | None]:
-                return people
+                return people()
 
         return orm.schema(query=Query)
 
@@ -294,7 +295,8 @@ class AbstractTestBatchingSiblingTypes(_SiblingTypes):
         """Which type an app's own ``is_type_of`` picks is not knowable ahead,
         so its parents are not batched with anyone."""
         Wide, Narrow = await self._two_user_types(orm, models, decides_its_own=True)
-        schema = self._people_schema(orm, Wide, Narrow, await self.load_users())
+        users = await self.load_users()
+        schema = self._people_schema(orm, Wide, Narrow, lambda: users)
         query = "{ people { __typename ... on Wide { name writing { title } }"
         query += " ... on Narrow { name writing { title } } } }"
         assert await self.execute(schema, query) == {
@@ -321,13 +323,17 @@ class AbstractTestBatchingSiblingTypes(_SiblingTypes):
         Wide, Narrow = await self._two_user_types(orm, models)
         alice, bob, charlie = await self.load_users()
         post = (await self.load_posts())[0]
-        people = [
-            strawberry.cast(Narrow, alice),
-            bob,
-            post,
-            strawberry.cast(Narrow, charlie),
-        ]
-        schema = self._people_schema(orm, Wide, Narrow, people)
+        schema = self._people_schema(
+            orm,
+            Wide,
+            Narrow,
+            lambda: [
+                strawberry.cast(Narrow, alice),
+                bob,
+                post,
+                strawberry.cast(Narrow, charlie),
+            ],
+        )
         query = "{ people { ... on Wide { name writing { title } }"
         query += " ... on Narrow { name writing { title } } } }"
         result = await self.run(schema, query, None)

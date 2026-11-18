@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sys
+import os
 import typing as _typing
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -35,14 +35,10 @@ from strawberry_orm._async import (
 )
 from strawberry_orm.backends.protocol import Backend
 from strawberry_orm.cover import build_covered, reached_types
-from strawberry_orm.fields import (
-    call_scope,
-    check_resolver_signature,
-    check_scope_signature,
-)
+from strawberry_orm.fields import check_resolver_signature, check_scope_signature
 from strawberry_orm.mutations import MutationNamespace
-from strawberry_orm.tags import field_metadata, tagged_schema_class
-from strawberry_orm.types import FieldDefinition, FieldHints
+from strawberry_orm.tags import field_metadata, served, tagged_schema_class
+from strawberry_orm.types import FieldDefinition, FieldHints, look_up_names
 
 BackendName = Literal["django", "sqlalchemy", "tortoise"]
 
@@ -76,7 +72,35 @@ def _extract_connection_node(ann: Any) -> Any:
             return args[0]
     if isinstance(ann, type) and hasattr(ann, "_node_type"):
         return ann._node_type
+    # A connection of the app's own: class PostPage(ORMListConnection[PostNode]).
+    for base in getattr(ann, "__orig_bases__", ()) if isinstance(ann, type) else ():
+        node_type = _extract_connection_node(base)
+        if node_type is not None and not isinstance(node_type, _typing.TypeVar):
+            return node_type
     return None
+
+
+def _own_connection_type(graphql_type: Any) -> bool:
+    """True when *graphql_type* is a connection class the app declared itself.
+
+    It may add fields of its own, so it is kept rather than replaced by the
+    connection type the library builds for the node.
+    """
+    from strawberry_orm.relay.connection import ORMConnection, ORMListConnection
+
+    ann = _unwrap_optional_annotation(graphql_type)
+    origin = _typing.get_origin(ann) or ann
+    return (
+        isinstance(origin, type)
+        and origin
+        not in (
+            relay.Connection,
+            relay.ListConnection,
+            ORMConnection,
+            ORMListConnection,
+        )
+        and "_node_type" not in vars(origin)
+    )
 
 
 def _extract_output_type(ann: Any) -> Any:
@@ -237,12 +261,16 @@ class _AutoFilterOrderExtension(FieldExtension):
         order: Any | None = None,
         group: Any | None = None,
         forward_inputs: bool = True,
+        limit: int | None = None,
+        pages: bool = False,
     ) -> None:
         self._backend = backend
         self._filters = filters
         self._order = order
         self._group = group
         self._forward_inputs = forward_inputs
+        self._limit = limit
+        self._pages = pages
         self._model: type | None = None
         self._output_type: Any | None = None
         self._resolver_accepts_filter = False
@@ -325,10 +353,33 @@ class _AutoFilterOrderExtension(FieldExtension):
         return forwarded
 
     def _defer_query_materialization(self, info: Any) -> bool:
-        """Leave query objects for OptimizerExtension when the schema has one."""
+        """Leave query objects for OptimizerExtension when the schema has one,
+        and for a connection that can tell which backend reads its page."""
         from strawberry_orm.optimizer.extension import schema_includes_optimizer
+        from strawberry_orm.relay.connection import (
+            _orm_backend_from_info,
+            connection_states,
+        )
 
-        return schema_includes_optimizer(info)
+        if schema_includes_optimizer(info):
+            return True
+        return self._pages and (
+            connection_states(info) is not None
+            or _orm_backend_from_info(info) is not None
+        )
+
+    def _limit_for(self, source: Any) -> int | None:
+        """The rows a list read for *source* is cut to: none for a parent row,
+        whose relation list returns all of its visible rows."""
+        if self._limit is None or self._backend.is_model_instance(source):
+            return None
+        return self._limit
+
+    def _cut(self, query: Any, limit: int | None) -> Any:
+        if limit is None:
+            return query
+        page = self._backend.apply_page(query, 0, limit)
+        return query if page is None else page
 
     def _stash_context(
         self,
@@ -371,6 +422,7 @@ class _AutoFilterOrderExtension(FieldExtension):
         filter: Any = None,
         order: Any = None,
         group_by: Any = None,
+        limit: int | None = None,
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
             result = _scope_then_filter(
@@ -378,6 +430,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             )
             self._stash_context(info, result, group_by=group_by, order=order)
             result = _ordered(self._backend, result, self._model, info, order)
+            result = self._cut(result, limit)
             if not self._defer_query_materialization(info):
                 result = self._backend.materialize_query(result, info)
 
@@ -391,6 +444,7 @@ class _AutoFilterOrderExtension(FieldExtension):
         filter: Any = None,
         order: Any = None,
         group_by: Any = None,
+        limit: int | None = None,
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
             if in_async_context():
@@ -401,6 +455,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                     filter=filter,
                     order=order,
                     group_by=group_by,
+                    limit=limit,
                 )
 
             result = _scope_then_filter(
@@ -408,6 +463,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             )
             self._stash_context(info, result, group_by=group_by, order=order)
             result = _ordered(self._backend, result, self._model, info, order)
+            result = self._cut(result, limit)
             if not self._defer_query_materialization(info):
                 result = self._backend.materialize_query(result, info)
 
@@ -439,10 +495,11 @@ class _AutoFilterOrderExtension(FieldExtension):
         **kwargs: Any,
     ) -> Any:
         result = next_(source, info, **self._resolver_kwargs(kwargs))
+        limit = self._limit_for(source)
         if in_async_context() and not self._defer_query_materialization(info):
             # Under async execution a sync field still resolves on the event
             # loop: rows waited on here would hold the loop up while they load.
-            return self._resolve_on_the_loop(result, info, kwargs)
+            return self._resolve_on_the_loop(result, info, kwargs, limit)
         if isawaitable(result) and not self._is_query(result):
             # An async-safe Django resolver hands its query back from a worker
             # thread. Filtered and stashed only once it is a query, or the
@@ -454,6 +511,7 @@ class _AutoFilterOrderExtension(FieldExtension):
             filter=kwargs.get("filter"),
             order=kwargs.get("order"),
             group_by=kwargs.get("group_by"),
+            limit=limit,
         )
         if isawaitable(result) and not self._is_query(result):
             result = await_maybe_blocking(result)
@@ -472,17 +530,17 @@ class _AutoFilterOrderExtension(FieldExtension):
         result = next_(source, info, **self._resolver_kwargs(kwargs))
         if isawaitable(result):
             result = await await_maybe(result)
-        return await self._filtered_async(result, info, kwargs)
+        return await self._filtered_async(result, info, kwargs, self._limit_for(source))
 
     async def _resolve_on_the_loop(
-        self, result: Any, info: Any, kwargs: dict[str, Any]
+        self, result: Any, info: Any, kwargs: dict[str, Any], limit: int | None
     ) -> Any:
         if isawaitable(result) and not self._is_query(result):
             result = await result
-        return await self._filtered_async(result, info, kwargs)
+        return await self._filtered_async(result, info, kwargs, limit)
 
     async def _filtered_async(
-        self, result: Any, info: Any, kwargs: dict[str, Any]
+        self, result: Any, info: Any, kwargs: dict[str, Any], limit: int | None
     ) -> Any:
         if self._model is not None and self._backend.is_query_object(result):
             materialize = self._backend.materialize_query
@@ -499,6 +557,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                 result = _ordered(
                     self._backend, result, self._model, info, kwargs.get("order")
                 )
+                result = self._cut(result, limit)
                 if not self._defer_query_materialization(info):
                     result = await materialize(result, info)
                 return self._cast_result(result)
@@ -512,6 +571,7 @@ class _AutoFilterOrderExtension(FieldExtension):
                         filter=kwargs.get("filter"),
                         order=kwargs.get("order"),
                         group_by=kwargs.get("group_by"),
+                        limit=limit,
                     ),
                     thread_sensitive=True,
                 )
@@ -526,10 +586,46 @@ class _AutoFilterOrderExtension(FieldExtension):
             filter=kwargs.get("filter"),
             order=kwargs.get("order"),
             group_by=kwargs.get("group_by"),
+            limit=limit,
         )
         if isawaitable(result):
             result = await await_maybe(result)
         return self._cast_result(result)
+
+
+async def _settled(value: Any) -> Any:
+    while isawaitable(value):
+        value = await value
+    return value
+
+
+class _ReadsUsingScoped(FieldExtension):
+    """Before a ``using=`` resolver reads its relations off ``self``, check them.
+
+    Whatever loaded a relation, the resolver sees only what its scope allows:
+    see :meth:`~strawberry_orm.backends._base.BaseBackend.resolve_using`.
+    """
+
+    def __init__(self, backend: Backend, using: list[str]) -> None:
+        self._backend = backend
+        self._using = using
+
+    def resolve(
+        self, next_: SyncExtensionResolver, source: Any, info: Any, **kwargs: Any
+    ) -> Any:
+        result = self._backend.resolve_using(
+            source, self._using, info, partial(next_, source, info, **kwargs)
+        )
+        return _settled(result) if isawaitable(result) else result
+
+    async def resolve_async(
+        self, next_: AsyncExtensionResolver, source: Any, info: Any, **kwargs: Any
+    ) -> Any:
+        return await _settled(
+            self._backend.resolve_using(
+                source, self._using, info, partial(next_, source, info, **kwargs)
+            )
+        )
 
 
 class FieldFactory:
@@ -606,6 +702,9 @@ class FieldFactory:
                     _return_annotation(supplied) if supplied is not None else None
                 ),
                 metadata=merged,
+                filters=filters,
+                order=order,
+                deprecation_reason=deprecation_reason,
             )
         return _AutoField(
             self._backend,
@@ -658,6 +757,7 @@ class FieldFactory:
                 field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
                     using=list(using),
                 )
+                field.extensions.append(_ReadsUsingScoped(self._backend, list(using)))
             return field
 
         return _build(fn) if fn is not None else _build
@@ -686,6 +786,9 @@ class FieldFactory:
                 disable_optimization=disable_optimization,
                 permission_classes=permission_classes,
                 description=description,
+                filters=filters,
+                order=order,
+                deprecation_reason=deprecation_reason,
             )
         return _AutoField(
             self._backend,
@@ -782,6 +885,8 @@ class FieldFactory:
             field._orm_computed_hints = FieldHints(  # type: ignore[attr-defined]
                 using=list(using) if using else None,
             )
+            if using:
+                field.extensions.append(_ReadsUsingScoped(self._backend, list(using)))
             return field
 
         return _build(fn) if fn is not None else _build
@@ -853,7 +958,15 @@ class _AutoField:
             order=self._order,
         )
         if model is None:
-            return
+            ann = look_up_names(owner, ann)
+            model, f_type, o_type, g_type, _a_type = _resolve_orm_metadata(
+                ann,
+                filters=self._filters,
+                order=self._order,
+            )
+            if model is None:
+                return
+            owner.__annotations__[name] = ann
 
         resolver = _make_query_resolver(
             self._backend,
@@ -872,6 +985,9 @@ class _AutoField:
         field._orm_auto_field = True  # type: ignore[attr-defined]
         field._orm_reads_as_is = True  # type: ignore[attr-defined]
         field._orm_returns_rows = True  # type: ignore[attr-defined]
+        # On an @orm.type this field is replaced by the relation's own, which
+        # takes what was declared from here.
+        field._orm_declaration = self  # type: ignore[attr-defined]
         setattr(owner, name, field)
 
     def __call__(self, resolver: Callable[..., Any]) -> Any:
@@ -885,6 +1001,7 @@ class _AutoField:
                     self._backend,
                     filters=self._filters,
                     order=self._order,
+                    limit=getattr(self._backend, "_default_query_limit", None),
                 )
             ],
         )
@@ -960,7 +1077,11 @@ class _AutoConnection:
         self._resolved_type = graphql_type
         field = self._build_field(graphql_type, self._resolver)
         if field is None:
-            return
+            graphql_type = look_up_names(owner, graphql_type)
+            field = self._build_field(graphql_type, self._resolver)
+            if field is None:
+                return
+            self._resolved_type = owner.__annotations__[name] = graphql_type
         if self._resolver is None:
             # __set_name__ runs before @orm.type knows the model, so a
             # connection over a relation cannot be built yet. Carry the
@@ -1019,7 +1140,11 @@ class _AutoConnection:
                 order_type,
                 aggregate_type=aggregate_type,
             )
-        elif node_type is not None and not _is_forward_reference(node_type):
+        elif (
+            node_type is not None
+            and not _is_forward_reference(node_type)
+            and not _own_connection_type(graphql_type)
+        ):
             from strawberry_orm.relay.connection import connection_type_for_node
 
             graphql_type = connection_type_for_node(node_type)
@@ -1040,7 +1165,9 @@ class _AutoConnection:
                     info = kw.get("info") or next(
                         (a for a in args if hasattr(a, "context")), None
                     )
-                    return call_scope(scope, generated(*args, **kw), info)
+                    return self._backend.call_row_scope(
+                        scope, generated(*args, **kw), info
+                    )
 
                 keep_annotations(resolver, generated)
 
@@ -1089,6 +1216,7 @@ class _AutoConnection:
                 # The extension filters and orders the generated resolver's
                 # query itself; handing it the inputs as well applies them twice.
                 forward_inputs=not generated_resolver,
+                pages=True,
             )
         )
         field = relay.connection(
@@ -1171,6 +1299,41 @@ class ConnectionFactory:
         return conn
 
 
+def _refuse_unbuilt(reached: Iterable[Any]) -> None:
+    """Refuse an ``orm.field.eager()`` or ``orm.connection`` left unbuilt.
+
+    Each is built from the model behind the type its annotation names, as its
+    class is created. One that could not be is still a placeholder, which
+    Strawberry would serve as a plain attribute.
+    """
+    for origin in reached:
+        for name, value in vars(origin).items():
+            if isinstance(value, (_AutoField, _AutoConnection)):
+                annotation = vars(origin).get("__annotations__", {}).get(name)
+                raise ValueError(
+                    f"{origin.__name__}.{name}: the library builds this field "
+                    f"from the @orm.type its annotation names, and "
+                    f"{annotation!r} names none declared before "
+                    f"{origin.__name__}. Declare that type first, or resolve "
+                    f"the field yourself with orm.field.lazy."
+                )
+
+
+def _grouped_type_names(connection_type: Any) -> tuple[str, str]:
+    """The name of a grouped connection over *connection_type*, the app's own,
+    and the prefix of the types beside it.
+
+    They are named after it rather than the model, so that two node types over
+    one model, each with a connection type of its own, can be told apart.
+    """
+    from strawberry.schema.name_converter import NameConverter
+    from strawberry.types.base import get_object_definition
+
+    own = StrawberryAnnotation(_unwrap_optional_annotation(connection_type)).resolve()
+    name = NameConverter().from_object(get_object_definition(own, strict=True))
+    return name, name.removesuffix("Connection")
+
+
 def _build_grouped_connection(
     backend: Backend,
     connection_type: Any,
@@ -1205,7 +1368,12 @@ def _build_grouped_connection(
         # min/max return exact values and a group key echoes one, so they
         # cover what the nodes show, like the filters beside them.
         backend._attach_to_type(model, meta, node_type)  # type: ignore[attr-defined]
-    model_name = model.__name__
+    own = node_type is not None and _own_connection_type(connection_type)
+    connection_name, prefix = (
+        _grouped_type_names(connection_type)
+        if own
+        else (f"{model.__name__}Connection", model.__name__)
+    )
     AggregatesType = meta.aggregates_type
     GroupKeyType = meta.group_key_type
 
@@ -1220,8 +1388,8 @@ def _build_grouped_connection(
         "aggregates": None,
     }
     ExtPageInfo = strawberry.type(
-        type(f"{model_name}PageInfo", (PageInfo,), page_info_ns),
-        name=f"{model_name}PageInfo",
+        type(f"{prefix}PageInfo", (PageInfo,), page_info_ns),
+        name=f"{prefix}PageInfo",
     )
 
     # -- Group items connection (cursor-based pagination) --------------------
@@ -1234,13 +1402,13 @@ def _build_grouped_connection(
             pass
 
         GroupItemsConnection = _types_mod.new_class(
-            f"{model_name}GroupItemsConnection",
+            f"{prefix}GroupItemsConnection",
             (_ListConnection[node_type],),  # type: ignore[misc]
             exec_body=_items_exec_body,
         )
         GroupItemsConnection = strawberry.type(
             GroupItemsConnection,
-            name=f"{model_name}GroupItemsConnection",
+            name=f"{prefix}GroupItemsConnection",
         )
 
     # -- Group type ----------------------------------------------------------
@@ -1286,12 +1454,15 @@ def _build_grouped_connection(
 
     if GroupItemsConnection is not None:
         _items_resolver.__annotations__["return"] = GroupItemsConnection
-        group_ns["items"] = strawberry.field(resolver=_items_resolver)
+        items_field = strawberry.field(resolver=_items_resolver)
+        # Each group's page is read from the connection's scoped query.
+        items_field._orm_connection = True  # type: ignore[attr-defined]
+        group_ns["items"] = items_field
         group_ns["__annotations__"]["items"] = GroupItemsConnection
 
     GroupType = strawberry.type(
-        type(f"{model_name}Group", (), group_ns),
-        name=f"{model_name}Group",
+        type(f"{prefix}Group", (), group_ns),
+        name=f"{prefix}Group",
     )
 
     conn_ns: dict[str, Any] = {
@@ -1313,18 +1484,20 @@ def _build_grouped_connection(
         def _exec_body(ns: dict[str, Any]) -> None:
             ns.update(conn_ns)
 
+        base = (
+            _unwrap_optional_annotation(connection_type)
+            if own
+            else ORMListConnection[node_type]
+        )
         NewConnection = _types_mod.new_class(
-            f"{model_name}Connection",
-            (ORMListConnection[node_type],),  # type: ignore[misc]
+            connection_name,
+            (base,),  # type: ignore[misc]
             exec_body=_exec_body,
         )
     else:
-        NewConnection = type(f"{model_name}Connection", (ORMListConnection,), conn_ns)
+        NewConnection = type(connection_name, (ORMListConnection,), conn_ns)
 
-    NewConnection = strawberry.type(
-        NewConnection,
-        name=f"{model_name}Connection",
-    )
+    NewConnection = strawberry.type(NewConnection, name=connection_name)
     NewConnection._orm_aggregate_meta = meta  # type: ignore[attr-defined]
     NewConnection._page_info_type = ExtPageInfo  # type: ignore[attr-defined]
     NewConnection._node_type = node_type  # type: ignore[attr-defined]
@@ -1729,22 +1902,31 @@ class StrawberryORM:
 
         from strawberry_orm.cover import rebuildable_schema_class
         from strawberry_orm.leaf_fields import leaf_skipping_schema_class
+        from strawberry_orm.relay.connection import paged_in_scope_schema_class
+        from strawberry_orm.type_names import refuse_merged_types
 
         schema_class = leaf_skipping_schema_class(schema_class, self._backend)
         schema_class = rebuildable_schema_class(schema_class)
         if tags is not None:
             schema_class = tagged_schema_class(schema_class, tags)
+        schema_class = paged_in_scope_schema_class(schema_class)
         schema = schema_class(extensions=list(extensions), **kwargs)
         reached = reached_types(schema)
+        _refuse_unbuilt(reached)
         self._backend.check_scoped_order_traversal(reached)
+        merged = refuse_merged_types(schema)
         # Which types each input serves is only known once the schema shows
-        # what it reaches, so the inputs are cut in a second build.
+        # what it reaches, so the inputs are cut in a second build. One served
+        # in place of another of its name is cut as well, so that the second
+        # build can tell whether the two are cut alike.
         cuts = self._backend.input_cuts(
-            reached, getattr(schema_class, "_orm_tags", None)
+            reached | merged, getattr(schema_class, "_orm_tags", None), served(schema)
         )
         if not cuts:
             return schema
-        return build_covered(schema_class, cuts, extensions=extensions, **kwargs)
+        covered = build_covered(schema_class, cuts, extensions=extensions, **kwargs)
+        refuse_merged_types(covered)
+        return covered
 
     def batching_extension(self) -> type[SchemaExtension]:
         from strawberry_orm.batching import BatchingExtension
@@ -1780,9 +1962,16 @@ def _infer_model_from_types(filters: Any | None, order: Any | None) -> type:
     )
 
 
+#: Set to ``0``, ``false``, ``no`` or ``off``, turns ``warn_missing_scope`` off
+#: for every ORM built in the process that does not pass it.
+WARN_MISSING_SCOPE_ENVIRONMENT = "STRAWBERRY_ORM_WARN_MISSING_SCOPE"
+
+
 def _create_backend(name: BackendName, **kwargs: Any) -> Backend:
-    if "warn_missing_scope" not in kwargs and "pytest" in sys.modules:
-        kwargs["warn_missing_scope"] = False
+    if "warn_missing_scope" not in kwargs:
+        setting = os.environ.get(WARN_MISSING_SCOPE_ENVIRONMENT, "")
+        if setting.strip().lower() in ("0", "false", "no", "off"):
+            kwargs["warn_missing_scope"] = False
 
     if name == "django":
         from strawberry_orm.backends.django import DjangoBackend

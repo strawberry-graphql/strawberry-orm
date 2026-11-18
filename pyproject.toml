@@ -1,6 +1,6 @@
 [project]
 name = "strawberry-orm"
-version = "0.34.0"
+version = "0.35.0"
 description = "Unified, backend-agnostic ORM abstraction for Strawberry GraphQL"
 readme = "README.md"
 license = "MIT"
@@ -53,6 +53,7 @@ dev = [
     "pytest-asyncio>=1.5.0",
     "pytest-cov>=7.1.0",
     "pytest-django>=4.14.0",
+    "pytest-xdist>=3.8.0",
     "starlette>=1.10.0",
     "typer>=0.29.1",
     "uvicorn>=0.54.0",
@@ -86,15 +87,13 @@ known-first-party = ["strawberry_orm"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = [
-    "--cov=strawberry_orm",
-    "--cov-report=term-missing",
-    "--cov-report=xml",
-    "--cov-fail-under=100",
-]
+addopts = ["-n", "auto"]
 markers = [
     "asyncio: mark test as async",
     "django_db: mark test as requiring django database access",
+]
+filterwarnings = [
+    "error:.*cartesian product:sqlalchemy.exc.SAWarning",
 ]
 
 [tool.coverage.run]
@@ -105,6 +104,7 @@ omit = [
 ]
 
 [tool.coverage.report]
+fail_under = 100
 show_missing = true
 exclude_lines = [
     "pragma: no cover",

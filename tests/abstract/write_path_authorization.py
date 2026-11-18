@@ -99,6 +99,10 @@ class WriteDb:
     async def upsert(self, orm: Any, payload: Any, **kwargs: Any) -> Any:
         return await self.write(lambda: orm.apply_upsert(payload, self.info, **kwargs))
 
+    async def execute(self, schema: Any, query: str) -> Any:
+        """Run *query* the way this mode's views would."""
+        return await schema.execute(query, context_value=self.context)
+
     # -- Per backend -----------------------------------------------------------
 
     def new_orm(self, **kwargs: Any) -> Any:
@@ -640,6 +644,101 @@ def hide_email(orm: Any, m: SimpleNamespace) -> None:
         name: auto
 
 
+def _reachable_inputs(roots: list[type]) -> list[type]:
+    seen: list[type] = []
+    pending = list(roots)
+    while pending:
+        current = pending.pop()
+        if current in seen or not hasattr(current, "__dataclass_fields__"):
+            continue
+        seen.append(current)
+        pending.extend(_declared_fields(current).values())
+    return seen
+
+
+FULL_POST = {
+    "_meta": {
+        "name": "FullPost",
+        "create": True,
+        "update": True,
+        "upsert": {"where": True, "onMatch": "UPDATE"},
+    },
+    "author": {
+        "_meta": {
+            "create": ["name"],
+            "update": ["name"],
+            "upsert": {"where": True, "onMatch": "UPDATE"},
+        }
+    },
+    "comments": {
+        "_meta": {
+            "create": True,
+            "update": True,
+            "upsert": {"where": True, "onMatch": "APPEND"},
+        }
+    },
+    "tags": {"_meta": {"create": True, "upsert": {"where": True, "onMatch": "IGNORE"}}},
+}
+
+
+def _early_user_where(meta: dict[str, Any]) -> Callable[[Any, Any], Any]:
+    def build(orm: Any, m: SimpleNamespace) -> Any:
+        return orm.mutations.upsert_node_input(
+            model=m.User, project={"_meta": {"name": "Early", **meta}}
+        )
+
+    return build
+
+
+def _early_nested_where(root: str) -> Callable[[Any, Any], Any]:
+    author = {
+        "_meta": {"create": ["name"], "update": ["name"], "upsert": {"where": True}}
+    }
+
+    def build(orm: Any, m: SimpleNamespace) -> Any:
+        if root == "upsert":
+            return orm.mutations.upsert_node_input(
+                model=m.Post,
+                project={
+                    "_meta": {
+                        "name": "EarlyPost",
+                        "create": True,
+                        "upsert": {"where": ["title"]},
+                    },
+                    "author": author,
+                },
+            )
+        return orm.mutations.create_node_input(
+            models=[m.Post], project={"post": {"author": author}}
+        )
+
+    return build
+
+
+#: Each way a ``where`` matching on ``User.email`` can be built before the
+#: type that excludes it.
+EARLY_WHERE = {
+    "where true": _early_user_where(
+        {"create": ["name"], "update": ["name"], "upsert": {"where": True}}
+    ),
+    "where listed": _early_user_where(
+        {"create": ["name"], "update": ["name"], "upsert": {"where": ["email"]}}
+    ),
+    "ignore": _early_user_where(
+        {
+            "create": ["name"],
+            "update": ["name"],
+            "upsert": {"where": ["email"], "onMatch": "IGNORE"},
+        }
+    ),
+    "immutable": _early_user_where(
+        {"immutable": True, "create": ["name"], "upsert": {"where": True}}
+    ),
+    "nested under an upsert": _early_nested_where("upsert"),
+    "nested under a create": _early_nested_where("create"),
+}
+
+
 class AbstractTestNodeInputsFollowTypeExclude:
     async def test_generated_inputs_leave_out_an_excluded_column(self, writes):
         orm = writes.new_orm()
@@ -683,10 +782,63 @@ class AbstractTestNodeInputsFollowTypeExclude:
         m = writes.m
         orm.mutations.upsert_node_input(
             model=m.User,
-            project={"_meta": {"name": "EarlyUser", "upsert": {"where": ["name"]}}},
+            project={
+                "_meta": {
+                    "name": "EarlyUser",
+                    "create": True,
+                    "upsert": {"where": ["name"]},
+                }
+            },
         )
         with pytest.raises(ValueError, match=r"EarlyUserCreate can still write"):
             hide_email(orm, m)
+
+    @pytest.mark.parametrize("built", sorted(EARLY_WHERE))
+    async def test_declaring_the_type_after_a_where_that_matches_on_it_is_refused(
+        self, writes, built
+    ):
+        orm = writes.new_orm()
+        m = writes.m
+        EARLY_WHERE[built](orm, m)
+        with pytest.raises(ValueError, match=r"Where\w* can still match rows on them"):
+            hide_email(orm, m)
+
+    async def test_every_generated_input_naming_a_column_is_registered(self, writes):
+        orm = writes.new_orm()
+        m = writes.m
+        roots = [
+            orm.mutations.upsert_node_input(model=m.Post, project=FULL_POST),
+            orm.mutations.create_node_input(
+                models=[m.Post], project={"post": FULL_POST}
+            ),
+            orm.mutations.update_node_input(
+                models=[m.Post], project={"post": FULL_POST}
+            ),
+        ]
+        registry = orm.backend._input_registry
+        unregistered = []
+        for generated in _reachable_inputs(roots):
+            model = getattr(generated, "__orm_model__", None)
+            if model is None:
+                continue
+            columns = {
+                name
+                for name, _type, is_relation, _related in orm.backend._introspect_model(
+                    model
+                )
+                if not is_relation
+            }
+            named = (fields_of(generated) & columns) - {"id"}
+            held = [
+                entry[1]
+                for entry in registry.get(model, [])
+                if entry[0] == generated.__name__
+            ]
+            if named and not any(named <= fields for fields in held):
+                unregistered.append((generated.__name__, sorted(named)))
+        assert not unregistered, (
+            f"generated inputs a later exclude= cannot see: {unregistered}"
+        )
 
 
 # -- Projections opt in to destructive operations -------------------------------------
@@ -788,10 +940,12 @@ class AbstractTestOnReplaceDelete(Blog):
     async def users(self, writes: WriteDb) -> list[str]:
         return [user.name for user in await writes.rows(writes.m.User)]
 
-    async def test_a_replaced_target_the_repo_hides_is_left_alone(self, writes, blog):
+    async def test_a_replaced_target_the_repo_hides_is_not_let_go(self, writes, blog):
+        """Re-pointing Other takes it from Bob's posts, which the caller cannot see."""
         orm = writes.new_orm(repos={writes.m.User: scoped_repo(writes, [1, 3])})
-        await writes.upsert(orm, self.replace_author(orm, writes, "Other", "1"))
-        assert (await writes.reload(blog.other)).author_id == 1
+        with pytest.raises(PermissionError, match="^The row the link held cannot"):
+            await writes.upsert(orm, self.replace_author(orm, writes, "Other", "1"))
+        assert (await writes.reload(blog.other)).author_id == 2
         assert await self.users(writes) == ["Alice", "Bob", "Carol"]
 
     async def test_a_replaced_target_authorize_will_not_delete_is_left_alone(

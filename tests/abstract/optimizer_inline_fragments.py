@@ -1,7 +1,7 @@
 """Shared optimizer tests for inline fragments and fragment spreads."""
 
 from collections.abc import Callable
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 import strawberry
@@ -10,6 +10,91 @@ from strawberry_orm.types import auto
 
 UsersQueryFactory = Callable[[type, Any], Any]
 PostsQueryFactory = Callable[[type, Any], Any]
+
+UNION_LIST_QUERY = """
+{
+  users {
+    id
+    posts {
+      __typename
+      ... on PostBriefUnion { title }
+      ... on PostFullUnion { title }
+    }
+  }
+}
+"""
+
+#: Each user's posts, as the union types they went to, with every row shown.
+UNION_POSTS = {
+    "1": [("PostFullUnion", "GraphQL Guide"), ("PostFullUnion", "Hello World")],
+    "2": [("PostBriefUnion", "Draft Post")],
+    "3": [("PostFullUnion", "Rust Adventures")],
+}
+
+
+def union_list_schema(
+    orm: Any,
+    User: type,
+    Post: type,
+    users_query: UsersQueryFactory,
+    published_only: Callable[[Any, type], Any] | None,
+) -> strawberry.Schema:
+    """Users whose posts list a union of two types over ``Post``, each deciding
+    its own rows: a draft is brief, a published post full. Given
+    *published_only*, the model's scope keeps only published posts."""
+
+    @orm.type(Post, name="PostBriefUnion")
+    class PostBriefUnion:
+        id: auto
+        title: auto
+
+        @classmethod
+        def is_type_of(cls, obj, info):
+            return isinstance(obj, Post) and not obj.is_published
+
+    @orm.type(Post, name="PostFullUnion")
+    class PostFullUnion:
+        id: auto
+        title: auto
+
+        @classmethod
+        def is_type_of(cls, obj, info):
+            return isinstance(obj, Post) and obj.is_published
+
+        if published_only is not None:
+
+            @classmethod
+            def scope_rows(cls, query, info):
+                return published_only(query, Post)
+
+    PostUnion = Annotated[PostBriefUnion | PostFullUnion, strawberry.union("PostUnion")]
+
+    @orm.type(User)
+    class UsersUnionType:
+        id: auto
+        posts: list[PostUnion] = orm.field.auto()
+
+    @strawberry.type
+    class UnionListQuery:
+        @strawberry.field
+        def users(self, info: strawberry.types.Info) -> list[UsersUnionType]:
+            return users_query(User, info)  # type: ignore[return-value]
+
+    return strawberry.Schema(
+        query=UnionListQuery, extensions=[orm.optimizer_extension()]
+    )
+
+
+def union_posts(result: Any, scoped: bool) -> None:
+    assert result.errors is None, f"{result.errors}"
+    found = {
+        str(user["id"]): sorted(
+            (post["__typename"], post["title"]) for post in user["posts"]
+        )
+        for user in result.data["users"]
+    }
+    expected = {**UNION_POSTS, "2": []} if scoped else UNION_POSTS
+    assert found == expected, f"the union listed {found}, not {expected}"
 
 
 class AbstractTestOptimizerInlineFragmentsSync:
@@ -285,6 +370,16 @@ class AbstractTestOptimizerInlineFragmentsSync:
         result = schema_execute(schema, query)
         assert result.errors is None
 
+    @pytest.mark.parametrize("scoped", [False, True], ids=["shown", "drafts hidden"])
+    def test_graphql_union_list_inline_fragments(
+        self, orm, seed, User, Post, schema_execute, users_query, scoped
+    ):
+        """Each row of a relation listing a union goes to the type its
+        ``is_type_of`` picks, under the scope of its model's rows."""
+        published_only = self.published_only if scoped else None
+        schema = union_list_schema(orm, User, Post, users_query, published_only)
+        union_posts(schema_execute(schema, UNION_LIST_QUERY), scoped)
+
 
 class AbstractTestOptimizerInlineFragmentsAsync:
     """Async variant for Tortoise — mirrors :class:`AbstractTestOptimizerInlineFragmentsSync`."""
@@ -551,11 +646,15 @@ class AbstractTestOptimizerInlineFragmentsAsync:
         result = await schema_execute_async(schema, query)
         assert result.errors is None
 
-    @pytest.mark.skip(
-        reason="GraphQL union list runtime mapping is only exercised on Django"
-    )
-    def test_graphql_union_list_inline_fragments(self):
-        pass
+    @pytest.mark.parametrize("scoped", [False, True], ids=["shown", "drafts hidden"])
+    async def test_graphql_union_list_inline_fragments(
+        self, orm, seed, User, Post, schema_execute_async, users_query, scoped
+    ):
+        """Each row of a relation listing a union goes to the type its
+        ``is_type_of`` picks, under the scope of its model's rows."""
+        published_only = self.published_only if scoped else None
+        schema = union_list_schema(orm, User, Post, users_query, published_only)
+        union_posts(await schema_execute_async(schema, UNION_LIST_QUERY), scoped)
 
 
 class AbstractTestOptimizerInlineFragmentsUnitSync:

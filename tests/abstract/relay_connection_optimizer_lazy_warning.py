@@ -170,14 +170,15 @@ def _build_schema(
             def users(self, info: strawberry.types.Info) -> list[UserNode]:
                 return users_query(User, info)  # type: ignore[return-value]
 
-    schema_extensions = extensions
-    if schema_extensions is None:
-        schema_extensions = [
+    if extensions is not None:
+        return orm.schema(query=Query, optimizer=False, extensions=extensions)
+    return strawberry.Schema(
+        query=Query,
+        extensions=[
             orm.optimizer_extension(),
             orm.lazy_resolution_extension(mode="warn"),
-        ]
-
-    return strawberry.Schema(query=Query, extensions=schema_extensions)
+        ],
+    )
 
 
 def _build_schema_with_tags(

@@ -19,10 +19,11 @@ class TestDiagnosticsMessages(AbstractTestDiagnosticsMessages):
                 qs = DjPost.objects.all()
                 return list(qs) if materialize else qs  # type: ignore[return-value]
 
-        extensions = [orm.lazy_resolution_extension(mode=mode)]
-        if optimize:
-            extensions.insert(0, orm.optimizer_extension())
-        return strawberry.Schema(query=Query, extensions=extensions)
+        return orm.schema(
+            query=Query,
+            optimizer=optimize,
+            extensions=[orm.lazy_resolution_extension(mode=mode)],
+        )
 
     def execute(self, schema, query):
         return schema.execute_sync(query)
@@ -52,8 +53,10 @@ class TestAsyncDiagnostics:
             def posts(self) -> list[PT]:
                 return list(DjPost.objects.all())  # type: ignore[return-value]
 
-        schema = strawberry.Schema(
-            query=Query, extensions=[orm.lazy_resolution_extension(mode="warn")]
+        schema = orm.schema(
+            query=Query,
+            optimizer=False,
+            extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = await schema.execute("{ posts { byline } }")
 

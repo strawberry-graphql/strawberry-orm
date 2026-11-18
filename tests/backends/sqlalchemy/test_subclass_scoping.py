@@ -161,7 +161,14 @@ def test_the_base_query_still_reads_every_visible_subclass(session):
     assert titles(data["documents"]) == sorted(MINE)
 
 
-def test_a_subclass_type_with_its_own_scope_keeps_it(session):
+@pytest.mark.parametrize(
+    ("prefix", "shown"),
+    [("their", []), ("my", ["my contract"]), ("", ["my contract"])],
+)
+def test_a_subclass_type_with_its_own_scope_adds_it_to_its_bases(
+    session, prefix, shown
+):
+    """A contract is a document row, so the base's scope still has its say."""
     orm, _schema = build()
 
     @orm.type(Contract)
@@ -171,14 +178,14 @@ def test_a_subclass_type_with_its_own_scope_keeps_it(session):
 
         @classmethod
         def scope_rows(cls, stmt, info):
-            return stmt.where(Contract.title.startswith("their"))
+            return stmt.where(Contract.title.startswith(prefix))
 
     @strawberry.type
     class Query:
         contracts: list[ContractType] = orm.field.eager()
 
     data = run(orm.schema(query=Query), session, "{ contracts { title } }")
-    assert titles(data["contracts"]) == ["their contract"]
+    assert titles(data["contracts"]) == shown
 
 
 def test_a_subclass_type_without_a_scope_takes_its_bases(session):
@@ -270,17 +277,20 @@ def test_a_read_through_an_alias_is_scoped_as_its_class(session, entity):
     assert titles(data["listed"]) == sorted(MINE)
 
 
-def test_an_alias_is_scoped_once_and_only_when_its_class_has_a_scope(session):
+def test_an_alias_is_read_as_its_class_and_scoped_once(session):
+    """Read as the class, the rows take the class's scope, and a second pass
+    leaves them as they are."""
     orm, _schema = build()
     info = SimpleNamespace(context={"session": session, "me": ME})
-    read = aliased(Document)
-    scoped = orm.backend.apply_type_scope(select(read), Document, info)
+    scoped = orm.backend.apply_type_scope(select(aliased(Document)), Document, info)
+    assert orm.backend.query_model(scoped) is Document
     assert orm.backend.apply_type_scope(scoped, Document, info) is scoped
-    rows = session.scalars(scoped.order_by(read.id))
+    rows = session.scalars(scoped.order_by(Document.id))
     assert sorted(row.title for row in rows) == sorted(MINE)
 
-    unscoped = select(aliased(Note))
-    assert orm.backend.apply_type_scope(unscoped, Note, info) is unscoped
+    read = orm.backend.apply_type_scope(select(aliased(Note)), Note, info)
+    assert orm.backend.query_model(read) is Note
+    assert orm.backend.apply_type_scope(read, Note, info) is read
 
 
 def test_a_joined_subclass_with_its_own_scope_is_read_through_the_base(session):

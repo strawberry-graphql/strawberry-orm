@@ -103,6 +103,21 @@ class AbstractTestAuthorizeIsToldTheStoredKey:
         rows = await writes.rows(writes.m.File)
         return {row.id: (row.title, row.shelf_id) for row in rows}
 
+    @pytest.mark.parametrize("through", ["ref list", "nested upsert"])
+    async def test_a_key_no_row_has_is_quoted_cut_short(
+        self, writes, shelf, orm, ref, shelf_upsert, through
+    ):
+        """The error goes back to the client and into the log, on every request."""
+        key = "k" * 50_000
+        if through == "ref list":
+            write = writes.refs(orm, shelf, "files", [item(ref, "unlink", id=key)])
+        else:
+            write = writes.upsert(orm, self.on_files(shelf_upsert, "update", key))
+        with pytest.raises((LookupError, ValueError)) as refused:
+            await write
+        message = str(refused.value)
+        assert len(message) <= 300 and key[:100] not in message, message[:600]
+
     @pytest.mark.parametrize("operation", ["update", "unlink", "delete"])
     async def test_a_ref_list_item_is_authorized_by_the_key_the_row_stores(
         self, writes, shelf, orm, asked, protect, ref, operation

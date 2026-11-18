@@ -420,35 +420,3 @@ class TestInternalSqlalchemyExtraCoverage:
         await async_session.flush()
         await async_session.refresh(post, ["tags"])
         assert tag_id not in {tag.id for tag in post.tags}
-
-
-def test_scoped_edge_marks_walk_loaded_collections(sa_session, seed):
-    from sqlalchemy import inspect as sa_inspect
-    from sqlalchemy.orm import selectinload
-
-    from strawberry_orm.backends.sqlalchemy import _mark_scoped, _PlannedLoad
-    from strawberry_orm.lazy_resolution import execution_scope, relation_cache_is_scoped
-    from tests.backends.sqlalchemy.models import Post, User
-
-    sa_session.expunge_all()
-    user = sa_session.scalars(
-        select(User).options(selectinload(User.posts)).order_by(User.id)
-    ).first()
-    backend = SQLAlchemyBackend(dialect="sqlite")
-    plan = {"posts": _PlannedLoad(User.posts, True, sa_inspect(Post), None)}
-    edges = [(User, "posts", None)]
-    with execution_scope():
-        assert backend._scoped_marks([([user], {})], edges, before={}) == []
-        _mark_scoped(backend._scoped_marks([([user], plan)], edges, before={}))
-        assert relation_cache_is_scoped(user, "posts")
-    assert not relation_cache_is_scoped(user, "posts")
-    assert user.posts
-
-
-def test_a_keyed_collection_is_walked_by_the_rows_it_holds():
-    from strawberry_orm.backends.sqlalchemy import _members
-
-    row = object()
-    assert list(_members({"posts": {"by title": row}}, "posts")) == [row]
-    assert list(_members({"posts": [row]}, "posts")) == [row]
-    assert list(_members({"author": row}, "author")) == [row]

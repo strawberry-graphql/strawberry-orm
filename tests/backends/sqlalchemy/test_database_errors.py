@@ -189,6 +189,14 @@ async def test_a_malformed_key_does_not_reveal_the_statement(run, read):
         assert error.message == "'not-a-uuid' is not a valid ID.", error.message
 
 
+async def test_a_long_malformed_key_is_quoted_cut_short(run):
+    key = "k" * 50_000
+    result = await run(READS["edges"] % f'{{field: {{id: {{exact: "{key}"}}}}}}')
+    assert result.errors, result.data
+    for error in result.errors:
+        assert error.message == f"{'k' * 40!r}… is not a valid ID.", error.message[:200]
+
+
 def _refused() -> Exception:
     return StatementError(
         "(builtins.ValueError) bad row",

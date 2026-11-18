@@ -35,6 +35,12 @@ EXCLUDED_FILES = {
     # A one-to-one written from the row without the foreign key, and a
     # primaryjoin narrower than its keys: only SQLAlchemy's mapper declares them.
     "test_relationship_shapes.py",
+    # Such a one-to-one holding a row by its key or its discriminator, and a
+    # subclass typing its rows again: only SQLAlchemy's mapper declares them.
+    "test_identity_columns_sqlalchemy.py",
+    # Rows read through aliased(), a subquery or an aliased with_polymorphic():
+    # only SQLAlchemy reads a model under another name.
+    "test_aliased_roots.py",
     # Only Django runs sync ORM reads from async resolvers, so only it has a
     # worker thread to keep loaded reads out of.
     "test_async_inline_reads.py",
@@ -47,6 +53,12 @@ EXCLUDED_FILES = {
     # Subclasses of Django's relation fields, as django-mptt and modelcluster
     # declare, and contenttypes' GenericRelation.
     "test_relation_field_subclasses.py",
+    # Subclasses a discriminator reads back as themselves, which only
+    # SQLAlchemy maps.
+    "test_write_lookup_scopes_polymorphic.py",
+    # Only SQLAlchemy reads a subclass row through its base as the subclass,
+    # and Django refuses a multi-table parent link to a composite key.
+    "test_whole_row_keys_subclasses.py",
 }
 
 EXCLUDED_METHODS = {
@@ -165,6 +177,9 @@ TORT_EXCLUDED_FILES = {
     "test_query_filter_reference_lookup_custom_pk.py",
     "test_lazy_query_logging.py",
     "test_mutation_meta_ops.py",
+    # Tortoise copies a base's fields into its subclass's table, so no row is
+    # a row of another model whose repo a write's lookup must answer to.
+    "test_write_lookup_scopes.py",
 }
 
 

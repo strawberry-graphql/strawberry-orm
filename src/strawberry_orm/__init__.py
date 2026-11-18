@@ -34,7 +34,11 @@ from strawberry_orm.types import (
     Ordering,
     auto,
 )
-from strawberry_orm.upserts import UpsertNotFoundError, UpsertValidationError
+from strawberry_orm.upserts import (
+    UpsertNotFoundError,
+    UpsertValidationError,
+    is_writing,
+)
 
 __all__ = [
     "AbstractRepo",
@@ -69,6 +73,7 @@ __all__ = [
     "auto",
     "filter_field",
     "group_field",
+    "is_writing",
     "make_ref_type",
     "order_field",
     "tags",

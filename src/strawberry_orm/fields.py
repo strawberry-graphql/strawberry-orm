@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Sequence
 from typing import Any
+from weakref import WeakValueDictionary
 
 
 def _positional_names(fn: Callable[..., Any]) -> list[str]:
@@ -23,12 +24,38 @@ def call_scope(scope: Callable[..., Any], query: Any, info: Any) -> Any:
     return scope(query, info)
 
 
-def every_scope(scopes: Sequence[Callable[..., Any]]) -> Callable[..., Any]:
-    """One ``scope=`` narrowing a query by each of *scopes* in turn."""
+#: Each combination of scopes composed once, while some field still uses it.
+_EVERY_SCOPE: WeakValueDictionary[tuple[Any, ...], Callable[..., Any]] = (
+    WeakValueDictionary()
+)
 
+
+def every_scope(
+    scopes: Sequence[Callable[..., Any]],
+    *,
+    call: Callable[[Callable[..., Any], Any, Any], Any] = call_scope,
+) -> Callable[..., Any]:
+    """One ``scope=`` narrowing a query by each of *scopes* in turn, run by *call*.
+
+    The same *scopes* and *call* compose to the same one: a relation cache is
+    marked with the scope it was loaded under, and that is checked by identity.
+    """
+    key = (*scopes, call)
+    try:
+        found = _EVERY_SCOPE.get(key)
+    except TypeError:
+        return _composed(tuple(scopes), call)
+    if found is None:
+        found = _EVERY_SCOPE[key] = _composed(tuple(scopes), call)
+    return found
+
+
+def _composed(
+    scopes: tuple[Any, ...], call: Callable[[Callable[..., Any], Any, Any], Any]
+) -> Callable[..., Any]:
     def scoped(query: Any, info: Any) -> Any:
         for scope in scopes:
-            query = call_scope(scope, query, info)
+            query = call(scope, query, info)
         return query
 
     return scoped

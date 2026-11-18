@@ -311,7 +311,7 @@ class TestAsyncSessionMutations:
                 await info.context["session"].refresh(post, ["tags"])
                 return post.tags  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Query, mutation=Mutation)
+        schema = orm.schema(query=Query, mutation=Mutation)
         result = await schema.execute(
             """
             mutation {

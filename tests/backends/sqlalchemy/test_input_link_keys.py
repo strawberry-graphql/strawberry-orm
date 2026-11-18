@@ -78,4 +78,4 @@ def test_a_key_a_join_alone_links_is_left_out(build):
 
 
 def test_a_child_keeps_the_key_of_its_own_row(build):
-    assert list(_declared_fields(build(Contract, exclude_pk=False))) == ["id", "kind"]
+    assert list(_declared_fields(build(Contract, exclude_pk=False))) == ["id"]

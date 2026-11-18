@@ -20,6 +20,14 @@ jobs:
         # Every version here is advertised in the pyproject classifiers; keep
         # the two lists in step so a claim of support is always backed by a run.
         python-version: ["3.12", "3.13", "3.14"]
+        include:
+          # Coverage, held at 100% by pyproject's fail_under, is measured on
+          # one version: the source has no version-specific branches, and
+          # tracing makes the run several times slower.
+          - python-version: "3.12"
+            coverage: >-
+              --cov=strawberry_orm --cov-report=term-missing:skip-covered
+              --cov-report=xml
 
     steps:
       - name: Check out repository
@@ -42,8 +50,8 @@ jobs:
           uv sync --group dev --python ${{ matrix.python-version }}
           --extra django --extra sqlalchemy --extra tortoise --extra contrib.mcp
 
-      - name: Run tests with coverage
-        run: uv run --python ${{ matrix.python-version }} pytest
+      - name: Run tests
+        run: uv run --python ${{ matrix.python-version }} pytest ${{ matrix.coverage }}
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5

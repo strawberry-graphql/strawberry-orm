@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 
 from strawberry_orm import StrawberryORM
 from strawberry_orm.repo import _get_sa_pk_column
+from tests.abstract.repo_scope_shapes import AbstractTestRepoScopeShapes
 from tests.abstract.write_path_authorization import (
     AbstractTestAuthorizeKeepsTheRepo,
     AbstractTestAuthorizeSeesTheKey,
@@ -148,4 +149,8 @@ class TestOnReplaceDelete(AbstractTestOnReplaceDelete):
 
 
 class TestAuthorizeSeesTheKey(AbstractTestAuthorizeSeesTheKey):
+    pass
+
+
+class TestRepoScopeShapes(AbstractTestRepoScopeShapes):
     pass

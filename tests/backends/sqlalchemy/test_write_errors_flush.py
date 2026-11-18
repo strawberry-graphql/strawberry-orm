@@ -2,7 +2,7 @@
 
 The unit of work refuses some writes itself, naming the tables, columns and
 instances: an update another request got to first (``StaleDataError``), or a
-re-pointed link that would blank out a key column (an ``AssertionError``).
+link let go of that would blank out a key column (an ``AssertionError``).
 The client is told "The database refused the write"; the original is kept as
 the cause, for the server log, and an ``assert`` of the app's own is left as
 it is.
@@ -91,7 +91,6 @@ def _schema(**kwargs):
                 "update": ["name"],
                 "upsert": {"where": ["id"], "onMatch": "UPDATE"},
             },
-            "profile": {"_meta": {"update": ["bio"]}},
         },
         name="AccountUpsert",
     )
@@ -119,6 +118,12 @@ def _schema(**kwargs):
         async def upsert_account(
             self, info: strawberry.Info, input: account
         ) -> AccountType:
+            # Keyed by its link, the profile cannot be let go of: its key would
+            # be blanked out when the write flushes.
+            session = info.context["session"]
+            mine = await _settled(session.get(Account, 1))
+            await _settled(session.refresh(mine, ["profile"]))
+            mine.profile = None
             return await _settled(orm.apply_upsert(input, info))
 
         @strawberry.mutation
@@ -138,9 +143,8 @@ def _schema(**kwargs):
     return orm.schema(query=Query, mutation=Mutation)
 
 
-RE_POINT = (
-    'mutation { upsertAccount(input: {where: {id: "1"}, '
-    'update: {profile: {update: {id: "2"}}}}) { id } }'
+LET_GO = (
+    'mutation { upsertAccount(input: {where: {id: "1"}, update: {name: "me"}}) { id } }'
 )
 RENAME = (
     'mutation { upsertMember(input: {where: {id: "1"}, update: {email: "%s"}}) { id } }'
@@ -209,8 +213,9 @@ def _assert_refused(result, cause):
 
 
 async def test_a_link_that_would_blank_out_a_key_is_refused(db):
-    result = await _schema().execute(RE_POINT, context_value={"session": db})
+    result = await _schema().execute(LET_GO, context_value={"session": db})
     _assert_refused(result, AssertionError)
+    await _settled(db.rollback())
     assert await _profiles(db) == [(1, "mine"), (2, "theirs")]
 
 

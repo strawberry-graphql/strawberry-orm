@@ -11,6 +11,7 @@ from tests.abstract.security_vulnerabilities import (
 )
 from tests.backends.django.models import Post as DjPost
 from tests.backends.django.models import User as DjUser
+from tests.recorded_warnings import recording
 
 
 @pytest.fixture
@@ -108,8 +109,6 @@ class TestSecurityVulnerabilities(AbstractTestSecurityVulnerabilities):
         return SensitiveEmployee
 
     def build_traversal_schema(self, orm):
-        import warnings
-
         user_filter = orm.filter(DjUser)
         post_filter = orm.filter(DjPost)
 
@@ -132,7 +131,6 @@ class TestSecurityVulnerabilities(AbstractTestSecurityVulnerabilities):
         class Query:
             posts: list[PT] = orm.field.auto()
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with recording() as caught:
             orm.schema(query=Query)
         return [str(warning.message) for warning in caught]

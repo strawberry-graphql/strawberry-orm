@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from typing import Any, Protocol, runtime_checkable
 
 from strawberry.extensions import SchemaExtension
@@ -254,6 +255,17 @@ class Backend(Protocol):
         Returns the rows it loaded onto - empty when the selection named no
         relations, so callers can tell a real load from a no-op.
         """
+        ...
+
+    def resolve_using(
+        self,
+        instance: Any,
+        paths: Iterable[str],
+        info: Any,
+        call: Callable[[], Any],
+    ) -> Any:
+        """Call *call*, a ``using=`` resolver of *instance*, once each relation
+        *paths* walk holds only what its scope allows."""
         ...
 
     def relation_names(self, model: type) -> set[str]:

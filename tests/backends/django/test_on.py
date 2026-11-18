@@ -121,7 +121,7 @@ class TestVia:
                 return User.objects.all()
 
         # No optimizer extension, so nothing prefetches under to_attr.
-        result = sb.Schema(query=Query).execute_sync(
+        result = orm.schema(query=Query, optimizer=False).execute_sync(
             "{ users { name published { title } } }", context_value={}
         )
         assert result.errors is None, result.errors

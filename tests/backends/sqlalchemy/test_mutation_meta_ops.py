@@ -460,17 +460,15 @@ class TestOpFieldInputs:
         assert "email" in _field_names(nested)
         assert "email" in _field_names(create_type)
 
-    def test_upsert_only_defaults_create_update_to_all_scalars(self, orm):
+    def test_upsert_only_offers_neither_create_nor_update(self, orm):
         project = orm.mutations._normalize_model_project(
             SATag, {"_meta": {"upsert": {"where": ["name"]}}}
         )
-        create_names = _field_names(orm.mutations._create_input(SATag, project))
-        update_names = _field_names(
+        with pytest.raises(ValueError, match="Create fields were requested for Tag"):
+            orm.mutations._create_input(SATag, project)
+        with pytest.raises(ValueError, match="Update fields were requested for Tag"):
             orm.mutations._update_input(SATag, project, include_id=False)
-        )
-        assert "name" in create_names
-        assert "name" in update_names
-        assert "id" not in update_names
+        assert _field_names(orm.mutations._upsert_input(SATag, project)) == {"where"}
 
 
 # ---------------------------------------------------------------------------

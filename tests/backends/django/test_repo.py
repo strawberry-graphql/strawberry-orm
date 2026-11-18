@@ -6,7 +6,6 @@ import pytest
 import strawberry
 
 from strawberry_orm import AbstractRepo, StrawberryORM
-from strawberry_orm.repo import _check_auth
 from tests.backends.django.models import (
     Comment as DjComment,
 )
@@ -136,28 +135,6 @@ def _seed():
         "post": p1,
         "comment": c1,
     }
-
-
-# ---------------------------------------------------------------------------
-# _check_auth unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestCheckAuth:
-    def test_none_repo_is_noop(self):
-        _check_auth(None, "can_create", {}, None)
-
-    def test_allow_repo_passes(self):
-        class AllowRepo(AbstractRepo[DjUser]):
-            pass
-
-        repo = AllowRepo.__new__(AllowRepo)
-        _check_auth(repo, "can_create", {}, None)
-
-    def test_deny_repo_raises(self):
-        repo = DenyAllTagRepo.__new__(DenyAllTagRepo)
-        with pytest.raises(PermissionError, match="can_create denied"):
-            _check_auth(repo, "can_create", {}, None)
 
 
 # ---------------------------------------------------------------------------

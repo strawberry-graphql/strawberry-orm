@@ -6,10 +6,13 @@ from typing import Annotated
 import pytest
 import strawberry
 from strawberry import relay
+from strawberry.annotation import StrawberryAnnotation
+from strawberry.extensions import FieldExtension
+from strawberry.types.arguments import StrawberryArgument
 
 from strawberry_orm import TAGS_KEY, PayloadPolicy, StrawberryORM, auto, tags
 from strawberry_orm.relay import ORMListConnection
-from tests.backends.sqlalchemy.models import Post, User
+from tests.backends.sqlalchemy.models import Comment, Post, User
 
 
 @pytest.fixture
@@ -166,6 +169,91 @@ class TestRootsArgumentsAndInputs:
 
         with pytest.raises(TypeError, match="Every field of Hidden is tagged out"):
             orm.schema(query=Query, tags="b")
+
+    @pytest.mark.parametrize("copied", [False, True])
+    def test_an_input_an_extension_gives_a_copied_field_is_cut_to_its_type(
+        self, orm, copied
+    ):
+        """A field hiding an argument is copied, and its extensions give the
+        copy the arguments they add: a filter added there narrows the rows
+        that field returns, so it offers only the columns their type shows."""
+        user_filter = orm.filter(User)
+
+        @orm.type(User, filters=user_filter)
+        class StUserFull:
+            id: auto
+            name: auto
+            email: auto
+
+        @orm.type(User)
+        class StUserNarrow:
+            id: auto
+            name: auto
+
+        class AddsFilter(FieldExtension):
+            def apply(self, field):
+                field.arguments = [
+                    *field.arguments,
+                    StrawberryArgument(
+                        python_name="filter",
+                        graphql_name=None,
+                        type_annotation=StrawberryAnnotation(user_filter | None),
+                        default=None,
+                    ),
+                ]
+
+        hidden = Annotated[bool, strawberry.argument(metadata=tags("internal"))]
+
+        @strawberry.type
+        class Query:
+            full: list[StUserFull] = orm.field.eager()
+
+            @strawberry.field(extensions=[AddsFilter()])
+            def narrow(self, secret: hidden = False) -> list[StUserNarrow]:
+                return []
+
+        schema = orm.schema(query=Query, tags="internal" if not copied else "public")
+        sdl = str(schema)
+        start = sdl.index("input UserField")
+        columns = sdl[start : sdl.index("}", start)]
+        assert "name:" in columns
+        assert "email:" not in columns
+
+    def test_the_filter_behind_a_relation_tagged_out_goes_with_it(self, orm):
+        """A filter reached only through a relation the schema leaves out of
+        ``object:`` serves nothing there, and is left out too."""
+        orm.filter(Comment)
+        orm.filter(User)
+
+        @orm.filter_type(Post)
+        class StPostFilter:
+            title: auto
+            author: auto = strawberry.field(metadata=tags("internal"))
+            comments: auto
+
+        @orm.type(User)
+        class StAuthor:
+            id: auto
+            name: auto
+
+        @orm.type(Comment)
+        class StComment:
+            id: auto
+            body: auto
+
+        @orm.type(Post, filters=StPostFilter)
+        class StPost:
+            id: auto
+            title: auto
+            author: StAuthor
+            comments: list[StComment]
+
+        @strawberry.type
+        class Query:
+            posts: list[StPost] = orm.field.eager()
+
+        assert "input UserFilter" not in str(orm.schema(query=Query, tags="public"))
+        assert "input UserFilter" in str(orm.schema(query=Query, tags="internal"))
 
 
 class TestSchemaClass:

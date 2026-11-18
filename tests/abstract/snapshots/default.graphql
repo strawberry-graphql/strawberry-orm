@@ -8,7 +8,7 @@ input CreatePostNodeInput4fa1a6dd {
   wordCount: Int
 }
 
-input CreateUserNodeInputD928c35f {
+input CreateUserNodeInputFa23ef24 {
   name: String
   email: String
   createdAt: DateTime
@@ -19,9 +19,9 @@ input CreateUserNodeInputD928c35f {
 scalar DateTime
 
 input DefaultUserInput {
-  where: WhereUserNodeInputD928c35f!
-  create: CreateUserNodeInputD928c35f
-  update: UpdatePatchUserNodeInputD928c35f
+  where: WhereUserNodeInputFa23ef24!
+  create: CreateUserNodeInputFa23ef24
+  update: UpdatePatchUserNodeInputFa23ef24
 }
 
 type Mutation {
@@ -32,15 +32,7 @@ type Query {
   ok: Boolean!
 }
 
-input UpdatePatchPostNodeInput4fa1a6dd {
-  title: String
-  body: String
-  isPublished: Boolean
-  createdAt: DateTime
-  wordCount: Int
-}
-
-input UpdatePatchUserNodeInputD928c35f {
+input UpdatePatchUserNodeInputFa23ef24 {
   name: String
   email: String
   createdAt: DateTime
@@ -50,7 +42,6 @@ input UpdatePatchUserNodeInputD928c35f {
 input UpsertPostNodeInput4fa1a6dd {
   where: WherePostNodeInput4fa1a6dd!
   create: CreatePostNodeInput4fa1a6dd
-  update: UpdatePatchPostNodeInput4fa1a6dd
 }
 
 input UserPostsRef4fa1a6dd @oneOf {
@@ -62,6 +53,6 @@ input WherePostNodeInput4fa1a6dd {
   title: String!
 }
 
-input WhereUserNodeInputD928c35f {
+input WhereUserNodeInputFa23ef24 {
   email: String!
 }

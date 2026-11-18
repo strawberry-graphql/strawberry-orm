@@ -145,7 +145,7 @@ PROJECTED_UPDATE = """
 
 
 UPSERT_USER_PROJECT = {
-    "_meta": {"upsert": {"where": ["email"]}},
+    "_meta": {"create": True, "update": True, "upsert": {"where": ["email"]}},
     "posts": {"_meta": {"create": True, "upsert": {"where": True}}},
 }
 

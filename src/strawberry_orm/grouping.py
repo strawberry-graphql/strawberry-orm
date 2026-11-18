@@ -182,7 +182,7 @@ def _collect(
                 hop = backend.relation_hop(model, relation)
                 if hop.many and hops:
                     raise ValueError(
-                        f"Cannot group by {model.__name__}.{relation} through "
+                        f"Cannot group by {relation} through "
                         f"{'.'.join(h.relation for h in hops)}: a to-many relation "
                         f"can only be grouped by directly on the model."
                     )
@@ -195,8 +195,9 @@ def _collect(
         elif key in custom:
             if hops:
                 raise ValueError(
-                    f"@group_field {key} groups {model.__name__} itself and "
-                    f"cannot be reached through object:."
+                    f"Cannot group by {key} through "
+                    f"{'.'.join(h.relation for h in hops)}: it groups the rows of "
+                    f"its own type, and cannot be reached through object:."
                 )
             path = GroupPath(
                 alias="",
@@ -223,7 +224,7 @@ def _collect_together(
     columns to the same value.
     """
     hop = backend.relation_hop(model, relation)
-    where = f"objects: {{{relation}}} on {model.__name__}"
+    where = f"objects: {{{relation}}}"
     if hops or not hop.many:
         raise ValueError(
             f"Cannot group by {where}: objects: groups a model by the rows of "
@@ -301,7 +302,7 @@ def order_terms(backend: Any, model: type, order_input: Any) -> list[Any]:
             if not _is_set(nested):
                 continue
             hop = backend.relation_hop(model, relation)
-            where = f"objects: {{{relation}}} on {model.__name__}"
+            where = f"objects: {{{relation}}}"
             if not hop.many:
                 raise ValueError(
                     f"Cannot order by {where}: objects: orders a model by the "

@@ -2,9 +2,9 @@
 
 ``{ users { comments { post { author } } } }`` reaches Alice again as the
 author of the posts she commented on, at a level of the plan that does not
-load her comments. ``User.comments`` loads only when it is read, so when no
-statement carried loader options but the plan's, only the plan filled it,
-and each relation is read once for all the rows rather than again for each.
+load her comments. Each scoped relation is read by a statement of its own
+and marked with exactly what it handed each row, so each relation is read
+once for all the rows rather than again for each.
 
 A scope that adds loader options of its own can fill a relation before the
 plan reaches it, unscoped, and then the relation is still read again.
@@ -109,7 +109,7 @@ def test_a_selection_looping_back_to_its_rows_reads_each_relation_once(
         for user in data["users"]
     }
     assert read == {"Alice": ["Alice"] * 6, "Bob": ["Alice"]}
-    assert len(sent) == 2, sent
+    assert len(sent) == 4, sent
 
 
 def test_a_relation_the_root_scope_loaded_is_still_read_again(sa_session, seed):

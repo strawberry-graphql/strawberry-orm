@@ -58,7 +58,8 @@ class Stamp(models.Model):
 
 
 REFUSED = "Invalid filter expression"
-BAD = '{field: {memo: {regex: "["}}}'
+# Python parses it, so the guard passes it, but ``re`` cannot compile it.
+BAD = '{field: {memo: {regex: "(?<=a+)b"}}}'
 
 READS = {
     "list": "{ ledgers(filter: %s) { memo } }",
@@ -134,9 +135,7 @@ def build(*, refuse_lines=False, optimized=True):
         async def loaded_async(self) -> list[LedgerNode]:
             return await sync_to_async(list)(Ledger.objects.order_by("id"))
 
-    if optimized:
-        return orm.schema(query=Query)
-    return strawberry.Schema(query=Query)
+    return orm.schema(query=Query, optimizer=optimized)
 
 
 def build_plain():
@@ -171,7 +170,7 @@ def build_plain():
         def ledgers(self) -> list[LedgerWithLines]:
             return list(Ledger.objects.order_by("id"))
 
-    return strawberry.Schema(query=Query)
+    return orm.schema(query=Query, optimizer=False)
 
 
 def assert_refused(result):

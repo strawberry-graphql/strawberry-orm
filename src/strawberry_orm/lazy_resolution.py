@@ -41,11 +41,17 @@ class _Execution:
     from one request's scope says nothing about the next request's.
     """
 
-    __slots__ = ("connection_states", "mark")
+    __slots__ = ("casts", "connection_states", "filter_costs", "mark", "plans")
 
     def __init__(self) -> None:
+        #: ``strawberry.cast`` marks made in this execution: (row, type) by row id.
+        self.casts: dict[int, tuple[Any, Any]] = {}
         self.connection_states: dict[tuple, Any] = {}
+        #: What each field's filters cost, as ``filter_budget`` counts it.
+        self.filter_costs: dict[tuple, tuple[int, int]] = {}
         self.mark = object()
+        #: What the optimizer has planned in this execution, and may still plan.
+        self.plans: Any = None
 
 
 _EXECUTION: ContextVar[_Execution | None] = ContextVar(
@@ -179,22 +185,34 @@ _LOADS_LOCK = threading.Lock()
 
 
 class _Load:
-    __slots__ = ("crossed",)
+    __slots__ = ("crossed", "names", "thread")
 
-    def __init__(self) -> None:
+    def __init__(self, names: frozenset[str]) -> None:
         self.crossed = False
+        self.names = names
+        self.thread = threading.get_ident()
+
+    def crosses(self, other: _Load) -> bool:
+        return self.thread != other.thread and bool(self.names & other.names)
 
 
 @contextmanager
-def load_alone(rows: Iterable[Any]) -> Iterator[Callable[[], bool]]:
-    """Track a load onto *rows*; yields whether it has had them to itself so far.
+def load_alone(
+    rows: Iterable[Any], names: Iterable[str]
+) -> Iterator[Callable[[], bool]]:
+    """Track a load of relations *names* onto *rows*; yields whether it has had them to itself so far.
 
     A row the app keeps between requests can be loaded onto by two at once,
-    and one load's caches replaced by the other's before it marks them. Its
-    mark would then vouch for rows another scope allowed, so a load that
-    crossed another one marks nothing, and the resolvers read again.
+    and one load's caches replaced by the other's between its check of what
+    they hold and its mark. Its mark would then vouch for rows another scope
+    allowed, so a load that crossed another one marks nothing, and the
+    resolvers read again. The check and the mark run without awaiting, so
+    only a load in another thread, of one of the same relations, can come
+    between them: one on the same event loop never crosses it, and two
+    resolvers reading one relation again onto a row that parents share would
+    otherwise keep each other from ever marking it.
     """
-    load = _Load()
+    load = _Load(frozenset(names))
     unique = list({id(row): row for row in rows}.values())
     with _LOADS_LOCK:
         for row in unique:
@@ -203,7 +221,8 @@ def load_alone(rows: Iterable[Any]) -> Iterator[Callable[[], bool]]:
                 loads = []
                 setattr(row, _LOADS_IN_FLIGHT, loads)
             for other in loads:
-                other.crossed = load.crossed = True
+                if load.crosses(other):
+                    other.crossed = load.crossed = True
             loads.append(load)
     try:
         yield lambda: not load.crossed
@@ -215,8 +234,9 @@ def load_alone(rows: Iterable[Any]) -> Iterator[Callable[[], bool]]:
 
 
 #: The scope a row mark or check leaves unnamed. A mark that names none vouches
-#: for the scope of each row's own class; a check that names none takes any
-#: mark. When both name one, it must be the same class.
+#: for the scope of each row's own class alone; a check that names none takes
+#: any mark. Otherwise each names a class or a set of classes, and the mark must
+#: name every class the check does.
 ANY_SCOPE: Any = object()
 
 
@@ -232,14 +252,24 @@ def row_mark(owner: Any = ANY_SCOPE) -> tuple[object, Any] | None:
 def row_mark_holds(made: Any, owner: Any = ANY_SCOPE) -> bool:
     """Whether the row mark *made* is this execution's and vouches for *owner*.
 
-    *owner* is the class that scopes the row's own class. A row of a subclass
-    whose type defines its own ``scope_rows`` is not scoped by its base's, so
-    a mark made by a read of the base does not vouch for it.
+    *owner* is the class that scopes the row's own class, or the set of every
+    class whose scope the row is held to. A row of a subclass whose type
+    defines its own ``scope_rows`` and keeps its rows in a table of its own
+    is not scoped by its base's, and one read as its base's type is not
+    scoped by its own class's alone, so a mark made by either read does not
+    vouch for the other.
     """
     mark = execution_mark()
     if mark is None or not isinstance(made, tuple) or made[0] is not mark:
         return False
-    return owner is ANY_SCOPE or made[1] is ANY_SCOPE or made[1] is owner
+    if owner is ANY_SCOPE:
+        return True
+    owed = _scopes(owner)
+    return len(owed) <= 1 if made[1] is ANY_SCOPE else owed <= _scopes(made[1])
+
+
+def _scopes(owner: Any) -> frozenset[Any]:
+    return owner if isinstance(owner, frozenset) else frozenset((owner,))
 
 
 def mark_rows_scoped(instances: Iterable[Any], owner: Any = ANY_SCOPE) -> None:
@@ -264,34 +294,44 @@ def _query_mark() -> object:
     return execution_mark() or _OUTSIDE_AN_EXECUTION
 
 
-def mark_query_scoped(query: Any) -> None:
-    """Remember that ``scope_rows`` has already been applied to *query*."""
-    mark = _query_mark()
+def mark_query_scoped(query: Any, scopes: frozenset[Any] = frozenset()) -> None:
+    """Remember that ``scope_rows`` has already been applied to *query*.
+
+    *scopes* are the classes whose ``scope_rows`` were applied.
+    """
+    made = (_query_mark(), scopes)
     with suppress(Exception):
-        setattr(query, _QUERY_SCOPED, mark)
+        setattr(query, _QUERY_SCOPED, made)
     with suppress(TypeError):
-        _SCOPED_QUERIES[query] = mark
+        _SCOPED_QUERIES[query] = made
+
+
+def query_scopes(query: Any) -> frozenset[Any] | None:
+    """The classes whose ``scope_rows`` *query* passed, or ``None`` if unscoped."""
+    mark = _query_mark()
+    made = getattr(query, _QUERY_SCOPED, None)
+    if not isinstance(made, tuple) or made[0] is not mark:
+        # WeakKeyDictionary treats an unhashable query as absent.
+        try:
+            made = _SCOPED_QUERIES.get(query)
+        except TypeError:
+            return None
+    return made[1] if isinstance(made, tuple) and made[0] is mark else None
 
 
 def query_is_scoped(query: Any) -> bool:
     """Return whether *query* was already passed through ``scope_rows``."""
-    mark = _query_mark()
-    if getattr(query, _QUERY_SCOPED, None) is mark:
-        return True
-    # WeakKeyDictionary treats an unhashable query as absent.
-    try:
-        return _SCOPED_QUERIES.get(query) is mark
-    except TypeError:
-        return False
+    return query_scopes(query) is not None
 
 
 def narrowed_from(query: Any, narrowed: Any) -> Any:
-    """*narrowed*, a filter or ordering of *query*, scoped if *query* was.
+    """*narrowed*, a filter, ordering or page of *query*, scoped if *query* was.
 
     A clone, as Django's querysets make, forgets the mark.
     """
-    if narrowed is not query and query_is_scoped(query):
-        mark_query_scoped(narrowed)
+    scopes = query_scopes(query) if narrowed is not query else None
+    if scopes is not None:
+        mark_query_scoped(narrowed, scopes)
     return narrowed
 
 
@@ -341,20 +381,37 @@ def _graphql_path_from_info(info: Any) -> str:
 
 
 def _format_selection_set(selection_set: Any) -> str:
+    """The field names under *selection_set*, as far as a report shows them.
+
+    It is recorded for every row that loads the relation, and a selection can
+    repeat a field any number of times that runs once, so it stops once a
+    report has as much as it would print.
+    """
     if selection_set is None:
         return ""
 
     parts: list[str] = []
-    for selection in selection_set.selections:
-        name_node = getattr(selection, "name", None)
-        if name_node is None:
-            continue
-        name = name_node.value
-        nested = getattr(selection, "selection_set", None)
-        if nested is not None and nested.selections:
-            parts.append(f"{name} {{ {_format_selection_set(nested)} }}")
-        else:
-            parts.append(name)
+    size = 0
+
+    def visit(node: Any) -> None:
+        nonlocal size
+        for selection in node.selections:
+            if size > _MOST_ECHOED:
+                return
+            name_node = getattr(selection, "name", None)
+            if name_node is None:
+                continue
+            nested = getattr(selection, "selection_set", None)
+            if nested is not None and nested.selections:
+                parts.append(f"{name_node.value} {{")
+                size += len(parts[-1]) + 1
+                visit(nested)
+                parts.append("}")
+            else:
+                parts.append(name_node.value)
+            size += len(parts[-1]) + 1
+
+    visit(selection_set)
     return " ".join(parts)
 
 
@@ -365,30 +422,11 @@ def _query_selection_path(info: Any) -> str:
     if operation is None or not path_fields:
         return f"{{ {_graphql_path_from_info(info)} }}"
 
-    def walk(selection_set: Any, remaining: list[str]) -> str | None:
-        target = remaining[0]
-        for selection in selection_set.selections:
-            name_node = getattr(selection, "name", None)
-            if name_node is None or name_node.value != target:
-                continue
-
-            nested = getattr(selection, "selection_set", None)
-            if len(remaining) == 1:
-                child = _format_selection_set(nested) if nested is not None else ""
-                return f"{target} {{ {child} }}" if child else target
-
-            if nested is None:
-                return None
-            inner = walk(nested, remaining[1:])
-            if inner is None:
-                return None
-            return f"{target} {{ {inner} }}"
-
-        return None
-
-    inner = walk(operation.selection_set, path_fields)
-    if inner is None:
-        return f"{{ {_graphql_path_from_info(info)} }}"
+    field_nodes = getattr(info, "field_nodes", None) or (None,)
+    child = _format_selection_set(getattr(field_nodes[0], "selection_set", None))
+    *outer, last = path_fields
+    opened = [*outer, f"{last} {{ {child} }}" if child else last]
+    inner = " { ".join(opened) + " }" * len(outer)
 
     op_type = getattr(getattr(operation, "operation", None), "value", None)
     op_name = getattr(getattr(operation, "name", None), "value", None)
@@ -405,6 +443,11 @@ def _parent_graphql_type(info: Any) -> str:
     if parent is None:
         return "?"
     return str(getattr(parent, "name", parent))
+
+
+def field_label(info: Any) -> str:
+    """``Type.field`` for the field *info* resolves, as the schema names it."""
+    return f"{_parent_graphql_type(info)}.{_graphql_field_name(info)}"
 
 
 def _relation_hint(backend: Backend, instance: Any = None, field_name: str = "") -> str:
@@ -581,11 +624,22 @@ def _format_resolver_queries(entry: _ResolverQueries) -> str:
     return f"  - resolver: {detail}\n    fix: @orm.field.computed(using=[{names}])"
 
 
+#: How much of a request's own text - a path through its response keys, its
+#: operation name, the selection under a relation - a report repeats, and how
+#: many findings it lists: it is logged for every request.
+_MOST_ECHOED = 160
+_MOST_LISTED = 8
+
+
+def _clipped(text: str) -> str:
+    return text if len(text) <= _MOST_ECHOED else f"{text[: _MOST_ECHOED - 1]}…"
+
+
 def _format_unoptimized_loads(
     loads: list[_UnoptimizedLoad],
     resolver_queries: list[_ResolverQueries] | None = None,
     causes: dict[str, list[_UnoptimizedLoad]] | None = None,
-    bails: dict[str, str] | None = None,
+    bails: dict[str, tuple[str, str]] | None = None,
 ) -> str:
     grouped: Counter[_UnoptimizedLoad] = Counter(loads)
     lines = []
@@ -599,7 +653,7 @@ def _format_unoptimized_loads(
     ):
         suffix = f" ({count} instances)" if count > 1 else ""
         lines.append(
-            f"  - path: {load.query_path}\n"
+            f"  - path: {_clipped(load.query_path)}\n"
             f"    resolver: {load.resolver_type}.{load.graphql_field} "
             f"(ORM: {load.model_name}.{load.orm_field}){suffix}\n"
             f"    fix: {load.hint}"
@@ -626,11 +680,14 @@ def _format_unoptimized_loads(
 
     for path in sorted(bails or {}):
         lines.append(
-            f"  - path: {path}\n"
-            f"    fell back to one query per parent: {(bails or {})[path]}\n"
+            f"  - path: {_clipped(path)}\n"
+            f"    fell back to one query per parent: {(bails or {})[path][1]}\n"
             f"    fix: narrow it with a scope on orm.field.eager, which cannot "
             f"vary per parent and so never needs rewriting"
         )
+
+    if len(lines) > _MOST_LISTED:
+        lines[_MOST_LISTED:] = [f"  … and {len(lines) - _MOST_LISTED} more"]
 
     total = (
         len(loads)
@@ -643,6 +700,44 @@ def _format_unoptimized_loads(
         f"— may waterfall (N+1):"
     )
     return f"{header}\n" + "\n".join(lines)
+
+
+def _findings(
+    loads: list[_UnoptimizedLoad],
+    resolver_queries: list[_ResolverQueries],
+    causes: dict[str, list[_UnoptimizedLoad]],
+    bails: dict[str, tuple[str, str]],
+) -> list[str]:
+    """One warning per finding, naming only the schema's types and fields.
+
+    Python keeps every distinct warning text it shows for the life of the
+    process, so nothing a request chooses - its response keys, operation
+    name, or how many rows it reads - may make a new one.
+    """
+    found = {
+        f"{label} returned rows instead of a query object, so the relations "
+        f"below it could not be eager-loaded"
+        for label in causes
+    }
+    found.update(
+        f"{load.resolver_type}.{load.graphql_field} loads "
+        f"{load.model_name}.{load.orm_field} once per parent row; "
+        f"fix: {load.hint}"
+        for load in loads
+    )
+    found.update(
+        f"{entry.resolver_type}.{entry.graphql_field} lazy-loaded "
+        f"{', '.join(f'{entry.model_name}.{rel}' for rel in entry.relations)}; "
+        f"fix: @orm.field.computed(using=[{', '.join(map(repr, entry.relations))}])"
+        for entry in resolver_queries
+    )
+    found.update(
+        f"{label} fell back to one query per parent: {reason}"
+        for label, reason in bails.values()
+    )
+    return [
+        f"Unoptimized relation loads detected: {finding}" for finding in sorted(found)
+    ]
 
 
 class LazyResolutionExtension(SchemaExtension):
@@ -691,23 +786,16 @@ class LazyResolutionExtension(SchemaExtension):
             self._record_return_shape(info, result)
             return result
 
-        # The probe has to stay open across an async resolver's await, so the
-        # context manager is driven by hand rather than with a ``with`` block.
         before = unloaded_relations(self._backend, root)
-        probe_cm = self._backend.query_probe(info)
-        probe = probe_cm.__enter__()
-        try:
+        with self._backend.query_probe(info) as probe:
             result = _next(root, info, *args, **kwargs)
-        except BaseException:
-            probe_cm.__exit__(None, None, None)
-            raise
 
+        # GraphQL drops a pending field when a sibling fails, and a coroutine
+        # never started never runs its ``finally``: the await is probed
+        # afresh, from inside the coroutine, so no probe outlives its frame.
         if isawaitable(result):
-            return self._await_probed_result(
-                probe_cm, probe, result, root, info, before
-            )
+            return self._await_probed_result(probe.count, result, root, info, before)
 
-        probe_cm.__exit__(None, None, None)
         self._record_resolver_queries(root, info, probe, before)
         self._record_return_shape(info, result)
         return result
@@ -719,17 +807,15 @@ class LazyResolutionExtension(SchemaExtension):
 
     async def _await_probed_result(
         self,
-        probe_cm: Any,
-        probe: Any,
+        counted: int,
         awaitable: Any,
         root: Any,
         info: Any,
         before: set[str],
     ) -> Any:
-        try:
+        with self._backend.query_probe(info) as probe:
             result = await awaitable
-        finally:
-            probe_cm.__exit__(None, None, None)
+        probe.count += counted
         self._record_resolver_queries(root, info, probe, before)
         self._record_return_shape(info, result)
         return result
@@ -759,9 +845,7 @@ class LazyResolutionExtension(SchemaExtension):
         if isawaitable(result):
             return
         self._shapes[path] = self._backend.is_query_object(result)
-        self._shape_labels[path] = (
-            f"{_parent_graphql_type(info)}.{_graphql_field_name(info)}"
-        )
+        self._shape_labels[path] = field_label(info)
 
     def _materializing_ancestor(self, path: str) -> str | None:
         """Nearest ancestor of *path* that returned rows instead of a query."""
@@ -833,8 +917,7 @@ class LazyResolutionExtension(SchemaExtension):
         for load in self._loads:
             ancestor = self._materializing_ancestor(load.path)
             if ancestor is not None:
-                label = self._shape_labels.get(ancestor, ancestor)
-                causes.setdefault(label, []).append(load)
+                causes.setdefault(self._shape_labels[ancestor], []).append(load)
 
         message = _format_unoptimized_loads(
             self._loads, self._resolver_queries, causes, bails
@@ -843,4 +926,7 @@ class LazyResolutionExtension(SchemaExtension):
         if self._mode == "error":
             raise RuntimeError(message)
         if self._mode == "warn":
-            warnings.warn(message, UserWarning, stacklevel=2)
+            for finding in _findings(
+                self._loads, self._resolver_queries, causes, bails
+            ):
+                warnings.warn(finding, UserWarning, stacklevel=2)

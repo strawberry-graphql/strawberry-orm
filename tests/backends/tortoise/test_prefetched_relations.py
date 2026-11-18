@@ -30,7 +30,7 @@ def users_schema(orm, User, Post, users, *, published_only=False):
         async def users(self) -> list[UserType]:
             return list(await users())
 
-    return strawberry.Schema(query=Query)
+    return orm.schema(query=Query, optimizer=False)
 
 
 async def titles(schema):

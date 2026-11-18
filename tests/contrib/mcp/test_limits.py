@@ -167,8 +167,10 @@ async def test_a_stored_operation_refuses_arguments_past_their_budget():
 
 
 async def test_variables_up_to_the_budget_still_run():
+    at_budget = {"anyOf": [{"title": "Hello"}] * 3_332, "status": "PUBLISHED"}
+
     async with Client(mcp_server(schema, operations=LIST_POSTS)) as client:
-        result = await client.call_tool("ListPosts", {"filter": _filter(4_999)})
+        result = await client.call_tool("ListPosts", {"filter": at_budget})
 
     assert result.structured_content == {"data": {"posts": [{"title": "Hello"}]}}
 

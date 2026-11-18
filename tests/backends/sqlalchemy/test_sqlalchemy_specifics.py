@@ -32,6 +32,7 @@ from sqlalchemy import (
     union,
 )
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.dialects import mysql, oracle, postgresql, sqlite
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -49,6 +50,7 @@ from strawberry_orm import StrawberryORM
 from strawberry_orm._async import in_async_context
 from strawberry_orm.backends.sqlalchemy import (
     SQLAlchemyBackend,
+    _bounded_regexp,
     _column_value,
     _liftable_criteria,
     _unordered,
@@ -352,8 +354,11 @@ class TestASyncSessionUnderAsyncExecution:
             "{ users { name } }", context_value={"session": sa_session}
         )
         assert [error.message for error in result.errors] == [
-            "cannot use the database from the event loop"
+            "Invalid filter expression"
         ]
+        assert str(result.errors[0].original_error.__cause__) == (
+            "cannot use the database from the event loop"
+        )
 
 
 class TestBatchedViews:
@@ -1697,3 +1702,34 @@ class TestAMappersOwnEagerLoad:
             [{"title": "bob's"}],
         ]
         assert [d["owner"] for d in data["docs"]] == [{"name": "visible"}, None]
+
+
+#: How each dialect runs ``iRegex``: SQLite's compiler drops ``flags``.
+REGEX_IGNORING_CASE = {
+    sqlite: "REGEXP ('(?i)' || ?)",
+    postgresql: "END ~* %(",
+    mysql: ", %s, 'i')",
+    oracle: ", :strawberry_orm_pattern_ignoring_case_1, 'i')",
+}
+
+
+def _regex_where(clause, dialect):
+    sql = str(select(User.id).where(clause).compile(dialect=dialect.dialect()))
+    return sql.split("WHERE", 1)[1]
+
+
+@pytest.mark.parametrize("dialect", REGEX_IGNORING_CASE, ids=lambda d: d.__name__)
+class TestARegexInEveryDialect:
+    def test_iregex_ignores_case_as_the_dialect_spells_it(self, dialect):
+        where = _regex_where(
+            _bounded_regexp(User.name, "^b", 4, ignore_case=True), dialect
+        )
+        assert REGEX_IGNORING_CASE[dialect] in where
+        assert "(?i)" not in where or dialect is sqlite
+
+    @pytest.mark.parametrize("ignore_case", [False, True])
+    def test_the_regex_is_given_only_bounded_text(self, dialect, ignore_case):
+        clause = _bounded_regexp(User.name, "^b", 4, ignore_case=ignore_case)
+        where = _regex_where(clause, dialect)
+        assert where.count("length(") == 2
+        assert "CASE WHEN (length(" in where

@@ -74,42 +74,6 @@ class TestQueryFilterLimits:
         assert result.errors is not None
         assert "maximum is 1" in str(result.errors[0])
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("pattern", "refusal"),
-        [
-            ("(a+)+$", "may not repeat a group"),
-            ("(a|aa)+$", "may not repeat a group"),
-            (".*" * 6 + "!", "may not hold two repeats"),
-            ("a" * 101, "at most 100 characters"),
-        ],
-    )
-    async def test_a_pattern_that_can_backtrack_for_long_is_refused(
-        self, seed, User, pattern, refusal
-    ):
-        schema = self._build_schema(User, enable_regex_filters=True)
-        result = await schema.execute(
-            "query ($p: String!) { users(filter: {field: {name: {regex: $p}}}) { name } }",
-            variable_values={"p": pattern},
-        )
-        assert result.data is None
-        assert refusal in result.errors[0].message
-
-    @pytest.mark.asyncio
-    async def test_a_rejected_regex_filter_does_not_list_the_models_columns(
-        self, seed, User
-    ):
-        schema = self._build_schema(User, enable_regex_filters=True)
-        result = await schema.execute(
-            """
-            {
-                users(filter: { field: { name: { regex: "^A.*" } } }) {
-                    name
-                }
-            }
-            """
-        )
-        assert result.errors is not None
-        message = result.errors[0].message
-        assert message == "Invalid filter expression"
-        assert "email" not in message
+    def test_regex_filters_cannot_be_enabled(self):
+        with pytest.raises(ValueError, match="Tortoise has no regex lookup"):
+            StrawberryORM.for_tortoise(enable_regex_filters=True)

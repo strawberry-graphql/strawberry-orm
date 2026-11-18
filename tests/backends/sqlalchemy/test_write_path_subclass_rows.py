@@ -8,7 +8,15 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import ForeignKey, String, create_engine, insert, select
+from sqlalchemy import (
+    Column,
+    ForeignKey,
+    String,
+    Table,
+    create_engine,
+    insert,
+    select,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -79,6 +87,51 @@ class WaPin(Base):
     doc: Mapped[WaDoc | None] = relationship(enable_typechecks=False)
 
 
+def _bound(name: str, table: str) -> Table:
+    return Table(
+        f"wa_binder_{name}",
+        Base.metadata,
+        Column("binder_id", ForeignKey("wa_binder.id"), primary_key=True),
+        Column("doc_id", ForeignKey(f"{table}.id"), primary_key=True),
+    )
+
+
+class WaBinder(Base):
+    __tablename__ = "wa_binder"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    docs: Mapped[list[WaDoc]] = relationship(
+        secondary=_bound("docs", "wa_doc"), enable_typechecks=False
+    )
+    sealed: Mapped[list[WaSealedDoc]] = relationship(
+        secondary=_bound("sealed", "wa_sealed_doc"), enable_typechecks=False
+    )
+    restricted: Mapped[list[WaRestrictedDoc]] = relationship(
+        secondary=_bound("restricted", "wa_restricted_doc"), enable_typechecks=False
+    )
+
+
+class WaMark(Base):
+    __tablename__ = "wa_mark"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(50))
+    doc_id: Mapped[int | None] = mapped_column(ForeignKey("wa_doc.id"))
+    sealed_id: Mapped[int | None] = mapped_column(ForeignKey("wa_sealed_doc.id"))
+    restricted_id: Mapped[int | None] = mapped_column(
+        ForeignKey("wa_restricted_doc.id")
+    )
+    doc: Mapped[WaDoc | None] = relationship(
+        foreign_keys=[doc_id], enable_typechecks=False
+    )
+    sealed: Mapped[WaSealedDoc | None] = relationship(
+        foreign_keys=[sealed_id], enable_typechecks=False
+    )
+    restricted: Mapped[WaRestrictedDoc | None] = relationship(
+        foreign_keys=[restricted_id], enable_typechecks=False
+    )
+
+
 class WaNote(Base):
     __tablename__ = "wa_note"
 
@@ -99,6 +152,8 @@ MODELS = SimpleNamespace(
     RestrictedDoc=WaRestrictedDoc,
     PublicDoc=WaPublicDoc,
     Pin=WaPin,
+    Binder=WaBinder,
+    Mark=WaMark,
 )
 
 

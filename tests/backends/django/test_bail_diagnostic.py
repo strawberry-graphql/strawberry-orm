@@ -55,7 +55,7 @@ class TestBailDiagnostic:
         """Materializing leaves nothing to rewrite, and that is worth saying."""
         message = self._warnings(self._schema(User, Post, materialize=True))
         assert "one query per parent" in message
-        assert "users.written" in message
+        assert "UserType.written" in message
 
     def test_a_rewritable_resolver_is_not_reported(self, seed, User, Post):
         """Returning the query lets the batcher collapse it, so there is nothing to say."""

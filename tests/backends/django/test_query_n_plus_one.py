@@ -131,7 +131,7 @@ class TestQueryNPlusOnePrevention:
             def users(self) -> list[UT]:
                 return User.objects.all()  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Q)
+        schema = orm.schema(query=Q, optimizer=False)
         with CaptureQueriesContext(connection) as ctx:
             result = schema.execute_sync("{ users { name posts { title } } }")
         assert result.errors is None

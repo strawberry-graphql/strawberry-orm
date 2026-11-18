@@ -8,7 +8,7 @@ import statistics
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, TypeVar, cast
+from typing import Annotated, Any, TypeVar, cast, get_args, get_origin
 
 import strawberry
 from strawberry import field, relay
@@ -21,19 +21,24 @@ from strawberry.relay.fields import ConnectionExtension
 from strawberry.relay.types import Node
 from strawberry.relay.utils import (
     SliceMetadata,
+    from_base64,
     to_base64,
 )
 from strawberry.types import Info
 from strawberry.types.base import StrawberryContainer, get_object_definition
+from strawberry.types.lazy_type import LazyType
 from strawberry.types.nodes import SelectedField
+from strawberry.types.union import StrawberryUnion
 
 from strawberry_orm._async import AwaitableOrValue, await_maybe
 from strawberry_orm.backends._base import (
     _selection_requests,
 )
+from strawberry_orm.cover import copy_field
 from strawberry_orm.optimizer.extension import (
     get_configured_optimizer,
     optimize_query_nodes,
+    settled,
 )
 from strawberry_orm.optimizer.selections import selected_fields, selects_anywhere
 
@@ -136,7 +141,51 @@ def _orm_backend_from_info(info: Any) -> Any | None:
     from strawberry_orm.optimizer.extension import get_configured_optimizer
 
     backend, _store = get_configured_optimizer(info)
-    return backend
+    if backend is not None:
+        return backend
+    backend = getattr(getattr(info, "schema", None), "_orm_backend", None)
+    return backend if backend is not None else _field_backend(info)
+
+
+def _field_backend(info: Any) -> Any:
+    """The backend an extension the library put on *info*'s field carries.
+
+    It is how an ``orm.connection`` holds its rows to scope in a schema that
+    ``strawberry.Schema`` built without any of the library's extensions.
+    """
+    from strawberry_orm.backends._base import BaseBackend
+    from strawberry_orm.batching import _strawberry_field
+    from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+    field = _strawberry_field(graphql_resolve_info(info))
+    for extension in getattr(field, "extensions", ()):
+        backend = getattr(extension, "_backend", None)
+        if isinstance(backend, BaseBackend):
+            return backend
+    return None
+
+
+def _read_query(backend: Any, query: Any, info: Any) -> AwaitableOrValue[Any]:
+    """The rows of *query*, held to ``scope_rows``.
+
+    The optimizer reads it, with its loads, when the schema has one. Without
+    it the scope goes on here and the rows it lets through are marked, so no
+    ``node`` checks its row again.
+    """
+    from strawberry_orm.lazy_resolution import mark_rows_scoped
+
+    if get_configured_optimizer(info)[1] is not None:
+        return optimize_query_nodes(query, info)
+    model = backend.query_model(query)
+    query = backend.apply_type_scope(query, model, info)
+    owners = frozenset() if model is None else backend.scope_owners(model)
+
+    def marked(rows: list[Any]) -> list[Any]:
+        if owners:
+            mark_rows_scoped(rows, owners)
+        return rows
+
+    return _then(backend.materialize_query(query, info), marked)
 
 
 def _page_size(info: Any, max_results: int | None) -> tuple[int, int]:
@@ -151,6 +200,23 @@ def _page_size(info: Any, max_results: int | None) -> tuple[int, int]:
     return max_results, max_results if limit is None else min(max_results, limit)
 
 
+def _refuse_unreadable_cursor(argument: str, cursor: str | None) -> None:
+    """Refuse a cursor that does not decode to a position, as one naming
+    another type is refused.
+
+    Strawberry's own error quotes what the cursor decoded to, which would
+    repeat any text a client sends in the response and the server's log.
+    """
+    if not cursor:
+        return
+    try:
+        int(from_base64(cursor)[1])
+    except ValueError:
+        raise TypeError(
+            f"Argument '{argument}' contains a non-existing value."
+        ) from None
+
+
 def _held_to_one_page(
     info: Any, prefix: str | None, limits: tuple[int, int], **kwargs: Any
 ) -> dict[str, Any]:
@@ -163,6 +229,8 @@ def _held_to_one_page(
     its end there, which only reading every row repeats.
     """
     max_results, size = limits
+    for argument in ("after", "before"):
+        _refuse_unreadable_cursor(argument, kwargs.get(argument))
     window = SliceMetadata.from_arguments(
         info,
         before=kwargs.get("before"),
@@ -224,30 +292,25 @@ class PreslicedRows(list):
 
 
 def _visible_rows(nodes: Any, info: Info) -> Any:
-    """*nodes* as a list, without the rows ``scope_rows`` hides.
+    """*nodes*, a list, without the rows ``scope_rows`` hides.
 
     A query is scoped where it is read. Rows a resolver already read reach the
     connection unchecked, and each ``node`` is checked only as it resolves -
     after ``totalCount`` and the cursors have counted the hidden rows too. So
-    they are checked here, before anything counts or slices them. Returns
-    *nodes* untouched when they are a query, or a coroutine on async backends.
+    they are checked here, before anything counts or slices them. ``settled``
+    read any other iterable into a list, so what is not one holds no rows and
+    is left as it is. Returns a coroutine on async backends.
     """
-    from strawberry_orm.optimizer.extension import (
-        _is_prepared,
-        _without_rejected,
-        read_rows,
-    )
+    from strawberry_orm.optimizer.extension import _is_prepared, _without_rejected
 
     backend = _orm_backend_from_info(info)
-    if backend is None or backend.is_query_object(nodes):
+    if backend is None or not isinstance(nodes, list):
         return nodes
-    if not isinstance(nodes, list):
-        listed = read_rows(nodes)
-        if listed is None:
-            return nodes
-        return _then(listed, lambda read: _visible_rows(read, info))
     rows = [
-        row for row in nodes if backend.is_model_instance(row) and not _is_prepared(row)
+        row
+        for row in nodes
+        if backend.is_model_instance(row)
+        and not _is_prepared(row, backend.row_scopes(type(row), info, row))
     ]
     if not rows:
         return nodes
@@ -255,6 +318,24 @@ def _visible_rows(nodes: Any, info: Info) -> Any:
         backend.scope_instances(rows, info),
         lambda kept: _without_rejected(nodes, rows, kept)[0],
     )
+
+
+def _held_to_scope(nodes: Any, info: Info) -> Any:
+    """*nodes* with nothing ``scope_rows`` hides, before anything pages them.
+
+    A query gets the type's scope, which a scoped query carries only once;
+    rows lose the ones the scope hides, as ``_visible_rows`` drops them, once
+    ``settled`` has read them into a list.
+    """
+    backend = _orm_backend_from_info(info)
+    if backend is None:
+        return nodes
+    read = settled(nodes, 1, backend)
+    if inspect.iscoroutine(read):
+        return _then(read, lambda nodes: _held_to_scope(nodes, info))
+    if backend.is_query_object(read):
+        return backend.apply_type_scope(read, backend.query_model(read), info)
+    return _visible_rows(read, info)
 
 
 def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
@@ -279,19 +360,23 @@ def _connection_total_count(nodes: Any, info: Info) -> AwaitableOrValue[int]:
 
 
 class ORMConnectionExtension(ConnectionExtension):
-    """Connection field extension that applies optimizer hints before pagination."""
+    """Connection field extension that holds rows to scope before pagination."""
 
     def apply(self, field: Any) -> None:
         """Make sure the field's connection type cuts its own page.
 
-        A forward reference (``ListConnection["PostNode"]``) is only resolved
-        here, as the schema is built, so the connection type ``orm.connection``
-        builds for a named node is built now. Any other type would read every
-        row and slice the page in Python, past ``max_results`` and
-        ``default_query_limit``, so it is refused.
+        A forward or lazy reference (``ListConnection["PostNode"]``) is only
+        resolved here, as the schema is built, so the connection type
+        ``orm.connection`` builds for a named node is built now. Any other type
+        would read every row and slice the page in Python, past ``max_results``
+        and ``default_query_limit``, so it is refused. A connection whose nodes
+        cannot be rows of a model keeps its type, and so does a connection
+        over a union, whose rows are held to scope before Strawberry pages
+        them.
         """
         super().apply(field)
-        if _cuts_its_own_page(self.connection_type):
+        node = _node_of(self.connection_type)
+        if _cuts_its_own_page(self.connection_type) or not _may_be_rows(node):
             return
         definition = get_object_definition(self.connection_type)
         generic = definition.concrete_of if definition is not None else None
@@ -307,9 +392,9 @@ class ORMConnectionExtension(ConnectionExtension):
                 f"to max_results and default_query_limit. Derive it from "
                 f"ORMListConnection."
             )
-        self.connection_type = connection_type_for_node(
-            definition.type_var_map["NodeType"]
-        )
+        if isinstance(node, StrawberryUnion):
+            return
+        self.connection_type = connection_type_for_node(node)
         field.type = self.connection_type
 
     def _paginate_nodes(
@@ -343,6 +428,7 @@ class ORMConnectionExtension(ConnectionExtension):
         first: int | None = None,
         last: int | None = None,
     ) -> Any:
+        nodes = _held_to_scope(nodes, info)
         # An ORM connection cuts its page out of the query before reading it,
         # so it has to receive the query, not every row the query matches.
         if not _cuts_its_own_page(self.connection_type):
@@ -451,6 +537,191 @@ def _cuts_its_own_page(connection_type: Any) -> bool:
     return isinstance(connection_type, type) and issubclass(
         connection_type, ORMListConnection
     )
+
+
+def _unwrapped(type_: Any) -> Any:
+    """*type_* without the lists, optionals and lazy references around it."""
+    while True:
+        if isinstance(type_, LazyType):
+            type_ = type_.resolve_type()
+        elif isinstance(type_, StrawberryContainer):
+            type_ = type_.of_type
+        else:
+            return type_
+
+
+def _node_of(connection_type: type) -> Any:
+    """The type the edges of *connection_type* carry."""
+    definition = get_object_definition(connection_type, strict=True)
+    edges = definition.get_field("edges")
+    assert edges is not None
+    edge = _unwrapped(edges.resolve_type(type_definition=definition))
+    edge_definition = get_object_definition(edge, strict=True)
+    node = edge_definition.get_field("node")
+    assert node is not None
+    return _unwrapped(node.resolve_type(type_definition=edge_definition))
+
+
+def _connection_nodes(type_: Any) -> list[Any]:
+    """The node types of the connections a field of *type_* returns.
+
+    A union can hold several connections; any other type holds one at most.
+    """
+    type_ = _unwrapped(type_)
+    members = type_.types if isinstance(type_, StrawberryUnion) else [type_]
+    return [
+        _node_of(member)
+        for member in map(_unwrapped, members)
+        if isinstance(member, type) and issubclass(member, Connection)
+    ]
+
+
+def _may_be_rows(node_type: Any) -> bool:
+    """Whether a connection over *node_type* can hand out rows of a model.
+
+    It can over an ``@orm.type``, and over an interface or a union one
+    belongs to: the rows are checked against scope by their model, not by
+    the type the connection declares.
+    """
+    if isinstance(node_type, StrawberryUnion):
+        return any(_may_be_rows(_unwrapped(member)) for member in node_type.types)
+    pending = [node_type] if isinstance(node_type, type) else []
+    while pending:
+        cls = pending.pop()
+        if getattr(cls, "__orm_model__", None) is not None:
+            return True
+        pending.extend(cls.__subclasses__())
+    return False
+
+
+def _holds_to_scope(extension: Any) -> bool:
+    """Whether *extension* pages only rows held to ``scope_rows``.
+
+    The library's own does, and so does Strawberry's when it pages an
+    ``ORMListConnection`` that reads its rows as the library declared.
+    """
+    if isinstance(extension, ORMConnectionExtension):
+        return True
+    connection_type = getattr(extension, "connection_type", None)
+    return (
+        type(extension) is ConnectionExtension
+        and _cuts_its_own_page(connection_type)
+        and connection_type.resolve_connection.__func__
+        is ORMListConnection.resolve_connection.__func__
+    )
+
+
+def _pages_before_scoping(field: Any) -> bool:
+    """Whether *field* pages rows of a model before they are held to scope.
+
+    Paging counts every row it is given into the cursors, ``pageInfo`` and
+    ``totalCount``. A connection the library declared holds them to scope
+    first; one a resolver builds itself, or an extension other than the
+    library's pages, does not. An ``orm.connection`` left unbuilt pages
+    nothing, and ``orm.schema()`` refuses it on its own.
+    """
+    if getattr(field, "_orm_connection", False) or getattr(
+        field.default, "_orm_auto_field", False
+    ):
+        return False
+    paging = [ext for ext in field.extensions if isinstance(ext, ConnectionExtension)]
+    if paging and all(map(_holds_to_scope, paging)):
+        return False
+    return any(map(_may_be_rows, _connection_nodes(field.type)))
+
+
+def _pages_before_scoping_message(name: str) -> str:
+    return (
+        f"{name}: its connection is paged before the rows in it are held to "
+        f"scope_rows, so its edges, cursors and pageInfo would count the rows "
+        f"the scope hides. Declare it with orm.connection or relay.connection "
+        f"and return the rows, not a connection."
+    )
+
+
+def refuse_unscoped_page(info: Any) -> None:
+    """Refuse the connection field *info* resolves if it paged rows unscoped.
+
+    ``orm.schema()`` refuses such a field at build. This is the backstop for
+    a schema built with ``strawberry.Schema`` directly, where Strawberry's
+    ``relay.connection`` pages what the resolver returns as it is. The client
+    is told only the field it asked for; what to do instead names the app's
+    declarations, so that is kept as the cause, for the server log.
+    """
+    from strawberry_orm.batching import _strawberry_field
+
+    field = _strawberry_field(info)
+    if not _pages_before_scoping(field):
+        return
+    raise TypeError(
+        f"Cannot page {info.field_name}: its pages would count rows the caller "
+        f"cannot read."
+    ) from TypeError(_pages_before_scoping_message(field.python_name))
+
+
+def refuse_page_held_by_nothing(info: Any) -> None:
+    """Refuse a page of rows that nothing in this execution holds to scope.
+
+    An ``ORMListConnection`` holds its rows to ``scope_rows`` through the
+    backend the schema's extensions name, or an ``orm.connection``'s own. A
+    ``relay.connection`` in a schema ``strawberry.Schema`` built without
+    ``orm.optimizer_extension()`` has neither: its rows would be paged,
+    counted and served as the resolver returned them. A field whose type
+    cannot be read may hold rows too.
+    """
+    from strawberry_orm.batching import _strawberry_field
+    from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+    field = _strawberry_field(graphql_resolve_info(info))
+    if field is not None and not any(map(_may_be_rows, _connection_nodes(field.type))):
+        return
+    raise TypeError(
+        f"Cannot page {info.field_name}: its pages would count rows the caller "
+        f"cannot read."
+    ) from TypeError(
+        f"{info.field_name}: no strawberry_orm backend holds its rows to "
+        f"scope_rows. Build the schema with orm.schema(), or give "
+        f"strawberry.Schema orm.optimizer_extension()."
+    )
+
+
+def paged_in_scope_schema_class(base: type) -> type:
+    """A subclass of *base* that pages connections only over rows in scope."""
+    return type(base.__name__, (_PagedInScopeSchema, base), {})
+
+
+class _PagedInScopeSchema:
+    """Mixed in ahead of a ``strawberry.Schema`` by ``paged_in_scope_schema_class``.
+
+    Strawberry's ``relay.connection`` pages what the resolver returns with a
+    ``ConnectionExtension`` of its own, rows the scopes hide included, and the
+    ``node`` checked as each edge resolves then reports where they were. This
+    schema converts a copy of such a field with ``ORMConnectionExtension`` in
+    its place, one copy per field, so every lookup sees the same field. A
+    field that would page rows of a model another way is refused.
+    """
+
+    def get_fields(self, type_definition: Any) -> list[Any]:
+        fields = super().get_fields(type_definition)  # type: ignore[misc]
+        return [self._orm_paged_in_scope(field) for field in fields]
+
+    def _orm_paged_in_scope(self, field: Any) -> Any:
+        copies = self.__dict__.setdefault("_orm_paged_copies", {})
+        if id(field) in copies:
+            return copies[id(field)][1]
+        paged = field
+        if any(type(ext) is ConnectionExtension for ext in field.extensions):
+            paged = copy_field(field)
+            paged.extensions = [
+                ORMConnectionExtension(max_results=ext.max_results)
+                if type(ext) is ConnectionExtension
+                else ext
+                for ext in field.extensions
+            ]
+        elif _pages_before_scoping(field):
+            raise TypeError(_pages_before_scoping_message(field.python_name))
+        copies[id(field)] = (field, paged)
+        return paged
 
 
 def _use_orm_connection_extension(field: Any) -> None:
@@ -612,9 +883,11 @@ def connection_type_for_node(node_type: type) -> Any:
     """
     import types as _types_mod
 
-    name = getattr(node_type, "__name__", None) or getattr(
-        node_type, "__forward_arg__", None
-    )
+    named = node_type
+    if get_origin(named) is Annotated:
+        # A lazy reference: named after the class it names.
+        named = get_args(named)[0]
+    name = getattr(named, "__name__", None) or getattr(named, "__forward_arg__", None)
     if name is None:
         name = str(node_type)
     type_name = f"{name}Connection"
@@ -670,12 +943,18 @@ class ORMListConnection(ORMConnection[NodeType]):
 
     @classmethod
     def _resolve(cls, nodes: Any, *, info: Any, **kwargs: Any) -> AwaitableOrValue:
-        backend, store = get_configured_optimizer(info)
-        if backend is not None and store is not None and backend.is_query_object(nodes):
-            paged = cls._resolve_query_page(backend, nodes, info=info, **kwargs)
+        backend = _orm_backend_from_info(info)
+        if backend is None:
+            refuse_page_held_by_nothing(info)
+            return cls._resolve_rows(nodes, info=info, **kwargs)
+        read = settled(nodes, 1, backend)
+        if inspect.iscoroutine(read):
+            return _then(read, lambda nodes: cls._resolve(nodes, info=info, **kwargs))
+        if backend.is_query_object(read):
+            paged = cls._resolve_query_page(backend, read, info=info, **kwargs)
             if paged is not None:
                 return paged
-        return cls._resolve_rows(nodes, info=info, **kwargs)
+        return cls._resolve_rows(read, info=info, **kwargs)
 
     @classmethod
     def _resolve_query_page(
@@ -746,7 +1025,7 @@ class ORMListConnection(ORMConnection[NodeType]):
             page = backend.apply_page(query, window.start, limit)
             if page is None:
                 return None
-            return _then(optimize_query_nodes(page, info), finish)
+            return _then(_read_query(backend, page, info), finish)
 
         # ``last`` without ``before`` counts back from the end, so the total
         # locates the window.
@@ -803,7 +1082,7 @@ class ORMListConnection(ORMConnection[NodeType]):
         page = backend.apply_page(query, offset, limit)
         if page is None:
             return cls._resolve_rows(query, info=info, **args)
-        return _then(optimize_query_nodes(page, info), finish)
+        return _then(_read_query(backend, page, info), finish)
 
     @classmethod
     def _slice(cls, nodes: Any, *, info: Any, **kwargs: Any) -> AwaitableOrValue[Any]:
@@ -836,7 +1115,10 @@ class ORMListConnection(ORMConnection[NodeType]):
                 )
             return cls._slice_rows(visible, info=info, **kwargs)
 
-        rows = optimize_query_nodes(nodes, info)
+        backend = _orm_backend_from_info(info)
+        rows = nodes
+        if backend is not None and backend.is_query_object(nodes):
+            rows = _read_query(backend, nodes, info)
         if _should_await_nodes(rows, info):
             return _then(rows, slice_visible)
         return slice_visible(rows)

@@ -6,12 +6,13 @@ from __future__ import annotations
 import pytest
 import strawberry
 from django.core.exceptions import SynchronousOnlyOperation
+from graphql import parse
 from mcp import Client
 from mcp.server.mcpserver.exceptions import ToolError
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
-from strawberry_orm.contrib.mcp.execution import Executor
+from strawberry_orm.contrib.mcp.execution import Call, Executor, Target
 
 LEDGER: list[int] = []
 
@@ -134,11 +135,11 @@ class _Raising:
 
 
 async def test_a_mutation_whose_execute_raised_is_not_run_again():
-    executor = Executor(_Raising(), sync=None, execute=None)
+    executor = Executor(sync=None, execute=None)
+    query = "mutation { writeReceipt }"
+    call = Call(query, parse(query), OperationType.MUTATION, {}, Target(_Raising()))
 
     with pytest.raises(ToolError, match="a mutation is not run a second time"):
-        await executor.run(
-            "mutation { writeReceipt }", {}, None, {OperationType.MUTATION}
-        )
+        await executor.run(call, None)
 
     assert not executor.sync_execute

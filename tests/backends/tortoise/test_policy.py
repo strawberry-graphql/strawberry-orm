@@ -7,7 +7,6 @@ import strawberry
 from tortoise import Tortoise
 
 from strawberry_orm import MutationPolicy, StrawberryORM
-from strawberry_orm.policy import _check_policy
 from tests.backends.tortoise.models import (
     Comment as TortComment,
 )
@@ -99,23 +98,6 @@ async def tortoise_db():
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for _check_policy helper
-# ---------------------------------------------------------------------------
-
-
-class TestCheckPolicy:
-    def test_none_policy_is_noop(self):
-        _check_policy(None, "can_create", TortUser, {}, None)
-
-    def test_allow_policy_passes(self):
-        _check_policy(MutationPolicy(), "can_create", TortUser, {}, None)
-
-    def test_deny_policy_raises(self):
-        with pytest.raises(PermissionError, match="can_create denied"):
-            _check_policy(DenyAllPolicy(), "can_create", TortUser, {}, None)
-
-
-# ---------------------------------------------------------------------------
 # apply_ref_list policy tests
 # ---------------------------------------------------------------------------
 
@@ -137,6 +119,21 @@ class TestRefListPolicy:
 
         with pytest.raises(PermissionError, match="can_create denied"):
             await orm.apply_ref_list(data["post"], "tags", [ref], info)
+
+    async def test_create_allowed_by_a_policy_that_keeps_the_default(self, tortoise_db):
+        data = await _seed()
+        orm = StrawberryORM.for_tortoise(policy=DenyUpdatePolicy())
+
+        @strawberry.input
+        class TortCreateTag:
+            name: str
+
+        ref_type = orm.ref(TortTag, create=TortCreateTag)
+        info = SimpleNamespace(context={})
+        ref = ref_type(create=TortCreateTag(name="go"))
+        await orm.apply_ref_list(data["post"], "tags", [ref], info)
+        names = sorted(tag.name for tag in await data["post"].tags.all())
+        assert names == ["go", "graphql", "python"]
 
     async def test_update_denied_by_policy(self, tortoise_db):
         data = await _seed()

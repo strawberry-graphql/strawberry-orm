@@ -92,7 +92,7 @@ def test_node_inputs_for_a_subclass_leave_out_what_its_bases_type_hides(orm):
     schema = _schema(
         create=orm.mutations.create_node_input(models=[Memo], name="Create")
     )
-    assert shape(schema, "CreateMemoNodeInput") == {"kind": "String", "title": "String"}
+    assert shape(schema, "CreateMemoNodeInput") == {"title": "String"}
 
 
 def test_an_input_for_a_subclass_naming_what_its_bases_type_hides_is_refused(orm):
@@ -117,8 +117,9 @@ def writer_hidden(orm):
         title: auto
 
 
-def test_a_foreign_keys_spec_names_its_attribute_not_its_column():
-    assert _sqlalchemy_relation_specs(Article)["writer"].fk_column == "writer_id"
+def test_a_foreign_keys_spec_names_its_attribute_not_its_column(orm):
+    specs = _sqlalchemy_relation_specs(Article, orm.backend._row_keys)
+    assert specs["writer"].fk_column == "writer_id"
 
 
 def test_a_link_whose_renamed_foreign_key_is_excluded_is_left_out(orm, writer_hidden):

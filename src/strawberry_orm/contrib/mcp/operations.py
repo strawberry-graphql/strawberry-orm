@@ -19,7 +19,7 @@ from graphql import (
 from graphql.language import Visitor, visit
 from strawberry.types.graphql import OperationType
 
-from .checks import strip_descriptions
+from .checks import VALIDATION_RULES, Parsed, strip_descriptions
 from .json_schema import input_schema, output_schema
 
 
@@ -34,20 +34,23 @@ class Operation:
     document: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    #: :attr:`document`, parsed.
+    parsed: Parsed
 
 
 def read_operations(schema: GraphQLSchema, source: str) -> list[Operation]:
     """Every operation in *source*, checked against *schema*.
 
     Raises :class:`ValueError` for a document that does not parse or
-    validate, an anonymous operation, or a subscription, so a schema change
-    that breaks a tool fails when the server is built.
+    validate, with the rules Strawberry validates with, an anonymous
+    operation, or a subscription, so a schema change that breaks a tool
+    fails when the server is built.
     """
     try:
         document = parse(source)
     except GraphQLError as error:
         raise ValueError(f"The operations do not parse: {error.message}") from error
-    errors = validate(schema, document)
+    errors = validate(schema, document, VALIDATION_RULES)
     if errors:
         listed = "\n".join(f"- {e.message}" for e in errors)
         raise ValueError(f"The operations do not validate:\n{listed}")
@@ -77,14 +80,16 @@ def read_operations(schema: GraphQLSchema, source: str) -> list[Operation]:
         own = DocumentNode(
             definitions=(definition, *(fragments[n] for n in sorted(used)))
         )
+        printed = print_ast(strip_descriptions(own))
         operations.append(
             Operation(
                 name=name,
                 kind=kind,
                 description=description,
-                document=print_ast(strip_descriptions(own)),
+                document=printed,
                 input_schema=input_schema(schema, definition),
                 output_schema=output_schema(schema, definition, fragments),
+                parsed=Parsed.of(parse(printed)),
             )
         )
     return operations

@@ -62,7 +62,7 @@ class TestAsyncExecution:
                 )
                 return fetched  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Query, mutation=Mutation)
+        schema = orm.schema(query=Query, mutation=Mutation)
         result = await schema.execute(
             """
             mutation {
@@ -115,7 +115,7 @@ class TestAsyncExecution:
             def users(self) -> list[UserType]:
                 return list(DjUser.objects.order_by("id"))  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Query)
+        schema = orm.schema(query=Query)
         result = await schema.execute("{ users { name } }")
         assert result.errors is None
         assert len(result.data["users"]) == 3

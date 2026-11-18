@@ -129,7 +129,7 @@ class TestLazyResolutionRuntime:
             def posts(self) -> list[PostType]:
                 return list(DjPost.objects.all())  # type: ignore[return-value]
 
-        return strawberry.Schema(query=Query, extensions=extensions)
+        return orm.schema(query=Query, optimizer=False, extensions=extensions)
 
     def test_runtime_lazy_fk_warns_with_extension(self, seed):
         orm = StrawberryORM.for_django(lazy_resolution="off")
@@ -138,7 +138,7 @@ class TestLazyResolutionRuntime:
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
 
-        with pytest.warns(UserWarning, match="path: query \\{ posts \\{ author"):
+        with pytest.warns(UserWarning, match="PostType.author loads Post.author"):
             result = schema.execute_sync("{ posts { author { name } } }")
 
         assert result.errors is None

@@ -9,6 +9,7 @@ import pytest_asyncio
 from asgiref.sync import sync_to_async
 
 from strawberry_orm import StrawberryORM
+from tests.abstract.repo_scope_shapes import AbstractTestRepoScopeShapes
 from tests.abstract.write_path_authorization import (
     AbstractTestAuthorizeKeepsTheRepo,
     AbstractTestAuthorizeSeesTheKey,
@@ -44,6 +45,13 @@ class DjangoWriteDb(WriteDb):
         if self.sync:
             return await _on_db_thread(call)
         return await resolve(call())
+
+    async def execute(self, schema: Any, query: str) -> Any:
+        if self.sync:
+            return await _on_db_thread(
+                lambda: schema.execute_sync(query, context_value=self.context)
+            )
+        return await super().execute(schema, query)
 
     def new_orm(self, **kwargs: Any) -> Any:
         return StrawberryORM.for_django(
@@ -122,4 +130,8 @@ class TestOnReplaceDelete(AbstractTestOnReplaceDelete):
 
 
 class TestAuthorizeSeesTheKey(AbstractTestAuthorizeSeesTheKey):
+    pass
+
+
+class TestRepoScopeShapes(AbstractTestRepoScopeShapes):
     pass

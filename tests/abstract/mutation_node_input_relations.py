@@ -179,7 +179,11 @@ class AbstractTestExcludedRelations:
         orm.mutations.upsert_node_input(
             model=models.Post,
             project={
-                "_meta": {"name": "EarlyPost", "upsert": {"where": ["title"]}},
+                "_meta": {
+                    "name": "EarlyPost",
+                    "create": True,
+                    "upsert": {"where": ["title"]},
+                },
                 "author": {"_meta": {"upsert": {"where": ["id"]}}},
             },
         )
@@ -195,7 +199,11 @@ class AbstractTestExcludedRelations:
         orm.mutations.upsert_node_input(
             model=models.User,
             project={
-                "_meta": {"name": "EarlyUser", "upsert": {"where": ["name"]}},
+                "_meta": {
+                    "name": "EarlyUser",
+                    "create": True,
+                    "upsert": {"where": ["name"]},
+                },
                 "posts": {},
             },
         )

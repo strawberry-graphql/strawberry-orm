@@ -202,7 +202,7 @@ class TestQueryNPlusOnePrevention:
                 users = await User.all().prefetch_related("posts")
                 return users  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Q)
+        schema = orm.schema(query=Q, optimizer=False)
         result = await schema.execute("{ users { name posts { title } } }")
         assert result.errors is None
 

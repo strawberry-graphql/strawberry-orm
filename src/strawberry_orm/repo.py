@@ -131,7 +131,9 @@ class AbstractRepo(Generic[M]):
         """Narrow object lookups to only rows the current user may access.
 
         *query* is a backend-native query object (Django ``QuerySet``,
-        SQLAlchemy ``Select``, or Tortoise ``QuerySet``).
+        SQLAlchemy ``Select``, or Tortoise ``QuerySet``). Narrow it with
+        conditions, or limit it to none; any other limit or offset is refused,
+        as a lookup takes its own.
         """
         return query
 
@@ -184,7 +186,28 @@ class AbstractRepo(Generic[M]):
         name = backend.__class__.__name__
 
         if name == "DjangoBackend":
-            return model.objects.create(**data)
+            if not model._meta.parents:
+                return model.objects.create(**data)
+            import django
+            from django.db import models, router
+
+            # ``objects.create()`` forces the insert into the model's own table
+            # only, and saves a parent whose key is set with an UPDATE; before
+            # Django 5.0, ``save()`` cannot force the parents' inserts either.
+            if django.VERSION < (5, 0):  # pragma: no cover - Django < 5.0
+                keys = sorted(
+                    key for key in backend._row_keys(model) if data.get(key) is not None
+                )
+                if keys:
+                    raise ValueError(
+                        f"A {model.__name__} cannot be created with {keys} "
+                        f"before Django 5.0: its parent rows would be updated"
+                    )
+            instance = model(**data)
+            instance.save(
+                force_insert=(models.Model,), using=router.db_for_write(model)
+            )
+            return instance
 
         if name == "TortoiseBackend":
             raise TypeError(
@@ -223,8 +246,7 @@ class AbstractRepo(Generic[M]):
         name = backend.__class__.__name__
 
         if name == "DjangoBackend":
-            qs = model.objects.all()
-            qs = self.scope_query(qs, info)
+            qs = backend.call_repo_scope(self, model.objects.all(), info)
             return qs.filter(pk=pk).first()
 
         if name == "TortoiseBackend":
@@ -235,9 +257,8 @@ class AbstractRepo(Generic[M]):
         session = _sa_sync_session(backend, info)
         from sqlalchemy import select as sa_select
 
-        pk_col = _get_sa_pk_column(model)
-        stmt = sa_select(model).where(pk_col == pk)
-        stmt = self.scope_query(stmt, info)
+        stmt = sa_select(model).where(*_sa_key_is(model, pk))
+        stmt = backend.call_repo_scope(self, stmt, info)
         result = session.execute(stmt)
         return result.scalars().first()
 
@@ -249,8 +270,7 @@ class AbstractRepo(Generic[M]):
         name = backend.__class__.__name__
 
         if name == "TortoiseBackend":
-            qs = model.all()
-            qs = self.scope_query(qs, info)
+            qs = backend.call_repo_scope(self, model.all(), info)
             return await qs.filter(pk=pk).first()
 
         if name == "SQLAlchemyBackend":
@@ -258,21 +278,32 @@ class AbstractRepo(Generic[M]):
             if backend._is_async_session(session):
                 from sqlalchemy import select as sa_select
 
-                pk_col = _get_sa_pk_column(model)
-                stmt = sa_select(model).where(pk_col == pk)
-                stmt = self.scope_query(stmt, info)
+                stmt = sa_select(model).where(*_sa_key_is(model, pk))
+                stmt = backend.call_repo_scope(self, stmt, info)
                 result = await session.execute(stmt)
                 return result.scalars().first()
 
         return self._get(model, pk, info)
 
     def _save(self, instance: Any, info: Any) -> None:
-        """Flush / save an already-tracked instance."""
+        """Flush / save an already-tracked instance.
+
+        A row a library write read is saved with an ``UPDATE`` of the
+        attributes the write set on it, every column assigned on it since the
+        read, and the columns the ORM stamps on each save, such as Django's
+        ``auto_now``, and of nothing else; if no row has its key any more, the
+        write is refused rather than the row inserted again. SQLAlchemy's unit
+        of work does this itself. An override that assigns a column before
+        calling this has it saved; one that saves the row itself has to do the
+        same. Any other instance is saved as the ORM saves it.
+        """
         backend = self._backend
         name = backend.__class__.__name__
 
         if name == "DjangoBackend":
-            instance.save()
+            from strawberry_orm.backends.django import save_changes
+
+            save_changes(instance)
             return
 
         if name == "TortoiseBackend":
@@ -296,7 +327,9 @@ class AbstractRepo(Generic[M]):
         name = backend.__class__.__name__
 
         if name == "TortoiseBackend":
-            await instance.save()
+            from strawberry_orm.backends.tortoise import save_changes
+
+            await save_changes(instance)
             return
 
         if name == "SQLAlchemyBackend":
@@ -371,33 +404,6 @@ def _sa_sync_session(backend: Any, info: Any) -> Any:
     return session.sync_session
 
 
-def _check_auth(
-    repo: AbstractRepo | None,
-    method_name: str,
-    *args: Any,
-) -> None:
-    """Call an authorization method on a repo and raise on denial."""
-    if repo is None:
-        return
-    check = f"AbstractRepo.{method_name}"
-    _require(_sync_result(getattr(repo, method_name)(*args), check), check)
-
-
-def _sync_result(result: Any, check: str) -> Any:
-    """*result*, refused if a sync write got an awaitable it cannot wait for.
-
-    An un-awaited coroutine is truthy, so letting it through would allow
-    whatever its ``return False`` was written to deny.
-    """
-    if inspect.isawaitable(result):
-        if inspect.iscoroutine(result):
-            result.close()
-        raise TypeError(
-            f"{check} returned an awaitable during a sync write; make it synchronous"
-        )
-    return result
-
-
 def _allows(result: Any, check: str) -> bool:
     """Whether a permission check's *result* allows the operation.
 
@@ -425,7 +431,11 @@ def _require(result: Any, check: str) -> None:
 
 
 def _get_sa_pk_column(model: type) -> Any:
-    """Return the primary key column for a SQLAlchemy model."""
+    """Return the primary key column for a SQLAlchemy model.
+
+    A key of several columns is refused: one of them alone matches every row
+    that shares it.
+    """
     from sqlalchemy import inspect as sa_inspect
 
     mapper = sa_inspect(model)
@@ -436,3 +446,22 @@ def _get_sa_pk_column(model: type) -> Any:
             "expected exactly 1"
         )
     return pk_cols[0]
+
+
+def _sa_key_is(model: type, pk: Any) -> list[Any]:
+    """The conditions that a SQLAlchemy *model* row's primary key is *pk*.
+
+    A key of several columns is the tuple of their values, as ``pk_value``
+    reads it off a row; one value cannot name a row by it.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    columns = list(sa_inspect(model).primary_key)
+    if len(columns) == 1:
+        return [columns[0] == pk]
+    if not isinstance(pk, tuple) or len(pk) != len(columns):
+        raise ValueError(
+            f"Model {model.__name__} has {len(columns)} primary key columns, "
+            f"so its key is a tuple of {len(columns)} values"
+        )
+    return [column == value for column, value in zip(columns, pk, strict=True)]

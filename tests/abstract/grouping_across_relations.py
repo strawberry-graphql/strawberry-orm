@@ -1082,7 +1082,7 @@ def _tagged_schema(orm, models, hide):
         def scope_rows(cls, qs, info):
             return hide(Tag, "rust", qs)
 
-    @orm.type(User, filters=orm.filter(User))
+    @orm.type(User)
     class UserNode(relay.Node):
         id: relay.NodeID[int]
         name: auto

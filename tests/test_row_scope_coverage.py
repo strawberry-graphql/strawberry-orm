@@ -139,6 +139,36 @@ def test_a_rejected_row_leaves_the_resolvers_list_alone():
     assert returned == [kept, dropped]
 
 
+def test_a_rejected_row_leaves_a_list_subclass_out_of_what_stands_in():
+    changes = []
+
+    class Collection(list):
+        """Records each change against its owner, as an ORM's collection does."""
+
+        def __setitem__(self, index, value):
+            changes.append(value)
+            super().__setitem__(index, value)
+
+    kept, dropped = _Row(), _Row()
+    returned = Collection([kept, dropped])
+    filtered, _to_load = _without_rejected(returned, returned, [kept])
+    assert type(filtered) is list
+    assert filtered == [kept]
+    assert changes == []
+
+
+def test_a_page_less_a_rejected_row_counts_one_row_fewer():
+    from strawberry_orm.relay.connection import PreslicedRows
+
+    kept, dropped = _Row(), _Row()
+    page = PreslicedRows([kept, dropped], total_count=7, offset=4)
+    filtered, _to_load = _without_rejected(page, list(page), [kept])
+    assert isinstance(filtered, PreslicedRows)
+    assert list(filtered) == [kept]
+    assert (filtered.orm_total_count, filtered.orm_offset) == (6, 4)
+    assert (page.orm_total_count, list(page)) == (7, [kept, dropped])
+
+
 def test_row_scope_extension_detection_and_rejected_singletons():
     assert extensions_include_row_scope([RowScopeExtension]) is True
     named = type("RowScopeExtension_Custom", (), {})
@@ -182,7 +212,6 @@ def test_backends_report_when_a_query_has_no_model():
 
     sqlalchemy = StrawberryORM.for_sqlalchemy(dialect="sqlite")
     assert sqlalchemy._backend.query_model(object()) is None
-    assert sqlalchemy._backend._unloaded_snapshot(SimpleNamespace(), [object()]) == {}
 
     tortoise = StrawberryORM.for_tortoise()
     assert tortoise._backend.query_model(SimpleNamespace(model=int)) is int

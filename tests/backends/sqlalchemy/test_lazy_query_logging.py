@@ -39,8 +39,9 @@ class TestLazyQueryLogging:
                 session = info.context["session"]
                 return session.execute(select(Post)).scalars().unique().all()
 
-        schema = strawberry.Schema(
+        schema = orm.schema(
             query=Query,
+            optimizer=False,
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = schema.execute_sync(
@@ -86,8 +87,9 @@ class TestLazyQueryLogging:
                 session = info.context["session"]
                 return session.execute(select(User)).scalars().unique().all()
 
-        schema = strawberry.Schema(
+        schema = orm.schema(
             query=Query,
+            optimizer=False,
             extensions=[orm.lazy_resolution_extension(mode="warn")],
         )
         result = schema.execute_sync(

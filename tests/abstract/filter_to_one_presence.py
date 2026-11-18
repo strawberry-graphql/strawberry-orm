@@ -32,7 +32,6 @@ def _schema(orm, models, narrow, hidden_author):
     """Comments, a reply's parent among them, by every author but one."""
     Comment = models.Comment
 
-    @orm.type(Comment, name="ParentComment", filters=orm.filter(Comment))
     class ParentType:
         id: auto
         body: auto
@@ -40,6 +39,11 @@ def _schema(orm, models, narrow, hidden_author):
         @classmethod
         def scope_rows(cls, query, info):
             return narrow.exclude(query, Comment, "author_id", hidden_author)
+
+    # A filter goes on through a parent only to what it shows. Set here, as
+    # types local to a function cannot be named in a string.
+    ParentType.__annotations__["parent"] = ParentType | None
+    orm.type(Comment, name="ParentComment", filters=orm.filter(Comment))(ParentType)
 
     @orm.type(Comment, name="ReplyComment", filters=orm.filter(Comment))
     class ReplyType:

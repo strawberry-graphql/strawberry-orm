@@ -66,7 +66,7 @@ def session():
         yield session
 
 
-def build(*, hide_orgs=True, hide_members=False):
+def build(*, hide_orgs=True, hide_members=False, by_members=False):
     orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
 
     def org_scope(cls, stmt, info):
@@ -75,11 +75,16 @@ def build(*, hide_orgs=True, hide_members=False):
     def member_scope(cls, stmt, info):
         return stmt.where(KeyedMember.name != "Bob") if hide_members else stmt
 
+    # Of two models that relate to each other, the group-by built first cannot
+    # group by the other, and one built again after it differs from it: a
+    # schema groups members by their org, or orgs by their members.
+    org_group = None if by_members else orm.group(KeyedOrg)
+
     @orm.type(
         KeyedOrg,
         filters=orm.filter(KeyedOrg),
         order=orm.order(KeyedOrg),
-        group=orm.group(KeyedOrg),
+        group=org_group,
     )
     class OrgNode(relay.Node):
         id: relay.NodeID[int]
@@ -100,7 +105,8 @@ def build(*, hide_orgs=True, hide_members=False):
 
         scope_rows = classmethod(member_scope)
 
-    @orm.type(KeyedMember, group=orm.group(KeyedMember))
+    # Grouped too, its connection would take the name MemberNode's has.
+    @orm.type(KeyedMember)
     class MemberOfOrg(relay.Node):
         id: relay.NodeID[int]
         name: auto
@@ -110,7 +116,7 @@ def build(*, hide_orgs=True, hide_members=False):
     @orm.type(
         KeyedOrg,
         order=orm.order(KeyedOrg, exclude=["members"]),
-        group=orm.group(KeyedOrg),
+        group=orm.group(KeyedOrg) if by_members else org_group,
     )
     class OrgWithMembers(relay.Node):
         id: relay.NodeID[int]
@@ -176,7 +182,7 @@ class TestToFieldKeys:
 
     def test_grouping_orgs_by_their_members_follows_the_key(self, run):
         data = run(
-            build(hide_orgs=False, hide_members=True),
+            build(hide_orgs=False, hide_members=True, by_members=True),
             """{ orgs(order: [{field: {id: ASC}}],
                       groupBy: [{objects: {members: {field: {name: true}}}}]) {
                 groups { key { objects { members { name } } }

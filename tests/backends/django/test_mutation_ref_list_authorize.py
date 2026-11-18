@@ -57,7 +57,7 @@ def build_ref_list_authorize_schema():
                 )
                 return list(post.tags.order_by("id"))  # type: ignore[return-value]
 
-        return strawberry.Schema(query=Query, mutation=Mutation)
+        return orm.schema(query=Query, mutation=Mutation)
 
     return _build
 

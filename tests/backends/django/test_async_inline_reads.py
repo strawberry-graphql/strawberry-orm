@@ -100,14 +100,14 @@ def user_node(orm, User, Post, *, published_only=False):
     return UserNode
 
 
-def users_from(queryset, UserNode):
+def users_from(orm, queryset, UserNode):
     @strawberry.type
     class Query:
         @strawberry.field
         async def users(self) -> list[UserNode]:
             return await sync_to_async(list)(queryset)
 
-    return strawberry.Schema(query=Query)
+    return orm.schema(query=Query, optimizer=False)
 
 
 def titles(result):
@@ -166,7 +166,9 @@ class TestAsyncInlineReads:
             async def users(self) -> list[UserType]:
                 return await sync_to_async(list)(User.objects.only("id").order_by("id"))
 
-        result = await strawberry.Schema(query=Query).execute("{ users { name } }")
+        result = await orm.schema(query=Query, optimizer=False).execute(
+            "{ users { name } }"
+        )
 
         assert result.errors is None, result.errors
         assert result.data == {
@@ -203,7 +205,7 @@ class TestAsyncInlineReads:
         """Its cache holds every row, the ones ``scope_rows`` hides included."""
         UserNode = user_node(orm, User, Post, published_only=True)
         schema = users_from(
-            User.objects.prefetch_related("posts").order_by("id"), UserNode
+            orm, User.objects.prefetch_related("posts").order_by("id"), UserNode
         )
 
         result = await schema.execute("{ users { name posts { title } } }")
@@ -219,7 +221,7 @@ class TestAsyncInlineReads:
         self, orm, seed, User, Post, hops
     ):
         UserNode = user_node(orm, User, Post)
-        schema = users_from(User.objects.order_by("id"), UserNode)
+        schema = users_from(orm, User.objects.order_by("id"), UserNode)
 
         result = await schema.execute("{ users { name posts { title } } }")
 
@@ -244,7 +246,7 @@ class TestAsyncInlineReads:
             async def announcements(self) -> list[AnnouncementType]:
                 return [Announcement(id=1, text="doors open at nine")]
 
-        result = await strawberry.Schema(query=Query).execute(
+        result = await orm.schema(query=Query, optimizer=False).execute(
             "{ announcements { text } }"
         )
 

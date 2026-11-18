@@ -40,19 +40,20 @@ Installing all three extras matches CI. Skipping one will make that backend's te
 ## Running tests
 
 ```bash
-uv run pytest                                   # full suite with coverage gate
+uv run pytest                                   # full suite, in parallel
 uv run pytest tests/backends/sqlalchemy         # one backend
 uv run pytest tests/backends/django/test_query_optimizer.py::TestQueryOptimizerEagerLoading
 uv run pytest -k filter_object_traversal        # by name
+uv run pytest -n0 tests/test_cover.py           # in one process, e.g. for --pdb
 ```
 
-Coverage options live in `pyproject.toml` (`--cov=strawberry_orm --cov-fail-under=100`), so every invocation reports coverage. When iterating on a subset, pass `--no-cov` to skip the gate that a partial run can never satisfy:
+`pyproject.toml` runs the suite across every CPU with [pytest-xdist](https://pytest-xdist.readthedocs.io/) (`-n auto`). Pass `-n0` to run in one process, which starts faster for a single file and is needed for `--pdb`.
+
+Coverage is not measured by default, since tracing makes a run several times slower. Measure it on the full suite before pushing; `fail_under = 100` in `pyproject.toml` fails the run below 100%:
 
 ```bash
-uv run pytest tests/backends/tortoise -q --no-cov
+uv run pytest --cov=strawberry_orm --cov-report=term-missing:skip-covered
 ```
-
-Always run the full suite without `--no-cov` before pushing.
 
 Notes:
 
@@ -136,6 +137,8 @@ Guidelines:
 - Assert on **SQL query counts** for anything touching the optimizer — see the `test_query_n_plus_one.py` files for the pattern.
 - Scoping behavior needs a test proving rows are hidden, not just that the hook ran.
 - Naming follows `test_<area>_<topic>.py` with a matching `tests/abstract/<area>_<topic>.py` module. Keep the names identical across backends so parity passes.
+- Tests run in parallel and in no fixed order, so a test must not depend on what another left behind, such as a schema already built from the same types. Where the order matters to the library, make it a dimension of the test, as `tests/test_tg_tag_visibility.py` does with `BEFORE`.
+- Cross the dimensions of a matrix only where they interact. When one dimension is only told apart in one place (every exception family by the backend's error handling, say), run each of its values once and cross the others with a representative few, as `tests/abstract/read_error_masking.py` does.
 
 ## Inspecting schemas locally
 
@@ -167,9 +170,9 @@ The README is the single source of user documentation. If your change affects be
 
 - Write commit subjects in the imperative mood, describing the change in one sentence: `Add relation FK presence filters and non-id primary key support`. Commits that also bump the version carry the version in parentheses, matching existing history: `Add totalCount to Relay connections and release v0.13.0`.
 - Keep pull requests focused. Unrelated refactors make review harder and bisecting worse.
-- Before pushing, confirm: `uvx ruff check .`, `uvx ruff format .`, and `uv run pytest` (full suite, coverage at 100%).
+- Before pushing, confirm: `uvx ruff check .`, `uvx ruff format .`, and `uv run pytest --cov=strawberry_orm` (full suite, coverage at 100%).
 - In the pull request description, state what changed, why, and how you verified it. Call out any backend that behaves differently and why.
-- CI runs the full suite on Python 3.12 with all three backends and uploads coverage to Codecov.
+- CI runs the full suite on Python 3.12, 3.13 and 3.14 with all three backends, and on 3.12 measures coverage, fails below 100% and uploads it to Codecov.
 
 ## Releasing
 

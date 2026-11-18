@@ -3,28 +3,35 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import logging
 import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from graphql import (
+    DocumentNode,
     FieldNode,
     FragmentDefinitionNode,
     FragmentSpreadNode,
     GraphQLError,
+    GraphQLField,
+    GraphQLObjectType,
+    GraphQLSchema,
     InlineFragmentNode,
     OperationDefinitionNode,
-    parse,
+    validate,
     value_from_ast_untyped,
 )
+from graphql.pyutils import Path
 from mcp.server.mcpserver.exceptions import ToolError
 from strawberry import Schema
 from strawberry.extensions import SchemaExtension
-from strawberry.schema.schema import validate_document
 from strawberry.types.graphql import OperationType
+
+from .checks import VALIDATION_RULES, Costs
 
 Execute = Callable[[str, dict[str, Any], Any, set[OperationType]], Awaitable[Any]]
 
@@ -49,95 +56,129 @@ _SYNC_MUTATION_STOPPED = (
     "to mcp_server."
 )
 
+_SPENT = (
+    "The arguments hold over {limit} values, each counted wherever a list "
+    "repeats it; the limit is {limit}."
+)
+
+
+class Target:
+    """Where a tool's operations run: *schema*, executing them on
+    *graphql_schema* (by default its own), with the document each call read
+    in a worker thread and no more argument values than the call may hold.
+
+    A schema that is not a Strawberry schema runs them as it is.
+    """
+
+    def __init__(
+        self,
+        schema: Any,
+        graphql_schema: GraphQLSchema | None = None,
+        *,
+        hide_suggestions: bool = False,
+    ) -> None:
+        self.graphql_schema = (
+            getattr(schema, "_schema", None)
+            if graphql_schema is None
+            else graphql_schema
+        )
+        self.hide_suggestions = hide_suggestions
+        self.awaited = _view(schema, graphql_schema, _PreparedAwaited)
+        self.sync = _view(schema, graphql_schema, _PreparedSync)
+        if graphql_schema is not None:
+            graphql_schema._strawberry_schema = self.awaited  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class Call:
+    """One operation to run, read and measured in a worker thread."""
+
+    query: str
+    document: DocumentNode
+    kind: OperationType
+    variables: dict[str, Any]
+    target: Target
+    #: What its fields' arguments cost, or ``None`` when its variables do not
+    #: coerce, so that it stops before any field runs.
+    costs: Costs | None = None
+
+    @property
+    def writes(self) -> bool:
+        """Whether it may run a mutation's resolvers: a mutation, or a query
+        that selects fields of an interface the Mutation type implements."""
+        return self.kind is OperationType.MUTATION or (
+            self.costs is not None and self.costs.writes
+        )
+
 
 class Executor:
     """Runs operations with ``await schema.execute``, ``execute_sync`` in a
     worker thread, or a caller's own ``execute``.
 
     With ``sync=None``, a query that Django refuses on the event loop is
-    rerun with ``execute_sync``, which is then kept for every later call. A
-    mutation is not rerun, since whatever it did before its first ORM call
-    would happen twice; its result comes back with an error naming the root
-    field Django stopped and those that ran before it.
+    rerun with ``execute_sync``, which is then kept for every later call. An
+    operation that may run a mutation is not rerun, since whatever it did
+    before its first ORM call would happen twice; its result comes back with
+    an error naming the root field Django stopped and those that ran before
+    it.
 
-    ``prepare_off_loop=True`` has ``schema.execute`` parse and validate the
-    operation in a worker thread, for one a client wrote; its resolvers
-    still run on the event loop.
+    Strawberry reuses the document a :class:`Call` holds rather than parse
+    and validate it again, and stops each field whose arguments would take
+    the call past the values its :class:`~.checks.Costs` allow.
     """
 
-    def __init__(
-        self, schema: Any, *, sync: bool | None, execute: Execute | None
-    ) -> None:
+    def __init__(self, *, sync: bool | None, execute: Execute | None) -> None:
         if execute is not None and sync is not None:
             raise ValueError("Pass execute= or sync=, not both.")
-        self.schema = schema
-        self._off_loop = _preparing_off_loop(schema)
         self._execute = execute
         self._sync = sync
         #: ``True`` once execution runs ``execute_sync`` in a worker thread.
         self.sync_execute = sync is True
 
-    async def run(
-        self,
-        query: str,
-        variables: dict[str, Any],
-        context: Any,
-        allowed: set[OperationType],
-        *,
-        prepare_off_loop: bool = False,
-    ) -> Any:
+    async def run(self, call: Call, context: Any) -> Any:
         if self._execute is not None:
-            return await self._execute(query, variables, context, set(allowed))
+            return await self._execute(call.query, call.variables, context, {call.kind})
         if self.sync_execute:
-            return await self._execute_sync(query, variables, context, allowed)
-        schema = self._off_loop if prepare_off_loop else self.schema
+            return await self._execute_sync(call, context)
+        token = _RUNNING.set(_Running(call))
         try:
-            result = await schema.execute(
-                query,
-                variable_values=variables,
+            result = await call.target.awaited.execute(
+                call.query,
+                variable_values=call.variables,
                 context_value=context,
-                allowed_operation_types=allowed,
+                allowed_operation_types={call.kind},
             )
         except Exception as exc:
             if self._sync is False or not _is_sync_only_operation(exc):
                 raise
-            return await self._switch(query, variables, context, allowed)
+            return await self._switch(call, context)
+        finally:
+            _RUNNING.reset(token)
         if self._sync is None and _result_has_sync_only_operation(result):
-            if allowed != {OperationType.QUERY}:
-                return _stopped(result, query, variables)
-            return await self._switch(query, variables, context, allowed)
+            if call.writes:
+                return _stopped(result, call)
+            return await self._switch(call, context)
         return result
 
-    async def _switch(
-        self,
-        query: str,
-        variables: dict[str, Any],
-        context: Any,
-        allowed: set[OperationType],
-    ) -> Any:
-        if allowed != {OperationType.QUERY}:
+    async def _switch(self, call: Call, context: Any) -> Any:
+        if call.writes:
             raise ToolError(_SYNC_MUTATION_ERROR)
         self.sync_execute = True
         logger.warning(_SYNC_EXECUTE_WARNING)
         warnings.warn(_SYNC_EXECUTE_WARNING, UserWarning, stacklevel=3)
-        return await self._execute_sync(query, variables, context, allowed)
+        return await self._execute_sync(call, context)
 
-    async def _execute_sync(
-        self,
-        query: str,
-        variables: dict[str, Any],
-        context: Any,
-        allowed: set[OperationType],
-    ) -> Any:
+    async def _execute_sync(self, call: Call, context: Any) -> Any:
         def run() -> Any:
             close = _django_close_old_connections()
             close()
+            _RUNNING.set(_Running(call))
             try:
-                return self.schema.execute_sync(
-                    query,
-                    variable_values=variables,
+                return call.target.sync.execute_sync(
+                    call.query,
+                    variable_values=call.variables,
                     context_value=context,
-                    allowed_operation_types=allowed,
+                    allowed_operation_types={call.kind},
                 )
             finally:
                 close()
@@ -145,49 +186,135 @@ class Executor:
         return await asyncio.to_thread(run)
 
 
-def _preparing_off_loop(schema: Any) -> Any:
-    """A copy of *schema* with :class:`_PrepareOffLoop` after its own
-    extensions, or *schema* itself if it is not a Strawberry schema.
+class _Running:
+    """A :class:`Call` as one attempt runs it, with the argument values it
+    has left."""
+
+    def __init__(self, call: Call) -> None:
+        self.call = call
+        self.left = 0 if call.costs is None else call.costs.max_values
+
+    def spend(self, field: GraphQLField, nodes: list[FieldNode], path: Path) -> None:
+        costs = self.call.costs
+        if costs is None:
+            return
+        self.left -= costs.of(field, nodes[0])
+        if self.left < 0:
+            raise GraphQLError(
+                _SPENT.format(limit=costs.max_values), nodes, path=path.as_list()
+            )
+
+
+_RUNNING: ContextVar[_Running | None] = ContextVar("mcp_running", default=None)
+
+
+class _Budgeted:
+    """Stops a field whose arguments would take its call past the values it
+    may hold, before GraphQL coerces them."""
+
+    def build_resolve_info(
+        self,
+        field_def: GraphQLField,
+        field_nodes: list[FieldNode],
+        parent_type: GraphQLObjectType,
+        path: Path,
+    ) -> Any:
+        running = _RUNNING.get()
+        if running is not None:
+            running.spend(field_def, field_nodes, path)
+        return super().build_resolve_info(  # type: ignore[misc]
+            field_def, field_nodes, parent_type, path
+        )
+
+
+def _view(schema: Any, graphql_schema: GraphQLSchema | None, extension: type) -> Any:
+    """A copy of *schema* that executes on *graphql_schema*, with *extension*
+    after its own extensions and its execution class :class:`_Budgeted`, or
+    *schema* itself if it is not a Strawberry schema.
 
     The copy shares everything else with *schema*, which is left as it is.
     """
     if not isinstance(schema, Schema):
         return schema
     view = copy.copy(schema)
-    view.extensions = (*schema.extensions, _PrepareOffLoop)
+    view.extensions = (*schema.extensions, extension)
+    base = schema.execution_context_class
+    view.execution_context_class = type(base.__name__, (_Budgeted, base), {})
+    if graphql_schema is not None:
+        view._schema = graphql_schema
     return view
 
 
-class _PrepareOffLoop(SchemaExtension):
-    """Parses and validates in a worker thread what ``schema.execute`` would
-    parse and validate on the event loop.
+class _Prepared(SchemaExtension):
+    """Hands Strawberry the document of the call running, and validates it
+    only with the rules the schema's own extensions add.
 
-    Coming after the schema's own extensions, it parses with the options and
-    validates with the rules they set, and leaves an operation one of them
-    already parsed or validated to them, as Strawberry does.
+    Coming after those extensions, it leaves an operation one of them parsed
+    or validated to them, and lets Strawberry parse it again with parse
+    options other than a token limit the document is within.
     """
 
-    async def on_parse(self) -> AsyncIterator[None]:
+    def on_parse(self) -> Iterator[None]:
+        running = _RUNNING.get()
         context = self.execution_context
-        if context.graphql_document is None:
-            # Strawberry parses a document refused here again, to report the
-            # error the way it reports any other.
-            with contextlib.suppress(GraphQLError):
-                context.graphql_document = await asyncio.to_thread(
-                    parse, context.query, **context.parse_options
-                )
+        if (
+            running is not None
+            and context.graphql_document is None
+            and _fits(running.call.document, context.parse_options)
+        ):
+            context.graphql_document = running.call.document
         yield
 
-    async def on_validate(self) -> AsyncIterator[None]:
+    def _left(self) -> tuple[tuple[Any, ...], Target] | None:
+        """The rules the document is still to be validated with, and where
+        it runs, or ``None`` if an extension validated it."""
+        running = _RUNNING.get()
         context = self.execution_context
-        if context.validation_rules and context.pre_execution_errors is None:
-            context.pre_execution_errors = await asyncio.to_thread(
-                validate_document,
-                context.schema._schema,
-                context.graphql_document,
-                context.validation_rules,
+        if running is None or context.pre_execution_errors is not None:
+            return None
+        rules = tuple(r for r in context.validation_rules if r not in VALIDATION_RULES)
+        return rules, running.call.target
+
+    def _validate(self, rules: tuple[Any, ...], target: Target) -> list[GraphQLError]:
+        context = self.execution_context
+        assert context.graphql_document is not None
+        return validate(
+            context.schema._schema,
+            context.graphql_document,
+            rules,
+            hide_suggestions=target.hide_suggestions,
+        )
+
+
+class _PreparedAwaited(_Prepared):
+    async def on_validate(self) -> AsyncIterator[None]:
+        left = self._left()
+        if left is not None:
+            rules, target = left
+            self.execution_context.pre_execution_errors = (
+                await asyncio.to_thread(self._validate, rules, target) if rules else []
             )
         yield
+
+
+class _PreparedSync(_Prepared):
+    def on_validate(self) -> Iterator[None]:
+        left = self._left()
+        if left is not None:
+            rules, target = left
+            self.execution_context.pre_execution_errors = (
+                self._validate(rules, target) if rules else []
+            )
+        yield
+
+
+def _fits(document: DocumentNode, options: Mapping[str, Any]) -> bool:
+    """Whether parsing again with *options* gives *document*: they set at
+    most a token limit, and it is within it."""
+    limit = options.get("max_tokens")
+    return options.keys() <= {"max_tokens"} and (
+        limit is None or document.token_count <= limit
+    )
 
 
 def _is_sync_only_operation(exc: BaseException) -> bool:
@@ -213,7 +340,7 @@ def _sync_only_error(result: Any) -> GraphQLError | None:
     return None
 
 
-def _stopped(result: Any, query: str, variables: dict[str, Any]) -> Any:
+def _stopped(result: Any, call: Call) -> Any:
     """*result* of a mutation ``SynchronousOnlyOperation`` stopped, with an
     error naming the root field it stopped and those that ran before it.
 
@@ -224,7 +351,7 @@ def _stopped(result: Any, query: str, variables: dict[str, Any]) -> Any:
     error = _sync_only_error(result)
     assert error is not None
     stopped = error.path[0] if error.path else None
-    keys = _root_fields(query, variables)
+    keys = _root_fields(call.document, call.variables)
     ran = keys[: keys.index(stopped)] if stopped in keys else []
     after = f", after {', '.join(ran)} had run" if ran else ""
     hint = _SYNC_MUTATION_STOPPED.format(stopped=stopped or "it", after=after)
@@ -232,10 +359,9 @@ def _stopped(result: Any, query: str, variables: dict[str, Any]) -> Any:
     return result
 
 
-def _root_fields(query: str, variables: dict[str, Any]) -> list[str]:
-    """The response keys of the root fields of *query*'s operation, in the
+def _root_fields(document: DocumentNode, variables: dict[str, Any]) -> list[str]:
+    """The response keys of the root fields of *document*'s operation, in the
     order they run, less those ``@skip`` or ``@include`` leaves out."""
-    document = parse(query)
     [operation] = [
         d for d in document.definitions if isinstance(d, OperationDefinitionNode)
     ]

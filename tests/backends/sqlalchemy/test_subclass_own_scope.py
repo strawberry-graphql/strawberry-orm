@@ -424,7 +424,7 @@ def test_ordering_through_a_base_whose_subclass_is_scoped_apart_is_refused(sessi
         context_value={"session": session, "me": ME},
     )
     assert result.data is None
-    assert "Cannot order by Comment.document" in result.errors[0].message
+    assert "Cannot order by document:" in result.errors[0].message
 
 
 def build_counted():
@@ -537,7 +537,8 @@ class SealedMemo(Memo):
     __mapper_args__ = {"polymorphic_identity": "sealed"}
 
 
-def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
+def test_a_subclass_of_a_scoped_subclass_is_held_to_both_scopes():
+    """A sealed memo is a memo row as well, so ``MemoType`` still has its say."""
     orm = StrawberryORM.for_sqlalchemy(dialect="sqlite", warn_missing_scope=False)
 
     @orm.type(Note)
@@ -551,7 +552,7 @@ def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
 
         @classmethod
         def scope_rows(cls, stmt, info):
-            return stmt.where(Note.level == 1)
+            return stmt.where(Note.level >= 1)
 
     @orm.type(SealedMemo)
     class SealedType:
@@ -559,7 +560,7 @@ def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
 
         @classmethod
         def scope_rows(cls, stmt, info):
-            return stmt.where(Note.level == 2)
+            return stmt.where(Note.level <= 1)
 
     @strawberry.type
     class Query:
@@ -575,6 +576,7 @@ def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
                 Memo(id=3, label="raised memo", level=2),
                 SealedMemo(id=4, label="sealed", level=2),
                 SealedMemo(id=5, label="lowered sealed", level=1),
+                SealedMemo(id=6, label="sunk sealed", level=0),
             ]
         )
         session.commit()
@@ -586,12 +588,13 @@ def test_a_subclass_of_a_scoped_subclass_answers_for_its_own_rows():
         )
 
     assert data == {
-        "notes": {"totalCount": 3},
+        "notes": {"totalCount": 4},
         "all": {
             "edges": [
                 {"node": {"label": "note"}},
                 {"node": {"label": "memo"}},
-                {"node": {"label": "sealed"}},
+                {"node": {"label": "raised memo"}},
+                {"node": {"label": "lowered sealed"}},
             ]
         },
     }

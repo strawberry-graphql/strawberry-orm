@@ -135,7 +135,7 @@ class TestQueryNPlusOnePrevention:
                 session = info.context["session"]
                 return session.execute(select(User)).scalars().unique().all()  # type: ignore[return-value]
 
-        schema = strawberry.Schema(query=Q)
+        schema = orm.schema(query=Q, optimizer=False)
         result = schema.execute_sync(
             "{ users { name posts { title } } }",
             context_value={"session": sa_session},

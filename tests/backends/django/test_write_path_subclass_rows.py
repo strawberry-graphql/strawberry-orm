@@ -74,6 +74,33 @@ class WaPin(models.Model):
         db_table = "wa_pin"
 
 
+class WaBinder(models.Model):
+    docs = models.ManyToManyField(WaDoc, related_name="+")
+    sealed = models.ManyToManyField(WaSealedDoc, related_name="+")
+    restricted = models.ManyToManyField(WaRestrictedDoc, related_name="+")
+
+    class Meta:
+        app_label = "testapp"
+        db_table = "wa_binder"
+
+
+class WaMark(models.Model):
+    label = models.CharField(max_length=50)
+    doc = models.ForeignKey(
+        WaDoc, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    sealed = models.ForeignKey(
+        WaSealedDoc, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    restricted = models.ForeignKey(
+        WaRestrictedDoc, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        app_label = "testapp"
+        db_table = "wa_mark"
+
+
 class WaNote(models.Model):
     title = models.CharField(max_length=50)
 
@@ -99,6 +126,8 @@ MODELS = SimpleNamespace(
     RestrictedDoc=WaRestrictedDoc,
     PublicDoc=WaPublicDoc,
     Pin=WaPin,
+    Binder=WaBinder,
+    Mark=WaMark,
 )
 
 

@@ -8,9 +8,11 @@ from typing import Any
 
 from graphql import (
     DirectiveNode,
+    DocumentNode,
     FieldNode,
     FragmentDefinitionNode,
     FragmentSpreadNode,
+    GraphQLDirective,
     GraphQLError,
     GraphQLField,
     GraphQLInterfaceType,
@@ -24,15 +26,23 @@ from graphql import (
     InlineFragmentNode,
     OperationDefinitionNode,
     SelectionSetNode,
+    TypeInfo,
+    TypeInfoVisitor,
     get_named_type,
-    get_variable_values,
     parse,
     print_ast,
     print_schema,
+    specified_rules,
     validate,
 )
+from graphql.execution.values import VariableValues, get_argument_values
 from graphql.language import BREAK, Node, Visitor, visit
+from strawberry.schema.validation_rules.maybe_null import MaybeNullValidationRule
+from strawberry.schema.validation_rules.one_of import OneOfInputValidationRule
 from strawberry.types.graphql import OperationType
+
+#: The rules Strawberry validates an operation with: graphql-core's, and its own.
+VALIDATION_RULES = (*specified_rules, MaybeNullValidationRule, OneOfInputValidationRule)
 
 #: The meta fields that describe the schema an operation runs on.
 _INTROSPECTION = frozenset({"__schema", "__type"})
@@ -52,24 +62,43 @@ def exposed_schema(
     allow_mutations: bool,
     root_fields: Collection[str] | None = None,
 ) -> GraphQLSchema:
-    """The schema as the ``graphql`` tool shows it and lets it be used.
+    """The schema as the ``graphql`` tool shows it and runs operations on.
 
     No mutations unless they are allowed, and with ``root_fields`` only those
     root fields and the types they reach. A field that returns a root type
-    returns it as shown here, and a field that returns a root type left out
-    is left out itself. A field that returns an interface reaches its
-    implementations, since a fragment on one is valid there, but a type is
-    not reached by sharing an interface with one that is.
+    returns it as shown here, and a field that returns a type left out is
+    left out itself: a root type no field of is kept, a type left with no
+    fields, or a union with no members. A type keeps an interface only while
+    it has every field the interface shows, so a root type narrowed out of
+    an interface is not reached through it. A field that returns an
+    interface reaches its implementations, since a fragment on one is valid
+    there, but a type is not reached by sharing an interface with one that
+    is.
+
+    ``root_fields`` names fields of the Query and Mutation types, bare or
+    qualified as ``Query.posts`` and ``Mutation.publish`` (or by the root
+    types' own names). With mutations allowed, a bare name both types have
+    is refused, as is a name of neither, and at least one query field must
+    be named.
     """
     assert schema.query_type is not None
-    kept = {schema.query_type.name: _kept(schema.query_type, root_fields)}
+    names = (
+        None
+        if root_fields is None
+        else _root_names(schema, root_fields, allow_mutations=allow_mutations)
+    )
+
+    def kept_of(root: GraphQLObjectType) -> list[str]:
+        return [name for name in root.fields if names is None or name in names[root]]
+
+    kept = {schema.query_type.name: kept_of(schema.query_type)}
     if schema.mutation_type is not None:
         kept[schema.mutation_type.name] = (
-            _kept(schema.mutation_type, root_fields) if allow_mutations else []
+            kept_of(schema.mutation_type) if allow_mutations else []
         )
     if schema.subscription_type is not None:
         kept[schema.subscription_type.name] = []
-    shown = _shown(kept)
+    shown = _shown(schema, kept)
     query = shown(schema.query_type)
     mutation = shown(schema.mutation_type) if schema.mutation_type else None
     exposed = GraphQLSchema(
@@ -87,6 +116,47 @@ def exposed_schema(
     return GraphQLSchema(
         query=query, mutation=mutation, types=missing, directives=schema.directives
     )
+
+
+def _root_names(
+    schema: GraphQLSchema, names: Collection[str], *, allow_mutations: bool
+) -> dict[GraphQLObjectType, set[str]]:
+    """The fields *names* keeps of each root type that may run."""
+    query = schema.query_type
+    assert query is not None
+    mutation = schema.mutation_type if allow_mutations else None
+    roots = [root for root in (query, mutation) if root is not None]
+    qualifiers = {"Query": query, query.name: query}
+    if mutation is not None:
+        qualifiers.update({"Mutation": mutation, mutation.name: mutation})
+    kept: dict[GraphQLObjectType, set[str]] = {root: set() for root in roots}
+    unknown = []
+    for name in names:
+        qualifier, dot, field = name.rpartition(".")
+        if dot:
+            owners = [qualifiers[qualifier]] if qualifier in qualifiers else []
+            owners = [root for root in owners if field in root.fields]
+        else:
+            field = name
+            owners = [root for root in roots if name in root.fields]
+        if len(owners) > 1:
+            raise ValueError(
+                f"root_fields names {name}, a field of both {query.name} and "
+                f"{owners[1].name}: write {query.name}.{name} or "
+                f"{owners[1].name}.{name}."
+            )
+        if not owners:
+            unknown.append(name)
+            continue
+        kept[owners[0]].add(field)
+    if unknown:
+        hint = "" if allow_mutations else " (mutations need allow_mutations)"
+        raise ValueError(
+            f"root_fields names no such root field: {sorted(unknown)}{hint}."
+        )
+    if not kept[query]:
+        raise ValueError("root_fields must include at least one query field.")
+    return kept
 
 
 def refuses_introspection(schema: Any) -> bool:
@@ -120,6 +190,32 @@ def exposed_sdl(schema: GraphQLSchema, *, descriptions: bool = True) -> str:
     return print_ast(visit(parse(sdl), _StripReasons()))
 
 
+def escaping_types(schema: GraphQLSchema, exposed: GraphQLSchema) -> set[str]:
+    """The names of the interfaces and unions of *exposed* that *schema*
+    resolves to an object type they do not have there: one *exposed* leaves
+    out, or a root type it narrows out of an interface."""
+    names = set()
+    for name, type_ in exposed.type_map.items():
+        if isinstance(type_, GraphQLInterfaceType | GraphQLUnionType):
+            shown = {t.name for t in exposed.get_possible_types(type_)}
+            original = schema.get_type(name)
+            assert isinstance(original, GraphQLInterfaceType | GraphQLUnionType)
+            if any(t.name not in shown for t in schema.get_possible_types(original)):
+                names.add(name)
+    return names
+
+
+def reaching(
+    schema: GraphQLSchema, document: DocumentNode, names: Collection[str]
+) -> str | None:
+    """The first field of *document*, which passed validation against
+    *schema*, that returns a type *names* names, as ``Type.field``."""
+    type_info = TypeInfo(schema)
+    finder = _FindReaching(type_info, names)
+    visit(document, TypeInfoVisitor(type_info, finder))
+    return finder.found
+
+
 def strip_descriptions(node: Node) -> Node:
     """*node* without the descriptions on it or anything inside it."""
     return visit(node, _StripDescriptions())
@@ -150,7 +246,7 @@ def _implementations(
         elif isinstance(named, GraphQLInterfaceType):
             for possible in schema.get_possible_types(named):
                 copy = shown(possible)
-                if copy is not None:
+                if isinstance(copy, GraphQLObjectType) and named in copy.interfaces:
                     found[copy.name] = copy
                     pending.append(copy)
         elif isinstance(named, GraphQLUnionType):
@@ -158,21 +254,19 @@ def _implementations(
     return [found[name] for name in schema.type_map if name in found]
 
 
-def _kept(root: GraphQLObjectType, names: Collection[str] | None) -> list[str]:
-    return [name for name in root.fields if names is None or name in names]
-
-
 def _shown(
-    kept: Mapping[str, Collection[str]],
+    schema: GraphQLSchema, kept: Mapping[str, Collection[str]]
 ) -> Callable[[GraphQLNamedType], GraphQLNamedType | None]:
     """A copy of each type that may reach a root type, through which a root
     type has only the fields *kept* names, so the root types as they are
     never reach the schema the copies make up.
 
-    A root type *kept* names no field of is ``None``, and a field or union
-    member that would return it is left out. Scalars, enums and input types
+    A type :func:`_hidden` leaves out is ``None``, and a field or union
+    member that would return it is left out. An interface or union resolves
+    a value's type as the original does. Scalars, enums and input types
     reach no root type and are left as they are.
     """
+    hidden = _hidden(schema, kept)
     copies: dict[str, GraphQLNamedType | None] = {}
 
     def named(type_: GraphQLNamedType) -> GraphQLNamedType | None:
@@ -180,20 +274,22 @@ def _shown(
             return copies[type_.name]
         names = kept.get(type_.name)
         copy: GraphQLNamedType | None
-        if names is not None and not names:
+        if type_.name in hidden:
             copy = None
         elif isinstance(type_, GraphQLObjectType | GraphQLInterfaceType):
             copy = type(type_)(
                 **{
                     **type_.to_kwargs(),
+                    **_resolving(type_),
                     "fields": lambda: fields(type_, names),
-                    "interfaces": lambda: [named(i) for i in type_.interfaces],
+                    "interfaces": lambda: interfaces(type_, names),
                 }
             )
         elif isinstance(type_, GraphQLUnionType):
             copy = GraphQLUnionType(
                 **{
                     **type_.to_kwargs(),
+                    **_resolving(type_),
                     "types": lambda: [
                         t for t in map(named, type_.types) if t is not None
                     ],
@@ -214,15 +310,69 @@ def _shown(
         type_: GraphQLObjectType | GraphQLInterfaceType, names: Collection[str] | None
     ) -> dict[str, GraphQLField]:
         copied = {}
-        for name, field in type_.fields.items():
-            if names is not None and name not in names:
-                continue
+        for name in _field_names(type_, names, hidden):
+            field = type_.fields[name]
             returned = output(field.type)
-            if returned is not None:
-                copied[name] = GraphQLField(**{**field.to_kwargs(), "type_": returned})
+            copied[name] = GraphQLField(**{**field.to_kwargs(), "type_": returned})
         return copied
 
+    def interfaces(
+        type_: GraphQLObjectType | GraphQLInterfaceType, names: Collection[str] | None
+    ) -> list[GraphQLInterfaceType]:
+        own = set(_field_names(type_, names, hidden))
+        return [
+            copy
+            for interface in type_.interfaces
+            if (copy := named(interface)) is not None
+            and own.issuperset(_field_names(interface, None, hidden))
+        ]
+
     return named
+
+
+def _hidden(schema: GraphQLSchema, kept: Mapping[str, Collection[str]]) -> set[str]:
+    """The names of the types left with nothing to show: a root type *kept*
+    names no field of, a type whose every field returns a type left out,
+    and a union whose every member is."""
+    hidden = {name for name, names in kept.items() if not names}
+    changed = True
+    while changed:
+        changed = False
+        for type_ in schema.type_map.values():
+            if type_.name in hidden:
+                continue
+            if isinstance(type_, GraphQLObjectType | GraphQLInterfaceType):
+                empty = not _field_names(type_, kept.get(type_.name), hidden)
+            elif isinstance(type_, GraphQLUnionType):
+                empty = all(member.name in hidden for member in type_.types)
+            else:
+                continue
+            if empty:
+                hidden.add(type_.name)
+                changed = True
+    return hidden
+
+
+def _field_names(
+    type_: GraphQLObjectType | GraphQLInterfaceType,
+    names: Collection[str] | None,
+    hidden: set[str],
+) -> list[str]:
+    return [
+        name
+        for name, field in type_.fields.items()
+        if (names is None or name in names)
+        and get_named_type(field.type).name not in hidden
+    ]
+
+
+def _resolving(type_: GraphQLNamedType) -> dict[str, Any]:
+    """``resolve_type`` for a copy of *type_*, if it is an abstract type
+    that resolves values itself: as *type_* does, given *type_*."""
+    resolve = getattr(type_, "resolve_type", None)
+    if resolve is None:
+        return {}
+    return {"resolve_type": lambda value, info, _copy: resolve(value, info, type_)}
 
 
 class _StripDescriptions(Visitor):
@@ -251,25 +401,79 @@ class _FindIntrospection(Visitor):
         return None
 
 
-def check_operation(
+class _FindReaching(Visitor):
+    def __init__(self, type_info: TypeInfo, names: Collection[str]) -> None:
+        super().__init__()
+        self.type_info = type_info
+        self.names = names
+        self.found: str | None = None
+
+    def enter_field(self, node: FieldNode, *_: Any) -> Any:
+        returned = get_named_type(self.type_info.get_type())
+        if returned is not None and returned.name in self.names:
+            parent = self.type_info.get_parent_type()
+            assert parent is not None
+            self.found = f"{parent.name}.{node.name.value}"
+            return BREAK
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class Parsed:
+    """A document of one operation and the fragments it uses, parsed once."""
+
+    document: DocumentNode
+    operation: OperationDefinitionNode
+    fragments: Mapping[str, FragmentDefinitionNode]
+
+    @property
+    def kind(self) -> OperationType:
+        return OperationType(self.operation.operation.value)
+
+    @classmethod
+    def of(cls, document: DocumentNode) -> Parsed:
+        """*document*, which holds one operation and only the fragments it
+        uses, each defined once."""
+        (operation,) = (
+            d for d in document.definitions if isinstance(d, OperationDefinitionNode)
+        )
+        fragments = {
+            d.name.value: d
+            for d in document.definitions
+            if isinstance(d, FragmentDefinitionNode)
+        }
+        return cls(document, operation, fragments)
+
+
+def read_operation(
     schema: GraphQLSchema,
     query: str,
     *,
     allowed: set[OperationType],
+    max_length: int = 100_000,
     max_depth: int,
     max_tokens: int,
     max_fields: int,
     schema_tool: bool = True,
     hide_suggestions: bool = False,
-) -> tuple[list[str], OperationType | None]:
-    """Errors that stop ``query`` from running, and the kind of operation it is.
+) -> tuple[list[str], Parsed | None]:
+    """Errors that stop ``query`` from running, and its operation, parsed
+    once, if it holds exactly one.
 
-    The operation runs on the whole schema, so ``__schema`` and ``__type``
-    are refused: they would describe what *schema* leaves out. A document
-    past ``max_tokens`` is refused while it is parsed, before anything else
-    reads it. ``hide_suggestions`` leaves the names validation would
-    suggest out of its errors.
+    A document past ``max_length`` characters is refused before anything
+    reads it, and one past ``max_tokens`` tokens while it is parsed. Each
+    fragment must be defined once and used, so the depth, merge and field
+    limits measure everything validation reads. ``__schema`` and ``__type``
+    are refused: ``graphql_schema`` describes what *schema* shows. Then it
+    is validated against *schema*, with the rules Strawberry validates with;
+    ``hide_suggestions`` leaves the names validation would suggest out of
+    its errors.
     """
+    if len(query) > max_length:
+        return [
+            f"The query is over {max_length} characters long; "
+            f"the limit is {max_length}."
+        ], None
     try:
         document = parse(query, max_tokens=max_tokens)
     except GraphQLError as error:
@@ -279,39 +483,82 @@ def check_operation(
     ]
     if len(operations) != 1:
         return ["Send exactly one operation."], None
-    kind = OperationType(operations[0].operation.value)
+    fragments: dict[str, FragmentDefinitionNode] = {}
+    twice = []
+    for definition in document.definitions:
+        if isinstance(definition, FragmentDefinitionNode):
+            name = definition.name.value
+            if name in fragments:
+                twice.append(f"There can be only one fragment named '{name}'.")
+            fragments[name] = definition
+    parsed = Parsed(document, operations[0], fragments)
+    kind = parsed.kind
     if kind not in allowed:
-        return [f"{kind.value.capitalize()} operations are not allowed."], kind
-    fragments = {
-        d.name.value: d
-        for d in document.definitions
-        if isinstance(d, FragmentDefinitionNode)
-    }
-    depth = _depth(operations[0].selection_set, fragments, {}, set())
+        return [f"{kind.value.capitalize()} operations are not allowed."], parsed
+    if twice:
+        return twice, parsed
+    used = _used(parsed.operation, fragments)
+    unused = [
+        f"Fragment '{name}' is never used." for name in fragments if name not in used
+    ]
+    if unused:
+        return unused, parsed
+    selection_set = parsed.operation.selection_set
+    depth = _depth(selection_set, fragments, {}, set())
     if depth > max_depth:
-        return [f"The query is {depth} levels deep; the limit is {max_depth}."], kind
-    repeats = _repeats(operations[0].selection_set, fragments, {}, set())
+        return [f"The query is {depth} levels deep; the limit is {max_depth}."], parsed
+    repeats = _repeats(selection_set, fragments, {}, set())
     if repeats > _MAX_REPEATS:
         return [
             f"The query selects a field up to {repeats} times in one place; "
             f"the limit is {_MAX_REPEATS}."
-        ], kind
-    fields = _fields(operations[0].selection_set, fragments, {}, set())
+        ], parsed
+    fields = _fields(selection_set, fragments, {}, set())
     if fields > max_fields:
         return [
             f"The query selects {fields} fields, fragments included; "
             f"the limit is {max_fields}."
-        ], kind
+        ], parsed
     finder = _FindIntrospection()
     visit(document, finder)
     if finder.found:
         if not schema_tool:
-            return ["Introspection is not available here."], kind
+            return ["Introspection is not available here."], parsed
         return [
             "Introspection is not available here; call graphql_schema for the schema."
-        ], kind
-    errors = validate(schema, document, hide_suggestions=hide_suggestions)
-    return [e.message for e in errors], kind
+        ], parsed
+    errors = validate(
+        schema, document, VALIDATION_RULES, hide_suggestions=hide_suggestions
+    )
+    return [e.message for e in errors], parsed
+
+
+def check_operation(
+    schema: GraphQLSchema,
+    query: str,
+    *,
+    allowed: set[OperationType],
+    max_depth: int,
+    max_tokens: int,
+    max_fields: int,
+    max_length: int = 100_000,
+    schema_tool: bool = True,
+    hide_suggestions: bool = False,
+) -> tuple[list[str], OperationType | None]:
+    """Errors that stop ``query`` from running, and the kind of operation it
+    is: :func:`read_operation` without the operation."""
+    errors, parsed = read_operation(
+        schema,
+        query,
+        allowed=allowed,
+        max_length=max_length,
+        max_depth=max_depth,
+        max_tokens=max_tokens,
+        max_fields=max_fields,
+        schema_tool=schema_tool,
+        hide_suggestions=hide_suggestions,
+    )
+    return errors, None if parsed is None else parsed.kind
 
 
 def check_variables(variables: Mapping[str, Any], *, max_values: int) -> list[str]:
@@ -345,28 +592,185 @@ def check_variables(variables: Mapping[str, Any], *, max_values: int) -> list[st
     return []
 
 
-def check_coercion(
-    schema: GraphQLSchema, query: str, variables: dict[str, Any]
-) -> list[str]:
-    """Errors coercing *variables* to the types *query* declares, without
-    suggestions.
+class _OverBudget(Exception):
+    pass
 
-    Execution coerces them too, but its errors suggest the names a value was
-    near, such as the enum value one a letter off was meant to be. *query*
-    must already have passed :func:`check_operation`.
+
+class Costs:
+    """How many values each field's arguments hold, as Strawberry converts
+    them each time the field runs: each object, list and scalar inside each
+    of its arguments and its directives' arguments, with variables
+    substituted and defaults filled in, as GraphQL coerces them.
+
+    A field is counted once, however often it runs, and counting it stops
+    past ``max_values``.
     """
-    (operation,) = (
-        d for d in parse(query).definitions if isinstance(d, OperationDefinitionNode)
-    )
-    coerced = get_variable_values(
-        schema, operation.variable_definitions or (), variables, hide_suggestions=True
-    )
-    return [error.message for error in coerced] if isinstance(coerced, list) else []
+
+    def __init__(
+        self, schema: GraphQLSchema, variables: VariableValues, max_values: int
+    ) -> None:
+        self.schema = schema
+        self.variables = variables
+        self.max_values = max_values
+        #: Whether a field :meth:`check` passed may be a Mutation type's.
+        self.writes = False
+        self._counted: dict[Any, int] = {}
+        self._writable: dict[str, bool] = {}
+
+    def of(self, field: GraphQLField, node: FieldNode) -> int:
+        """What *field*'s arguments, as *node* gives them, cost each time it runs."""
+        key = (node.loc.start, node.loc.end) if node.loc else id(node)
+        cost = self._counted.get(key)
+        if cost is None:
+            cost = self._counted[key] = self._count(field, node)
+        return cost
+
+    def check(self, parsed: Parsed) -> list[str]:
+        """Errors if *parsed*'s fields, which passed validation, cost more
+        than ``max_values`` between them, each counted wherever an alias or
+        fragment repeats it, as if every list held one item."""
+        root = self.schema.get_root_type(parsed.operation.operation)
+        assert root is not None
+        try:
+            self._total(parsed.operation.selection_set, root, parsed.fragments, {})
+        except _OverBudget:
+            return [
+                f"The arguments hold over {self.max_values} values, each counted "
+                "wherever an alias or fragment repeats it; "
+                f"the limit is {self.max_values}."
+            ]
+        return []
+
+    def _total(
+        self,
+        selection_set: SelectionSetNode,
+        parent: GraphQLNamedType | None,
+        fragments: Mapping[str, FragmentDefinitionNode],
+        totals: dict[str, int],
+    ) -> int:
+        total = 0
+        spread: set[str] = set()
+        for selection in selection_set.selections:
+            if isinstance(selection, FieldNode):
+                total += self._field(selection, parent, fragments, totals)
+            elif isinstance(selection, InlineFragmentNode):
+                condition = selection.type_condition
+                inner = (
+                    parent if condition is None else self._type(condition.name.value)
+                )
+                total += self._total(selection.selection_set, inner, fragments, totals)
+            else:
+                assert isinstance(selection, FragmentSpreadNode)
+                name = selection.name.value
+                if name in spread:
+                    continue
+                spread.add(name)
+                if name not in totals:
+                    fragment = fragments[name]
+                    totals[name] = self._total(
+                        fragment.selection_set,
+                        self._type(fragment.type_condition.name.value),
+                        fragments,
+                        totals,
+                    )
+                total += totals[name]
+            if total > self.max_values:
+                raise _OverBudget
+        return total
+
+    def _field(
+        self,
+        node: FieldNode,
+        parent: GraphQLNamedType | None,
+        fragments: Mapping[str, FragmentDefinitionNode],
+        totals: dict[str, int],
+    ) -> int:
+        if not isinstance(parent, GraphQLObjectType | GraphQLInterfaceType):
+            return 0
+        field = parent.fields.get(node.name.value)
+        if field is None:
+            return 0
+        self.writes = self.writes or self._may_write(parent)
+        total = self.of(field, node)
+        if node.selection_set is not None:
+            total += self._total(
+                node.selection_set, get_named_type(field.type), fragments, totals
+            )
+        return total
+
+    def _type(self, name: str) -> GraphQLNamedType | None:
+        return self.schema.get_type(name)
+
+    def _may_write(self, parent: GraphQLObjectType | GraphQLInterfaceType) -> bool:
+        mutation = self.schema.mutation_type
+        if parent.name not in self._writable:
+            self._writable[parent.name] = mutation is not None and (
+                parent is mutation
+                or (
+                    isinstance(parent, GraphQLInterfaceType)
+                    and self.schema.is_sub_type(parent, mutation)
+                )
+            )
+        return self._writable[parent.name]
+
+    def _count(self, field: GraphQLField, node: FieldNode) -> int:
+        count = self._inside(field, node) if field.args else 0
+        for directive in node.directives or ():
+            definition = self.schema.get_directive(directive.name.value)
+            if definition is not None and definition.args:
+                count += self._inside(definition, directive)
+        return count
+
+    def _inside(
+        self,
+        definition: GraphQLField | GraphQLDirective,
+        node: FieldNode | DirectiveNode,
+    ) -> int:
+        try:
+            values = get_argument_values(definition, node, self.variables)
+        except GraphQLError:
+            # Execution raises the same error before the field runs.
+            return 0
+        most = self.max_values + 2
+        return sum(_size(value, most) - 1 for value in values.values())
+
+
+def _size(value: Any, most: int) -> int:
+    """How many objects, lists and scalars *value* holds, counting no further
+    than *most*."""
+    pending = [value]
+    count = 0
+    while pending and count < most:
+        item = pending.pop()
+        count += 1
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list | tuple):
+            pending.extend(item)
+    return count
+
+
+def _used(
+    operation: OperationDefinitionNode, fragments: Mapping[str, FragmentDefinitionNode]
+) -> set[str]:
+    """The names of the fragments *operation* spreads, directly or not."""
+    used: set[str] = set()
+    pending = [operation.selection_set]
+    while pending:
+        for selection in pending.pop().selections:
+            if isinstance(selection, FragmentSpreadNode):
+                name = selection.name.value
+                if name in fragments and name not in used:
+                    used.add(name)
+                    pending.append(fragments[name].selection_set)
+            elif selection.selection_set is not None:
+                pending.append(selection.selection_set)
+    return used
 
 
 def _depth(
     selection_set: SelectionSetNode | None,
-    fragments: dict[str, FragmentDefinitionNode],
+    fragments: Mapping[str, FragmentDefinitionNode],
     depths: dict[str, int],
     entered: set[str],
 ) -> int:
@@ -404,7 +808,7 @@ def _depth(
 
 def _fields(
     selection_set: SelectionSetNode | None,
-    fragments: dict[str, FragmentDefinitionNode],
+    fragments: Mapping[str, FragmentDefinitionNode],
     counts: dict[str, int],
     entered: set[str],
 ) -> int:
@@ -445,7 +849,7 @@ def _fields(
 
 def _repeats(
     selection_set: SelectionSetNode | None,
-    fragments: dict[str, FragmentDefinitionNode],
+    fragments: Mapping[str, FragmentDefinitionNode],
     tables: dict[str, dict[str, tuple[int, int]]],
     entered: set[str],
 ) -> int:
@@ -467,7 +871,7 @@ def _repeats(
 
 def _merged(
     selection_set: SelectionSetNode,
-    fragments: dict[str, FragmentDefinitionNode],
+    fragments: Mapping[str, FragmentDefinitionNode],
     tables: dict[str, dict[str, tuple[int, int]]],
     entered: set[str],
 ) -> dict[str, tuple[int, int]]:

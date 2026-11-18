@@ -58,7 +58,7 @@ def build_ref_list_authorize_schema():
                 await post.fetch_related("tags")
                 return list(post.tags)  # type: ignore[return-value]
 
-        return strawberry.Schema(query=Query, mutation=Mutation)
+        return orm.schema(query=Query, mutation=Mutation)
 
     return _build
 

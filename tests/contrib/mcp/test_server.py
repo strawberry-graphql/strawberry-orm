@@ -26,7 +26,11 @@ from strawberry.extensions import (
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import GraphQLTool, mcp_server
-from strawberry_orm.contrib.mcp.checks import check_operation, refuses_introspection
+from strawberry_orm.contrib.mcp.checks import (
+    check_operation,
+    read_operation,
+    refuses_introspection,
+)
 
 from .fakes import OPERATIONS, RUNS, Mutation, Query, relay_schema, schema
 
@@ -144,6 +148,18 @@ async def test_an_unknown_argument_is_refused():
 
     assert result.is_error is True
     assert "ListPosts has no arguments named ['nope']" in result.content[0].text
+
+
+async def test_unknown_arguments_are_named_cut_short():
+    names = {f"{n}{'x' * 5_000}": 1 for n in range(100)}
+    async with Client(_server()) as client:
+        result = await client.call_tool("ListPosts", names)
+
+    assert result.is_error is True
+    text = result.content[0].text
+    assert "ListPosts has no arguments named ['0xxx" in text, text[:200]
+    assert text.endswith(", and 95 more]."), text[-200:]
+    assert len(text) <= 400, len(text)
 
 
 async def test_invalid_variables_are_a_tool_error():
@@ -417,9 +433,9 @@ async def test_the_graphql_tool_checks_an_operation_off_the_event_loop(monkeypat
 
     def recording(*args, **kwargs):
         threads.append(threading.current_thread())
-        return check_operation(*args, **kwargs)
+        return read_operation(*args, **kwargs)
 
-    monkeypatch.setattr(module, "check_operation", recording)
+    monkeypatch.setattr(module, "read_operation", recording)
     async with Client(_server(graphql_tool=True)) as client:
         await client.call_tool("graphql", {"query": "{ named { name } }"})
 
@@ -453,8 +469,8 @@ async def test_the_graphql_tool_parses_and_validates_off_the_event_loop(monkeypa
         written, seen[:] = seen[:], []
         await client.call_tool("Named", {})
 
-    assert written == [("parse", False), ("parse", False), ("validate", False)]
-    assert seen == [("parse", True), ("validate", True)]
+    assert written == [("parse", False), ("validate", False)]
+    assert seen == [("validate", False)]
 
 
 @pytest.mark.parametrize(

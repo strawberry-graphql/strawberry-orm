@@ -74,8 +74,10 @@ def _user(name: str, posts: dict[str, Any], **meta: Any) -> dict[str, Any]:
 
 class AbstractTestSnapshots:
     def test_default(self, orm, models):
+        """A user is updated on a match, a post is left alone: its projection
+        names no update."""
         project = {
-            "_meta": {"upsert": {"where": ["email"]}},
+            "_meta": {"create": True, "update": True, "upsert": {"where": ["email"]}},
             "posts": {"_meta": {"create": True, "upsert": {"where": ["title"]}}},
         }
         upsert = orm.mutations.upsert_node_input(
@@ -252,6 +254,7 @@ class AbstractTestGeneratedShapes:
         project = {
             "_meta": {
                 "immutable": True,
+                "create": True,
                 "upsert": {"where": ["ssn", "dob"], "onMatch": "IGNORE"},
                 "maxVisits": 3,
             },
@@ -400,7 +403,19 @@ class AbstractTestConfigurationErrors:
                 models=[models.Post], project={"post": {"_meta": {"create": True}}}
             )
 
-    def test_an_upsert_alone_still_enables_its_update_branch(self):
+    def test_a_create_root_needs_a_create_operation(self, orm, models):
+        @orm.type(models.Post)
+        class PostNode(strawberry.relay.Node):
+            id: strawberry.relay.NodeID[int]
+
+        with pytest.raises(ValueError, match="create_node_input\\(\\) cannot include"):
+            orm.mutations.create_node_input(
+                models=[models.Post], project={"post": {"_meta": {"update": True}}}
+            )
+
+    def test_an_upsert_alone_offers_neither_create_nor_update(self):
         policy = RelationPolicy(explicit_ops=True, upsert_where=("email",))
-        assert policy.update_enabled
-        assert not RelationPolicy(explicit_ops=True).update_enabled
+        assert policy.offers("upsert")
+        assert not policy.offers("create")
+        assert not policy.offers("update")
+        assert policy.effective_on_match == "IGNORE"

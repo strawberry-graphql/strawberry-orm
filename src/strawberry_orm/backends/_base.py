@@ -7,10 +7,12 @@ import datetime
 import hashlib
 import inspect
 import re
+import sys
+import traceback
 import typing
 import warnings
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -22,14 +24,20 @@ from weakref import WeakKeyDictionary
 
 import strawberry
 from graphql import get_named_type, is_abstract_type
-from strawberry.types.cast import get_strawberry_type_cast
+from strawberry.types.cast import TYPE_CAST_ATTRIBUTE, get_strawberry_type_cast
 from strawberry.types.field import StrawberryField
 
+from strawberry_orm.backends.filter_budget import (
+    MAX_FILTER_TEXT_LENGTH,
+    MAX_FILTER_VALUE_LENGTH,
+    MAX_REGEX_FILTERS,
+)
 from strawberry_orm.filters import (
     _CUSTOM_AGGREGATE_ATTR,
     _CUSTOM_FILTER_ATTR,
     _CUSTOM_GROUP_ATTR,
     _CUSTOM_ORDER_ATTR,
+    MAX_REGEX_TEXT_LENGTH,
     TYPE_TO_LOOKUP,
     ReferenceLookup,
     StringLookup,
@@ -41,9 +49,10 @@ from strawberry_orm.grouping import (
     MAX_GROUPS,
     MAX_ORDER_ENTRIES,
 )
-from strawberry_orm.lazy_resolution import reads_relation
+from strawberry_orm.lazy_resolution import current_execution, reads_relation
 from strawberry_orm.mutations import make_ref_type
 from strawberry_orm.optimizer import OptimizerStore
+from strawberry_orm.optimizer.extension import refuse_rows_held_by_nothing
 from strawberry_orm.types import DateGroupByOption, FieldHints, Ordering
 
 LazyResolutionMode = Literal["off", "warn", "error"]
@@ -62,8 +71,73 @@ _NOT_FILTERING: Any = object()
 #: Its own error names tables and columns, and can carry the row's values.
 WRITE_REFUSED = "The database refused the write"
 
+#: What a client is told when a row scope limits or offsets the rows it allows.
+SCOPE_LIMIT_REFUSED = (
+    "A row scope cannot limit or offset the rows it allows: the library applies "
+    "it under a client's filter and order, to relations and within other "
+    "statements, where the limit would count other rows. Narrow the rows with "
+    "a condition, or limit them to none."
+)
+
+#: Each database driver a backend runs on, and the error all of its own derive
+#: from (``aiosqlite`` and ``aiomysql`` raise those of ``sqlite3`` and
+#: ``pymysql``).
+_DRIVER_ERRORS = (
+    ("sqlite3", "Error"),
+    ("psycopg", "Error"),
+    ("psycopg2", "Error"),
+    ("asyncpg", "PostgresError"),
+    ("asyncpg", "InterfaceError"),
+    ("pymysql", "Error"),
+    ("MySQLdb", "Error"),
+    ("asyncmy.errors", "Error"),
+    ("oracledb", "Error"),
+    ("pyodbc", "Error"),
+)
+
+
+def driver_errors() -> tuple[type[BaseException], ...]:
+    """The base error of each driver loaded; one not loaded raises nothing.
+
+    A driver's message quotes the statement, its tables and columns, or the
+    values bound, and the ORM does not wrap every one it lets through.
+    """
+    loaded = (
+        getattr(sys.modules.get(module), name, None) for module, name in _DRIVER_ERRORS
+    )
+    return tuple(error for error in loaded if isinstance(error, type))
+
+
+def raised_by_orm(
+    exc: BaseException, orm: tuple[str, ...], statements: tuple[str, ...]
+) -> bool:
+    """True for *exc* raised by the ORM, whatever its type.
+
+    That is, raised in a module of *orm* itself, or in a call made while the
+    ORM built or ran a statement, from one of *statements*: a field preparing
+    a value, a driver binding it. Either carries the value, the column or the
+    statement. One raised in this library's own code, called back from there,
+    is the library's, and keeps its message.
+    """
+    running = False
+    frames = [
+        str(frame.f_globals.get("__name__"))
+        for frame, _line in traceback.walk_tb(exc.__traceback__)
+    ]
+    for name in frames:
+        if name.startswith(statements):
+            running = True
+        elif name.startswith("strawberry_orm."):
+            running = False
+    return running or (bool(frames) and frames[-1].startswith(orm))
+
+
 #: The integers a 64-bit key column holds, the widest any backend's driver binds.
 _KEY_RANGE = range(-(2**63), 2**63)
+
+#: Passes over a ``using=`` resolver's relations before rows other loads keep
+#: replacing are refused.
+_USING_PASSES = 3
 
 
 def key_in_range(key: Any) -> Any:
@@ -74,6 +148,44 @@ def key_in_range(key: Any) -> Any:
     if isinstance(key, int) and key not in _KEY_RANGE:
         raise ValueError(key)
     return key
+
+
+#: Values a batch signature reads by value; ``bool`` comes before ``int``.
+_PLAIN_VALUES = (
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    Decimal,
+    datetime.datetime,
+    datetime.date,
+    datetime.time,
+    datetime.timedelta,
+)
+
+
+def signed_value(value: Any) -> tuple[Any, ...] | None:
+    """*value* by its type and value, or ``None`` for one it cannot read.
+
+    A plain value is rendered by the plain type, so a subclass's ``__repr__``
+    cannot hide what it holds.
+    """
+    from uuid import UUID
+
+    if value is None:
+        return ("NoneType",)
+    for plain in _PLAIN_VALUES:
+        if isinstance(value, plain):
+            return type(value).__qualname__, plain.__repr__(value)
+    if isinstance(value, UUID):
+        return type(value).__qualname__, int.__repr__(value.int)
+    if isinstance(value, memoryview):
+        return "memoryview", bytes(value)
+    if isinstance(value, (list, tuple)):
+        items = tuple(signed_value(item) for item in value)
+        return None if None in items else (type(value).__qualname__, items)
+    return None
 
 
 #: While a filter is built, the name of the type its rows are read as; ``None``
@@ -99,8 +211,11 @@ _ROW_TYPES: WeakKeyDictionary[Any, dict[type, list[type]]] = WeakKeyDictionary()
 _POSSIBLE_TYPES: WeakKeyDictionary[Any, frozenset[type]] = WeakKeyDictionary()
 
 
-def model_is_type_of(model: type) -> Any:
+def model_is_type_of(model: type, own: Any = None) -> Any:
     """The ``is_type_of`` of a type over *model*: is the value one of its rows.
+
+    A type that declares its own, *own*, keeps its decision, and a row it
+    takes is still refused where nothing holds rows to scope.
 
     Under an interface or union, graphql-core gives a row returned as it is
     the first possible type that takes it. Of two types over one model, which
@@ -110,13 +225,28 @@ def model_is_type_of(model: type) -> Any:
     has to ``strawberry.cast`` it to one of the interface's or union's types.
 
     A cast to any other type says nothing here. Rows are shared within a
-    request, and Strawberry's ``node()`` casts the row it returns for good,
-    so a cast can be left over from another field.
+    request, and Strawberry's ``node()`` casts the row it returns, so a cast
+    can be left over from another field. One made in another execution is
+    not seen at all (see ``CastPerExecution``).
     """
+    if own is not None:
+        made = getattr(own, "__func__", own)
+        if hasattr(made, "orm_model") or hasattr(made, "orm_decided_by"):
+            return own
+
+        def decided(cls: type, obj: object, info: Any) -> bool:
+            taken = own.__get__(None, cls)(obj, info)
+            if taken:
+                refuse_rows_held_by_nothing(info, cls)
+            return taken
+
+        decided.orm_decided_by = own  # type: ignore[attr-defined]
+        return classmethod(decided)
 
     def is_type_of(cls: type, obj: object, info: Any) -> bool:
         if not isinstance(obj, model):
             return False
+        refuse_rows_held_by_nothing(info, cls)
         abstract = get_named_type(info.return_type)
         if not is_abstract_type(abstract):
             return True
@@ -129,6 +259,53 @@ def model_is_type_of(model: type) -> Any:
     return classmethod(is_type_of)
 
 
+#: Where a cast made with no execution open is kept on the row.
+_CAST_OUTSIDE_AN_EXECUTION = "_strawberry_orm_cast"
+
+
+class CastPerExecution:
+    """``strawberry.cast``'s mark on a model's rows, held by the execution making it.
+
+    ``strawberry.cast`` sets ``TYPE_CAST_ATTRIBUTE`` on the row, and an
+    interface or union reads a row as the type it names. A row can outlive
+    the request that cast it - an app's cache, a long-lived session's
+    identity map - and that request's cast says nothing of how the next may
+    read it. Installed under that name on a model class, this keeps each cast
+    in the execution that made it, for that execution alone. A cast made with
+    no execution open, as under a schema built without the library's
+    extensions, stays on the row and is seen only outside an execution.
+    """
+
+    def __get__(self, row: Any, owner: type | None = None) -> Any:
+        if row is None:
+            return None
+        execution = current_execution()
+        if execution is None:
+            return getattr(row, _CAST_OUTSIDE_AN_EXECUTION, None)
+        made = execution.casts.get(id(row))
+        return made[1] if made is not None and made[0] is row else None
+
+    def __set__(self, row: Any, type_: Any) -> None:
+        execution = current_execution()
+        if execution is None:
+            setattr(row, _CAST_OUTSIDE_AN_EXECUTION, type_)
+        else:
+            # The row is held, so its id is not reused while the execution runs.
+            execution.casts[id(row)] = (row, type_)
+
+
+def _cast_per_execution(model: type) -> None:
+    """Keep the casts of *model*'s rows, and its subclasses', per execution.
+
+    A class that takes no attributes, such as a builtin, keeps Strawberry's.
+    """
+    if not isinstance(
+        inspect.getattr_static(model, TYPE_CAST_ATTRIBUTE, None), CastPerExecution
+    ):
+        with suppress(TypeError):
+            setattr(model, TYPE_CAST_ATTRIBUTE, CastPerExecution())
+
+
 def _possible_types(info: Any, abstract: Any) -> frozenset[type]:
     known = _POSSIBLE_TYPES.get(abstract)
     if known is None:
@@ -139,7 +316,8 @@ def _possible_types(info: Any, abstract: Any) -> frozenset[type]:
     return known
 
 
-def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
+def _nearest_row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
+    """The types of *abstract* over the nearest class of *row_class* any is over."""
     known = _ROW_TYPES.setdefault(abstract, {})
     if row_class not in known:
         ranked = []
@@ -150,7 +328,11 @@ def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
                 ranked.append((row_class.__mro__.index(model), origin))
         nearest = min((rank for rank, _ in ranked), default=None)
         known[row_class] = [origin for rank, origin in ranked if rank == nearest]
-    types = known[row_class]
+    return known[row_class]
+
+
+def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
+    types = _nearest_row_types(info, abstract, row_class)
     if len(types) > 1:
         names = " and ".join(sorted(t.__strawberry_definition__.name for t in types))
         raise TypeError(
@@ -161,41 +343,267 @@ def _row_types(info: Any, abstract: Any, row_class: type) -> list[type]:
     return types
 
 
-#: Matched anywhere in a name, so ``hashed_password`` and ``isAdmin`` are
-#: caught, along with a few ordinary names such as ``controller``.
+def _plurals(*words: str) -> frozenset[str]:
+    return frozenset(words) | {
+        f"{word}es" if word.endswith(("s", "sh")) else f"{word}s" for word in words
+    }
+
+
+#: Matched anywhere in a name, so ``hashedPassword`` and ``isSuperuser`` are.
 _SENSITIVE_ANYWHERE = (
-    r"password|passwd|secret|token|api_key|apikey|hash|ssn|"
-    r"credit_card|creditcard|private_key|privatekey|admin|staff|"
-    r"superuser|permission|role"
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "privatekey",
+    "private_key",
+    "creditcard",
+    "credit_card",
+    "superuser",
+    "permission",
 )
-#: Matched only as whole words of a snake_case, kebab-case or camelCase name,
-#: so ``pin`` catches ``card_pin`` and ``pinCode`` but not ``pinned``,
-#: ``spinner`` or ``opinion``. A bare ``pin`` counts only as the last word,
-#: which leaves ``pin_count`` alone. Words that also name ordinary data
-#: (``is_active``, ``group``, ``scope``, ``plan``, ``balance``) are left out.
-_SENSITIVE_WORDS = (
-    r"pwd?s?|pass[_-]?(?:phrase|code)s?|salt|[th]?otps?|mfa|creds?|"
-    r"(?:recovery|backup)[_-]?codes?|pin[_-]?(?:code|number)s?|pin$|jwts?|"
-    r"(?:api|access|signing|encryption|auth|license|master|session|hmac|"
-    r"shared|client|app|activation|product|serial|webhook|stripe|ssh|gpg|pgp)"
-    r"[_-]?keys?|"
-    r"credentials?|priv[_-]?keys?|mnemonics?|(?:seed|recovery)[_-]?phrases?|"
-    r"wallet[_-]?seeds?|bearer|csrf|code[_-]?verifiers?|"
-    r"(?:verification|reset|invite|one[_-]?time|two[_-]?factor|2fa|sms|"
-    r"login|auth|unlock|activation|confirmation)[_-]?codes?|magic[_-]?links?|"
-    r"security[_-]?answers?|mothers?[_-]?maiden[_-]?names?|"
-    r"ciphertexts?|encrypted[_-]?(?:data|values?|payloads?|blobs?|bytes|text)|"
-    r"social[_-]?security|national[_-]?ids?|tax[_-]?ids?|passports?|"
-    r"driv(?:er|ers|ing)[_-]?licen[cs]es?|"
-    r"card[_-]?numbers?|cc[_-]?(?:num|number|no)s?|cvv|cvc|ibans?|"
-    r"bank[_-]?accounts?|(?:routing|account)[_-]?numbers?|"
-    r"groups|scopes|acls?|privileges?"
+#: Words that name a secret, a credential or a privilege on their own.
+#: Words that also name ordinary data (``group``, ``scope``, ``plan``) are
+#: left out, and so is ``pin``, which counts only as the last word, as in
+#: ``card_pin``, and so leaves ``pin_count`` alone.
+_SENSITIVE_WORDS = _plurals(
+    "pw",
+    "pwd",
+    "passphrase",
+    "passcode",
+    "secret",
+    "token",
+    "credential",
+    "cred",
+    "salt",
+    "otp",
+    "totp",
+    "hotp",
+    "jwt",
+    "privkey",
+    "mnemonic",
+    "ciphertext",
+    "iban",
+    "passport",
+    "admin",
+    "administrator",
+    "role",
+    "privilege",
+    "acl",
+    "hash",
+    "ssn",
+) | {
+    "bearer",
+    "authorization",
+    "csrf",
+    "xsrf",
+    "mfa",
+    "cvv",
+    "cvc",
+    "otpauth",
+    "hashed",
+    "staff",
+    "groups",
+    "scopes",
+}
+#: A word ending in one of these names a secret, as ``fcmtoken`` or
+#: ``sysadmin`` do; ``hashtag`` and ``secretary`` only begin with one.
+_SENSITIVE_ENDINGS = ("secret", "token", "hash", "admin", "role", "staff")
+#: Words that make any of ``key``, ``seed``, ``pass`` or ``tok`` a secret.
+_SECRET_QUALIFIERS = frozenset(
+    {
+        "decryption",
+        "encryption",
+        "aes",
+        "rsa",
+        "dsa",
+        "ecdsa",
+        "ed25519",
+        "tls",
+        "ssl",
+        "private",
+        "priv",
+        "signing",
+        "recovery",
+        "backup",
+        "master",
+        "root",
+        "wrapped",
+        "kms",
+        "api",
+        "secret",
+        "access",
+        "refresh",
+        "session",
+        "auth",
+        "oauth",
+        "otp",
+        "totp",
+        "mfa",
+        "2fa",
+        "smtp",
+        "db",
+        "hmac",
+        "jwt",
+        "ssh",
+        "gpg",
+        "pgp",
+        "crypto",
+        "cipher",
+        "wallet",
+        "shared",
+        "client",
+        "app",
+        "unlock",
+    }
 )
-_WORD_START = r"(?:(?<![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
-_WORD_END = r"(?:(?![A-Za-z])|(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
-_SENSITIVE_PATTERNS = re.compile(
-    rf"(?i:{_SENSITIVE_ANYWHERE})|{_WORD_START}(?i:{_SENSITIVE_WORDS}){_WORD_END}"
+#: Nouns that name a secret after one of the words given for them, as
+#: ``aes_key``, ``key_material``, ``db_pass`` and ``mothers_maiden_name`` do,
+#: and data on their own (``primary_key``, ``boarding_pass``, ``zip_code``).
+#: A qualifier may be run together from up to three words (``one_time``).
+_QUALIFIED_NOUNS: dict[str, frozenset[str]] = {
+    **dict.fromkeys(
+        _plurals("key"),
+        _SECRET_QUALIFIERS
+        | {"license", "activation", "product", "serial", "webhook", "stripe"},
+    ),
+    **dict.fromkeys(_plurals("seed"), _SECRET_QUALIFIERS | {"mnemonic", "key"}),
+    **dict.fromkeys(_plurals("tok"), _SECRET_QUALIFIERS | {"id", "bearer", "csrf"}),
+    **dict.fromkeys(
+        _plurals("pass"),
+        _SECRET_QUALIFIERS
+        | {"user", "admin", "ldap", "imap", "pop", "ftp", "sftp", "vpn", "wifi"}
+        | {"mysql", "postgres", "pg", "redis", "mongo", "mail", "email", "proxy"},
+    ),
+    **dict.fromkeys(_plurals("material"), _SECRET_QUALIFIERS | {"key", "keying"}),
+    **dict.fromkeys(
+        _plurals("code"),
+        {"verification", "verify", "reset", "invite", "onetime", "twofactor"}
+        | {"2fa", "sms", "login", "signin", "auth", "unlock", "activation"}
+        | {"confirmation", "recovery", "backup", "pass", "pin", "security"}
+        | {"access", "secret", "otp", "totp", "mfa"},
+    ),
+    **dict.fromkeys(
+        _plurals("phrase"),
+        {"seed", "recovery", "pass", "secret", "mnemonic", "backup", "wallet"},
+    ),
+    **dict.fromkeys(
+        _plurals("url", "uri", "link"),
+        {"magic", "reset", "login", "signin", "invite", "verification"}
+        | {"activation", "unlock", "recovery", "confirmation", "signed", "presigned"},
+    ),
+    **dict.fromkeys(
+        _plurals("number", "num", "no"),
+        {"card", "cc", "routing", "account", "pin", "passport", "ssn"},
+    ),
+    **dict.fromkeys(_plurals("id"), {"national", "tax"}),
+    **dict.fromkeys(_plurals("answer"), {"security"}),
+    **dict.fromkeys(_plurals("name"), {"mothersmaiden", "mothermaiden"}),
+    **dict.fromkeys(_plurals("license", "licence"), {"driver", "drivers", "driving"}),
+    "security": frozenset({"social"}),
+    **dict.fromkeys(_plurals("account"), {"bank"}),
+    **dict.fromkeys(_plurals("card"), {"credit", "debit"}),
+    **dict.fromkeys(_plurals("verifier"), {"code"}),
+    **dict.fromkeys(
+        ("data", "bytes", "text", *_plurals("value", "payload", "blob")),
+        {"encrypted"},
+    ),
+    "refresh": frozenset({"oauth", "auth", "oidc", "sso", "openid"}),
+}
+#: What a run of letters such as ``aeskey`` or ``smtppass`` is split into.
+_NAME_WORDS = (
+    _SENSITIVE_WORDS
+    | set(_QUALIFIED_NOUNS)
+    | {word for words in _QUALIFIED_NOUNS.values() for word in words}
+    | {"pin"}
 )
+_NAME_BREAKS = re.compile(
+    r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+
+
+def _name_words(name: str) -> list[str]:
+    """*name*'s words: split at ``_``, ``-`` and camelCase, then into words.
+
+    Digits are dropped from a word unless they are part of it (``2fa``), so
+    ``aes256Key`` is ``aes`` and ``key``, and a run of letters made only of
+    known words is split into the fewest of them, so ``masterseed`` is
+    ``master`` and ``seed`` while ``keyboard`` and ``passenger`` stay whole.
+    """
+    words = []
+    for part in _NAME_BREAKS.split(name):
+        word = part.lower()
+        if word not in _NAME_WORDS:
+            word = re.sub(r"\d+", "", word)
+        if word:
+            words.extend(_known_words(word))
+    return words
+
+
+def _known_words(word: str) -> list[str]:
+    """*word* as the fewest known words, or a word this does not know and two
+    or more known words after it (``awssecretaccesskey``), or as it is.
+
+    One known word after an unknown one is not enough: ``basalt``,
+    ``monkey`` and ``compass`` end in ``salt``, ``key`` and ``pass``.
+    """
+    whole = _fewest_known_words(word)
+    if whole is not None:
+        return whole
+    for start in range(1, len(word) - 1):
+        rest = _fewest_known_words(word[start:])
+        if rest is not None and len(rest) > 1:
+            return [word[:start], *rest]
+    return [word]
+
+
+def _fewest_known_words(word: str) -> list[str] | None:
+    fewest: list[list[str] | None] = [[]] + [None] * len(word)
+    for end in range(1, len(word) + 1):
+        for start in range(end):
+            before, best = fewest[start], fewest[end]
+            if (
+                before is not None
+                and word[start:end] in _NAME_WORDS
+                and (best is None or len(before) + 1 < len(best))
+            ):
+                fewest[end] = [*before, word[start:end]]
+    return fewest[-1]
+
+
+class _SensitiveNames:
+    """Tells a sensitive-looking column or relation name by its words.
+
+    A name is sensitive when it holds a word that names a secret, credential
+    or privilege on its own (``token``, ``salt``, ``authorization``) or ends
+    in one (``fcmtoken``), a bare ``pin`` as its last word, or a noun after a
+    word that makes it a secret (``aes_key``, ``smtp_pass``, ``master_seed``,
+    ``key_material``): ``passenger``, ``keyboard`` and ``tokenizer`` hold no
+    such word, and ``primary_key`` and ``boarding_pass`` no such qualifier.
+    """
+
+    def search(self, name: str) -> str | None:
+        """The part of *name* that looks sensitive, or ``None``."""
+        lowered = name.lower()
+        for stem in _SENSITIVE_ANYWHERE:
+            if stem in lowered:
+                return stem
+        words = _name_words(name)
+        for index, word in enumerate(words):
+            if word in _SENSITIVE_WORDS or word.endswith(_SENSITIVE_ENDINGS):
+                return word
+            if word == "pin" and index == len(words) - 1:
+                return word
+            qualifiers = _QUALIFIED_NOUNS.get(word, frozenset())
+            for start in range(max(index - 3, 0), index):
+                if "".join(words[start:index]) in qualifiers:
+                    return "_".join(words[start : index + 1])
+        return None
+
+
+#: Used by generated inputs, which leave such names out, and by
+#: ``warn_sensitive``, which warns about a type that shows one.
+_SENSITIVE_PATTERNS = _SensitiveNames()
 
 
 def _metadata_only_field(value: Any) -> bool:
@@ -216,6 +624,53 @@ def _metadata_only_field(value: Any) -> bool:
         and not value.permission_classes
         and not value.directives
         and not value.extensions
+    )
+
+
+@dataclasses.dataclass
+class _Declared:
+    """What a field removed from an ``@orm.type`` class was declared with.
+
+    The backend builds the field in its place, around the library's resolver,
+    and ``_finalize_type`` gives it the rest. ``options`` is a resolver-less
+    Strawberry field: description, deprecation, name, metadata, directives,
+    permissions and extensions.
+    """
+
+    options: StrawberryField
+    filters: Any = None
+    order: Any = None
+    #: Set once a to-many relation's resolver has taken filters and order.
+    served: bool = False
+
+
+def _declared_by_auto_field(
+    value: Any, type_name: str, field_name: str, annotation: Any
+) -> _Declared:
+    """What ``orm.field.eager()`` declared, or why ``orm.connection`` cannot be built."""
+    from strawberry_orm.core import _AutoConnection
+
+    declaration = getattr(value, "_orm_declaration", value)
+    if isinstance(declaration, _AutoConnection):
+        shown = (
+            "it has no annotation"
+            if annotation is None
+            else f"{annotation!r} names none declared yet"
+        )
+        raise ValueError(
+            f"{type_name}.{field_name}: a connection is built around a node "
+            f"type declared with @orm.type, and {shown}. Declare the node "
+            f"type before {type_name} and annotate the field with a "
+            f"connection over it."
+        )
+    return _Declared(
+        strawberry.field(
+            description=getattr(declaration, "_description", None),
+            deprecation_reason=getattr(declaration, "_deprecation_reason", None),
+            metadata=getattr(declaration, "metadata", None),
+        ),
+        filters=getattr(declaration, "_filters", None),
+        order=getattr(declaration, "_order", None),
     )
 
 
@@ -499,6 +954,27 @@ def _annotate_filter_relation_presence(FilterCls: type) -> None:
     FilterCls.is_null = strawberry.UNSET
 
 
+def _keep_declared_metadata(cls: type, *generated: type | None) -> None:
+    """Give the inputs built from *cls* the metadata (tags) its fields declared."""
+    declared = {
+        name: value.metadata
+        for name, value in vars(cls).items()
+        if isinstance(value, StrawberryField) and value.metadata
+    }
+    for input_type in generated:
+        if input_type is None:
+            continue
+        for field in input_type.__strawberry_definition__.fields:
+            if field.python_name in declared:
+                field.metadata = {**field.metadata, **declared[field.python_name]}
+
+
+#: What a caller can do through a generated input with a column its type hides.
+_INPUT_USES = {
+    "write": "write them, so a caller can set values they cannot read",
+    "match": "match rows on them, so a caller can test values they cannot read",
+}
+
 _ROW_SCOPE_HOOK = "scope_rows"
 #: What the hook was called before 0.15. Left in place it is simply not read,
 #: so the rows it was written to hide come back instead.
@@ -760,6 +1236,55 @@ def input_to_dict(obj: Any) -> dict[str, Any]:
     return result
 
 
+#: On a row a write read: its :class:`WriteRecord`.
+_WRITE_RECORD = "_strawberry_orm_write_record"
+
+
+class WriteRecord:
+    """What a row held when a write read it, and the attributes the write set on it.
+
+    Saving the row writes those attributes and the columns whose value is no
+    longer the one read, and nothing else: a column the write left alone
+    keeps whatever the database holds by then, which another request may have
+    changed since the read.
+    """
+
+    __slots__ = ("held", "names")
+
+    def __init__(self, held: dict[str, Any]) -> None:
+        self.held = held
+        self.names: set[str] = set()
+
+    def changed(self, now: dict[str, Any]) -> set[str]:
+        """The columns of *now*, a row's loaded columns, assigned since the read."""
+        held = self.held
+        return {
+            column
+            for column, value in now.items()
+            if column not in held
+            or (held[column] is not value and held[column] != value)
+        }
+
+
+def write_record(row: Any, columns: Callable[[Any], dict[str, Any]]) -> WriteRecord:
+    """*row*'s :class:`WriteRecord`, begun with ``columns(row)`` if it has none.
+
+    A row read again, by a repo whose ``_get`` returns the object it returned
+    before, keeps the record of the first read.
+    """
+    return row.__dict__.setdefault(_WRITE_RECORD, WriteRecord(columns(row)))
+
+
+def read_record(row: Any) -> WriteRecord | None:
+    """*row*'s :class:`WriteRecord`, or ``None`` for a row no write has read."""
+    return row.__dict__.get(_WRITE_RECORD)
+
+
+def renew_record(row: Any, columns: Callable[[Any], dict[str, Any]]) -> None:
+    """Begin *row*'s :class:`WriteRecord` again, once it is saved."""
+    row.__dict__[_WRITE_RECORD] = WriteRecord(columns(row))
+
+
 @dataclass
 class RelationConnectionSpec:
     """What a connection field needs in order to be read one window at a time."""
@@ -788,24 +1313,65 @@ class ScopeHooks(dict):
     A row of a subclass - an inherited mapping, a proxy, a multi-table child -
     is a row of its base as well, and the base's type accepts it as one. Looked
     up by its exact class, such a row or query would find no scope at all, so
-    ``get`` and ``in`` answer for the nearest class up its hierarchy that has
-    one. Iterating, indexing and storing stay exact.
+    ``get`` and ``in`` answer for the classes up its hierarchy that have one
+    and govern its rows (see ``BaseBackend.governs``). Iterating, indexing
+    and storing stay exact.
     """
+
+    def __init__(
+        self,
+        governs: Callable[[type, type], bool],
+        models_inherited: Callable[[type], list[type]],
+        call: Callable[[Any, Any, Any], Any],
+    ) -> None:
+        super().__init__()
+        self._governs = governs
+        self._models_inherited = models_inherited
+        self._call = call
+        self._composed: dict[tuple[Any, ...], Any] = {}
 
     def owner(self, model: Any) -> type | None:
         """The class whose ``scope_rows`` scopes *model*'s rows, if any."""
         for cls in getattr(model, "__mro__", ()):
-            if dict.__contains__(self, cls):
+            if dict.__contains__(self, cls) and self._governs(cls, model):
                 return cls
         return None
+
+    def owners(self, model: Any) -> tuple[type, ...]:
+        """Every class whose ``scope_rows`` scopes *model*'s rows, base first.
+
+        A row is a row of each model whose table holds it (see
+        ``BaseBackend.models_inherited``), so it is held to the scope of
+        each one's owner, as a write asks each one's repo. A subclass whose
+        type has a scope of its own adds it to its base's; it does not stand
+        in for it.
+        """
+        if self.owner(model) is None:
+            return ()
+        return tuple(
+            dict.fromkeys(
+                owner
+                for held in self._models_inherited(model)
+                if (owner := self.owner(held)) is not None
+            )
+        )
 
     def exact(self, model: Any) -> Any | None:
         """The hook registered for *model* itself, not one it inherits."""
         return dict.get(self, model)
 
     def get(self, model: Any, default: Any = None) -> Any:
-        owner = self.owner(model)
-        return default if owner is None else dict.__getitem__(self, owner)
+        """The scope narrowing a query over *model* to the rows each owner allows."""
+        hooks = tuple(dict.__getitem__(self, owner) for owner in self.owners(model))
+        if not hooks:
+            return default
+        if len(hooks) == 1:
+            return hooks[0]
+        if hooks not in self._composed:
+            from strawberry_orm.fields import every_scope
+
+            self._composed[hooks] = every_scope(hooks, call=self._call)
+        return self._composed[hooks]
 
     def __contains__(self, model: object) -> bool:
         return self.owner(model) is not None
@@ -835,10 +1401,28 @@ class BaseBackend:
         self._group_registry: dict[type, type] = {}
         self._aggregate_type_cache: dict[type, AggregateMeta] = {}
         self._group_key_cache: dict[tuple, tuple[type, dict[str, Any]]] = {}
-        self._type_querysets = ScopeHooks()
+        self._type_querysets = ScopeHooks(
+            self.governs, self.models_inherited, self.call_row_scope
+        )
         self._type_queryset_owner: dict[type, str] = {}
+        #: Per GraphQL type a field returns: what ``_types_returned`` found.
+        self._returned_types: WeakKeyDictionary[Any, tuple[tuple, tuple]] = (
+            WeakKeyDictionary()
+        )
         self._warn_sensitive: bool = kwargs.get("warn_sensitive", True)
         self._warn_missing_scope: bool = kwargs.get("warn_missing_scope", True)
+        self._max_regex_filters: int = kwargs.get(
+            "max_regex_filters", MAX_REGEX_FILTERS
+        )
+        self._max_regex_text_length: int = kwargs.get(
+            "max_regex_text_length", MAX_REGEX_TEXT_LENGTH
+        )
+        self._max_filter_text_length: int = kwargs.get(
+            "max_filter_text_length", MAX_FILTER_TEXT_LENGTH
+        )
+        self._max_filter_value_length: int = kwargs.get(
+            "max_filter_value_length", MAX_FILTER_VALUE_LENGTH
+        )
         self._exclude_sensitive_fields: bool = kwargs.get(
             "exclude_sensitive_fields", True
         )
@@ -865,7 +1449,9 @@ class BaseBackend:
         self._batch_relations: bool = kwargs.get("batch_relations", True)
         self._to_query: Callable[[Any, Any], Any] | None = kwargs.get("to_query")
         self._type_excludes: dict[type, set[str]] = {}
-        self._input_registry: dict[type, list[tuple[str, set[str]]]] = {}
+        #: Per model, each generated input's name, the columns and relations
+        #: it takes from a caller, and what it does with them.
+        self._input_registry: dict[type, list[tuple[str, set[str], str]]] = {}
         #: Per GraphQL type, the columns and relations it shows as they are,
         #: each with the tags of the field showing it.
         self._shown_by_type: dict[type, dict[str, frozenset[str] | None]] = {}
@@ -900,13 +1486,16 @@ class BaseBackend:
         A model with no repo of its own takes the repo of the nearest class
         it inherits that has one, as its rows take that class's scope: a row
         of a subclass is a row of its base, and writing it must not skip the
-        base's ``scope_query`` and ``can_*`` checks.
+        base's ``scope_query`` and ``can_*`` checks. A repo bound to a class
+        that does not govern the model's rows (see ``governs``) has no say
+        over them; one bound to no model answers for this one.
         """
         repo_cls = next(
             (
                 found
                 for cls in getattr(model, "__mro__", (model,))
                 if (found := self._repos.get(cls)) is not None
+                and (found.model is None or self.governs(cls, model))
             ),
             None,
         )
@@ -937,6 +1526,47 @@ class BaseBackend:
         ``UpsertWriter._row_model``).
         """
         return []
+
+    def models_inherited(self, model: type) -> list[type]:
+        """*model* and every model whose rows its rows are too, base first.
+
+        Those are the models whose tables hold every *model* row, so only
+        they can find it by its key. A write of a row is checked against each
+        of them (see ``UpsertWriter._concerned``).
+        """
+        return [model]
+
+    def governs(self, model: type, row_class: type) -> bool:
+        """Whether *model*'s repo and row scope have a say over *row_class*'s rows.
+
+        Each is applied to a statement over *row_class*, where the fields
+        *row_class* inherits are its own: a Django or Tortoise query names
+        the fields of the model it reads. A backend whose scopes name a
+        model's own table holds them to the models whose tables hold the
+        rows (see ``models_inherited``) instead.
+        """
+        return model is row_class or (
+            isinstance(model, type)
+            and isinstance(row_class, type)
+            and issubclass(row_class, model)
+        )
+
+    def classes_holding(self, model: type) -> list[type]:
+        """The subclasses, besides the models *model* inherits, whose tables can hold its row.
+
+        Those of *model* read as their base, and those of the models it
+        inherits: a sibling's table can hold the same row as *model*'s. A
+        row one of them holds is that subclass's too, so its repo governs
+        the row as much as *model*'s does: in the writer (see
+        ``UpsertWriter._row_model``), and in an upsert's lookup, which
+        counts only the rows the writer can read.
+        """
+        inherited = self.models_inherited(model)
+        return [
+            cls
+            for cls in self.subclasses_read_as_base(inherited[0])
+            if cls not in inherited
+        ]
 
     def classes_written_apart(
         self, repo: Any, models: Iterable[type]
@@ -1062,14 +1692,14 @@ class BaseBackend:
         exclude_pk = kwargs.get("exclude_pk", True)
         name = kwargs.get("name")
 
-        pk_names = self._get_pk_names(model) if exclude_pk else set()
+        row_keys = self._row_keys(model) if exclude_pk else self._model_keys(model)
 
         fields_meta = self._introspect_model(model)
         link_keys = self._link_key_columns(model) | self._generic_key_columns(model)
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
         for fname, ftype, is_relation, _rel_model in fields_meta:
-            if fname in pk_names:
+            if fname in row_keys:
                 continue
             if include and fname not in include:
                 continue
@@ -1088,7 +1718,9 @@ class BaseBackend:
         self._check_input_does_not_expose_excluded(model, type_name, annotations)
         ns: dict[str, Any] = {"__annotations__": annotations, **defaults}
         cls = type(type_name, (), ns)
-        self._input_registry.setdefault(model, []).append((type_name, set(annotations)))
+        self._input_registry.setdefault(model, []).append(
+            (type_name, set(annotations), "write")
+        )
         return strawberry.input(cls)
 
     def _get_pk_names(self, model: type) -> set[str]:
@@ -1099,6 +1731,27 @@ class BaseBackend:
             if fname == "id" or fname.endswith("_id"):
                 pk_candidates.add(fname)
         return {"id"} if "id" in pk_candidates else set()
+
+    def _row_keys(self, model: type) -> set[str]:
+        """Attributes naming a row an input could write onto: a key of *model*,
+        each column of one made of several, a key of a parent model its rows
+        extend, and the links that set one; and :meth:`_model_keys`.
+
+        Set by a create, a key picks the row the write lands on, and some ORMs
+        save a parent row whose key is set with an ``UPDATE``; set by an update,
+        it moves the row onto another's key, or turns it into a row of another
+        model. Generated inputs offer none of them, and no update sets one.
+        """
+        return self._get_pk_names(model) | self._model_keys(model)
+
+    def _model_keys(self, model: type) -> set[str]:
+        """Attributes picking the model a *model* row loads as, and the links
+        that set one.
+
+        Written, they make the row a row of a subclass whose repo is never
+        asked, so not even a create, nor ``exclude_pk=False``, sets them.
+        """
+        return set()
 
     def _link_key_columns(self, model: type) -> set[str]:
         """Columns holding the key a link to another model's row sets.
@@ -1593,6 +2246,7 @@ class BaseBackend:
             FilterType._relation_models = relation_models  # type: ignore[attr-defined]
         if custom_filters:
             FilterType._custom_filters = custom_filters  # type: ignore[attr-defined]
+        _keep_declared_metadata(cls, FieldType, ObjectType)
         self._cover_shown_fields(model, FilterType)
 
         self._filter_registry[model] = FilterType
@@ -1738,6 +2392,12 @@ class BaseBackend:
         if custom_orders:
             OrderType._custom_orders = custom_orders  # type: ignore[attr-defined]
         _set_scoped_ordering_allowance(OrderType, model, allow_scoped_ordering)
+        _keep_declared_metadata(
+            cls,
+            OrderFieldType,
+            OrderObjectType if object_annotations else None,
+            objects_type,
+        )
         self._cover_shown_fields(model, OrderType)
 
         self._order_registry[model] = OrderType
@@ -2071,6 +2731,7 @@ class BaseBackend:
             GroupByType._objects_type = objects_type  # type: ignore[attr-defined]
         if custom_groups:
             GroupByType._custom_groups = custom_groups  # type: ignore[attr-defined]
+        _keep_declared_metadata(cls, GroupByFieldType, object_type, objects_type)
         self._cover_shown_fields(model, GroupByType)
 
         self._group_registry[model] = GroupByType
@@ -2402,34 +3063,192 @@ class BaseBackend:
         """Cut *query* to one page in SQL, or ``None`` to have it read whole."""
         return None
 
-    def apply_type_scope(self, query: Any, model: type | None, info: Any) -> Any:
-        """Apply *model*'s ``scope_rows`` to *query*, if one is registered.
+    def apply_type_scope(
+        self,
+        query: Any,
+        model: type | None,
+        info: Any,
+        *,
+        read_as: Iterable[type] | None = None,
+    ) -> Any:
+        """Apply to *query* the ``scope_rows`` of each type its rows are read as.
 
-        A query is scoped at most once. The optimizer and a resolver can both
-        call this; the second call is a no-op so a scope that joins is not
-        applied twice. A query reading a subclass of *model* whose own type
-        scopes its rows is held to that scope as well, as the rows are read
-        as the subclass's.
+        That is *model*'s, and the scopes ``row_scopes`` holds the rows to:
+        those of the class *query* reads, a subclass of *model* whose own type
+        may scope its rows, and of each type the field *info* resolves reads
+        them as. *read_as* stands for the models of those types.
+
+        A scope is applied to a query at most once. The optimizer and a
+        resolver can both call this; a scope applied already is not applied
+        again, so one that joins is not applied twice.
         """
         if model is None:
             return query
-        from strawberry_orm.lazy_resolution import mark_query_scoped, query_is_scoped
+        from strawberry_orm.lazy_resolution import mark_query_scoped, query_scopes
 
-        if query_is_scoped(query):
+        read = self.query_model(query)
+        rows_of = read if isinstance(read, type) and issubclass(read, model) else model
+        own = self._type_querysets.owner(model)
+        if own is not None and not self.governs(own, rows_of):
+            own = None
+        apart = frozenset(self.classes_scoped_apart(model))
+        owed = (frozenset({own, *apart}) - {None}) | self.row_scopes(
+            rows_of, info, read_as=read_as
+        )
+        done = query_scopes(query)
+        if done is not None and owed <= done:
             return query
-        get_qs = self._type_querysets.get(model)
-        scoped = query if get_qs is None else get_qs(query, info)
-        scoped = self._scope_subclass_rows(scoped, model, info)
-        apart = self._subclass_read_apart(query, model)
-        if apart is not None:
-            scoped = self._type_querysets.exact(apart)(scoped, info)
+        done = done or frozenset()
+        scoped = query
+        if own not in done | {None}:
+            scoped = self.call_row_scope(self._type_querysets.exact(own), scoped, info)
+        if not apart <= done:
+            scoped = self._scope_subclass_rows(scoped, model, info)
+        # The others, nearest the base first, as each wraps what it is given.
+        for cls in reversed(rows_of.__mro__):
+            if cls in owed and cls not in done | apart | {own}:
+                scoped = self.call_row_scope(
+                    self._type_querysets.exact(cls), scoped, info
+                )
         # A scope that hands back what it was given (everything, for an admin)
         # leaves the caller's own object, which a module-level statement can
         # share with requests the scope would narrow. Scoping it again costs
         # nothing, so only a query scoping built is marked.
         if scoped is not query:
-            mark_query_scoped(scoped)
+            mark_query_scoped(scoped, done | owed)
         return scoped
+
+    def call_row_scope(self, scope: Any, query: Any, info: Any) -> Any:
+        """What *scope*, a type's ``scope_rows`` or a field's ``scope=``, makes of *query*.
+
+        Every scope runs through here, so it allows the same rows wherever the
+        library applies it; see ``rows_scope_allows``. An error the ORM raises
+        as the scope builds its query is told to the client as a read's.
+        """
+        from strawberry_orm.fields import call_scope
+
+        with self.read_errors():
+            scoped = call_scope(scope, query, info)
+        return self.rows_scope_allows(query, scoped)
+
+    def call_repo_scope(self, repo: Any, query: Any, info: Any) -> Any:
+        """What *repo*'s ``scope_query`` makes of *query*, a write's lookup.
+
+        Every lookup a write makes through a repo runs through here, so its
+        scope allows the same rows there as a row scope does anywhere: a
+        lookup takes at most a row or two of what it finds, and a limit of
+        none would give way to its own (see ``rows_scope_allows``).
+        """
+        return self.rows_scope_allows(query, repo.scope_query(query, info))
+
+    def read_errors(self) -> AbstractContextManager[None]:
+        """Raise only what a client may see in place of the ORM failing a read."""
+        return nullcontext()
+
+    def rows_scope_allows(self, given: Any, scoped: Any) -> Any:
+        """*scoped*, what a row scope made of *given*, as the rows it allows.
+
+        A scope is applied to statements of the library's own as well as to the
+        read it was handed: a relation loaded for many parents, a filter's or a
+        group's subquery, the keys of rows a resolver returned. A scope allowing
+        no rows comes back saying so with a condition, which each of those
+        keeps where a limit of none may be dropped or replaced. A limit or
+        offset the scope adds is refused: in another statement it would count
+        that statement's rows, and in the read itself a client's filter or
+        order would pick the rows it keeps. A limit *given* already carries is
+        the resolver's, and stays.
+        """
+        return scoped
+
+    def row_scopes(
+        self,
+        row_class: type,
+        info: Any,
+        row: Any = None,
+        *,
+        read_as: Iterable[type] | None = None,
+    ) -> frozenset[type]:
+        """The classes whose ``scope_rows`` a *row_class* row the field hands out passes.
+
+        A row is held to the scope of each type it may be read as: the types
+        over its own class and the models whose tables hold it (see
+        ``ScopeHooks.owners``), the ORM type field *info* is declared with,
+        which may be over a base of that class, and under an interface or
+        union, the type *row* is cast to in this execution or else the one
+        over its nearest class. Wrappers such as a connection's
+        ``edges { node }`` or a payload's ``data`` are looked through.
+        *read_as*, when given, are the models of the types read as instead;
+        ``()`` leaves the own class's. A type over a model that does not
+        govern the row (see ``governs``) has no say over it.
+        """
+        owner = self._type_querysets.owner
+        if read_as is None:
+            read_as = self._models_read_as(info, row_class, row)
+        scopes = set(self._type_querysets.owners(row_class))
+        scopes.update(
+            owner(model) for model in read_as if self.governs(model, row_class)
+        )
+        scopes.discard(None)
+        return frozenset(scopes)
+
+    def _models_read_as(
+        self, info: Any, row_class: type, row: Any = None
+    ) -> list[type]:
+        """The models of the types field *info* reads a *row_class* row as."""
+        from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+        models, abstracts = self._types_returned(info)
+        read = list(models)
+        if not abstracts:
+            return read
+        raw = graphql_resolve_info(info)
+        cast = None if row is None else get_strawberry_type_cast(row)
+        for abstract in abstracts:
+            if cast is not None and cast in _possible_types(raw, abstract):
+                read.append(getattr(cast, "__orm_model__", None))
+            else:
+                read.extend(
+                    origin.is_type_of.orm_model
+                    for origin in _nearest_row_types(raw, abstract, row_class)
+                )
+        return read
+
+    def _types_returned(self, info: Any) -> tuple[tuple[type, ...], tuple[Any, ...]]:
+        """The models of the ORM types field *info* returns rows of, and its abstract types.
+
+        Wrappers around the rows, such as a connection's ``edges { node }``,
+        are looked through, as in ``_returned_type_name``. An ORM type is not,
+        nor an interface or union: their fields lead to other rows.
+        """
+        from strawberry_orm.optimizer.selections import graphql_resolve_info
+
+        return_type = getattr(graphql_resolve_info(info), "return_type", None)
+        named = None if return_type is None else get_named_type(return_type)
+        if named is None:
+            return (), ()
+        known = self._returned_types.get(named)
+        if known is not None:
+            return known
+        models: list[type] = []
+        abstracts: list[Any] = []
+        frontier = [named]
+        seen: set[Any] = set()
+        for _ in range(4):
+            wrapped: list[Any] = []
+            for graphql_type in frontier:
+                if graphql_type in seen:
+                    continue
+                seen.add(graphql_type)
+                name = getattr(graphql_type, "name", None)
+                if name in self._type_registry:
+                    models.append(self._type_registry[name])
+                elif is_abstract_type(graphql_type):
+                    abstracts.append(graphql_type)
+                elif isinstance(fields := getattr(graphql_type, "fields", None), dict):
+                    wrapped.extend(get_named_type(f.type) for f in fields.values())
+            frontier = wrapped
+        known = self._returned_types[named] = (tuple(models), tuple(abstracts))
+        return known
 
     def classes_scoped_apart(self, model: type) -> list[type]:
         """Subclasses a read of *model* returns as themselves, scoped by their own type.
@@ -2442,61 +3261,75 @@ class BaseBackend:
         """*query* over *model*, less the rows of a subclass its own scope hides."""
         return query
 
-    def _subclass_read_apart(self, query: Any, model: type) -> type | None:
-        """The class scoping the rows *query* reads, where *model*'s does not.
-
-        A field over *model*'s type may return a query over a subclass, whose
-        rows are scoped by the subclass's own type when it has one. ``None``
-        when *model*'s scope covers them, or ``_scope_subclass_rows`` already
-        held them to theirs.
-        """
-        read = self.query_model(query)
-        if not isinstance(read, type) or read is model or not issubclass(read, model):
-            return None
-        owner = self._type_querysets.owner(read)
-        if owner in (None, self._type_querysets.owner(model)):
-            return None
-        return None if owner in self.classes_scoped_apart(model) else owner
-
-    def filter_scoped_pks(self, model: type, pks: list[Any], info: Any) -> Any:
+    def filter_scoped_pks(
+        self,
+        model: type,
+        pks: list[Any],
+        info: Any,
+        *,
+        read_as: Iterable[type] | None = None,
+    ) -> Any:
         """Return the subset of *pks* ``scope_rows`` still allows.
 
+        The scopes are those ``apply_type_scope`` applies, given *read_as*.
         May be a set or an awaitable of a set. Override per backend.
         """
         raise NotImplementedError(
             f"{type(self).__name__} cannot re-check scope_rows against loaded rows"
         )
 
-    def scope_instances(self, rows: list[Any], info: Any) -> Any:
-        """Drop instances whose model ``scope_rows`` rejects.
+    def scope_instances(
+        self, rows: list[Any], info: Any, *, read_as: Iterable[type] | None = None
+    ) -> Any:
+        """Drop instances the ``scope_rows`` of a type they are read as rejects.
 
-        Returns a list, or an awaitable of a list on async backends. Instances
-        of models with no ``scope_rows`` pass through. A subclass's instance is
-        checked against the scope it inherits, by the class that declares it,
-        and a mark another read left on it is trusted only if it was made by
-        that class's scope. A scoped model whose instance has no primary key
-        cannot be checked, so that raises rather than returning the row.
+        Returns a list, or an awaitable of a list on async backends. Each row
+        is held to the scopes ``row_scopes`` finds for it in the field *info*
+        resolves: its own class's, inherited from the class that declares it,
+        and those of the types the field reads it as, whose models *read_as*
+        stands for. A row held to none passes through, and a mark another read
+        left on it is trusted only if it names every one. A scoped model whose
+        instance has no primary key cannot be checked, so that raises rather
+        than returning the row.
         """
         from inspect import isawaitable
 
         from strawberry_orm.lazy_resolution import mark_rows_scoped, row_is_scoped
 
-        owners: dict[type, type | None] = {}
-        for row in rows:
-            if type(row) not in owners:
-                owners[type(row)] = self._type_querysets.owner(type(row))
-        groups: dict[type, list[Any]] = {}
+        known: dict[tuple[type, Any], tuple[tuple[type, ...], frozenset[type]]] = {}
+
+        def owed(row: Any) -> tuple[tuple[type, ...], frozenset[type]]:
+            cls = type(row)
+            # Under an interface or union, the type it is read as is its cast's.
+            key = (cls, None if read_as is not None else get_strawberry_type_cast(row))
+            if key not in known:
+                read = (
+                    self._models_read_as(info, cls, row) if read_as is None else read_as
+                )
+                models = tuple(
+                    dict.fromkeys(model for model in read if self.governs(model, cls))
+                )
+                known[key] = (models, self.row_scopes(cls, info, read_as=models))
+            return known[key]
+
+        each = [owed(row) for row in rows]
         # Read once: another execution sharing the row can mark it meanwhile.
-        scoped = {id(row) for row in rows if row_is_scoped(row, owners[type(row)])}
-        for row in rows:
-            owner = owners[type(row)]
-            if id(row) not in scoped and owner is not None:
-                groups.setdefault(owner, []).append(row)
+        scoped = {
+            id(row)
+            for row, (_models, scopes) in zip(rows, each, strict=True)
+            if not scopes or row_is_scoped(row, scopes)
+        }
+        # By the row's own class, not the one whose scope it inherits: a
+        # subclass can keep its rows in a table of its own, keyed apart.
+        groups: dict[tuple[type, tuple[type, ...]], list[Any]] = {}
+        for row, (models, _scopes) in zip(rows, each, strict=True):
+            if id(row) not in scoped:
+                groups.setdefault((type(row), models), []).append(row)
         if not groups:
             return list(rows)
 
-        pending: list[tuple[type, Any]] = []
-        for model, group in groups.items():
+        pending: list[tuple[tuple[type, tuple[type, ...]], Any]] = []
+        for (model, models), group in groups.items():
             pks: list[Any] = []
             for row in group:
                 pk = self.instance_pk(row)
@@ -2507,56 +3340,64 @@ class BaseBackend:
                         f"key, so the scope could not be checked."
                     )
                 pks.append(pk)
-            pending.append((model, self.filter_scoped_pks(model, pks, info)))
+            allowed = self.filter_scoped_pks(model, pks, info, read_as=models)
+            pending.append(((model, models), allowed))
 
-        def finish(allowed: dict[type, set[Any]]) -> list[Any]:
-            kept = [
-                row
-                for row in rows
-                if id(row) in scoped
-                or owners[type(row)] is None
-                or self.instance_pk(row) in allowed[owners[type(row)]]
-            ]
-            by_owner: dict[type | None, list[Any]] = {}
-            for row in kept:
-                by_owner.setdefault(owners[type(row)], []).append(row)
-            for owner, group in by_owner.items():
-                mark_rows_scoped(group, owner)
+        def finish(allowed: dict[tuple[type, tuple[type, ...]], set[Any]]) -> list[Any]:
+            by_scopes: dict[frozenset[type], list[Any]] = {}
+            kept = []
+            for row, (models, scopes) in zip(rows, each, strict=True):
+                if (
+                    id(row) in scoped
+                    or self.instance_pk(row) in allowed[(type(row), models)]
+                ):
+                    kept.append(row)
+                    by_scopes.setdefault(scopes, []).append(row)
+            for scopes, group in by_scopes.items():
+                mark_rows_scoped(group, scopes)
             return kept
 
-        if any(isawaitable(pks) for _model, pks in pending):
+        if any(isawaitable(pks) for _group, pks in pending):
 
             async def _await_allowed() -> list[Any]:
-                allowed: dict[type, set[Any]] = {}
-                for model, pks in pending:
-                    allowed[model] = await pks if isawaitable(pks) else pks
+                allowed: dict[tuple[type, tuple[type, ...]], set[Any]] = {}
+                for group, pks in pending:
+                    allowed[group] = await pks if isawaitable(pks) else pks
                 return finish(allowed)
 
             return _await_allowed()
 
-        return finish({model: pks for model, pks in pending})
+        return finish(dict(pending))
 
     def scope_owner(self, model: Any) -> type | None:
         """The class whose ``scope_rows`` scopes *model*'s rows, if any."""
         return self._type_querysets.owner(model)
 
-    def rows_scoped_apart(self, rows: Any, model: Any) -> list[Any]:
+    def scope_owners(self, model: Any) -> frozenset[type]:
+        """Every class whose ``scope_rows`` scopes *model*'s rows (see ``ScopeHooks.owners``)."""
+        return frozenset(self._type_querysets.owners(model))
+
+    def rows_scoped_apart(self, rows: Any, model: Any, info: Any = None) -> list[Any]:
         """The *rows* that a read scoped by *model*'s ``scope_rows`` did not scope.
 
         A read is scoped by the model it is over, the one a query selects or a
         relation targets. A row of a subclass whose type defines its own
-        ``scope_rows`` is scoped by that instead, and under an interface or
-        union it is shown as that type, so it has to be checked again.
+        ``scope_rows`` is scoped by that as well, and under an interface or
+        union it is shown as that type, so it has to be checked again. Given
+        the *info* of the field handing the rows out, so is a row that field
+        reads as a type whose scope is another's.
         """
-        owner = self._type_querysets.owner(model)
-        owners: dict[type, type | None] = {}
-        apart: list[Any] = []
-        for row in rows:
-            if type(row) not in owners:
-                owners[type(row)] = self._type_querysets.owner(type(row))
-            if owners[type(row)] not in (None, owner):
-                apart.append(row)
-        return apart
+        read = self.scope_owners(model)
+        return [
+            row
+            for row in rows
+            if (
+                self.row_scopes(type(row), info, row)
+                if info is not None
+                else self.scope_owners(type(row))
+            )
+            - read
+        ]
 
     # -- Scoping across relation traversal -----------------------------------
 
@@ -2598,7 +3439,7 @@ class BaseBackend:
 
         from strawberry_orm.fields import every_scope
 
-        return every_scope(scopes)
+        return every_scope(scopes, call=self.call_row_scope)
 
     def _reading_type_names(self, model: type, info: Any) -> list[str]:
         """The type *model*'s rows are read as outside a filter.
@@ -2665,7 +3506,13 @@ class BaseBackend:
         return found.pop() if len(found) == 1 else None
 
     def relation_scope(
-        self, model: type, relation: str, info: Any, *, on: str | None = None
+        self,
+        model: type,
+        relation: str,
+        info: Any,
+        *,
+        on: str | None = None,
+        type_name: str | None = None,
     ) -> Any | None:
         """Everything that restricts the far side of *relation*, or ``None``.
 
@@ -2678,12 +3525,19 @@ class BaseBackend:
         A ``on=`` field is not a relation, so the far side is found through
         the relation it names while the edge's own scope stays keyed to the
         field. Without that split the scope silently resolves to nothing.
+
+        Given *type_name*, the edge's ``scope=`` is that type's, as when a
+        ``using=`` path walks the relation from rows shown as that type.
         """
         related = self._relation_target_model(model, on or relation)
         if related is None:
             return None
         get_qs = self._type_querysets.get(related)
-        field_scope = self._field_scope(model, relation, info)
+        field_scope = (
+            self._field_scope(model, relation, info)
+            if type_name is None
+            else self._edge_scope(type_name, relation)
+        )
         if (
             get_qs is None
             and field_scope is None
@@ -2697,25 +3551,192 @@ class BaseBackend:
                 f"resolver's info. Pass info= to apply_filters()."
             )
 
-        from strawberry_orm.fields import call_scope
+        applied = self.scope_owners(related) | set(self.classes_scoped_apart(related))
 
         def restrict(query: Any, resolver_info: Any) -> Any:
             from strawberry_orm.lazy_resolution import mark_query_scoped
 
             given = query
             if get_qs is not None:
-                query = get_qs(query, resolver_info)
+                query = self.call_row_scope(get_qs, query, resolver_info)
             query = self._scope_subclass_rows(query, related, resolver_info)
             if field_scope is not None:
-                query = call_scope(field_scope, query, resolver_info)
+                query = self.call_row_scope(field_scope, query, resolver_info)
             # The query is scoped, so a later apply_type_scope must not apply
-            # scope_rows a second time. One the scopes handed back unchanged
+            # these scopes a second time. One the scopes handed back unchanged
             # is the caller's, as in apply_type_scope.
             if query is not given:
-                mark_query_scoped(query)
+                mark_query_scoped(query, applied)
             return query
 
         return restrict
+
+    def _edge_scope(self, type_name: str, relation: str) -> Any | None:
+        """The ``scope=`` type *type_name* puts on *relation*, if any."""
+        hints = self._store.get(type_name, relation)
+        return getattr(hints, "scope", None) if hints else None
+
+    # -- Relations a resolver reads itself -----------------------------------
+
+    def resolve_using(
+        self,
+        instance: Any,
+        paths: Iterable[str],
+        info: Any,
+        call: Callable[[], Any],
+    ) -> Any:
+        """Call *call*, a ``using=`` resolver, once *instance*'s relations hold what they may.
+
+        A ``using=`` resolver reads its relations off the rows itself, where
+        nothing checks them, and a relation can hold rows that some other read
+        put there: an app's loader options, a mapper's eager default, a sibling
+        field over the same rows, or an earlier request on a row the app
+        keeps. Each relation *paths* walk is trusted only as this execution's
+        own scoped load left it, under the scope of the type the rows are
+        shown as; any other is read again under that scope, onto the rows.
+
+        *call* runs straight after a pass over them all that read nothing, so
+        no load onto the rows runs between that check and the resolver. Rows
+        other loads keep replacing meanwhile are refused.
+        """
+        from strawberry_orm._async import Steps, drive
+
+        tree: dict[str, dict[str, Any]] = {}
+        for path in paths:
+            level = tree
+            for hop in hint_hops(path):
+                level = level.setdefault(hop, {})
+        if not tree or not self.is_model_instance(instance):
+            return call()
+        model = type(instance)
+        hops = self._using_hops(
+            model, self._resolved_type_name(model, info), tree, info
+        )
+
+        def passes() -> Steps:
+            for _attempt in range(_USING_PASSES):
+                read = yield from self._hops_read_scoped([instance], model, hops, info)
+                if not read:
+                    return call()
+            raise RuntimeError(
+                f"Other loads kept replacing the relations of this "
+                f"{model.__name__} while a using= resolver waited to read them."
+            )
+
+        return self._exclusively(lambda: drive(passes()))
+
+    def _reads_using(self, using: list[str] | None) -> list[Any]:
+        """The extensions a field reading *using* off its row needs: see :meth:`resolve_using`."""
+        from strawberry_orm.core import _ReadsUsingScoped
+
+        return [_ReadsUsingScoped(self, list(using))] if using else []
+
+    def _exclusively(self, work: Callable[[], Any]) -> Any:
+        """Run *work* where no other load onto rows runs while it does."""
+        return work()
+
+    def _using_hops(
+        self,
+        model: type,
+        type_name: str | None,
+        tree: dict[str, dict[str, Any]],
+        info: Any,
+    ) -> list[tuple[str, type, Any, Any, list[Any]]]:
+        """Each relation *tree* walks: ``(name, related, restrict, token, below)``.
+
+        *restrict* is its :meth:`relation_scope` for rows shown as *type_name*,
+        *token* the edge's ``scope=`` a mark must name. An unscoped relation is
+        kept only to walk on from.
+        """
+        names = self.relation_names(model)
+        hops: list[tuple[str, type, Any, Any, list[Any]]] = []
+        for name, below in tree.items():
+            related = self._relation_target_model(model, name)
+            if name not in names or related is None:
+                continue
+            children = (
+                self._using_hops(
+                    related,
+                    self._child_type_name(type_name, name, related, info),
+                    below,
+                    info,
+                )
+                if below
+                else []
+            )
+            restrict = self.relation_scope(model, name, info, type_name=type_name)
+            if restrict is None and not children:
+                continue
+            token = self._edge_scope(type_name, name) if type_name else None
+            hops.append((name, related, restrict, token, children))
+        return hops
+
+    def _hops_read_scoped(
+        self,
+        rows: list[Any],
+        model: type,
+        hops: list[tuple[str, type, Any, Any, list[Any]]],
+        info: Any,
+    ) -> Generator[Any, Any, bool]:
+        """Read again each of *hops* that does not hold what it may.
+
+        Returns whether it read any.
+        """
+        read = False
+        for name, related, restrict, token, below in hops:
+            stale = [
+                row
+                for row in rows
+                if not (
+                    self.relation_loaded(row, name)
+                    if restrict is None
+                    else self.relation_holds_scoped(row, name, token)
+                )
+            ]
+            if stale:
+                yield self.read_relation_scoped(
+                    stale, model, name, restrict, token, info
+                )
+                read = True
+            related_rows = self.held_related(rows, name) if below else []
+            if related_rows:
+                read = (
+                    yield from self._hops_read_scoped(
+                        related_rows, related, below, info
+                    )
+                ) or read
+        return read
+
+    def relation_loaded(self, row: Any, name: str) -> bool:
+        """Whether relation *name* of *row* holds something, without reading it."""
+        raise NotImplementedError
+
+    def relation_holds_scoped(self, row: Any, name: str, token: Any) -> bool:
+        """Whether *name* holds what this execution's scoped load left there.
+
+        *token* is the edge's ``scope=`` that load had to apply.
+        """
+        raise NotImplementedError
+
+    def held_related(self, rows: list[Any], name: str) -> list[Any]:
+        """The rows *name* holds on each of *rows*, each once, reading nothing."""
+        raise NotImplementedError
+
+    def read_relation_scoped(
+        self,
+        rows: list[Any],
+        model: type,
+        name: str,
+        restrict: Any,
+        token: Any,
+        info: Any,
+    ) -> Any:
+        """Read *name* onto *rows* under *restrict*, marked with *token*.
+
+        *restrict* is a :meth:`relation_scope`, or ``None`` for a relation
+        nothing restricts. Returns ``None``, or an awaitable.
+        """
+        raise NotImplementedError
 
     def reject_scoped_order_traversal(
         self, model: type, relation: str, order_type: Any = None
@@ -2727,7 +3748,9 @@ class BaseBackend:
 
         ``orm.schema()`` rejects these at build time. This is the backstop for
         schemas built with ``strawberry.Schema`` directly, which skips that
-        check.
+        check. The client is told only the relation it named: what scopes it
+        names the app's classes and settings, so that is kept as the cause, for
+        the server log.
         """
         related = self._relation_target_model(model, relation)
         if related is None or scoped_ordering_allowed(order_type, relation):
@@ -2735,6 +3758,9 @@ class BaseBackend:
         reason = self._order_scope_reason(model, relation, related)
         if reason is not None:
             raise ValueError(
+                f"Cannot order by {relation}: its rows are scoped, so ordering "
+                f"by them would rank rows the caller cannot read."
+            ) from ValueError(
                 self._scoped_order_message(model, relation, related, reason)
             )
 
@@ -2862,15 +3888,15 @@ class BaseBackend:
             if issubclass(input_model, model)
             for entry in entries
         ]
-        for input_name, fields in written:
+        for input_name, fields, use in written:
             leaked = sorted(excluded & fields)
             if leaked:
                 raise ValueError(
                     f"{type_name} excludes {leaked} but {input_name} can still "
-                    f"write them, so a caller can set values they cannot read. "
-                    f"Leave them out of {input_name}: pass exclude={leaked!r} to "
-                    f"orm.input()/orm.partial(), or drop them from its _meta "
-                    f"projection, or declare the type before the input."
+                    f"{_INPUT_USES[use]}. Leave them out of {input_name}: pass "
+                    f"exclude={leaked!r} to orm.input()/orm.partial(), or drop "
+                    f"them from its _meta projection, or declare the type before "
+                    f"the input."
                 )
 
     def _register_model_filter(self, model: type, filter_type: type) -> None:
@@ -2981,9 +4007,15 @@ class BaseBackend:
         return columns, relations
 
     def input_cuts(
-        self, reached: set[Any], schema_tags: frozenset[str] | None = None
+        self,
+        reached: set[Any],
+        schema_tags: frozenset[str] | None = None,
+        served: Callable[[Any], Any] = lambda field: field,
     ) -> dict[Any, Any]:
         """How a schema reaching *reached* cuts the generated inputs it reaches.
+
+        *served* is the field the schema serves for a declared one: a tagged
+        schema serves a copy, whose extensions may give it arguments of their own.
 
         Each input covers what the types it serves in that schema show: the
         types it is attached to, the types of the rows the fields taking it
@@ -3001,7 +4033,7 @@ class BaseBackend:
             for item in inputs
             if _reached_input(item, reached)
         ]
-        uses = self._input_uses(items, reached, schema_tags)
+        uses = self._input_uses(items, reached, schema_tags, served)
         part_covers: dict[Any, list[tuple[_Cover, _Cover]]] = {}
         part_labels: dict[Any, str | None] = {}
         holders: dict[Any, list[tuple[Any, str | None]]] = {}
@@ -3072,7 +4104,8 @@ class BaseBackend:
         self,
         items: list[tuple[type, Any]],
         reached: set[Any],
-        schema_tags: frozenset[str] | None = None,
+        schema_tags: frozenset[str] | None,
+        served: Callable[[Any], Any],
     ) -> dict[int, list[type]]:
         """The types each input serves in a schema that reaches *reached*.
 
@@ -3084,7 +4117,7 @@ class BaseBackend:
             id(item): [o for o in getattr(item, "_orm_owners", ()) if o in reached]
             for _, item in items
         }
-        self._follow_arguments(items, uses, reached, schema_tags)
+        self._follow_arguments(items, uses, reached, schema_tags, served)
         behind = self._follow_relations(items, uses, reached)
         for model, item in items:
             if not uses[id(item)] and id(item) not in behind:
@@ -3099,6 +4132,7 @@ class BaseBackend:
         uses: dict[int, list[type]],
         reached: set[Any],
         schema_tags: frozenset[str] | None,
+        served: Callable[[Any], Any],
     ) -> None:
         """Add, to each input a field takes, the type its rows are returned as.
 
@@ -3125,7 +4159,7 @@ class BaseBackend:
             for field in definition.fields:
                 if not _in_schema(tags_of(field), schema_tags):
                     continue
-                for argument in field.arguments:
+                for argument in served(field).arguments:
                     item = named_type(argument.type)
                     model = models.get(id(item))
                     if model is None or not _in_schema(tags_of(argument), schema_tags):
@@ -3253,7 +4287,12 @@ class BaseBackend:
     # The default refuses to batch, which is always correct - just slower.
 
     def instance_pk(self, instance: Any) -> Any:
-        """Primary key of *instance*, used to key batched rows back to parents."""
+        """Primary key of *instance*, used to key batched rows back to parents
+        and check rows against a scope.
+
+        A key of several columns is the tuple of their values, as
+        :meth:`filter_scoped_pks` and :meth:`group_memberships` answer it.
+        """
         return None
 
     def split_parent_predicate(
@@ -3349,45 +4388,26 @@ class BaseBackend:
 
     # One model can be registered as several GraphQL types, each with its own
     # field hints, so ``_type_name_for_model`` - which can only ever return the
-    # first registration - must not decide which hints apply. The three lookups
-    # below read the type out of the request instead, and fall back to the
-    # registration-order name only when the request does not carry one (a test
-    # double without a schema, a wrapper referencing two types of one model).
-
-    def _selection_type_name(self, model: type, info: Any) -> str | None:
-        """Name of *model*'s type whose selection the optimizer is walking."""
-        from strawberry_orm.optimizer.selections import (
-            graphql_resolve_info,
-            registered_type_name,
-        )
-
-        return_type = getattr(graphql_resolve_info(info), "return_type", None)
-        name = registered_type_name(return_type, model, self._type_registry)
-        return (
-            name if name is not None else next(iter(self._type_names_of(model)), None)
-        )
+    # first registration - must not decide which hints apply. The optimizer's
+    # planner reads the types out of the request; the lookups below do too,
+    # and fall back to the registration-order name only when the request
+    # does not carry one.
 
     def _child_type_name(
-        self,
-        parent_type_name: str | None,
-        field_name: str,
-        model: type,
-        info: Any,
+        self, type_name: str | None, field_name: str, related: type, info: Any
     ) -> str | None:
-        """Name of *model*'s type that *field_name* under *parent_type_name* yields."""
-        from strawberry_orm.optimizer.selections import (
-            child_field_type,
-            graphql_resolve_info,
-            registered_type_name,
-        )
+        """The hints rows of *related* that *field_name* of *type_name* holds are read under.
 
-        schema = getattr(graphql_resolve_info(info), "schema", None)
-        field_type = child_field_type(schema, parent_type_name, field_name)
-        name = registered_type_name(field_type, model, self._type_registry)
-        return name if name is not None else self._every_type_name(model)
+        The types are the ones the optimizer's planner loads the relation as,
+        so a ``using=`` hop is held to the scope its load applied.
+        """
+        from strawberry_orm.optimizer.planning import Planner
 
-    def _every_type_name(self, model: type) -> str | None:
-        """A name for the hints of whichever type over *model* reads its rows.
+        planner = Planner(self, self._store, info)
+        return self._hints_name(planner._child_types(type_name, field_name, related))
+
+    def _hints_name(self, names: Iterable[str | None]) -> str | None:
+        """A name for the hints of whichever of *names* reads the rows.
 
         Which one cannot be told, so under it each relation carries the
         ``scope=`` of every one of them and loads only the rows all of them
@@ -3395,7 +4415,7 @@ class BaseBackend:
         """
         from strawberry_orm.fields import every_scope
 
-        names = self._type_names_of(model)
+        names = [name for name in dict.fromkeys(names) if name is not None]
         if len(names) < 2:
             return next(iter(names), None)
         hints = dict(self._store.hints.get(names[0], {}))
@@ -3409,7 +4429,9 @@ class BaseBackend:
             if found:
                 hints[field_name] = dataclasses.replace(
                     hints.get(field_name) or FieldHints(),
-                    scope=found[0] if len(found) == 1 else every_scope(found),
+                    scope=found[0]
+                    if len(found) == 1
+                    else every_scope(found, call=self.call_row_scope),
                 )
         # Not a GraphQL name, so it never stands for a type in the schema.
         every = "|".join(names)
@@ -3518,7 +4540,7 @@ class BaseBackend:
         friends, processes ``FieldDefinition`` / ``_orm_auto_field`` attrs,
         registers ``scope_rows``, and returns the resolved type name.
         """
-        from strawberry_orm.types import FieldDefinition
+        from strawberry_orm.types import FieldDefinition, look_up_names
 
         annotations = getattr(cls, "__annotations__", {}).copy()
         if include:
@@ -3534,6 +4556,7 @@ class BaseBackend:
 
         cls.__annotations__ = annotations
         cls.__orm_model__ = model  # type: ignore[attr-defined]
+        _cast_per_execution(model)
         # Read before the backend installs resolvers of its own, which would
         # make every relation look like a field with a custom resolver. Own
         # annotations alone miss columns an interface or mixin declares.
@@ -3586,32 +4609,33 @@ class BaseBackend:
 
         self._check_missing_scope(cls, model, type_name)
 
-        # Metadata of the placeholders removed below, so the backend builds
-        # the field as usual; _finalize_type puts it back on that field.
-        removed_metadata: dict[str, Any] = {}
+        # The placeholders removed below, so the backend builds each field as
+        # it builds any other; _finalize_type gives it what was declared.
+        declared: dict[str, _Declared] = {}
         for attr_name in list(vars(cls)):
             val = getattr(cls, attr_name, None)
             if isinstance(val, FieldDefinition):
+                # The backend reads the relation's shape off the annotation.
+                if isinstance(annotations.get(attr_name), str):
+                    annotations[attr_name] = look_up_names(cls, annotations[attr_name])
                 hints = val.to_hints()
                 self._validate_scoped_relation(model, type_name, attr_name, hints)
                 self._validate_hints(model, type_name, attr_name, hints)
                 self._store.register(type_name, attr_name, hints)
-                if getattr(val, "permission_classes", None):
-                    setattr(
-                        cls,
-                        attr_name,
-                        strawberry.field(
-                            permission_classes=val.permission_classes,
-                            description=val.description,
-                            metadata=val.metadata,
-                        ),
-                    )
-                else:
-                    if val.metadata:
-                        removed_metadata[attr_name] = val.metadata
-                    delattr(cls, attr_name)
+                declared[attr_name] = _Declared(
+                    strawberry.field(
+                        permission_classes=val.permission_classes,
+                        description=val.description,
+                        deprecation_reason=val.deprecation_reason,
+                        metadata=val.metadata,
+                        extensions=self._reads_using(val.using),
+                    ),
+                    filters=val.filters,
+                    order=val.order,
+                )
+                delattr(cls, attr_name)
             elif _metadata_only_field(val) and attr_name in annotations:
-                removed_metadata[attr_name] = dict(val.metadata)
+                declared[attr_name] = _Declared(val)
                 delattr(cls, attr_name)
             elif getattr(val, "_orm_computed_hints", None) is not None:
                 self._validate_hints(
@@ -3625,12 +4649,80 @@ class BaseBackend:
                         cls, model, type_name, attr_name, pending
                     )
                     continue
-                if getattr(val, "metadata", None):
-                    removed_metadata[attr_name] = dict(val.metadata)
+                declared[attr_name] = _declared_by_auto_field(
+                    val, type_name, attr_name, annotations.get(attr_name)
+                )
                 delattr(cls, attr_name)
+            elif attr_name in annotations and attr_name in self.relation_names(model):
+                if isinstance(val, StrawberryField):
+                    if val.base_resolver is None:
+                        declared[attr_name] = _Declared(val)
+                        delattr(cls, attr_name)
+                elif not callable(val):
+                    raise ValueError(
+                        f"{type_name}.{attr_name}: {attr_name!r} is a relation, "
+                        f"which the library resolves under its scopes, so it "
+                        f"takes no default ({val!r}). Remove the default, or "
+                        f"resolve the field yourself with orm.field.lazy."
+                    )
 
-        cls._orm_removed_metadata = removed_metadata  # type: ignore[attr-defined]
+        cls._orm_declared = declared  # type: ignore[attr-defined]
         return type_name
+
+    def _relation_inputs(
+        self, cls: type, field_name: str, element_type: Any
+    ) -> tuple[Any, Any]:
+        """The filter and order inputs of to-many relation *field_name*.
+
+        Those its field declared, else those of *element_type*.
+        """
+        declared = vars(cls).get("_orm_declared", {}).get(field_name)
+        filters = getattr(element_type, "__orm_filter__", None)
+        order = getattr(element_type, "__orm_order__", None)
+        if declared is None:
+            return filters, order
+        declared.served = True
+        return declared.filters or filters, declared.order or order
+
+    def _apply_declared(self, cls: type, graphql_type: Any, type_name: str) -> None:
+        """Give each field built in place of a declaration what it declared.
+
+        Its extensions go last, which makes a permission check the outermost.
+        """
+        fields = {
+            field.python_name: field
+            for field in graphql_type.__strawberry_definition__.fields
+        }
+        for field_name, declared in vars(cls).get("_orm_declared", {}).items():
+            field = fields.get(field_name)
+            if field is None:
+                raise ValueError(
+                    f"{type_name}.{field_name} has no type, so no field is "
+                    f"built for it. Annotate it: {field_name}: SomeType = ..."
+                )
+            if not declared.served and (
+                declared.filters is not None or declared.order is not None
+            ):
+                raise ValueError(
+                    f"{type_name}.{field_name}: filters= and order= are "
+                    f"arguments of a list read through the relation of the "
+                    f"same name, and {field_name} is not one. Narrow its rows "
+                    f"with scope= instead."
+                )
+            options = declared.options
+            for attr in ("description", "deprecation_reason", "graphql_name"):
+                if getattr(options, attr) is not None:
+                    setattr(field, attr, getattr(options, attr))
+            if options.metadata:
+                field.metadata = MappingProxyType(
+                    {**field.metadata, **options.metadata}
+                )
+            field.directives = [*field.directives, *options.directives]
+            field.permission_classes = [
+                *field.permission_classes,
+                *options.permission_classes,
+            ]
+            field.extensions = [*field.extensions, *options.extensions]
 
     def _register_relation_connection(
         self, model: type, type_name: str, field_name: str, relation: str
@@ -3806,13 +4898,7 @@ class BaseBackend:
         from strawberry_orm.tags import tags_of
 
         result = strawberry.type(cls, name=name if name else None)
-        removed = vars(cls).get("_orm_removed_metadata")
-        if removed:
-            for field in result.__strawberry_definition__.fields:
-                if field.python_name in removed:
-                    field.metadata = MappingProxyType(
-                        {**field.metadata, **removed[field.python_name]}
-                    )
+        self._apply_declared(cls, result, type_name)
         reads_as_is = vars(cls).get("_orm_reads_as_is", frozenset())
         shown = {
             field.python_name: tags_of(field)

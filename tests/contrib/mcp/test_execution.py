@@ -10,12 +10,12 @@ from types import SimpleNamespace
 import pytest
 import strawberry
 from django.core.exceptions import SynchronousOnlyOperation
-from graphql import GraphQLError
+from graphql import GraphQLError, parse
 from mcp import Client
 from strawberry.types.graphql import OperationType
 
 from strawberry_orm.contrib.mcp import execution, mcp_server
-from strawberry_orm.contrib.mcp.execution import Executor
+from strawberry_orm.contrib.mcp.execution import Call, Executor, Target
 
 from .fakes import schema
 
@@ -23,6 +23,10 @@ QUERY = {OperationType.QUERY}
 MUTATION = {OperationType.MUTATION}
 POSTS = "{ posts { title } }"
 TITLES = {"posts": [{"title": "Hello"}]}
+
+
+def _call(on, query, variables=None):
+    return Call(query, parse(query), OperationType.QUERY, variables or {}, Target(on))
 
 
 def _counting_schema():
@@ -55,14 +59,14 @@ def _counting_schema():
 
 async def test_a_sync_query_is_rerun_off_the_event_loop_and_warned_about(caplog):
     counting, runs = _counting_schema()
-    executor = Executor(counting, sync=None, execute=None)
+    executor = Executor(sync=None, execute=None)
 
     with (
         caplog.at_level(logging.WARNING, logger=execution.__name__),
         pytest.warns(UserWarning, match="execute_sync in a worker thread"),
     ):
-        first = await executor.run("{ count }", {}, None, QUERY)
-    second = await executor.run("{ count }", {}, None, QUERY)
+        first = await executor.run(_call(counting, "{ count }"), None)
+    second = await executor.run(_call(counting, "{ count }"), None)
 
     assert first.data == {"count": 2}
     assert second.data == {"count": 3}
@@ -101,10 +105,10 @@ async def test_sync_true_makes_no_async_attempt():
         def execute_sync(self, *args, **kwargs):
             return schema.execute_sync(*args, **kwargs)
 
-    executor = Executor(SyncOnly(), sync=True, execute=None)
+    executor = Executor(sync=True, execute=None)
 
     result = await executor.run(
-        '{ posts(filter: {title: "Hello"}) { title } }', {}, {}, QUERY
+        _call(SyncOnly(), '{ posts(filter: {title: "Hello"}) { title } }'), {}
     )
 
     assert result.data == TITLES
@@ -112,9 +116,9 @@ async def test_sync_true_makes_no_async_attempt():
 
 async def test_sync_false_never_falls_back():
     counting, runs = _counting_schema()
-    executor = Executor(counting, sync=False, execute=None)
+    executor = Executor(sync=False, execute=None)
 
-    result = await executor.run("{ count }", {}, None, QUERY)
+    result = await executor.run(_call(counting, "{ count }"), None)
 
     assert result.data is None
     assert "async context" in result.errors[0].message
@@ -134,30 +138,28 @@ class _Raising:
 
 
 async def test_a_raised_sync_only_operation_also_falls_back():
-    executor = Executor(
-        _Raising(SynchronousOnlyOperation("async unsafe")), sync=None, execute=None
-    )
+    raising = _Raising(SynchronousOnlyOperation("async unsafe"))
+    executor = Executor(sync=None, execute=None)
 
     with pytest.warns(UserWarning, match="execute_sync"):
-        result = await executor.run(POSTS, {}, {}, QUERY)
+        result = await executor.run(_call(raising, POSTS), {})
 
     assert result.data["posts"][0] == {"title": "Hello"}
 
 
 async def test_sync_false_lets_a_raised_sync_only_operation_through():
-    executor = Executor(
-        _Raising(SynchronousOnlyOperation("async unsafe")), sync=False, execute=None
-    )
+    raising = _Raising(SynchronousOnlyOperation("async unsafe"))
+    executor = Executor(sync=False, execute=None)
 
     with pytest.raises(SynchronousOnlyOperation):
-        await executor.run(POSTS, {}, {}, QUERY)
+        await executor.run(_call(raising, POSTS), {})
 
 
 async def test_other_errors_still_raise():
-    executor = Executor(_Raising(RuntimeError("db down")), sync=None, execute=None)
+    executor = Executor(sync=None, execute=None)
 
     with pytest.raises(RuntimeError, match="db down"):
-        await executor.run(POSTS, {}, {}, QUERY)
+        await executor.run(_call(_Raising(RuntimeError("db down")), POSTS), {})
 
 
 async def test_an_execute_hook_runs_every_operation_and_cannot_widen_it():
@@ -170,19 +172,22 @@ async def test_an_execute_hook_runs_every_operation_and_cannot_widen_it():
             query, variable_values=variables, context_value=context
         )
 
-    executor = Executor(schema, sync=None, execute=execute)
-    allowed = set(QUERY)
+    executor = Executor(sync=None, execute=execute)
+    call = _call(schema, POSTS, {"a": 1})
 
-    result = await executor.run(POSTS, {"a": 1}, {"user": "alice"}, allowed)
+    first = await executor.run(call, {"user": "alice"})
+    second = await executor.run(call, {"user": "bob"})
 
-    assert result.data["posts"][0] == {"title": "Hello"}
-    assert seen == [(POSTS, {"a": 1}, {"user": "alice", "seen": ["alice"]}, QUERY)]
-    assert allowed == QUERY
+    assert first.data["posts"][0] == second.data["posts"][0] == {"title": "Hello"}
+    assert seen == [
+        (POSTS, {"a": 1}, {"user": "alice", "seen": ["alice"]}, QUERY),
+        (POSTS, {"a": 1}, {"user": "bob", "seen": ["bob"]}, QUERY),
+    ]
 
 
 def test_execute_and_sync_cannot_both_be_given():
     with pytest.raises(ValueError, match="not both"):
-        Executor(schema, sync=True, execute=lambda *a: None)
+        Executor(sync=True, execute=lambda *a: None)
 
 
 async def test_sync_execution_closes_stale_connections_around_each_call(monkeypatch):
@@ -198,9 +203,9 @@ async def test_sync_execution_closes_stale_connections_around_each_call(monkeypa
             return schema.execute_sync(*args, **kwargs)
 
     monkeypatch.setattr(execution, "_django_close_old_connections", lambda: close)
-    executor = Executor(Recording(), sync=True, execute=None)
+    executor = Executor(sync=True, execute=None)
 
-    await executor.run(POSTS, {}, {}, QUERY)
+    await executor.run(_call(Recording(), POSTS), {})
 
     assert events == [("close", True), ("execute", True), ("close", True)]
 

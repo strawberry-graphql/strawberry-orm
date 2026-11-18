@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from functools import partial, wraps
 from inspect import isawaitable, iscoroutinefunction
 from typing import Any, TypeVar
@@ -14,6 +14,32 @@ from weakref import WeakSet
 T = TypeVar("T")
 
 AwaitableOrValue = T | Awaitable[T]
+
+#: Work that yields each step's effect, a value or an awaitable, and is sent
+#: back its result.
+Steps = Generator[Any, Any, Any]
+
+
+def drive(steps: Steps) -> Any:
+    """Run *steps* to the end, awaiting only once a step is awaitable."""
+    value = None
+    try:
+        while True:
+            effect = steps.send(value)
+            if isawaitable(effect):
+                return _drive_async(steps, effect)
+            value = effect
+    except StopIteration as stop:
+        return stop.value
+
+
+async def _drive_async(steps: Steps, effect: Any) -> Any:
+    value = await effect
+    try:
+        while True:
+            value = await await_maybe(steps.send(value))
+    except StopIteration as stop:
+        return stop.value
 
 
 def keep_annotations(wrapper: Any, wrapped: Any) -> Any:

@@ -220,7 +220,7 @@ class TestLazyResolutionRemaining:
         assert "Named" in path
         assert "users" in path
 
-    def test_query_selection_path_fallback_inner(self):
+    def test_query_selection_path_names_a_field_the_document_does_not_spell(self):
         operation = SimpleNamespace(
             operation=SimpleNamespace(value="query"),
             name=None,
@@ -232,7 +232,7 @@ class TestLazyResolutionRemaining:
             field_name="missing",
             python_name="missing",
         )
-        assert _query_selection_path(info) == "{ missing }"
+        assert _query_selection_path(info) == "query { missing }"
 
     def test_parent_graphql_type_missing(self):
         assert _parent_graphql_type(SimpleNamespace(parent_type=None)) == "?"

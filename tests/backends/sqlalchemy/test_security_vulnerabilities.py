@@ -12,6 +12,7 @@ from tests.abstract.security_vulnerabilities import (
 )
 from tests.backends.sqlalchemy.models import Post as SAPost
 from tests.backends.sqlalchemy.models import User as SAUser
+from tests.recorded_warnings import recording
 
 
 def _orm(sa_session):
@@ -126,8 +127,6 @@ class TestSecurityVulnerabilities(AbstractTestSecurityVulnerabilities):
         return SensitiveEmployee
 
     def build_traversal_schema(self, orm):
-        import warnings
-
         user_filter = orm.filter(SAUser)
         post_filter = orm.filter(SAPost)
 
@@ -150,7 +149,6 @@ class TestSecurityVulnerabilities(AbstractTestSecurityVulnerabilities):
         class Query:
             posts: list[PT] = orm.field.auto()
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with recording() as caught:
             orm.schema(query=Query)
         return [str(warning.message) for warning in caught]

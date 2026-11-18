@@ -1,15 +1,11 @@
 """Tests for optimizer handling of union inline fragments and fragment spreads."""
 
-from typing import Annotated
-
 import pytest
-import strawberry
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from graphql import parse
 
 from strawberry_orm.backends.django import DjangoBackend
-from strawberry_orm.types import auto
 from tests.abstract.optimizer_inline_fragments import (
     AbstractTestOptimizerInlineFragmentsSync,
     AbstractTestOptimizerInlineFragmentsUnitSync,
@@ -65,61 +61,9 @@ def apply_optimizer_hints_inline_fragment(Post):
 
 
 class TestOptimizerInlineFragments(AbstractTestOptimizerInlineFragmentsSync):
-    @pytest.mark.django_db
-    def test_graphql_union_list_inline_fragments(
-        self, orm, seed, User, Post, schema_execute, users_query
-    ):
-        """Union list fields selected only via inline fragments (Django runtime)."""
-
-        @orm.type(Post, name="PostBriefUnion")
-        class PostBriefUnion:
-            id: auto
-            title: auto
-
-            @classmethod
-            def is_type_of(cls, obj, info):
-                return isinstance(obj, Post) and not obj.is_published
-
-        @orm.type(Post, name="PostFullUnion")
-        class PostFullUnion:
-            id: auto
-            title: auto
-
-            @classmethod
-            def is_type_of(cls, obj, info):
-                return isinstance(obj, Post) and obj.is_published
-
-        PostUnion = Annotated[
-            PostBriefUnion | PostFullUnion, strawberry.union("PostUnion")
-        ]
-
-        @orm.type(User)
-        class UsersUnionType:
-            id: auto
-            posts: list[PostUnion] = orm.field.auto()
-
-        @strawberry.type
-        class UnionListQuery:
-            @strawberry.field
-            def users(self, info: strawberry.types.Info) -> list[UsersUnionType]:
-                return users_query(User, info)  # type: ignore[return-value]
-
-        schema = strawberry.Schema(
-            query=UnionListQuery, extensions=[orm.optimizer_extension()]
-        )
-        query = """
-        {
-          users {
-            posts {
-              ... on PostBriefUnion { title }
-              ... on PostFullUnion { title }
-            }
-          }
-        }
-        """
-        result = schema_execute(schema, query)
-        assert result.errors is None
-        assert len(result.data["users"]) == self.expected_user_count
+    @staticmethod
+    def published_only(query, Post):
+        return query.filter(is_published=True)
 
 
 class TestOptimizerInlineFragmentsUnit(AbstractTestOptimizerInlineFragmentsUnitSync):

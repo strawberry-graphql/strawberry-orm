@@ -40,22 +40,26 @@ Accepted by all three constructors.
 | `payload` | `None` | A [`PayloadPolicy`](#payloads); required before using `orm.payload`. |
 | `repos` | `{}` | `{model: AbstractRepo subclass}` for mutation authorization and lifecycle hooks. |
 | `policy` | `None` | Deprecated `MutationPolicy`; use `repos` instead. |
-| `warn_missing_scope` | `True` | Warn when an `@orm.type` has no `scope_rows`. |
+| `warn_missing_scope` | `True` | Warn when an `@orm.type` has no `scope_rows`. `STRAWBERRY_ORM_WARN_MISSING_SCOPE=0` turns it off when the option is not given. |
 | `warn_sensitive` | `True` | Warn when a sensitive-looking column is exposed. |
 | `exclude_sensitive_fields` | `True` | Keep sensitive-looking columns out of generated inputs, filters, and orders. |
 | `lazy_resolution` | `"warn"` | `"off"`, `"warn"`, or `"error"` when a relation resolves lazily. |
 | `enable_optimizer` | `True` | Mount the optimizer extension from `orm.schema()`. |
 | `strict_hints` | `True` | Raise at schema build when `using=` names a missing relation, or `scope=` sits on a non-relation. |
-| `batch_relations` | `True` | Collapse per-parent relation resolvers into one query per shape. |
-| `default_query_limit` | `None` | Cap each connection page (its size when `first`/`last` are not given) and each generated root list, after its filter, order and scope. Nested relation lists are not capped. |
+| `batch_relations` | `True` | Collapse per-parent relation resolvers whose queries are identical apart from the parent key into one query. |
+| `default_query_limit` | `None` | Cap each connection page (its size when `first`/`last` are not given), each generated root list, and each root list an `@orm.field.eager()` or `orm.field.lazy(filters=…, order=…)` resolver returns as a query, after its filter, order and scope. Nested relation lists, and a resolver's own query on a field with no generated filter or order, are not capped. |
 | `max_filter_depth` | `10` | Cap filter nesting: each `not`, `all` / `any` / `oneOf` entry and `object` hop is a level, the foreign-key shortcut included. |
 | `max_filter_branches` | `50` | Cap the `all` / `any` / `oneOf` entries across one filter argument, each reference to a variable included. |
 | `max_in_list_size` | `500` | Cap the `inList` / `notInList` values (two per `range`) across one filter argument, each reference to a variable included. |
+| `max_regex_filters` | `3` | Cap the `regex` and `iRegex` lookups across one filter argument and across one request. |
+| `max_filter_text_length` | `1000` | Cap the characters of `contains`, `startsWith` and `endsWith` text, `i` forms included, across one filter argument and across one request. |
+| `max_filter_value_length` | `100000` | Cap the characters of every value a filter binds, each reference to a variable counted, across one filter argument and across one request. |
 | `max_order_entries` | `10` | Cap the entries in an `order` list. |
 | `max_group_by_entries` | `10` | Cap the entries in a `groupBy` list. |
 | `max_groups` | `100` | Refuse a connection whose `groupBy` makes more groups. |
 | `max_group_key_rows` | `100` | Refuse an `objects:` group key holding more related rows. |
-| `enable_regex_filters` | `False` | Enable the `regex` and `iRegex` string lookups. |
+| `enable_regex_filters` | `False` | Enable the `regex` and `iRegex` string lookups (raises `ValueError` on Tortoise). |
+| `max_regex_text_length` | `256` | Longest value a regex is tested on, in characters (bytes on MySQL); longer values do not match. |
 | `filter_overrides` | `{}` | `{python_type: lookup_type}` to change the generated lookup for a column type. |
 
 Backend-specific:
@@ -141,7 +145,7 @@ orm.field.eager(fn=None, *, scope=None, filters=None, order=None, compute=None,
                 description=None, deprecation_reason=None, tags=None, metadata=None)
 ```
 
-A field the library resolves: one query for the whole result set. Bare, it writes the query itself; assign it to an annotated attribute. Handed a `(query, info)` callable — as `scope=`, or as a decorator — that callable narrows which rows load, running while the eager load is built and composing **after** the related type's `scope_rows`.
+A field the library resolves: one query for the whole result set. Bare, it writes the query itself; assign it to an annotated attribute. Handed a `(query, info)` callable — as `scope=`, or as a decorator — that callable narrows which rows load, running while the eager load is built and composing **after** the related type's `scope_rows`. A limit, offset or fetch it adds is refused; `.limit(0)`, `[:0]` and `.none()` hide every row.
 
 Nothing here sees a parent row, and passing a callable that takes `self` raises. There is deliberately no `using=`: that hint discloses relations the optimizer cannot see being read, and an eager field hides nothing from it.
 
@@ -150,14 +154,14 @@ orm.field.lazy(fn=None, *, using=None, filters=None, order=None,
                description=None, deprecation_reason=None, tags=None, metadata=None)
 ```
 
-A field you resolve yourself: your callable receives `self` and runs once per parent row. Sync ORM work is moved off the event loop automatically. Name the relations it reads with `using=[...]` and they load alongside the parent, so those reads cost no extra query.
+A field you resolve yourself: your callable receives `self` and runs once per parent row. Sync ORM work is moved off the event loop automatically. Name the relations it reads with `using=[...]` and they load alongside the parent under each hop's scopes. Before your callable runs, a relation holding anything else is read again under those scopes, which costs a query.
 
 | Parameter | Applies to | Meaning |
 | --- | --- | --- |
 | `scope` | `eager` | Narrow rows through this relation edge; the keyword spelling of handing `eager` a `(query, info)` callable. |
 | `using` | `lazy` | Relations the resolver reads, eager-loaded alongside the parent. An entry can walk several hops, `"author.posts"` or `"author__posts"`, and each hop is scoped as a selection of it would be. |
 | `compute` | `eager` | Backend expressions annotated onto the query. |
-| `filters` / `order` | both | Attach generated `filter` / `order` arguments to this field. |
+| `filters` / `order` | both | Attach generated `filter` / `order` arguments to this field. On an `@orm.type`, `eager` takes them only on a to-many relation, where an argument not given falls back to the related type's; on a to-one relation, a column or an `on=` view they raise. |
 | `disable_optimization` | `eager` | Skip the optimizer for this field, and silence its lazy-load warning. |
 | `permission_classes` | `eager` | Strawberry permission classes. |
 | `tags` | both | Schemas the field belongs to; see [`orm.schema`](#building-the-schema). Also taken by `orm.field.computed`, `orm.connection.*`, `orm.node` and `orm.payload.*`. |
@@ -199,8 +203,8 @@ Generated per column type, and exported so you can reference them in custom filt
 
 | Lookup | Fields |
 | --- | --- |
-| `StringLookup` | `exact`, `neq`, `is_null`, `in_list`, `not_in_list`, `contains`, `i_contains`, `starts_with`, `i_starts_with`, `ends_with`, `i_ends_with`, `regex`, `i_regex` |
-| `StringLookupNoRegex` | as above without `regex` / `i_regex` (the default unless `enable_regex_filters=True`) |
+| `StringLookup` | `exact`, `neq`, `is_null`, `in_list`, `not_in_list`, `contains`, `i_contains`, `starts_with`, `i_starts_with`, `ends_with`, `i_ends_with`, `regex`, `i_regex` (not on Tortoise) |
+| `StringLookupNoRegex` | as above without `regex` / `i_regex` (the default unless `enable_regex_filters=True`, and always on Tortoise) |
 | `IntComparisonLookup`, `FloatComparisonLookup` | `exact`, `neq`, `is_null`, `in_list`, `not_in_list`, `gt`, `gte`, `lt`, `lte`, `range` |
 | `DateComparisonLookup`, `DateTimeComparisonLookup`, `TimeComparisonLookup` | as the numeric lookups |
 | `BooleanLookup` | `exact`, `neq`, `is_null` |
@@ -223,7 +227,7 @@ On an `@orm.type` an eager connection is served by the parent's relation, and ev
 
 `lazy` takes a resolver receiving `self` that returns the rows, and runs once per parent row. Return a query rather than a list and each parent's page is cut in SQL, like any other connection's.
 
-Either way you still get the generated `filter` / `order` / `groupBy` arguments, the grouped connection type, `totalCount`, and optimizer integration. Both also accept `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`; any other keyword raises rather than being ignored. Calling `orm.connection(...)` directly still works. See [Connection fields](README.md#connection-fields).
+Either way you still get the generated `filter` / `order` / `groupBy` arguments, the grouped connection type, `totalCount`, and optimizer integration. Both also accept `name`, `description`, `deprecation_reason`, `extensions`, and `max_results`; any other keyword raises rather than being ignored. A connection class of your own, a subclass of `ORMListConnection[Node]` or a generic one parameterized by the node, is kept with its fields. The node type has to be declared before the field, named directly or by a name already bound in its module; a connection that cannot be built raises. Calling `orm.connection(...)` directly still works. See [Connection fields](README.md#connection-fields).
 
 ```python
 orm.node(**kwargs)
@@ -362,17 +366,17 @@ orm.mutations.update_node_input(*, models=None, project=None, name=None) -> type
 orm.mutations.upsert_node_input(*, model, project, name=None) -> type
 ```
 
-Catch-all Relay node mutation *inputs* with recursive nested refs; you write the resolver. `upsert_node_input` builds a single-model `{where, create, update}` root from a project that declares `_meta.upsert.where`; the `update` member is present only when matched rows are updated. See [Node mutation inputs](README.md#node-mutations) and [Upserting](README.md#upserting-with-_metaupsert).
+Catch-all Relay node mutation *inputs* with recursive nested refs; you write the resolver. `upsert_node_input` builds a single-model `{where, create, update}` root from a project that declares `_meta.upsert.where`; the `create` member is present only when the projection names `create`, and `update` only when matched rows are updated. See [Node mutation inputs](README.md#node-mutations) and [Upserting](README.md#upserting-with-_metaupsert).
 
 `project` `_meta` keys:
 
 | Key | Value |
 | --- | --- |
-| `create`, `update` | `True` or a list of field names |
+| `create`, `update` | `True` or a list of field names. A projection naming none of `create`, `update`, `upsert`, `unlink` and `delete` offers `create` and `update`; one naming any offers only those it names, through every arm, an upsert's `create` and `update` included, and `create_node_input()`/`update_node_input()` refuse a model whose projection lacks their operation |
 | `unlink`, `delete` | `True` (to-many relations only); absent unless set |
-| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only); a replaced row is only disconnected unless `"DELETE"` is listed, and one the related repo's `scope_query` hides or `authorize` will not delete is never deleted |
+| `onReplace` | `"DISCONNECT"`, `"DELETE"` or a list of them (single links only); a replaced row is only disconnected unless `"DELETE"` is listed, and one the related repo's `scope_query` hides or `authorize` will not delete is never deleted; a delete whose cascade takes a row its repo hides or will not delete, or that `authorize` denies, is refused |
 | `upsert.where` | a list of field names to match on, or `True` for caller-chosen optional fields |
-| `upsert.onMatch` | `"UPDATE"` (default; requires `update` when set), `"IGNORE"` or `"APPEND"` |
+| `upsert.onMatch` | `"UPDATE"` (the default with `update`; requires `update` when set), `"IGNORE"` (the default without it) or `"APPEND"` |
 | `upsert.onMatchLinks` | `"ERROR"` (default) or `"IGNORE"`; only with `onMatch: "APPEND"` |
 | `immutable` | `True`: no `update`, `unlink`, `delete` or `onReplace`; matches `APPEND` unless `onMatch: "IGNORE"` |
 | `maxVisits` | positive integer: how many times the model may appear on one nesting path |
@@ -386,6 +390,12 @@ orm.apply_upsert(input, info, *, authorize=None) -> instance
 
 Executes an input built by `upsert_node_input()` as one unit of work and returns the matched or created row. The unit is a savepoint of the SQLAlchemy session, `transaction.atomic()` on the database Django's router writes to, or `in_transaction()` on the connection Tortoise's router writes to. Awaitable on an async SQLAlchemy session, in an async Django context, and always on Tortoise. Raises `UpsertValidationError` (a `ValueError`) before writing when the payload breaks its projection, `UpsertNotFoundError` (a `LookupError`) when an upsert without `create` or an `id` names no row, and `PermissionError` on any denial. See [Applying an upsert](README.md#applying-an-upsert).
 
+```python
+strawberry_orm.is_writing() -> bool
+```
+
+`True` while `orm.apply_upsert()` or `orm.apply_ref_list()` runs, in the thread or task running it. Every read the write makes then goes where it writes: Django and Tortoise route them so, and on SQLAlchemy a session's `get_bind()` must, or the write raises `TypeError` before reading anything. See [Writes and read replicas](README.md#writes-and-read-replicas).
+
 ### `AbstractRepo`
 
 Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook the lifecycle.
@@ -393,10 +403,10 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | Hook | Signature |
 | --- | --- |
 | `model` | class attribute naming the model |
-| `scope_query` | `(query, info) -> query`; every row a write finds goes through it. Writes do not apply `scope_rows`, so mirror it here |
+| `scope_query` | `(query, info) -> query`; every row a write finds goes through it. Writes do not apply `scope_rows`, so mirror it here. It narrows with conditions: a limit, offset or fetch it adds is refused wherever a write looks a row up, since the lookup takes its own, and `.limit(0)`, `[:0]` or `.none()` hides every row |
 | `can_create` | `(data, info) -> bool` |
 | `can_update` | `(instance, data, info) -> bool` |
-| `can_delete` | `(instance, info) -> bool` |
+| `can_delete` | `(instance, info) -> bool`; also asked for each row a library delete cascades to |
 | `can_link` | `(parent, field, instance, info) -> bool`; also when a single link is pointed at an existing row |
 | `can_unlink` | `(parent, field, instance, info) -> bool`; also for the row a re-pointed link replaces, and for the old parent of a row moved into another's list |
 | `can_upsert` | `(instance, info) -> bool`, for a row an upsert matched |
@@ -409,9 +419,9 @@ Subclass per model and pass `repos={Model: MyRepo}` to authorize writes and hook
 | `on_after_update` | `(instance, info) -> None` |
 | `on_before_delete` | `(instance, info) -> None` |
 
-A `can_*` hook allows with `True` and denies with `False` or `None`. Any other truthy value still allows but emits a `DeprecationWarning`. On an async SQLAlchemy session and on Tortoise a `can_*` hook may be `async`; a sync write that gets an awaitable raises `TypeError` instead of allowing. An `authorize=` callback on `apply_ref_list` or `apply_upsert` is checked in addition to these hooks, and follows the same rules.
+A `can_*` hook allows with `True` and denies with `False` or `None`. Any other truthy value still allows but emits a `DeprecationWarning`. On an async SQLAlchemy session and on Tortoise a `can_*` hook may be `async`; a sync write that gets an awaitable raises `TypeError` instead of allowing. An `authorize=` callback on `apply_ref_list` or `apply_upsert` is checked in addition to these hooks, and follows the same rules. Both are asked about every model the row belongs to (the input's model, the row's own model, and their bases), each repo once, and the row must be one each of those models' repos' `scope_query` shows.
 
-The writes create, load, save and delete rows through `_create`, `_get`, `_save` and `_delete`, or their `*_async` variants. Override one of a pair: each `*_async` default calls an override of its sync counterpart, on an async SQLAlchemy session through `AsyncSession.run_sync`, so the override's `super()` calls work there too. A sync default called with an async session outside one raises `TypeError`; on Tortoise the sync defaults always do.
+The writes create, load, save and delete rows through `_create`, `_get`, `_save` and `_delete`, or their `*_async` variants. Override one of a pair: each `*_async` default calls an override of its sync counterpart, on an async SQLAlchemy session through `AsyncSession.run_sync`, so the override's `super()` calls work there too. A sync default called with an async session outside one raises `TypeError`; on Tortoise the sync defaults always do. The `_save` default saves a row a write read with an `UPDATE` of what the write set on it, every column assigned on it since the read and the columns the ORM stamps on a save, and refuses the write if no row has its key any more; an override that assigns a column and then calls `super()._save(instance, info)` has it saved, and one that saves the row itself has to do the same. Any other instance is saved as the ORM saves it. See [A write saves what it set](README.md#a-write-saves-what-it-set).
 
 `MutationPolicy` is the deprecated predecessor. Pass `policy=` or `repos=`, not both; together they raise `ValueError`.
 
@@ -455,7 +465,7 @@ def scope_rows(cls, select, info):
     return select.where(Post.is_published.is_(True))
 ```
 
-Row-level access control. Applied wherever this model's rows load — as a root query, through a relation, during filter traversal, and when relations are read off rows already in memory. One per model. See [`scope_rows`](README.md#scope_rows--one-model-one-type). Reads only: `apply_upsert` and `apply_ref_list` find rows through the model's repo, so give a writable model an `AbstractRepo` whose `scope_query` does the same. See [Writes do not apply `scope_rows`](README.md#writes-do-not-apply-scope_rows).
+Row-level access control. Applied wherever this model's rows load — as a root query, through a relation, during filter traversal, and when relations are read off rows already in memory. One per model. A limit, offset or fetch it adds is refused; `.limit(0)`, `[:0]` and `.none()` hide every row. See [`scope_rows`](README.md#scope_rows--one-model-one-type). Reads only: `apply_upsert` and `apply_ref_list` find rows through the model's repo, so give a writable model an `AbstractRepo` whose `scope_query` does the same. See [Writes do not apply `scope_rows`](README.md#writes-do-not-apply-scope_rows).
 
 ```python
 @classmethod
@@ -475,7 +485,7 @@ Strawberry's Relay node resolution hook.
 | `Ordering` | `ASC`, `DESC`, `ASC_NULLS_FIRST`, `ASC_NULLS_LAST`, `DESC_NULLS_FIRST`, `DESC_NULLS_LAST` |
 | `DateGroupByInterval` | `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR` |
 | `DateGroupByOption` | Input pairing a date column with an interval. |
-| `FieldDefinition` | What `orm.field.eager` returns for a scope or metadata: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`, `metadata`. |
+| `FieldDefinition` | What `orm.field.eager` returns for a scope or metadata: `using`, `scope`, `compute`, `disable_optimization`, `permission_classes`, `description`, `declared_type`, `metadata`, `filters`, `order`, `deprecation_reason`. |
 | `FieldHints` | The optimizer-relevant subset: `using`, `scope`, `compute`, `disable_optimization`. |
 | `OperationInfo` | `messages: list[OperationMessage]` |
 | `OperationMessage` | `kind`, `field`, `message` |
@@ -487,7 +497,7 @@ Strawberry's Relay node resolution hook.
 
 Everything in `strawberry_orm.__all__`:
 
-`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TAGS_KEY`, `TimeComparisonLookup`, `UNSET`, `UpsertNotFoundError`, `UpsertValidationError`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `make_ref_type`, `order_field`, `tags`
+`AbstractRepo`, `BooleanLookup`, `DateComparisonLookup`, `DateGroupByInterval`, `DateGroupByOption`, `DateTimeComparisonLookup`, `FieldDefinition`, `FieldHints`, `FloatComparisonLookup`, `IDLookup`, `IntComparisonLookup`, `LazyResolutionExtension`, `MutationPolicy`, `OperationInfo`, `OperationMessage`, `OptimizerExtension`, `OptimizerStore`, `Ordering`, `PayloadPolicy`, `ReferenceLookup`, `StrawberryORM`, `StringLookup`, `StringLookupNoRegex`, `TAGS_KEY`, `TimeComparisonLookup`, `UNSET`, `UpsertNotFoundError`, `UpsertValidationError`, `aggregate_field`, `auto`, `filter_field`, `group_field`, `is_writing`, `make_ref_type`, `order_field`, `tags`
 
 From `strawberry_orm.relay`:
 

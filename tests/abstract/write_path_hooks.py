@@ -53,11 +53,17 @@ def async_lifecycle_repo(log: list[tuple[str, str]]) -> type:
 
 async def refused_on_a_sync_write(write: Callable[[], Awaitable[Any]]) -> None:
     """A sync write refuses an async hook outright, leaving no coroutine behind."""
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with pytest.raises(TypeError, match="returned an awaitable"):
-            await write()
-        gc.collect()
+    # Earlier tests' unawaited coroutines warn whenever they are collected, so
+    # they are frozen out of it and only what the write leaves is collected.
+    gc.freeze()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(TypeError, match="returned an awaitable"):
+                await write()
+            gc.collect()
+    finally:
+        gc.unfreeze()
     assert not [w for w in caught if "never awaited" in str(w.message)]
 
 

@@ -187,10 +187,12 @@ class TestRelationFieldSubclasses:
         assert backend._introspect_model(TreeDoc) == backend._introspect_model(PlainDoc)
 
     def test_a_subclassed_relation_is_written_as_the_field_it_extends(self):
+        row_keys = StrawberryORM.for_django().backend._row_keys
+
         def specs(model):
             return {
                 name: (spec.relation_mode, spec.fk_column, spec.remote_attr)
-                for name, spec in _django_relation_specs(model).items()
+                for name, spec in _django_relation_specs(model, row_keys).items()
             }
 
         assert (

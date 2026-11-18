@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -75,6 +76,27 @@ def _own_annotations(owner: type) -> dict[str, Any] | None:
     )
 
 
+def look_up_names(owner: type, ann: Any) -> Any:
+    """*ann* with the type names in it looked up, or as it was if one is unbound.
+
+    Under ``from __future__ import annotations`` every annotation is a string,
+    and a connection may name its node type as one. Strawberry looks such
+    names up in *owner*'s module once the schema is built; looked up now, the
+    field can be built from the type they name.
+    """
+    holder = type(
+        owner.__name__,
+        (),
+        {"__annotations__": {"ann": ann}, "__module__": owner.__module__},
+    )
+    try:
+        return typing.get_type_hints(
+            holder, localns=dict(vars(owner)), include_extras=True
+        )["ann"]
+    except Exception:
+        return ann
+
+
 @dataclass
 class FieldDefinition:
     """Metadata attached to fields created via orm.field()."""
@@ -89,6 +111,10 @@ class FieldDefinition:
     declared_type: Any = None
     #: Strawberry field metadata, tags included, for the field this becomes.
     metadata: dict[Any, Any] | None = None
+    #: The filter and order inputs of a to-many relation's arguments.
+    filters: Any = None
+    order: Any = None
+    deprecation_reason: str | None = None
 
     def __set_name__(self, owner: type, name: str) -> None:
         """Publish the field's type when it came from a decorated function.
